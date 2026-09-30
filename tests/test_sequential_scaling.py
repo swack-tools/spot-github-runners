@@ -146,6 +146,138 @@ class SequentialScalingTests(unittest.TestCase):
             reconcile_lost_vms([], [], self.args, state, self.path)
         self.assertIn('host_operation', controller.read_scale_state(self.path))
 
+    def test_pending_price_eviction_pauses_retry_without_releasing_uncertain_barrier(self):
+        key = f'{self.vm.zone}/{self.vm.name}'
+        state = {'price_replacement_target': 1}
+        controller.begin_host_operation('delete', self.vm, self.runners, [self.vm], state, self.path, price_eviction=True)
+        with patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]) as prices, \
+                patch('lib.spot_runner_autoscaler.delete_overpriced_vm') as delete:
+            controller.reconcile_host_operation([self.vm], self.runners, self.args, state, self.path)
+            prices.assert_called_once_with([self.vm], self.args.project, self.args.max_daily_usd, raise_on_error=True)
+            delete.assert_not_called()
+        self.assertIn('host_operation', state)
+        self.assertIn(key, state['intentional_deletions'])
+        self.assertIn(key, state['intentional_deletion_ids'])
+        self.assertEqual(state['price_replacement_target'], 1)
+        self.assertIn('host_operation', controller.read_scale_state(self.path))
+        with patch('lib.spot_runner_autoscaler.launch_offer') as launch:
+            self.assertEqual(controller.scale_up(1, ['offer'], self.args, state, self.path), 0)
+            launch.assert_not_called()
+
+    def test_pending_price_eviction_waits_when_fresh_price_is_unavailable(self):
+        state = {}
+        controller.begin_host_operation('delete', self.vm, self.runners, [self.vm], state, self.path, price_eviction=True)
+        with patch('lib.spot_runner_autoscaler.check_running_prices', side_effect=RuntimeError('pricing unavailable')), \
+                patch('lib.spot_runner_autoscaler.delete_overpriced_vm') as delete:
+            controller.reconcile_host_operation([self.vm], self.runners, self.args, state, self.path)
+            delete.assert_not_called()
+        self.assertIn('host_operation', state)
+        self.assertIn(f'{self.vm.zone}/{self.vm.name}', state['intentional_deletions'])
+
+    def test_pending_price_eviction_retries_only_after_fresh_overpriced_check(self):
+        state = {}
+        controller.begin_host_operation('delete', self.vm, self.runners, [self.vm], state, self.path, price_eviction=True)
+        with patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[self.vm]) as prices, \
+                patch('lib.spot_runner_autoscaler.delete_overpriced_vm') as delete:
+            controller.reconcile_host_operation([self.vm], self.runners, self.args, state, self.path)
+            prices.assert_called_once_with([self.vm], self.args.project, self.args.max_daily_usd, raise_on_error=True)
+            delete.assert_called_once_with(self.vm, self.args.project)
+        self.assertIn('host_operation', state)
+
+    def test_inflight_launch_and_concurrent_old_host_loss_restore_four_hosts(self):
+        from dataclasses import asdict
+        from lib.vm_recovery import reconcile_lost_vms
+        lost_launch = replace(self.vm, name='oxidex-runners-new', status='TERMINATED', instance_id='999')
+        lost_old = replace(self.vm, status='TERMINATED')
+        survivor = replace(self.vm, name='oxidex-runners-third', instance_id='333')
+        live = [self.other, survivor]
+        state = {'pending_vm_recovery': {'new': asdict(lost_launch), 'old': asdict(lost_old)}}
+        controller.begin_host_operation('launch', lost_launch, [], [], state, self.path)
+        controller.reconcile_host_operation([lost_launch, lost_old, *live], [], self.args, state, self.path)
+        self.assertEqual(state['price_replacement_target'], 4)
+        self.assertTrue(all(record['_target_recorded'] for record in state['pending_vm_recovery'].values()))
+        with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True):
+            controller.reconcile_host_operation([lost_launch, lost_old, *live], [], self.args, state, self.path)
+            controller.reconcile_host_operation(live, [], self.args, state, self.path)
+            reconcile_lost_vms(live, [], self.args, state, self.path)
+        self.assertEqual(state['price_replacement_target'], 4)
+        self.assertEqual(controller.read_scale_state(self.path)['price_replacement_target'], 4)
+
+    def test_failed_launch_known_vm_disappearing_before_next_poll_enters_recovery(self):
+        from lib.fleet_logging import observe_vms
+        offer = SimpleNamespace(region='asia-south2', machine_type='n2-standard-32', vcpu=32, ram_gib=128, hourly_usd=.1)
+        state = {}
+        actual = None
+        def command(args, **kwargs):
+            if args[:3] == ['gcloud', 'compute', 'zones']:
+                return SimpleNamespace(returncode=0, stdout='asia-south2-a\n')
+            return SimpleNamespace(returncode=1, stdout='', stderr='registration failed')
+        def inventory(*args, **kwargs):
+            nonlocal actual
+            name = state['host_operation']['vm']['name']
+            actual = replace(self.vm, name=name, disks=({'source': 'recorded-source', 'diskId': 'disk-123', 'autoDelete': True},))
+            return [actual]
+        with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=command), \
+                patch('lib.spot_runner_autoscaler.list_gcloud_vms', side_effect=inventory):
+            controller.scale_up(1, [offer], self.args, state, self.path)
+        restarted = controller.read_scale_state(self.path)
+        observe_vms([], restarted)
+        controller.reconcile_host_operation([], [], self.args, restarted, self.path)
+        self.assertEqual(restarted['host_operation']['kind'], 'recovery')
+        self.assertEqual(restarted['host_operation']['vm']['instance_id'], '123')
+        self.assertEqual(restarted['host_operation']['vm']['disks'][0]['diskId'], 'disk-123')
+        self.assertEqual(restarted['price_replacement_target'], 1)
+
+    def test_known_launch_identity_without_old_observation_still_detects_loss(self):
+        from lib.fleet_logging import observe_vms
+        state = {'observed_vms': {}}
+        controller.begin_host_operation('launch', self.vm, [], [], state, self.path)
+        observe_vms([], state)
+        controller.reconcile_host_operation([], [], self.args, state, self.path)
+        self.assertEqual(state['host_operation']['kind'], 'recovery')
+        self.assertEqual(state['price_replacement_target'], 1)
+
+    def test_pending_price_and_scale_down_delete_cleanup_terminated_same_host(self):
+        for price_eviction in (False, True):
+            with self.subTest(price_eviction=price_eviction):
+                state = {'price_replacement_target': 2 if price_eviction else 0}
+                baseline = replace(self.vm, disks=({'source': 'saved-source', 'diskId': '123', 'autoDelete': True},))
+                controller.begin_host_operation('delete', baseline, self.runners, [baseline], state, self.path,
+                                                price_eviction=price_eviction)
+                stopped = replace(baseline, status='TERMINATED')
+                with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True) as cleanup, \
+                        patch('lib.spot_runner_autoscaler.check_running_prices') as prices, \
+                        patch('lib.spot_runner_autoscaler.delete_overpriced_vm') as delete, \
+                        patch('lib.spot_runner_autoscaler.terminate_spot_vm') as terminate:
+                    controller.reconcile_host_operation([stopped, self.other], [], self.args, state, self.path)
+                    cleanup.assert_called_once_with(stopped, self.args.project)
+                    prices.assert_not_called()
+                    delete.assert_not_called()
+                    terminate.assert_not_called()
+                self.assertEqual(state['host_operation']['kind'], 'delete_cleanup')
+                self.assertTrue(state['host_operation']['drives_deleted'])
+                controller.reconcile_host_operation([self.other], [], self.args, state, self.path)
+                self.assertNotIn('host_operation', state)
+                self.assertEqual(state['price_replacement_target'], 2 if price_eviction else 0)
+                self.assertFalse(state.get('pending_vm_recovery'))
+
+    def test_terminated_delete_keeps_saved_disk_identity_during_partial_inventory(self):
+        baseline = replace(self.vm, disks=({'source': 'saved-source', 'diskId': '123', 'autoDelete': True},))
+        stopped = replace(baseline, status='TERMINATED')
+        partial = replace(stopped, disks=({'source': 'saved-source', 'autoDelete': True},))
+        state = {}
+        controller.begin_host_operation('delete', baseline, self.runners, [baseline], state, self.path)
+        with patch('lib.vm_recovery.cleanup_lost_vm', side_effect=[False, True]) as cleanup:
+            controller.reconcile_host_operation([partial], [], self.args, state, self.path)
+            cleanup.assert_called_once_with(stopped, self.args.project)
+            saved = controller.read_scale_state(self.path)
+            self.assertEqual(saved['host_operation']['vm']['disks'][0]['diskId'], '123')
+            controller.reconcile_host_operation([stopped], [], self.args, saved, self.path)
+            self.assertEqual(cleanup.call_count, 2)
+            self.assertEqual(cleanup.call_args.args[0].disks[0]['diskId'], '123')
+        controller.reconcile_host_operation([], [], self.args, saved, self.path)
+        self.assertNotIn('host_operation', saved)
+
 
 if __name__ == '__main__':
     unittest.main()

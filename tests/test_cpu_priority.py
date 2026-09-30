@@ -37,6 +37,15 @@ class CpuPriorityTests(unittest.TestCase):
                   Offer('a', 'n2-standard-64', 64, 256, .15)]
         self.assertEqual([o.ram_gib for o in eligible_offers(offers, Decimal('5'))], [110])
 
+    def test_exact_32_cpu_generation_tiers_use_cheapest_peer(self):
+        offers = [Offer('a', 'c4-standard-32', 32, 120, .19),
+                  Offer('b', 'n4-standard-32', 32, 128, .17),
+                  Offer('c', 'c4d-standard-32', 32, 124, .18),
+                  Offer('d', 'n4d-standard-32', 32, 128, .16)]
+        self.assertEqual([o.machine_type for o in eligible_offers(offers, Decimal('5'))],
+                         ['n4d-standard-32', 'c4d-standard-32',
+                          'n4-standard-32', 'c4-standard-32'])
+
     def test_new_families_are_counted_as_managed_x64_runners(self):
         for family in ('c4', 'c4d', 'n4', 'n4d', 'n2d'):
             runner = GitHubRunner(1, 'gha-worker-1', 'online', False, ('spot', 'X64', family + '-standard-32'))
@@ -87,6 +96,15 @@ class CpuPriorityTests(unittest.TestCase):
 
     def test_matching_arm_label_does_not_count_toward_x64_capacity(self):
         self.assertFalse(runner_is_managed(GitHubRunner(1,'arm','online',False,('spot','ARM64','c4a-standard-32'))))
+
+    def test_fractional_custom_ram_cannot_understate_the_compute_price(self):
+        from lib.runner_manager import verify_price_and_capacity
+        args = args_parser().parse_args(['--max-cost', str(Decimal('5') / 24),
+                                        '--instance-type', 'n2-custom-32-112896', '--ram', '110'])
+        with patch('lib.runner_manager.gcloud', return_value=json.dumps({'guestCpus': 32, 'memoryMb': 112896})), \
+             patch('lib.runner_manager.spot_rates', return_value=(Decimal('.005'), Decimal('.0004389'))):
+            with self.assertRaisesRegex(RuntimeError, 'no resources changed'):
+                verify_price_and_capacity(args, 'zone-a')
 
     def test_family_like_non_machine_label_does_not_count_as_managed(self):
         self.assertFalse(runner_is_managed(GitHubRunner(1,'other','online',False,('spot','X64','n4-region'))))

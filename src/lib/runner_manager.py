@@ -137,10 +137,11 @@ def verify_price_and_capacity(args: argparse.Namespace, zone: str) -> Decimal:
     profile = configure_storage(args)
     machine = json.loads(gcloud(["compute", "machine-types", "describe", args.instance_type, "--zone", zone, "--format=json"], quiet=True))
     cpu, ram = int(machine["guestCpus"]), int(machine["memoryMb"]) // 1024
+    priced_ram = Decimal(str(machine["memoryMb"])) / 1024
     if (cpu, ram) != (args.cpu, args.ram):
         raise RuntimeError(f"GCE reports {cpu} vCPU/{ram} GiB; request was {args.cpu}/{args.ram}")
     core_rate, ram_rate = spot_rates(args.region, family)
-    hourly = core_rate * cpu + ram_rate * ram
+    hourly = core_rate * cpu + ram_rate * priced_ram
     LOG.info(f"Live Spot {family.upper()} rates ({args.region}): ${core_rate}/vCPU-hour, ${ram_rate}/GiB-hour")
     LOG.info(f"Compute estimate: ${hourly:.6f}/hour per VM. {args.disk_size_gb} GiB {args.disk_type} disk is billed separately.")
     if hourly >= args.max_cost:

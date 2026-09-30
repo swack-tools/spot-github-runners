@@ -83,6 +83,13 @@ class PriceGuardTests(unittest.TestCase):
                 reconcile_prices([self.vm], [], self.args, recovered, path)
             self.assertEqual(read_scale_state(path)["price_replacement_target"], 0)
 
+    @patch("lib.price_guard.subprocess.run")
+    @patch("lib.price_guard.spot_rates", side_effect=RuntimeError("API unavailable"))
+    def test_strict_pending_eviction_price_check_exposes_lookup_failure(self, rates, command):
+        with self.assertRaisesRegex(RuntimeError, "API unavailable"):
+            check_running_prices([self.vm], "project", Decimal("5"), raise_on_error=True)
+        command.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

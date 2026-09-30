@@ -96,23 +96,32 @@ def cleanup_lost_vm(vm: GceVm, project: str) -> bool:
 
 
 
+def record_loss_restoration_target(vms, state, state_path):
+    """Record all new losses together so a launch transition cannot undercount."""
+    from .spot_runner_autoscaler import spot_instances, write_scale_state
+
+    pending = state.get('pending_vm_recovery', {})
+    new_losses = sum(not record.get('_target_recorded') for record in pending.values())
+    if not new_losses:
+        return
+    state['price_replacement_target'] = max(state.get('price_replacement_target', 0),
+                                            len(spot_instances(vms)) + new_losses)
+    for record in pending.values():
+        record['_target_recorded'] = True
+    write_scale_state(state_path, state)
+
+
 def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
     """Share a persisted restoration target with price recovery; launch each deficit once."""
     from .spot_runner_autoscaler import (begin_host_operation, reconcile_prices,
-                                        spot_instances, write_scale_state)
+                                        write_scale_state)
 
     pending = state.get('pending_vm_recovery', {})
     if not pending:
         return False
     if state.get('host_operation'):
         return True
-    new_losses = sum(not record.get('_target_recorded') for record in pending.values())
-    if new_losses:
-        state['price_replacement_target'] = max(state.get('price_replacement_target', 0),
-                                                len(spot_instances(vms)) + new_losses)
-        for record in pending.values():
-            record['_target_recorded'] = True
-        write_scale_state(state_path, state)
+    record_loss_restoration_target(vms, state, state_path)
     for key, record in pending.items():
         if record.get('_cleanup_complete'):
             continue

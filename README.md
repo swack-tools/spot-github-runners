@@ -212,7 +212,8 @@ python3 src/spot_runner_autoscaler.py
 
 The autoscaler considers supported x86 Spot offers with exactly 32 vCPU and
 at least 110 GiB of RAM that cost less than the daily compute cap. It prefers
-C4/C4D, then N4D, N4, older N2/N2D/C2D, and finally E2, choosing the cheapest
+C4D/N4D (Turin), then C4/N4 (Emerald Rapids at 32 vCPU), older N2/N2D/C2D,
+and finally E2, choosing the cheapest
 offer within each tier. These are CPU-generation preferences, not measured
 Rust build rankings. C4's 120 GiB and C4D's 124 GiB qualify; ARM, Local SSD,
 and bare-metal variants are excluded. Data and boot disk charges are separate

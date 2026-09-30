@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from decimal import Decimal
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -211,6 +211,14 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         vm = current
         write_scale_state(state_path, state)
     assigned = host_runners(vm, runners, [vm, *[item for item in vms if item.name != vm.name]])
+    if operation["kind"] == "delete" and current and current.status.upper() == "TERMINATED":
+        # A timed-out intentional delete can be followed by a stopped host.
+        # Finish only this identity's disk cleanup without creating a loss target.
+        # Keep the saved drive IDs as cleanup authorization. A partial current
+        # inventory must not discard IDs, or authorize newly attached drives.
+        vm = replace(vm, status=current.status)
+        operation.update(kind="delete_cleanup", vm=asdict(vm))
+        write_scale_state(state_path, state)
     if operation["kind"] == "launch":
         # A restart without a manager receipt cannot prove that an absent VM will
         # not finish provisioning later. Retain intent until registration/loss is observed.
@@ -221,21 +229,27 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
             state.pop("host_operation")
             write_scale_state(state_path, state)
         else:
-            losses = state.get("pending_vm_recovery", {})
+            losses = state.setdefault("pending_vm_recovery", {})
+            if current is None and vm.instance_id:
+                # The manager observed a real host; its disappearance is a loss
+                # even when it happened before the controller's next full poll.
+                from .fleet_logging import recovery_key
+                key = recovery_key(f"{vm.zone}/{vm.name}", vm, losses)
+                if key not in losses:
+                    losses[key] = asdict(vm)
+                    LOG.warning("In-flight launch VM no longer present: %s; cause unconfirmed", vm_details(vm))
             lost = next(((key, record) for key, record in losses.items()
                          if record.get("name") == vm.name and record.get("zone") == vm.zone
                          and (not vm.instance_id or record.get("instance_id") == vm.instance_id)), None)
             if lost:
                 key, record = lost
-                if not record.get("_target_recorded"):
-                    state["price_replacement_target"] = max(state.get("price_replacement_target", 0),
-                                                             len(spot_instances(vms)) + 1)
-                    record["_target_recorded"] = True
+                from .vm_recovery import record_loss_restoration_target
+                record_loss_restoration_target(vms, state, state_path)
                 operation.update(kind="recovery", vm=record, recovery_key=key)
                 write_scale_state(state_path, state)
             LOG.info("Fleet scaling waits for eight online runner slots on %s", vm_details(vm))
         return True
-    if operation["kind"] == "recovery" and not operation.get("drives_deleted"):
+    if operation["kind"] in ("recovery", "delete_cleanup") and not operation.get("drives_deleted"):
         from .vm_recovery import cleanup_lost_vm
         try:
             if cleanup_lost_vm(vm, args.project):
@@ -244,13 +258,23 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.warning("Recovery pending for %s: %s", vm_details(vm), error_detail(exc))
         return True
-    if current and operation["kind"] == "recovery":
+    if current and operation["kind"] in ("recovery", "delete_cleanup"):
         LOG.info("Recovery waits for fresh VM absence confirmation: %s", vm_details(vm))
         return True
     if current:
         LOG.info("Retrying deletion of the same pending host: %s", vm_details(vm))
         try:
             if operation.get("price_eviction"):
+                if not current.running:
+                    LOG.info("Price eviction waits for VM deletion confirmation: %s", vm_details(current))
+                    return True
+                overpriced = check_running_prices([current], args.project, args.max_daily_usd, raise_on_error=True)
+                if not overpriced:
+                    # The previous delete may still complete asynchronously.
+                    # Pause retries but retain its identity, intent and fleet barrier.
+                    LOG.info("Paused pending price eviction: fresh price is within cap; previous deletion outcome remains pending for %s",
+                             vm_details(current))
+                    return True
                 delete_overpriced_vm(current, args.project)
             else:
                 terminate_spot_vm(current, args.project, args.org, runners, vms)
@@ -484,6 +508,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         existing = next((item for item in inventory if item.zone == zone and item.name == instance_name), None)
         if existing:
             state["host_operation"]["vm"] = asdict(existing)
+            state.setdefault("observed_vms", {})[f"{existing.zone}/{existing.name}"] = asdict(existing)
             write_scale_state(state_path, state)
             raise RuntimeError(f"Deployment failed but {instance_name} still exists; waiting for this host")
         failure = error_detail(result.stderr or result.stdout or "").lower()

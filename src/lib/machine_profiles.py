@@ -19,9 +19,10 @@ class MachineProfile:
 
 MACHINE_PROFILES = {
     'c4d': MachineProfile(0, 'C4D_CPUS', 'hyperdisk-balanced', 'NVME'),
-    'c4': MachineProfile(0, 'C4_CPUS', 'hyperdisk-balanced', 'NVME'),
-    'n4d': MachineProfile(1, 'N4D_CPUS', 'hyperdisk-balanced', 'NVME'),
-    'n4': MachineProfile(2, 'N4_CPUS', 'hyperdisk-balanced', 'NVME'),
+    # Exact 32-vCPU C4 uses Emerald Rapids, as does N4. C4D/N4D use Turin.
+    'c4': MachineProfile(1, 'C4_CPUS', 'hyperdisk-balanced', 'NVME'),
+    'n4d': MachineProfile(0, 'N4D_CPUS', 'hyperdisk-balanced', 'NVME'),
+    'n4': MachineProfile(1, 'N4_CPUS', 'hyperdisk-balanced', 'NVME'),
     'c2d': MachineProfile(3, 'C2D_CPUS'),
     'n2': MachineProfile(3, 'N2_CPUS'),
     'n2d': MachineProfile(3, 'N2D_CPUS'),
