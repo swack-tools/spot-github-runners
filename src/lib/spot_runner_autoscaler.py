@@ -17,6 +17,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .autoscaling_policy import affordable_offers
+from .machine_profiles import MINIMUM_RAM_GIB, machine_profile
 from .compute_api import get_auth
 from .environment import load_env
 from .job_recovery import JobRecovery
@@ -41,8 +42,7 @@ def count_online_runners(org: str, label: str) -> int:
 
 def runner_is_managed(runner: GitHubRunner) -> bool:
     """Return whether a runner belongs to this GCP x64 fleet."""
-    current_shape = bool({"n2-standard-32", "e2-standard-32", "c2d-standard-32"}
-                         .intersection(runner.labels))
+    current_shape = any('-' in label and machine_profile(label) is not None for label in runner.labels)
     legacy_toronto = {
         "oxidex-spot-7x27", "northamerica-northeast2"
     }.issubset(runner.labels)
@@ -399,7 +399,7 @@ def scaling_decision(online: int, busy: int, vm_count: int, idle_loops: int,
 def discover_offers(project: str, max_daily_usd: Decimal, top: int = 500):
     auth = get_auth(project)
     offers, _, _, errors = asyncio.run(
-        find(auth, min_vcpu=32, min_ram=128, top=top, concurrency=200,
+        find(auth, min_vcpu=32, min_ram=MINIMUM_RAM_GIB, top=top, concurrency=200,
              billing_api_key=os.environ.get("GOOGLE_CLOUD_API_KEY"))
     )
     for error in errors[:5]:
@@ -408,9 +408,11 @@ def discover_offers(project: str, max_daily_usd: Decimal, top: int = 500):
 
 
 def eligible_offers(offers, max_daily_usd: Decimal):
-    """Keep affordable offers with exactly 32 vCPU and 128 GiB of RAM."""
-    exact_shapes = [offer for offer in offers if offer.vcpu == 32 and offer.ram_gib == 128]
-    return affordable_offers(exact_shapes, max_daily_usd)
+    """Prefer newer supported CPUs within the compute cap and 110-GiB floor."""
+    shapes = [offer for offer in offers if offer.vcpu == 32 and offer.ram_gib >= MINIMUM_RAM_GIB
+              and machine_profile(offer.machine_type) is not None]
+    return sorted(affordable_offers(shapes, max_daily_usd),
+                  key=lambda offer: machine_profile(offer.machine_type).cpu_tier)
 
 
 def runner_capacity(vcpu: int) -> int:
@@ -454,10 +456,15 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             "--runner-prefix", runner_prefix,
             "--runner-label", args.label, "--apply",
         ]
+        profile = machine_profile(offer.machine_type)
+        if profile is None:
+            raise RuntimeError(f'Unsupported runner machine type: {offer.machine_type}')
         vm = GceVm(instance_name, zone, "PROVISIONING", offer.machine_type, True,
                    vcpu=offer.vcpu, ram_gib=offer.ram_gib,
-                   disks=({"boot": True, "diskSizeGb": 40, "diskType": "pd-balanced"},
-                          {"boot": False, "diskSizeGb": args.disk_size_gb, "diskType": "pd-balanced"}))
+                   disks=({"boot": True, "diskSizeGb": 40, "diskType": profile.disk_type,
+                           "interface": profile.disk_interface},
+                          {"boot": False, "diskSizeGb": args.disk_size_gb, "diskType": profile.disk_type,
+                           "interface": profile.disk_interface}))
         LOG.info("Found instance in region %s: %s; $%.4f/day compute; attempting to launch it now",
                  offer.region, vm_details(vm), offer.hourly_usd * 24)
         begin_host_operation("launch", vm, [], [], state, state_path)

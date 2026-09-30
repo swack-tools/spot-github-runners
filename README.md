@@ -156,8 +156,12 @@ python3 src/spot_runner_manager.py \
 ```
 
 The manager verifies current Spot rates and quota before creating resources. It
-uses a Spot VM with a 40-GiB boot disk and a 100-GiB `pd-balanced` data
-disk configured to delete with its VM. Stopping a VM preserves the data disk;
+uses a Spot VM with a 40-GiB boot disk and a 100-GiB data disk configured to
+delete with its VM. C4, C4D, N4, and N4D use Hyperdisk Balanced boot and data
+disks with NVMe and gVNIC. Both disks explicitly provision the included
+3,000 IOPS and 140 MiB/s throughput baseline. N2, N2D, C2D, and E2 retain
+`pd-balanced` defaults. An incompatible existing data disk or explicit disk
+type is rejected before attachment. Stopping a VM preserves the data disk;
 deleting the VM removes its attached runner disk as well. Before deployment,
 the manager also removes unattached disks carrying its ownership label in the
 target zone when they are at least six hours old. This avoids racing an active
@@ -206,8 +210,14 @@ cap:
 python3 src/spot_runner_autoscaler.py
 ```
 
-The autoscaler only considers Spot offers for exactly 32 vCPU and 128 GiB of
-RAM that cost less than the daily cap. New runner names use the short `gha`
+The autoscaler considers supported x86 Spot offers with exactly 32 vCPU and
+at least 110 GiB of RAM that cost less than the daily compute cap. It prefers
+C4/C4D, then N4D, N4, older N2/N2D/C2D, and finally E2, choosing the cheapest
+offer within each tier. These are CPU-generation preferences, not measured
+Rust build rankings. C4's 120 GiB and C4D's 124 GiB qualify; ARM, Local SSD,
+and bare-metal variants are excluded. Data and boot disk charges are separate
+from the compute cap. Every deployment verifies fresh regional prices using
+the selected host's actual CPU and RAM counts. New runner names use the short `gha`
 prefix and are checked against GitHub's 64-character name limit. The autoscaler
 stores its idle-loop counters, restoration targets, and pending host operation in
 `~/Library/Application Support/Spot Runner Autoscaler/state.json`.
