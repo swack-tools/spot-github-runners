@@ -114,6 +114,23 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual([call.args[0] for call in launch.call_args_list], [2])
             self.assertEqual(read_scale_state(path)['pending_vm_recovery'], {})
 
+    def test_new_loss_does_not_recount_loss_already_covered_by_live_replacement(self):
+        old = {**asdict(self.vm), '_target_recorded': True, '_cleanup_complete': True}
+        newly_lost = {**asdict(self.vm), 'name': 'oxidex-runners-second-loss'}
+        live = [GceVm(name, self.vm.zone, 'RUNNING', self.vm.machine_type, True)
+                for name in ('oxidex-runners-live', 'oxidex-runners-replacement')]
+        state = {'idle_loops': 0, 'scale_up_active': False, 'price_replacement_target': 3,
+                 'pending_vm_recovery': {'old': old, 'new': newly_lost}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            with patch('lib.vm_recovery.cleanup_lost_vm', return_value=True), \
+                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
+                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=live), \
+                    patch('lib.spot_runner_autoscaler.discover_offers', return_value=['offer']), \
+                    patch('lib.spot_runner_autoscaler.scale_up', side_effect=lambda n, *args: n) as launch:
+                vm_recovery.reconcile_lost_vms(live, [], self.args, state, path)
+            self.assertEqual([call.args[0] for call in launch.call_args_list], [1])
+
     def test_restart_after_successful_launch_observes_restored_target_without_relaunch(self):
         key = f'{self.vm.zone}/{self.vm.name}'
         state = {'idle_loops': 0, 'scale_up_active': False, 'pending_vm_recovery': {key: asdict(self.vm)}}

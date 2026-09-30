@@ -103,9 +103,10 @@ def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
     pending = state.get('pending_vm_recovery', {})
     if not pending:
         return False
-    if any(not record.get('_target_recorded') for record in pending.values()):
+    new_losses = sum(not record.get('_target_recorded') for record in pending.values())
+    if new_losses:
         state['price_replacement_target'] = max(state.get('price_replacement_target', 0),
-                                                len(spot_instances(vms)) + len(pending))
+                                                len(spot_instances(vms)) + new_losses)
         for record in pending.values():
             record['_target_recorded'] = True
         write_scale_state(state_path, state)
