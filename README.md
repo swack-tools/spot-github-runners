@@ -15,19 +15,26 @@ for the two ARM64 runners through the OrbStack socket.
 ```mermaid
 flowchart TD
     A[Read runners and current VM prices] --> P{Any VM over the price cap?}
-    P -- Yes --> R[Delete overpriced VMs and disks]
-    R --> S[Find and launch affordable replacements]
-    S --> A
+    P -- Yes --> R[Clear custom labels and drain jobs]
+    R --> S{All host runners online and idle?}
+    S -- No --> A
+    S -- Yes --> T[Remove runner registrations and delete VM disks]
+    T --> U[Find and launch affordable replacements]
+    U --> A
     P -- No --> B{Busy share above 50%?}
     B -- Yes and at most 25 workers --> C[Double Spot VM count]
     C --> D{More than 25 workers online?}
     D -- No --> C
     D -- Yes --> A
     B -- No --> E{Below 50% busy for two checks?}
-    E -- Yes --> F[Halve idle Spot VM count]
-    F --> G{One Spot VM remains?}
-    G -- No --> A
-    G -- Yes --> A
+    E -- Yes --> F[Select hosts with at most half busy]
+    F --> G[Clear custom runner labels]
+    G --> H{All host runners online and idle?}
+    H -- No --> A
+    H -- Yes --> I[Remove runner registrations and delete VM disks]
+    I --> J{One Spot VM remains?}
+    J -- No --> A
+    J -- Yes --> A
     E -- No --> A
 ```
 
@@ -37,13 +44,17 @@ label. GitHub
 adds the standard `self-hosted`, `Linux`, and `X64` labels to both pools. Spot
 runners also receive `spot` and optional machine and region labels. Docker
 runners receive `docker` and optional machine and region labels. The autoscaler
-launches whole hosts and checks again every five minutes. When more than half
-of the online GCP runners are busy and 25 or fewer are online, it doubles the
-Spot VM count on each check until more than 25 workers are online. When fewer
-than half are busy for two consecutive checks, it halves the Spot VM count,
-repeating that reduction until one Spot VM remains. It removes only hosts
-whose registered runners are all online and idle, and it preserves the Docker
-runner and distinct-host floors. Deleting a VM also deletes its attached disks.
+launches whole hosts and checks utilization every five minutes. When more than
+half of the online GCP runners are busy and 25 or fewer are online, it doubles
+the Spot VM count on each check until more than 25 workers are online. When
+fewer than half are busy for two consecutive checks, it halves the Spot VM
+count, repeating that reduction until one Spot VM remains. Each loop records
+the busy and online runner counts for every host. Scale-down selects hosts with
+at most half of their assigned runners busy, while preserving the Docker runner
+and distinct-host floors. It removes each selected host's custom labels, checks
+job status on every later loop, and waits while any runner is busy or offline.
+When all registered runners are online and idle, it unregisters them and deletes
+the VM and attached disks.
 Each added host contributes eight runner containers, including two Docker
 workers and six Spot workers. Spot VM prices cover compute only. Persistent
 disks and network use have separate charges.
@@ -53,12 +64,14 @@ VM against `--max-daily-usd` (default: $5 per VM per day for compute).
 Prices are shared within one loop for VMs of the same family and region, then
 fetched again on the next loop. The launch price is not a price guarantee.
 
-If a VM's current compute price exceeds the cap, the autoscaler deletes that VM
-and its attached disks immediately, even if its runners have active jobs. Those
-jobs can fail and need to be rerun. It then searches for affordable replacements
-and uses the deployment manager to check their prices again before launch.
-Pending replacements survive process restarts and are retried when no eligible
-capacity is available. Utilization scaling waits during replacement work.
+If a VM's current compute price exceeds the cap, the autoscaler removes its
+custom runner labels and waits for its jobs to finish before unregistering the
+runners and deleting the VM and its attached disks. GitHub keeps the standard
+read-only labels until each runner is unregistered. Pending price drains and
+replacement targets survive process restarts. The autoscaler searches for
+affordable replacements and checks their prices again before launch. It retries
+when no eligible capacity is available, and utilization scaling waits during
+price replacement work.
 If GCP cannot provide a valid price, the autoscaler logs the failed
 check, keeps that VM, and retries on the next loop.
 

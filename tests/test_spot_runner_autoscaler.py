@@ -6,6 +6,8 @@ from lib.autoscaling_policy import affordable_offers, vm_count_for_floor
 from lib.runner_labels import counts_toward_capacity, custom_labels_for_runner
 from lib.runner_fleet import GitHubRunner
 from lib.spot_runner_autoscaler import (
+    begin_vm_drain,
+    scale_down,
     docker_pool_hosts,
     docker_pool_satisfied,
     eligible_offers,
@@ -137,6 +139,117 @@ class AutoscalerPolicyTests(unittest.TestCase):
         ]
         self.assertEqual(host_runners(short, runners, [short, long]), [runners[0]])
         self.assertEqual(host_runners(long, runners, [short, long]), [runners[1]])
+
+    def test_scale_down_candidates_can_have_at_most_half_their_runners_busy(self):
+        from lib.runner_fleet import GceVm
+        from lib.spot_runner_autoscaler import removable_spot_vms
+
+        vm = GceVm("oxidex-runners-asia-a-123", "asia-south2-a", "RUNNING",
+                   "n2-standard-32", True)
+        runners = [
+            GitHubRunner(index, f"gha-{vm.name}-{index}", "online", index <= 4,
+                         ("spot", "n2-standard-32", "asia-south2"))
+            for index in range(1, 9)
+        ]
+        self.assertEqual(removable_spot_vms([vm], runners, 0, 0), [vm])
+        runners[4] = GitHubRunner(5, f"gha-{vm.name}-5", "online", True,
+                                  ("spot", "n2-standard-32", "asia-south2"))
+        self.assertEqual(removable_spot_vms([vm], runners, 0, 0), [])
+
+    def test_scale_down_preserves_docker_floor_across_all_selected_hosts(self):
+        from lib.runner_fleet import GceVm
+        from lib.spot_runner_autoscaler import removable_spot_vms
+
+        vms = [GceVm(f"oxidex-runners-asia-{letter}-123", f"asia-south2-{letter}",
+                      "RUNNING", "n2-standard-32", True) for letter in "abcd"]
+        runners = []
+        for host_index, vm in enumerate(vms):
+            labels = (("docker", "n2-standard-32") if host_index < 3
+                      else ("spot", "n2-standard-32"))
+            runners.extend(
+                GitHubRunner(host_index * 8 + index,
+                             f"gha-{vm.name}-{index}", "online", False, labels)
+                for index in range(1, 9)
+            )
+
+        candidates = removable_spot_vms(vms, runners, 2, 2)
+
+        self.assertEqual([vm.name for vm in candidates],
+                         ["oxidex-runners-asia-d-123", "oxidex-runners-asia-a-123"])
+
+    def test_scale_down_accounts_for_docker_hosts_already_draining(self):
+        from lib.runner_fleet import GceVm
+        from lib.spot_runner_autoscaler import removable_spot_vms
+
+        vms = [GceVm(f"oxidex-runners-asia-{letter}-123", f"asia-south2-{letter}",
+                      "RUNNING", "n2-standard-32", True) for letter in "abc"]
+        runners = []
+        for host_index, vm in enumerate(vms):
+            runners.extend(
+                GitHubRunner(host_index * 8 + index,
+                             f"gha-{vm.name}-{index}", "online", False,
+                             ("docker", "n2-standard-32"))
+                for index in range(1, 9)
+            )
+
+        candidates = removable_spot_vms(
+            vms, runners, 2, 2, {vms[0].name}, set(range(1, 9)))
+
+        self.assertEqual(candidates, [])
+
+    def test_begin_vm_drain_removes_custom_labels_and_records_drain_reason(self):
+        from unittest.mock import patch
+        from lib.runner_fleet import GceVm
+
+        vm = GceVm("oxidex-runners-asia-a-123", "asia-south2-a", "RUNNING",
+                   "n2-standard-32", True)
+        runners = [
+            GitHubRunner(1, f"gha-{vm.name}-1", "online", True,
+                         ("self-hosted", "Linux", "X64", "spot", "n2-standard-32")),
+            GitHubRunner(2, f"gha-{vm.name}-2", "online", False,
+                         ("self-hosted", "Linux", "X64", "docker", "n2-standard-32")),
+        ]
+        state = {"draining_vms": {}}
+        with patch("lib.spot_runner_autoscaler.subprocess.run") as run:
+            self.assertTrue(begin_vm_drain(vm, runners, [vm], "swack-tools", state, "scale-down"))
+
+        self.assertEqual(len(run.call_args_list), 2)
+        self.assertTrue(all(call.args[0][:4] == ["gh", "api", "-X", "DELETE"]
+                            for call in run.call_args_list))
+        self.assertTrue(all(call.args[0][-1].endswith("/labels")
+                            for call in run.call_args_list))
+        self.assertEqual(state["draining_vms"][vm.name]["reason"], "scale-down")
+
+    def test_scale_down_starts_drain_for_half_busy_host_without_shutting_it_down(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from lib.runner_fleet import GceVm
+
+        candidate = GceVm("oxidex-runners-asia-a-123", "asia-south2-a", "RUNNING",
+                          "n2-standard-32", True)
+        busy_host = GceVm("oxidex-runners-asia-b-456", "asia-south2-b", "RUNNING",
+                          "n2-standard-32", True)
+        runners = [
+            GitHubRunner(index, f"gha-{candidate.name}-{index}", "online", index <= 4,
+                         ("spot", "n2-standard-32"))
+            for index in range(1, 9)
+        ] + [
+            GitHubRunner(index + 8, f"gha-{busy_host.name}-{index}", "online", index <= 5,
+                         ("spot", "n2-standard-32"))
+            for index in range(1, 9)
+        ]
+        args = SimpleNamespace(org="swack-tools", minimum_docker_runners=0,
+                               minimum_docker_hosts=0)
+        state = {"draining_vms": {}}
+        with patch("lib.spot_runner_autoscaler.subprocess.run") as command:
+            started = scale_down([candidate, busy_host], runners, args, state)
+
+        self.assertEqual(started, 1)
+        self.assertIn(candidate.name, state["draining_vms"])
+        self.assertNotIn(busy_host.name, state["draining_vms"])
+        self.assertEqual(command.call_count, 8)
+        self.assertTrue(all(call.args[0][-1].endswith("/labels")
+                            for call in command.call_args_list))
 
 
 if __name__ == "__main__":

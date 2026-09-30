@@ -8,9 +8,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from lib.price_guard import check_running_prices, delete_overpriced_vm
+from lib.price_guard import check_running_prices
 from lib.runner_fleet import GceVm, GitHubRunner
-from lib.spot_runner_autoscaler import read_scale_state, reconcile_prices, utilization_counts
+from lib.spot_runner_autoscaler import (
+    advance_vm_drains,
+    read_scale_state,
+    reconcile_prices,
+    utilization_counts,
+)
 
 
 class PriceGuardTests(unittest.TestCase):
@@ -36,40 +41,37 @@ class PriceGuardTests(unittest.TestCase):
             self.assertEqual(check_running_prices([self.vm], "project", Decimal("5")), [])
         command.assert_not_called()
 
-    @patch("lib.price_guard.subprocess.run")
-    def test_price_eviction_deletes_disks_and_rejects_other_vms(self, command):
-        delete_overpriced_vm(self.vm, "project")
-        self.assertIn("--delete-disks=all", command.call_args.args[0])
-        other = GceVm("unrelated", "asia-south2-a", "RUNNING", "n2-standard-32", True)
-        with self.assertRaises(ValueError):
-            delete_overpriced_vm(other, "project")
-        self.assertEqual(command.call_count, 1)
-
     def test_alternative_supported_replacement_families_count_as_capacity(self):
         runners = [GitHubRunner(index, f"gha-replacement-{index}", "online", False,
                                ("spot", "X64", shape))
                    for index, shape in enumerate(("e2-standard-32", "c2d-standard-32"))]
         self.assertEqual(utilization_counts(runners, "spot"), (2, 0))
 
-    def test_busy_price_eviction_saves_replacement_before_deleting(self):
-        runner = GitHubRunner(1, "gha-oxidex-runners-test-1", "online", True, ("spot",))
-        state = {"idle_loops": 1, "scale_up_active": False}
+    def test_busy_price_eviction_clears_labels_and_waits_before_deleting(self):
+        runner = GitHubRunner(1, "gha-oxidex-runners-test-1", "online", True,
+                              ("self-hosted", "Linux", "X64", "spot", "n2-standard-32"))
+        state = {"idle_loops": 1, "scale_up_active": False, "draining_vms": {}}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
-
-            def remove(vm, project):
-                self.assertEqual(read_scale_state(path)["price_replacement_target"], 1)
-
             with patch("lib.spot_runner_autoscaler.check_running_prices", return_value=[self.vm]), \
-                    patch("lib.spot_runner_autoscaler.delete_overpriced_vm", side_effect=remove) as delete, \
-                    patch("lib.spot_runner_autoscaler.subprocess.run", return_value=SimpleNamespace(returncode=0)), \
-                    patch("lib.spot_runner_autoscaler.list_gcloud_vms", return_value=[]), \
-                    patch("lib.spot_runner_autoscaler.discover_offers", return_value=["offer"]), \
-                    patch("lib.spot_runner_autoscaler.scale_up", return_value=0):
+                    patch("lib.spot_runner_autoscaler.subprocess.run") as command, \
+                    patch("lib.spot_runner_autoscaler.list_gcloud_vms", return_value=[self.vm]):
                 self.assertTrue(reconcile_prices([self.vm], [runner], self.args, state, path))
-                delete.assert_called_once_with(self.vm, "project")
+                self.assertTrue(command.call_args.args[0][-1].endswith("/labels"))
             recovered = read_scale_state(path)
             self.assertEqual(recovered["price_replacement_target"], 1)
+            self.assertEqual(recovered["draining_vms"][self.vm.name]["reason"], "price")
+
+            idle_runner = GitHubRunner(1, runner.name, "online", False,
+                                       ("self-hosted", "Linux", "X64"))
+            with patch("lib.spot_runner_autoscaler.subprocess.run") as command:
+                removed, runner_ids = advance_vm_drains(
+                    [self.vm], [idle_runner], self.args, recovered)
+            self.assertEqual(removed, {self.vm.name})
+            self.assertEqual(runner_ids, {runner.runner_id})
+            self.assertTrue(command.call_args_list[0].args[0][4].endswith("/1"))
+            self.assertIn("--delete-disks=all", command.call_args_list[1].args[0])
+
             with patch("lib.spot_runner_autoscaler.check_running_prices", return_value=[]), \
                     patch("lib.spot_runner_autoscaler.list_gcloud_vms", return_value=[]), \
                     patch("lib.spot_runner_autoscaler.discover_offers", return_value=["offer"]), \
@@ -77,6 +79,22 @@ class PriceGuardTests(unittest.TestCase):
                 self.assertTrue(reconcile_prices([], [], self.args, recovered, path))
                 launch.assert_called_once_with(1, ["offer"], self.args)
             self.assertEqual(read_scale_state(path)["price_replacement_target"], 0)
+
+    def test_drain_keeps_vm_running_while_any_runner_is_busy(self):
+        runner = GitHubRunner(1, "gha-oxidex-runners-test-1", "online", True,
+                              ("self-hosted", "Linux", "X64"))
+        state = {"draining_vms": {self.vm.name: {
+            "zone": self.vm.zone,
+            "reason": "scale-down",
+            "runner_ids": [runner.runner_id],
+        }}}
+        with patch("lib.spot_runner_autoscaler.subprocess.run") as command:
+            removed, runner_ids = advance_vm_drains([self.vm], [runner], self.args, state)
+
+        self.assertEqual(removed, set())
+        self.assertEqual(runner_ids, set())
+        self.assertEqual(command.call_count, 0)
+        self.assertIn(self.vm.name, state["draining_vms"])
 
 
 if __name__ == "__main__":

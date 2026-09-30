@@ -18,8 +18,8 @@ from .autoscaling_policy import affordable_offers
 from .compute_api import get_auth
 from .environment import load_env
 from .fleet_logging import lifecycle_log, observe_vms
-from .price_guard import check_running_prices, delete_overpriced_vm
-from .runner_labels import counts_toward_capacity
+from .price_guard import check_running_prices
+from .runner_labels import DEFAULT_RUNNER_LABELS, counts_toward_capacity
 from .runner_fleet import GceVm, GitHubRunner, list_gcloud_vms, list_github_runners
 from .spot_finder import find
 
@@ -95,6 +95,21 @@ def utilization_counts(runners: list[GitHubRunner] | tuple[GitHubRunner, ...], l
     return len(online), sum(runner.busy for runner in online)
 
 
+def utilization_counts_with_draining(
+    runners: list[GitHubRunner] | tuple[GitHubRunner, ...], label: str,
+    draining_vm_names: set[str], vms: list[GceVm] | tuple[GceVm, ...],
+) -> tuple[int, int]:
+    """Count online runners after their custom labels have been cleared."""
+    counted = {runner.runner_id: runner for runner in managed_online_runners(runners, label)}
+    for runner in runners:
+        if not runner.online:
+            continue
+        matches = [vm.name for vm in vms if vm.name in runner.name]
+        if matches and max(matches, key=len) in draining_vm_names:
+            counted[runner.runner_id] = runner
+    return len(counted), sum(runner.busy for runner in counted.values())
+
+
 def host_runners(vm: GceVm, runners: list[GitHubRunner] | tuple[GitHubRunner, ...],
                  vms: list[GceVm] | tuple[GceVm, ...]):
     """Find runners assigned to the longest matching VM name."""
@@ -107,42 +122,145 @@ def host_runners(vm: GceVm, runners: list[GitHubRunner] | tuple[GitHubRunner, ..
     return assigned
 
 
-def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner],
-                       docker_floor: int, docker_host_floor: int) -> list[GceVm]:
-    """Choose idle VMs without violating the Docker runner and host floors."""
-    candidates = []
+def host_utilization(vms: list[GceVm] | tuple[GceVm, ...],
+                     runners: list[GitHubRunner] | tuple[GitHubRunner, ...]) -> dict[str, tuple[int, int, int]]:
+    """Return busy, online, and assigned runner counts for every Spot VM."""
     fleet = spot_instances(vms)
+    usage = {}
     for vm in fleet:
         assigned = host_runners(vm, runners, fleet)
-        if not assigned or any(not runner.online or runner.busy for runner in assigned):
+        online = [runner for runner in assigned if runner.online]
+        usage[vm.name] = (sum(runner.busy for runner in online), len(online), len(assigned))
+    return usage
+
+
+def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner],
+                       docker_floor: int, docker_host_floor: int,
+                       draining_vm_names: set[str] | None = None,
+                       draining_runner_ids: set[int] | None = None) -> list[GceVm]:
+    """Choose VMs with at most half of their online runners busy."""
+    candidates = []
+    fleet = spot_instances(vms)
+    draining_vm_names = draining_vm_names or set()
+    draining_runner_ids = draining_runner_ids or set()
+    potential = []
+    for vm in fleet:
+        if vm.name in draining_vm_names:
             continue
+        assigned = host_runners(vm, runners, fleet)
+        if (not assigned or any(not runner.online for runner in assigned)
+                or 2 * sum(runner.busy for runner in assigned) > len(assigned)):
+            continue
+        potential.append(vm)
+    potential.sort(key=lambda vm: any(
+        DOCKER_LABEL in runner.labels and "spot" not in runner.labels
+        for runner in host_runners(vm, runners, fleet)))
+    removed_ids = set(draining_runner_ids)
+    for vm in potential:
+        host = host_runners(vm, runners, fleet)
+        proposed_removed = removed_ids | {runner.runner_id for runner in host}
         remaining_docker = [runner for runner in runners
-                            if runner.online and DOCKER_LABEL in runner.labels
-                            and "spot" not in runner.labels
-                            and runner not in host_runners(vm, runners, fleet)]
+                            if runner.online and runner.runner_id not in proposed_removed
+                            and DOCKER_LABEL in runner.labels and "spot" not in runner.labels]
         if not docker_pool_satisfied(len(remaining_docker), len(docker_pool_hosts(remaining_docker)),
                                      docker_floor, docker_host_floor):
             continue
         candidates.append(vm)
-    return sorted(candidates, key=lambda vm: any(
-        DOCKER_LABEL in runner.labels and "spot" not in runner.labels
-        for runner in host_runners(vm, runners, fleet)))
+        removed_ids = proposed_removed
+    return candidates
 
 
-def terminate_spot_vm(vm: GceVm, project: str, org: str, runners: list[GitHubRunner],
-                      vms: list[GceVm]) -> None:
-    """Delete an idle Spot VM and its attached disks, then remove stale runner records."""
+def clear_custom_runner_labels(runners: list[GitHubRunner], org: str) -> None:
+    """Remove custom labels so new label-specific jobs stop targeting runners."""
+    for runner in runners:
+        if not any(label not in DEFAULT_RUNNER_LABELS for label in runner.labels):
+            continue
+        subprocess.run(
+            ["gh", "api", "-X", "DELETE",
+             f"orgs/{org}/actions/runners/{runner.runner_id}/labels"],
+            check=True, text=True, capture_output=True, timeout=60,
+        )
+
+
+def begin_vm_drain(vm: GceVm, runners: list[GitHubRunner], vms: list[GceVm],
+                   org: str, state: dict, reason: str) -> bool:
+    """Clear custom labels and persist the host's drain request."""
+    if not vm.running or not vm.spot or not vm.name.startswith("oxidex-runners-"):
+        return False
     assigned = host_runners(vm, runners, spot_instances(vms))
-    if not assigned or any(not runner.online or runner.busy for runner in assigned):
-        raise RuntimeError(f"Refusing to delete {vm.name}: runners are missing, offline, or busy")
-    subprocess.run(["gcloud", "compute", "instances", "delete", vm.name,
-                    f"--zone={vm.zone}", f"--project={project}", "--delete-disks=all", "--quiet"],
-                   check=True, text=True, capture_output=True)
-    LOG.info("Deleted idle Spot VM %s in %s and its attached disks", vm.name, vm.zone)
+    if any(not runner.online for runner in assigned):
+        return False
+    if not assigned and reason != "price":
+        return False
+    clear_custom_runner_labels(assigned, org)
+    state.setdefault("draining_vms", {})[vm.name] = {
+        "zone": vm.zone,
+        "reason": reason,
+        "runner_ids": [runner.runner_id for runner in assigned],
+    }
+    return True
+
+
+def delete_drained_vm(vm: GceVm, project: str, org: str,
+                      runners: list[GitHubRunner], vms: list[GceVm]) -> None:
+    """Unregister idle runners, then delete their Spot VM and attached disk."""
+    if not vm.running or not vm.spot or not vm.name.startswith("oxidex-runners-"):
+        raise RuntimeError(f"Refusing to delete unmanaged Spot VM {vm.name}")
+    assigned = host_runners(vm, runners, spot_instances(vms))
+    if any(not runner.online or runner.busy for runner in assigned):
+        raise RuntimeError(f"Refusing to delete {vm.name}: a runner is offline or busy")
     for runner in assigned:
-        subprocess.run(["gh", "api", "-X", "DELETE",
-                        f"orgs/{org}/actions/runners/{runner.runner_id}"],
-                       check=True, text=True, capture_output=True)
+        subprocess.run(
+            ["gh", "api", "-X", "DELETE",
+             f"orgs/{org}/actions/runners/{runner.runner_id}"],
+            check=True, text=True, capture_output=True, timeout=60,
+        )
+    subprocess.run(
+        ["gcloud", "compute", "instances", "delete", vm.name,
+         f"--zone={vm.zone}", f"--project={project}", "--delete-disks=all", "--quiet"],
+        check=True, text=True, capture_output=True, timeout=180,
+    )
+    LOG.info("Deleted drained Spot VM %s in %s and its attached disk", vm.name, vm.zone)
+
+
+def advance_vm_drains(vms: list[GceVm], runners: list[GitHubRunner],
+                      args: argparse.Namespace, state: dict) -> tuple[set[str], set[int]]:
+    """Delete drained VMs after their registered runners finish their jobs."""
+    removed_vms: set[str] = set()
+    removed_runner_ids: set[int] = set()
+    fleet = spot_instances(vms)
+    drains = state.setdefault("draining_vms", {})
+    for name, drain in list(drains.items()):
+        vm = next((candidate for candidate in fleet if candidate.name == name), None)
+        if vm is None:
+            drains.pop(name, None)
+            continue
+        assigned = host_runners(vm, runners, fleet)
+        if any(not runner.online for runner in assigned):
+            LOG.warning("Drain waits for offline runners on %s; job state is unknown", name)
+            continue
+        try:
+            custom_labels = [runner for runner in assigned
+                             if any(label not in DEFAULT_RUNNER_LABELS for label in runner.labels)]
+            if custom_labels:
+                clear_custom_runner_labels(custom_labels, args.org)
+                LOG.info("Cleared custom labels from %s; checking job state next loop", name)
+                continue
+            if any(runner.busy for runner in assigned):
+                LOG.info("Drain waits for %d active jobs on %s", sum(r.busy for r in assigned), name)
+                continue
+            if not assigned and not drain.get("runner_ids") and drain.get("reason") != "price":
+                LOG.warning("Drain waits for runner inventory on %s", name)
+                continue
+            delete_drained_vm(vm, args.project, args.org, runners, vms)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            LOG.error("Could not finish draining %s; retrying next loop: %s", name, exc)
+            continue
+        removed_vms.add(name)
+        removed_runner_ids.update(drain.get("runner_ids", []))
+        removed_runner_ids.update(runner.runner_id for runner in assigned)
+        drains.pop(name, None)
+    return removed_vms, removed_runner_ids
 
 
 def read_scale_state(path: Path) -> dict:
@@ -150,14 +268,15 @@ def read_scale_state(path: Path) -> dict:
     try:
         state = json.loads(path.read_text())
     except FileNotFoundError:
-        return {"idle_loops": 0, "scale_up_active": False}
+        return {"idle_loops": 0, "scale_up_active": False, "draining_vms": {}}
     except (json.JSONDecodeError, OSError) as exc:
         LOG.warning("Ignoring unreadable autoscaler state at %s: %s", path, exc)
-        return {"idle_loops": 0, "scale_up_active": False}
+        return {"idle_loops": 0, "scale_up_active": False, "draining_vms": {}}
     return {"idle_loops": int(state.get("idle_loops", 0)),
             "scale_up_active": bool(state.get("scale_up_active", False)),
             "price_replacement_target": int(state.get("price_replacement_target", 0)),
-            "observed_vms": state.get("observed_vms", {})}
+            "observed_vms": state.get("observed_vms", {}),
+            "draining_vms": state.get("draining_vms", {})}
 
 
 def write_scale_state(path: Path, state: dict) -> None:
@@ -171,26 +290,31 @@ def write_scale_state(path: Path, state: dict) -> None:
     temporary_path.replace(path)
 
 
-def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace) -> int:
-    """Halve the Spot VM fleet, deleting only idle hosts and their disks."""
+def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace,
+               state: dict) -> int:
+    """Halve the Spot fleet by draining hosts with at most half busy runners."""
     fleet = spot_instances(vms)
     target = max(1, len(fleet) // 2)
-    count = len(fleet) - target
+    drains = state.setdefault("draining_vms", {})
+    existing = {name for name, item in drains.items() if item.get("reason") == "scale-down"}
+    draining_runner_ids = {runner_id for item in drains.values()
+                           for runner_id in item.get("runner_ids", [])}
+    count = max(0, len(fleet) - target - len(existing))
     candidates = removable_spot_vms(vms, runners, args.minimum_docker_runners,
-                                    args.minimum_docker_hosts)
+                                    args.minimum_docker_hosts, existing, draining_runner_ids)
     if len(candidates) < count:
-        LOG.info("Scale-down waits: %d idle hosts are removable; %d are needed",
+        LOG.info("Scale-down waits: %d hosts are at most half busy; %d are needed",
                  len(candidates), count)
-    removed = 0
+    draining = 0
     for vm in candidates[:count]:
-        LOG.info("Removing idle Spot VM %s and its attached disks", vm.name)
+        LOG.info("Starting drain for Spot VM %s", vm.name)
         try:
-            terminate_spot_vm(vm, args.project, args.org, runners, vms)
-            removed += 1
-        except (OSError, subprocess.CalledProcessError) as exc:
-            LOG.error("Could not remove %s: %s", vm.name, exc)
+            if begin_vm_drain(vm, runners, vms, args.org, state, "scale-down"):
+                draining += 1
+        except (OSError, subprocess.SubprocessError) as exc:
+            LOG.error("Could not start draining %s: %s", vm.name, exc)
             break
-    return removed
+    return draining
 
 
 def scale_up(additional_hosts: int, offers, args: argparse.Namespace) -> int:
@@ -219,24 +343,26 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
         state["idle_loops"] = 0
         write_scale_state(state_path, state)
     for vm in overpriced:
-        LOG.warning("Price exceeds cap: deleting %s with its disks, including any active jobs", vm.name)
-        try:
-            delete_overpriced_vm(vm, args.project)
-            LOG.info("Deleted overpriced Spot VM %s in %s and its attached disks", vm.name, vm.zone)
-        except (ValueError, OSError, subprocess.SubprocessError) as exc:
-            LOG.error("Price eviction failed for %s; retrying next loop: %s", vm.name, exc)
+        if vm.name in state.setdefault("draining_vms", {}):
             continue
-        for runner in host_runners(vm, runners, fleet):
-            result = subprocess.run([
-                "gh", "api", "-X", "DELETE", f"orgs/{args.org}/actions/runners/{runner.runner_id}",
-            ], text=True, capture_output=True, timeout=60)
-            if result.returncode:
-                LOG.warning("Could not remove stale runner record %s", runner.name)
+        try:
+            if begin_vm_drain(vm, runners, fleet, args.org, state, "price"):
+                LOG.warning("Price exceeds cap; cleared custom labels on %s and will wait for its jobs",
+                            vm.name)
+            else:
+                LOG.warning("Price exceeds cap, but runner state is unsafe to drain on %s; retrying next loop",
+                            vm.name)
+        except (OSError, subprocess.SubprocessError) as exc:
+            LOG.error("Could not start price drain for %s; retrying next loop: %s", vm.name, exc)
+            continue
     target = state.get("price_replacement_target", 0)
     if not target:
         return False
+    write_scale_state(state_path, state)
     remaining = spot_instances(list_gcloud_vms(args.project, name_prefix="oxidex-runners-"))
-    if {vm.name for vm in remaining} & {vm.name for vm in overpriced}:
+    price_drains = {name for name, drain in state.get("draining_vms", {}).items()
+                    if drain.get("reason") == "price"}
+    if {vm.name for vm in remaining} & (price_drains | {vm.name for vm in overpriced}):
         return True
     missing = max(0, target - len(remaining))
     if missing:
@@ -415,14 +541,23 @@ def run_controller(args: argparse.Namespace) -> int:
         runners = list_github_runners(args.org)
         vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
         observe_vms(vms, state)
+        removed_vm_names, removed_runner_ids = advance_vm_drains(vms, runners, args, state)
+        if removed_vm_names:
+            vms = [vm for vm in vms if vm.name not in removed_vm_names]
+            runners = [runner for runner in runners if runner.runner_id not in removed_runner_ids]
         write_scale_state(state_path, state)
+        fleet_vms = spot_instances(vms)
+        for vm_name, (host_busy, host_online, host_assigned) in host_utilization(
+                fleet_vms, runners).items():
+            LOG.info("Spot VM %s utilization: %d/%d online runners busy (%d assigned)",
+                     vm_name, host_busy, host_online, host_assigned)
+        current, busy = utilization_counts_with_draining(
+            runners, args.label, set(state.get("draining_vms", {})), fleet_vms)
         if reconcile_prices(vms, runners, args, state, state_path):
             if args.once:
                 return 0
             time.sleep(args.interval_seconds)
             continue
-        fleet_vms = spot_instances(vms)
-        current, busy = utilization_counts(runners, args.label)
         docker_runners = [runner for runner in runners
                           if runner.online and DOCKER_LABEL in runner.labels
                           and "spot" not in runner.labels]
@@ -457,9 +592,9 @@ def run_controller(args: argparse.Namespace) -> int:
                 LOG.error("Could not restore the Docker runner floor")
         elif action == "down":
             state["idle_loops"] = idle_loops
-            LOG.info("Low usage persisted for two checks; removing up to %d Spot hosts", host_count)
-            removed = scale_down(vms, runners, args)
-            LOG.info("Scale-down step removed %d hosts", removed)
+            LOG.info("Low usage persisted for two checks; draining up to %d Spot hosts", host_count)
+            draining = scale_down(vms, runners, args, state)
+            LOG.info("Scale-down step started draining %d hosts", draining)
         else:
             state["idle_loops"] = idle_loops
             if action == "wait" and idle_loops:

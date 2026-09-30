@@ -56,13 +56,3 @@ def check_running_prices(vms: list[GceVm], project: str,
             LOG.error("Cannot verify price for %s; keeping VM and retrying next loop: %s",
                       vm.name, exc)
     return overpriced
-
-
-def delete_overpriced_vm(vm: GceVm, project: str) -> None:
-    """Delete a managed Spot VM and its disks even when jobs are running."""
-    if not vm.running or not vm.spot or not vm.name.startswith("oxidex-runners-"):
-        raise ValueError("Price eviction requires a running managed Spot VM")
-    subprocess.run([
-        "gcloud", "compute", "instances", "delete", vm.name,
-        f"--zone={vm.zone}", f"--project={project}", "--delete-disks=all", "--quiet",
-    ], check=True, text=True, capture_output=True, timeout=180)
