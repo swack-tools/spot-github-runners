@@ -1,0 +1,96 @@
+"""Test provider inventory and the controller's recovery integration."""
+import json
+import subprocess
+import tempfile
+import unittest
+from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from lib.runner_fleet import GceVm, GitHubRunner, list_gcloud_vms
+from lib.spot_runner_autoscaler import args_parser, read_scale_state, run_controller, scale_down, write_scale_state
+
+
+class FleetInventoryTests(unittest.TestCase):
+    def test_inventory_retains_actual_shapes_disk_types_ids_and_gpu(self):
+        source = 'https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/disks/root'
+        vm = {'name': 'oxidex-runners-test', 'zone': 'zones/us-central1-a', 'status': 'RUNNING',
+              'id': '42', 'machineType': 'machineTypes/custom-8-16384',
+              'scheduling': {'provisioningModel': 'SPOT'},
+              'disks': [{'source': source, 'diskSizeGb': '20', 'boot': True, 'autoDelete': True}],
+              'guestAccelerators': [{'acceleratorType': 'nvidia-tesla-t4', 'acceleratorCount': 1}]}
+        payloads = [SimpleNamespace(stdout=json.dumps([vm, {**vm, 'name': 'oxidex-runners-test2'}])),
+                    SimpleNamespace(stdout=json.dumps([{'selfLink': source, 'id': '7', 'type': 'diskTypes/pd-ssd'}])),
+                    SimpleNamespace(stdout=json.dumps({'guestCpus': 8, 'memoryMb': 16384}))]
+        with patch('lib.runner_fleet.subprocess.run', side_effect=payloads) as command:
+            vms = list_gcloud_vms('p', name_prefix='oxidex-runners-')
+        self.assertEqual(command.call_count, 3)  # Shared shape queried once per snapshot.
+        self.assertEqual((vms[0].vcpu, vms[0].ram_gib), (8, 16))
+        self.assertEqual(vms[0].disks[0]['diskType'], 'pd-ssd')
+        self.assertEqual(vms[0].disks[0]['diskId'], '7')
+        self.assertEqual(vms[0].instance_id, '42')
+        self.assertEqual(vms[0].accelerators[0]['acceleratorCount'], 1)
+
+    def test_missing_metadata_keeps_instance_visible_with_unknown_specs(self):
+        vm = {'name': 'oxidex-runners-test', 'zone': 'zones/us-central1-a', 'status': 'RUNNING',
+              'machineType': 'machineTypes/n2-standard-32', 'scheduling': {'provisioningModel': 'SPOT'}}
+        error = subprocess.CalledProcessError(1, ['gcloud'], stderr='permission denied\nretry later')
+        with patch('lib.runner_fleet.subprocess.run', side_effect=[SimpleNamespace(stdout=json.dumps([vm])), error, error]), \
+                self.assertLogs('spot_runner_autoscaler', 'WARNING'):
+            vms = list_gcloud_vms('p')
+        self.assertEqual(len(vms), 1)
+        self.assertIsNone(vms[0].vcpu)
+        self.assertIsNone(vms[0].ram_gib)
+
+    def test_controller_replaces_missing_vm_and_does_not_skip_price_checks(self):
+        vm = GceVm('oxidex-runners-test', 'us-central1-a', 'RUNNING', 'n2-standard-32', True)
+        state = {'observed_vms': {f'{vm.zone}/{vm.name}': asdict(vm)}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            write_scale_state(path, state)
+            args = args_parser().parse_args(['--once', '--state-file', str(path)])
+            with patch('lib.spot_runner_autoscaler.JobRecovery.poll'), \
+                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[]), \
+                    patch('lib.spot_runner_autoscaler.list_github_runners', return_value=[]), \
+                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]) as prices, \
+                    patch('lib.vm_recovery.cleanup_lost_vm', return_value=True), \
+                    patch('lib.spot_runner_autoscaler.discover_offers', return_value=['offer']), \
+                    patch('lib.spot_runner_autoscaler.scale_up', return_value=1) as launch:
+                self.assertEqual(run_controller(args), 0)
+            self.assertEqual(read_scale_state(path)['pending_vm_recovery'], {})
+            prices.assert_called_once()
+            launch.assert_called_once_with(1, ['offer'], args)
+
+    def test_deletion_intent_is_persisted_before_provider_request(self):
+        from lib.spot_runner_autoscaler import reconcile_prices
+        vm = GceVm('oxidex-runners-test', 'us-central1-a', 'RUNNING', 'n2-standard-32', True, instance_id='123')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            args = args_parser().parse_args(['--state-file', str(path)])
+            state = {'idle_loops': 0, 'scale_up_active': False}
+            def uncertain(vm, project):
+                recovered = read_scale_state(path)
+                self.assertIn(f'{vm.zone}/{vm.name}', recovered['intentional_deletions'])
+                self.assertEqual(recovered['intentional_deletion_ids'][f'{vm.zone}/{vm.name}'], '123')
+                raise subprocess.TimeoutExpired('gcloud', 180)
+            with patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[vm]), \
+                    patch('lib.spot_runner_autoscaler.delete_overpriced_vm', side_effect=uncertain), \
+                    patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[vm]):
+                reconcile_prices([vm], [], args, state, path)
+
+    def test_scale_down_records_deletion_even_if_runner_deregistration_fails(self):
+        vm = GceVm('oxidex-runners-test', 'us-central1-a', 'RUNNING', 'n2-standard-32', True)
+        other = GceVm('oxidex-runners-other', vm.zone, 'RUNNING', vm.machine_type, True)
+        runner = GitHubRunner(1, f'gha-{vm.name}-1', 'online', False, ('spot',))
+        with tempfile.TemporaryDirectory() as directory:
+            args = args_parser().parse_args(['--state-file', str(Path(directory) / 'state.json')])
+            state = {'idle_loops': 0, 'scale_up_active': False}
+            with patch('lib.spot_runner_autoscaler.removable_spot_vms', return_value=[vm]), \
+                    patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=[SimpleNamespace(returncode=0), subprocess.CalledProcessError(1, ['gh'])]):
+                scale_down([vm, other], [runner], args, state)
+            self.assertEqual(read_scale_state(args.state_file)['intentional_deletions'], [f'{vm.zone}/{vm.name}'])
+
+
+if __name__ == '__main__':
+    unittest.main()
