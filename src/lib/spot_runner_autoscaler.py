@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -179,6 +180,27 @@ def write_scale_state(path: Path, state: dict) -> None:
     temporary_path.replace(path)
 
 
+def clear_rejected_deletion(vm: GceVm, exc: Exception, state: dict | None, state_path: Path) -> None:
+    """Retire intent only when gcloud confirms the delete request was rejected."""
+    if state is None or not isinstance(exc, subprocess.CalledProcessError):
+        return
+    command = exc.cmd if isinstance(exc.cmd, (list, tuple)) else []
+    if not command or Path(str(command[0])).name != 'gcloud':
+        return  # A subsequent runner deregistration failure does not undo VM deletion.
+    detail = error_detail(exc).lower()
+    rejected = (re.search(r'http (400|401|403)\b', detail)
+                or 'permission_denied' in detail or 'permission denied' in detail
+                or ('required' in detail and 'permission' in detail)
+                or 'invalid_argument' in detail)
+    if not rejected:
+        return  # Timeouts and unknown operation outcomes must retain intent.
+    key = f'{vm.zone}/{vm.name}'
+    state['intentional_deletions'] = [item for item in state.get('intentional_deletions', []) if item != key]
+    state.get('intentional_deletion_ids', {}).pop(key, None)
+    write_scale_state(state_path, state)
+    LOG.warning('Cleared deletion intent after provider rejection for %s: %s', vm_details(vm), error_detail(exc))
+
+
 def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace,
                state: dict | None = None, state_path: Path | None = None) -> int:
     """Halve the Spot VM fleet, deleting only idle hosts and their disks."""
@@ -203,6 +225,7 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
             terminate_spot_vm(vm, args.project, args.org, runners, vms, on_deleted=record_deletion)
             removed += 1
         except (OSError, subprocess.CalledProcessError) as exc:
+            clear_rejected_deletion(vm, exc, state, state_path or args.state_file.expanduser())
             LOG.error("Could not remove %s: %s", vm_details(vm), error_detail(exc))
             break
     return removed
@@ -244,6 +267,7 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
             delete_overpriced_vm(vm, args.project)
             LOG.info("Deleted overpriced Spot VM %s and its attached disks", vm_details(vm))
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            clear_rejected_deletion(vm, exc, state, state_path)
             LOG.error("Price eviction failed for %s; retrying next loop: %s", vm_details(vm), error_detail(exc))
             continue
         for runner in host_runners(vm, runners, fleet):

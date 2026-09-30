@@ -102,6 +102,43 @@ class FleetInventoryTests(unittest.TestCase):
                     patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[vm]):
                 reconcile_prices([vm], [], args, state, path)
 
+    def test_rejected_deletion_does_not_hide_later_spot_loss(self):
+        from dataclasses import replace
+        from lib.fleet_logging import observe_vms
+        from lib.job_recovery import JobRecovery
+        from lib.spot_runner_autoscaler import reconcile_prices
+        vm = GceVm('oxidex-runners-test', 'us-central1-a', 'RUNNING', 'n2-standard-32', True, instance_id='123')
+        other = replace(vm, name='oxidex-runners-other', instance_id='456')
+        runner = GitHubRunner(1, f'gha-{vm.name}-1', 'online', False, ('spot',))
+        key = f'{vm.zone}/{vm.name}'
+        for operation in ('scale_down', 'price_eviction'):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'state.json'
+                args = args_parser().parse_args(['--state-file', str(path)])
+                state = {}
+                jobs = JobRecovery(state, lambda: write_scale_state(path, state), [])
+                jobs.poll([vm, other])
+                observe_vms([vm, other], state)
+                rejected = subprocess.CalledProcessError(1, ['gcloud', 'compute', 'instances', 'delete'], stderr='PERMISSION_DENIED: required compute.instances.delete permission')
+                with patch('lib.spot_runner_autoscaler.subprocess.run', side_effect=rejected), \
+                        patch('lib.spot_runner_autoscaler.removable_spot_vms', return_value=[vm]), \
+                        patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[vm]), \
+                        patch('lib.spot_runner_autoscaler.list_gcloud_vms', return_value=[vm, other]):
+                    if operation == 'scale_down':
+                        self.assertEqual(scale_down([vm, other], [runner], args, state, path), 0)
+                    else:
+                        reconcile_prices([vm, other], [], args, state, path)
+                state = read_scale_state(path)
+                self.assertNotIn(key, state['intentional_deletions'])
+                jobs = JobRecovery(state, lambda: None, [])
+                jobs.poll([vm, other])
+                observe_vms([vm, other], state)
+                lost = replace(vm, status='TERMINATED')
+                jobs.poll([lost, other])
+                observe_vms([lost, other], state)
+                self.assertIn(key, state['job_tracking']['losses'])
+                self.assertIn(key, state['pending_vm_recovery'])
+
     def test_scale_down_records_deletion_even_if_runner_deregistration_fails(self):
         vm = GceVm('oxidex-runners-test', 'us-central1-a', 'RUNNING', 'n2-standard-32', True)
         other = GceVm('oxidex-runners-other', vm.zone, 'RUNNING', vm.machine_type, True)
