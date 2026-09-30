@@ -18,7 +18,7 @@ from .autoscaling_policy import affordable_offers
 from .compute_api import get_auth
 from .environment import load_env
 from .job_recovery import JobRecovery
-from .fleet_logging import lifecycle_log, observe_vms, vm_details
+from .fleet_logging import lifecycle_log, observe_vms, reconcile_deletion_identities, vm_details
 from .log_format import configure_logging, error_detail
 from .vm_recovery import reconcile_lost_vms
 from .price_guard import check_running_prices, delete_overpriced_vm
@@ -270,8 +270,8 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
         if launched < missing:
             LOG.warning("Replacement capacity is pending; retrying next loop")
             return True
-    for key in pending:
-        state.get("observed_vms", {}).pop(key, None)
+    for record in pending.values():
+        state.get("observed_vms", {}).pop(f"{record['zone']}/{record['name']}", None)
     state["pending_vm_recovery"] = {}
     state["price_replacement_target"] = 0
     state["idle_loops"] = 0
@@ -475,6 +475,7 @@ def _run_controller(args: argparse.Namespace) -> int:
     while True:
         runners = list_github_runners(args.org)
         vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
+        reconcile_deletion_identities(vms, state)
         jobs.poll(vms)
         observe_vms(vms, state)
         write_scale_state(state_path, state)

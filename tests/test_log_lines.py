@@ -16,6 +16,11 @@ from lib.spot_runner_autoscaler import args_parser, launch_offer, read_scale_sta
 
 
 class LogLineTests(unittest.TestCase):
+    def setUp(self):
+        external = patch('subprocess.run', side_effect=AssertionError('Unexpected external command in offline test'))
+        external.start()
+        self.addCleanup(external.stop)
+
     def test_multiline_messages_and_tracebacks_are_one_physical_line(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'events.log'

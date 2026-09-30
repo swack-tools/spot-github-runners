@@ -16,6 +16,9 @@ SOURCE = 'https://www.googleapis.com/compute/v1/projects/project/zones/asia-sout
 
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
+        external = patch('subprocess.run', side_effect=AssertionError('Unexpected external command in offline test'))
+        external.start()
+        self.addCleanup(external.stop)
         self.vm = GceVm('oxidex-runners-test', 'asia-south2-a', 'TERMINATED', 'n2-standard-32', True,
                         vcpu=32, ram_gib=128, instance_id='123',
                         disks=({'source': SOURCE, 'boot': True, 'autoDelete': True, 'diskSizeGb': '40', 'diskId': '456'},))
@@ -130,6 +133,25 @@ class RecoveryTests(unittest.TestCase):
                     patch('lib.spot_runner_autoscaler.scale_up', side_effect=lambda n, *args: n) as launch:
                 vm_recovery.reconcile_lost_vms(live, [], self.args, state, path)
             self.assertEqual([call.args[0] for call in launch.call_args_list], [1])
+
+    def test_new_instance_identity_never_reuses_previous_cleanup_authorization(self):
+        from dataclasses import replace
+        from lib.fleet_logging import observe_vms
+        key = f'{self.vm.zone}/{self.vm.name}'
+        old = {**asdict(self.vm), '_target_recorded': True, '_cleanup_complete': True}
+        state = {'idle_loops': 0, 'scale_up_active': False, 'price_replacement_target': 1,
+                 'pending_vm_recovery': {key: old}, 'observed_vms': {key: asdict(self.vm)}}
+        recreated = replace(self.vm, instance_id='999', disks=({'source': SOURCE, 'diskId': '999', 'autoDelete': True},))
+        observe_vms([recreated], state)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            with patch('lib.vm_recovery.cleanup_lost_vm', return_value=False) as cleanup, \
+                    patch('lib.spot_runner_autoscaler.check_running_prices', return_value=[]), \
+                    patch('lib.spot_runner_autoscaler.scale_up') as launch:
+                vm_recovery.reconcile_lost_vms([recreated], [], self.args, state, path)
+            cleanup.assert_called_once()
+            self.assertEqual(cleanup.call_args.args[0].instance_id, '999')
+            launch.assert_not_called()
 
     def test_restart_after_successful_launch_observes_restored_target_without_relaunch(self):
         key = f'{self.vm.zone}/{self.vm.name}'

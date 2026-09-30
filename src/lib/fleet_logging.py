@@ -74,8 +74,28 @@ def vm_from_record(record: dict) -> GceVm:
     return GceVm(**{key: value for key, value in record.items() if key in allowed})
 
 
+
+def reconcile_deletion_identities(vms, state: dict) -> None:
+    """Remove old-instance intent before either observer considers a new identity."""
+    intentional = state.setdefault('intentional_deletions', [])
+    ids = state.get('intentional_deletion_ids', {})
+    for vm in vms:
+        key = f'{vm.zone}/{vm.name}'
+        if key in intentional and ids.get(key) and vm.instance_id and ids[key] != vm.instance_id:
+            intentional.remove(key)
+            ids.pop(key, None)
+            LOG.warning('Intentional deletion record belongs to a previous instance identity: %s', vm_details(vm))
+
+
+def recovery_key(key: str, vm: GceVm, pending: dict) -> str:
+    """Keep independent cleanup authorizations for reused VM names."""
+    if key in pending and pending[key].get('instance_id') != vm.instance_id:
+        return f"{key}#{vm.instance_id or 'unknown'}"
+    return key
+
 def observe_vms(vms, state: dict) -> None:
     """Persist hardware and recovery work before the controller changes resources."""
+    reconcile_deletion_identities(vms, state)
     previous = state.get("observed_vms", {})
     current = {}
     pending = state.setdefault("pending_vm_recovery", {})
@@ -102,11 +122,6 @@ def observe_vms(vms, state: dict) -> None:
             ram = old.get('ram_gib') if same_shape and vm.ram_gib is None else vm.ram_gib
             last_known |= cpu != vm.vcpu or ram != vm.ram_gib
             vm = replace(vm, vcpu=cpu, ram_gib=ram, disks=tuple(disks), specs_last_known=last_known)
-        deletion_id = state.get('intentional_deletion_ids', {}).get(key)
-        if key in intentional and deletion_id and vm.instance_id and deletion_id != vm.instance_id:
-            intentional.remove(key)
-            state['intentional_deletion_ids'].pop(key, None)
-            LOG.warning('Intentional deletion record belongs to a previous instance identity: %s', vm_details(vm))
         current[key] = asdict(vm)
         old_status = old.get("status") if isinstance(old, dict) else old
         if key not in previous:
@@ -114,10 +129,11 @@ def observe_vms(vms, state: dict) -> None:
         elif old_status != vm.status:
             LOG.warning("Spot VM status changed: %s; %s -> %s", vm_details(vm), old_status, vm.status)
         if vm.status.upper() == "TERMINATED" and key not in intentional:
-            if key not in pending:
+            pending_key = recovery_key(key, vm, pending)
+            if pending_key not in pending:
                 LOG.warning("Spot VM is terminated: %s; reason: termination cause is unconfirmed", vm_details(vm))
                 LOG.info("Searching for a new VM to replace the old VM; ensuring all drives from the previous instance are deleted: %s", vm_details(vm))
-            pending[key] = {**pending.get(key, {}), **asdict(vm)}
+            pending[pending_key] = {**pending.get(pending_key, {}), **asdict(vm)}
     for key in previous.keys() - current.keys():
         old = previous[key]
         if isinstance(old, dict):
@@ -127,7 +143,7 @@ def observe_vms(vms, state: dict) -> None:
             vm = GceVm(name, zone, str(old), "", True)
         LOG.warning("Spot VM no longer present: %s; reason: consult deletion events for controller actions; otherwise the cause is unconfirmed", vm_details(vm))
         if key not in intentional:
-            pending.setdefault(key, asdict(vm))
+            pending.setdefault(recovery_key(key, vm, pending), asdict(vm))
             LOG.info("Searching for a new VM to replace the old VM; ensuring all drives from the previous instance are deleted: %s", vm_details(vm))
     state["observed_vms"] = current
     state["intentional_deletions"] = [key for key in intentional if key in current]

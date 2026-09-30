@@ -13,6 +13,11 @@ from lib.spot_runner_autoscaler import args_parser, read_scale_state, run_contro
 
 
 class FleetInventoryTests(unittest.TestCase):
+    def setUp(self):
+        external = patch('subprocess.run', side_effect=AssertionError('Unexpected external command in offline test'))
+        external.start()
+        self.addCleanup(external.stop)
+
     def test_inventory_retains_actual_shapes_disk_types_ids_and_gpu(self):
         source = 'https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/disks/root'
         vm = {'name': 'oxidex-runners-test', 'zone': 'zones/us-central1-a', 'status': 'RUNNING',
@@ -61,6 +66,24 @@ class FleetInventoryTests(unittest.TestCase):
             self.assertEqual(read_scale_state(path)['pending_vm_recovery'], {})
             prices.assert_called_once()
             launch.assert_called_once_with(1, ['offer'], args)
+
+    def test_job_and_fleet_observers_share_intent_until_disappearance(self):
+        from lib.job_recovery import JobRecovery
+        from lib.fleet_logging import observe_vms
+        vm = GceVm('oxidex-runners-test', 'us-central1-a', 'TERMINATED', 'n2-standard-32', True, instance_id='123')
+        key = f'{vm.zone}/{vm.name}'
+        state = {'intentional_deletions': [key], 'intentional_deletion_ids': {key: '123'},
+                 'observed_vms': {key: asdict(vm)}}
+        jobs = JobRecovery(state, lambda: None, [])
+        jobs.poll([vm])
+        observe_vms([vm], state)
+        self.assertEqual(state['pending_vm_recovery'], {})
+        self.assertIn(key, state['intentional_deletions'])
+        jobs.poll([])
+        observe_vms([], state)
+        self.assertEqual(state['pending_vm_recovery'], {})
+        self.assertEqual(state['intentional_deletions'], [])
+        self.assertEqual(state['job_tracking']['losses'], {})
 
     def test_deletion_intent_is_persisted_before_provider_request(self):
         from lib.spot_runner_autoscaler import reconcile_prices
