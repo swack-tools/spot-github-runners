@@ -1,4 +1,6 @@
 import json
+import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 import unittest
 from types import SimpleNamespace
@@ -68,6 +70,29 @@ class RunnerDiskLifecycleTests(unittest.TestCase):
         self.assertIn('--auto-delete', attach)
         self.assertIn('--interface=NVME', attach)
         self.assertTrue(any('--device-name=boot-device' in c and '--auto-delete' in c for c in calls))
+
+    def test_create_receipt_survives_loss_before_registration_inventory(self):
+        args = args_parser().parse_args(['--max-cost', '.2', '--instance-name', 'test-vm'])
+        select_sizing(args)
+        with tempfile.TemporaryDirectory() as directory:
+            args.deployment_receipt = Path(directory) / 'receipt.json'
+            created = {'id': '123', 'name': 'test-vm', 'zone': 'zones/zone-a',
+                       'status': 'RUNNING', 'disks': [
+                           {'boot': True, 'source': 'disks/root', 'autoDelete': True},
+                           {'boot': False, 'source': 'disks/data', 'autoDelete': True}]}
+            def cloud(command, **kwargs):
+                if command[:3] == ['compute', 'instances', 'create']:
+                    self.assertTrue(any(flag.startswith('--format=json(') for flag in command))
+                    return json.dumps([created])
+                return '[]' if command[:3] == ['compute', 'disks', 'list'] else ''
+            with patch('lib.runner_manager.subprocess.run', return_value=SimpleNamespace(stdout='', returncode=1)), \
+                 patch('lib.runner_manager.gcloud', side_effect=cloud):
+                apply_startup(args, 'zone-a', 'safe-test-script')
+            receipt = json.loads(args.deployment_receipt.read_text())
+            self.assertEqual(receipt['instance_id'], '123')
+            self.assertEqual(receipt['name'], 'test-vm')
+            self.assertEqual(receipt['disks'][0]['source'], 'disks/root')
+            self.assertTrue(receipt['disks'][1]['autoDelete'])
 
     @patch("lib.runner_manager.datetime")
     @patch("lib.runner_manager.gcloud")
