@@ -65,6 +65,9 @@ def cheapest_storage(machine_type: str, size_gib: int, rates: dict) -> tuple[str
     def choose(kinds, size):
         choices = []
         for kind in kinds:
+            if kind == 'hyperdisk-throughput' and not {
+                    kind + ':capacity', kind + ':throughput'}.issubset(rates):
+                continue  # This optional alternative cannot be quoted in the region.
             cost = disk_monthly_cost(kind, size, rates,
                                      throughput=throughput_floor(size) if kind == 'hyperdisk-throughput' else 140)
             choices.append((cost, kind))

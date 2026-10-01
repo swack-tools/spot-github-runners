@@ -33,6 +33,16 @@ class StorageSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'price'):
             cheapest_storage('n2-standard-32', 100, {'pd-ssd:capacity': Decimal('.17')})
 
+    def test_missing_optional_throughput_sku_keeps_priced_baseline_choice(self):
+        from lib.storage_selection import cheapest_storage
+        optional_rates = [{}, {'hyperdisk-throughput:capacity': Decimal('.007')},
+                          {'hyperdisk-throughput:throughput': Decimal('.35')}]
+        for optional in optional_rates:
+            rates = {'hyperdisk-balanced:capacity': Decimal('.112'), **optional}
+            boot, data, monthly = cheapest_storage('n4-standard-32', 2048, rates)
+            self.assertEqual((boot, data), ('hyperdisk-balanced', 'hyperdisk-balanced'))
+            self.assertEqual(monthly, Decimal('233.856'))
+
     def test_existing_host_total_cap_uses_retained_boot_disk_cost(self):
         from lib.runner_fleet import GceVm
         import json
