@@ -64,9 +64,9 @@ def cleanup_lost_vm(vm: GceVm, project: str) -> bool:
                 LOG.warning('Disk cleanup waits for %s: attached drive identity is unknown or changed', vm_details(vm))
                 return False
         subprocess.run(['gcloud', 'compute', 'instances', 'delete', vm.name,
-                        f'--zone={vm.zone}', f'--project={project}', '--delete-disks=all', '--quiet'],
+                        f'--zone={vm.zone}', f'--project={project}', '--quiet'],
                        check=True, text=True, capture_output=True, timeout=180)
-        LOG.info('Deleted terminated Spot VM and its attached disks: %s', vm_details(vm))
+        LOG.info('Deleted terminated Spot VM; checking recorded drive cleanup: %s', vm_details(vm))
         if any(item.get('name') == vm.name for item in _list(
                 ['instances', 'list', f'--project={project}', f'--zones={vm.zone}'])):
             return False
