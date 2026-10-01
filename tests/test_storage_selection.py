@@ -160,6 +160,20 @@ class StorageSelectionTests(unittest.TestCase):
         with patch('lib.storage_selection.catalog_skus', return_value=rows):
             self.assertEqual(storage_rates('region'), {'pd-standard:capacity': Decimal('.04')})
 
+    def test_throughput_skus_accept_plain_and_compound_monthly_units(self):
+        from lib.storage_selection import storage_rates
+        for unit in ['mo', 'MiBy/s.mo']:
+            rows = [{'description': description, 'serviceRegions': ['region'],
+                     'pricingInfo': [{'pricingExpression': {'usageUnit': unit,
+                      'tieredRates': [{'startUsageAmount': 0,
+                        'unitPrice': {'currencyCode': 'USD', 'units': '0', 'nanos': nanos}}]}}]}
+                    for description, nanos in [('Hyperdisk Balanced Throughput in Region', 56000000),
+                                                ('Hyperdisk Throughput Throughput in Region', 350000000)]]
+            with patch('lib.storage_selection.catalog_skus', return_value=rows):
+                rates = storage_rates('region')
+            self.assertEqual(rates, {'hyperdisk-balanced:throughput': Decimal('.056'),
+                                     'hyperdisk-throughput:throughput': Decimal('.35')})
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -24,6 +24,8 @@ def storage_rates(region: str) -> dict[str, Decimal]:
         for prefix, (key, usage_unit) in PREFIXES.items():
             if description.startswith(prefix):
                 price = unit_price(sku, usage_unit)
+                if price is None and key.endswith(':throughput'):
+                    price = unit_price(sku, 'MiBy/s.mo')
                 if price is not None:
                     prices[key] = price
     return prices
