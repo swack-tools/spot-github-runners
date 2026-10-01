@@ -54,15 +54,15 @@ deleting it and its attached disks. It removes the empty temporary group after
 confirming VM absence. GitHub group and label management require organization
 self-hosted runner write permissions through `gh`.
 Each added host contributes eight runner containers, including two Docker
-workers and six Spot workers. Spot VM prices cover compute only. Persistent
-disks and network use have separate charges.
+workers and six Spot workers. The VM budget includes compute and boot/data disk
+capacity and provisioned performance charges. Network use is billed separately.
 
 Every loop fetches current regional Spot prices and checks each running managed
-VM against `--max-daily-usd` (default: $5 per VM per day for compute).
+VM against `--max-daily-usd` (default: $10 per VM per day for compute and attached storage).
 Prices are shared within one loop for VMs of the same family and region, then
 fetched again on the next loop. The launch price is not a price guarantee.
 
-If a VM's current compute price exceeds the cap, the autoscaler deletes that VM
+If a VM's current compute and attached storage price reaches or exceeds the cap, the autoscaler deletes that VM
 and its attached disks immediately, even if its runners have active jobs. Those
 jobs can fail and need to be rerun. It then searches for affordable replacements
 one host at a time and uses the deployment manager to check prices again before launch.
@@ -167,8 +167,10 @@ The manager verifies current Spot rates and quota before creating resources. It
 uses a Spot VM with a 40-GiB boot disk and a 100-GiB data disk configured to
 delete with its VM. C4, C4D, N4, and N4D use Hyperdisk Balanced boot and data
 disks with NVMe and gVNIC. Both disks explicitly provision the included
-3,000 IOPS and 140 MiB/s throughput baseline. N2, N2D, C2D, and E2 retain
-`pd-balanced` defaults. An incompatible existing data disk or explicit disk
+3,000 IOPS and 140 MiB/s throughput baseline. N2, N2D, C2D, and E2 use
+`pd-standard` boot/data defaults. Manual invocations can explicitly choose a
+compatible data disk with `--disk-type`; `--cheapest-storage` selects disks by
+their current regional prices. An incompatible existing data disk or explicit disk
 type is rejected before attachment. New Spot VMs use the `DELETE` preemption
 action, with automatic deletion explicitly enabled for both boot and data
 disks. Adopting a VM also enables automatic deletion on its boot and runner
