@@ -72,6 +72,19 @@ class ProjectCostTests(unittest.TestCase):
             project_costs.project_cost_totals('homelab', 'billing.costs.table')
         self.assertIn('location=EU', request.call_args.args[1])
 
+    def test_export_partition_is_pruned_without_excluding_delayed_records(self):
+        for partition, expected in [({'field': 'export_time', 'type': 'DAY'}, 'AND export_time >='),
+                                    ({'type': 'DAY'}, 'AND (_PARTITIONTIME >='),
+                                    ({'field': 'usage_start_time', 'type': 'DAY'}, 'AND usage_start_time >=')]:
+            with patch.object(project_costs, '_request', side_effect=[{'location': 'US', 'timePartitioning': partition}, self.result()]) as request, \
+                 patch.object(project_costs, '_access_token', return_value='test-token'):
+                project_costs.project_cost_totals('homelab', 'billing.costs.table')
+            query = request.call_args.args[3]['query']
+            self.assertIn(expected, query)
+            if 'export_time' in expected:
+                self.assertIn('INTERVAL 31 DAY', query)
+                self.assertNotIn('export_time <=', query)
+
     def test_manager_logs_history_before_provisioning(self):
         from lib import runner_manager as manager
         events = []

@@ -46,6 +46,16 @@ def project_cost_totals(project: str, table: str) -> ProjectCosts:
     token = _access_token()
     metadata = _request('GET', f'projects/{source_project}/datasets/{dataset}/tables/{name}', token)
     location = metadata['location']
+    partition_filter = ''
+    partitioning = metadata.get('timePartitioning')
+    if partitioning:
+        # Usage is exported after it occurs. Include an extra partition day
+        # and no upper bound so delayed exports still contribute to totals.
+        field = partitioning.get('field')
+        if field == 'export_time':
+            partition_filter = 'AND export_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 31 DAY)'
+        elif not field:
+            partition_filter = 'AND (_PARTITIONTIME >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 31 DAY) OR _PARTITIONTIME IS NULL)'
     # Project-specific usage totals across every service. Cast before summing
     # to avoid accumulating FLOAT64 monetary rounding errors.
     sums = []
@@ -60,6 +70,7 @@ def project_cost_totals(project: str, table: str) -> ProjectCosts:
       WHERE project.id = @project_id
         AND usage_start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
         AND usage_start_time <= CURRENT_TIMESTAMP()
+        {partition_filter}
     ) SELECT currency, {', '.join(sums)},
       FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', MAX(export_time)),
       FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', MIN(usage_start_time))

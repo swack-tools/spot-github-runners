@@ -74,7 +74,8 @@ def platform_preferences(machine_type: str, zone: str | None = None) -> list[tup
     preferences = [(rank, platform) for rank, (series, platform) in enumerate(CPU_PREFERENCES)
                    if series == family]
     if family == 'c4':
-        vcpu = int(machine_type.rsplit('-', 1)[-1])
+        parts = machine_type.split('-')
+        vcpu = int(parts[2] if parts[1] == 'custom' else parts[-1])
         if vcpu in {144, 288}:
             preferences = [(rank, platform) for rank, platform in preferences if platform == 'Intel Granite Rapids']
         elif zone is not None and zone not in C4_GRANITE_MIN_CPU_ZONES:

@@ -86,6 +86,15 @@ class CpuPlatformTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'platform'):
                 manager.observed_deployment_vm(args, 'region-a')
 
+    def test_extended_custom_c4_parses_cpu_count_before_memory_and_ext(self):
+        from lib.machine_profiles import platform_preferences
+        args = manager.args_parser().parse_args(['--max-cost', '.4', '--instance-type',
+                                                'c4-custom-32-122880-ext', '--ram', '120'])
+        manager.select_sizing(args)
+        self.assertEqual(args.min_cpu_platform, 'Intel Granite Rapids')
+        self.assertEqual([platform for _, platform in platform_preferences('c4-custom-144-552960-ext')],
+                         ['Intel Granite Rapids'])
+
     def test_newer_supported_platform_satisfies_minimum_after_restart(self):
         from lib.runner_fleet import GitHubRunner
         args = manager.args_parser().parse_args(['--max-cost', '.2', '--min-cpu-platform', 'Intel Cascade Lake'])
