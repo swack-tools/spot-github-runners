@@ -82,7 +82,6 @@ def drain_runners(operation, vm, args, state, save, assigned):
             save()
         if runner.runner_id in done:
             raise RuntimeError('A deregistered runner appeared again during drain')
-    members = set()
     if legacy_group:
         members = {row['id'] for row in pages(api(args.org, 'GET', path + '/runners', paginate=True), 'runners')}
         if members - set(operation['runner_ids']):
