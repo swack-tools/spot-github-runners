@@ -32,6 +32,7 @@ class RunnerDrainTests(unittest.TestCase):
         self.fail_delete = False
         self.provider_id = '123'
         self.timeout_deregister = False
+        self.fail_describe = False
         self.job_status = 'in_progress'
         self.state = {}
         self.external = patch('subprocess.run', side_effect=self.command)
@@ -49,6 +50,8 @@ class RunnerDrainTests(unittest.TestCase):
         self.commands.append(command)
         if command[0] == 'gcloud':
             if command[3] == 'describe':
+                if self.fail_describe:
+                    raise subprocess.CalledProcessError(1,command,stderr='PERMISSION_DENIED: required compute.instances.get permission')
                 return SimpleNamespace(returncode=0, stdout=self.provider_id)
             self.assertFalse(any(r.busy for r in self.live), 'Deleted a busy host')
             self.assertEqual(self.live, [], 'Deleted before runner deregistration')
@@ -111,6 +114,7 @@ class RunnerDrainTests(unittest.TestCase):
 
     def test_labels_are_removed_before_waiting_and_deletion_requires_fresh_absence(self):
         self.begin()
+        self.assertIn('host_operation',self.state)
         self.assertEqual(self.state['host_operation']['kind'],'drain')
         self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
         self.assertTrue(all(r.labels==('self-hosted','Linux','X64') for r in self.live))
@@ -175,6 +179,16 @@ class RunnerDrainTests(unittest.TestCase):
         self.begin();self.reconcile();self.provider_id='999';self.reconcile()
         self.assertFalse(any(c[:4]==['gcloud','compute','instances','delete'] for c in self.commands))
         self.assertFalse(self.state.get('intentional_deletions'))
+
+    def test_provider_read_rejection_preserves_drain_and_group_identity(self):
+        self.begin();self.reconcile();self.fail_describe=True;self.reconcile()
+        self.state=controller.read_scale_state(self.path)
+        self.assertEqual(self.state['host_operation']['kind'],'drain')
+        self.assertEqual(self.state['host_operation']['drain_group_id'],99)
+        self.assertEqual(len(self.state['host_operation']['deregistered_runner_ids']),8)
+        self.assertFalse(self.state.get('intentional_deletions'))
+        self.fail_describe=False;self.reconcile()
+        self.assertEqual(self.state['host_operation']['kind'],'delete')
 
     def test_rejected_delete_keeps_drain_state_and_can_retry(self):
         self.begin();self.reconcile();self.fail_delete=True;self.reconcile()

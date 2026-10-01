@@ -387,7 +387,8 @@ def clear_rejected_deletion(vm: GceVm, exc: Exception, state: dict | None, state
     if state is None or not isinstance(exc, subprocess.CalledProcessError):
         return
     command = exc.cmd if isinstance(exc.cmd, (list, tuple)) else []
-    if not command or Path(str(command[0])).name != 'gcloud':
+    if (not command or Path(str(command[0])).name != 'gcloud'
+            or list(command[1:4]) != ['compute', 'instances', 'delete']):
         return  # A subsequent runner deregistration failure does not undo VM deletion.
     detail = error_detail(exc).lower()
     rejected = (re.search(r'http (400|401|403)\b', detail)
