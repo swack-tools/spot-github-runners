@@ -215,7 +215,7 @@ python3 src/spot_runner_autoscaler.py --once
 ```
 
 Run continuously with a target of 25 online runners across the Spot and Docker
-pools, two Docker hosts, a five-minute interval, and a $5 per-VM daily compute
+pools, two Docker hosts, a five-minute interval, and a $10 per-VM daily compute and storage
 cap:
 
 ```bash
@@ -223,17 +223,55 @@ python3 src/spot_runner_autoscaler.py
 ```
 
 The autoscaler considers supported x86 Spot offers with exactly 32 vCPU and
-at least 110 GiB of RAM that cost less than the daily compute cap. It prefers
-C4D/N4D (Turin), then C4/N4 (Emerald Rapids at 32 vCPU), older N2/N2D/C2D,
-and finally E2, choosing the cheapest
-offer within each tier. These are CPU-generation preferences, not measured
-Rust build rankings. C4's 120 GiB and C4D's 124 GiB qualify; ARM, Local SSD,
-and bare-metal variants are excluded. Data and boot disk charges are separate
-from the compute cap. Every deployment verifies fresh regional prices using
+at least 110 GiB of RAM that cost less than the daily total cost cap. It prefers
+C4D (AMD Turin), N4D (AMD Turin), C4 (Intel Granite Rapids),
+C4 (Intel Emerald Rapids), N4 (Intel Emerald Rapids), C2D (AMD Milan),
+N2D (AMD Milan), N2 (Intel Ice Lake), then N2 (Intel Cascade Lake).
+Within each family/platform preference it chooses the cheapest regional offer,
+including 40 GiB of boot storage and the configured data disk size.
+These are provisional hardware estimates; Rust build performance is unmeasured.
+E2 hosts remain recognized, but automatic launches exclude E2 because GCP does
+not allow requesting a CPU platform for that family. C4's 120 GiB and C4D's 124 GiB qualify; ARM, Local SSD,
+and bare-metal variants are excluded. Boot and data disks use the cheapest
+supported baseline storage: Standard/Balanced/SSD Persistent Disk for older
+families and Hyperdisk Balanced for C4/C4D/N4/N4D. Data disks of at least 2 TiB
+also compare Hyperdisk Throughput where supported, including its minimum
+provisioned throughput charge. Hyperdisk Balanced uses its included 3,000 IOPS
+and 140 MiB/s throughput. Monthly SKU storage prices use Google's 730-hour month for the
+daily estimate. The running-VM price guard includes actual attached disk sizes
+and provisioned performance; missing prices or disk details pause price-based
+decisions. Every deployment verifies fresh regional prices using
 the selected host's actual CPU and RAM counts. New runner names use the short `gha`
 prefix and are checked against GitHub's 64-character name limit. The autoscaler
 stores its idle-loop counters, restoration targets, and pending host operation in
 `~/Library/Application Support/Spot Runner Autoscaler/state.json`.
+
+Each launch passes an explicit `--min-cpu-platform` request to GCP. The manager
+checks that the observed platform meets the requested minimum before confirming a running host, and the controller
+preserves that request across restarts. Failed launches fall back through zones,
+regions, and platform preferences only after confirming that no VM, disks, or
+runner records remain. Uncertain results pause fallback. Logs include the
+requested platform, observed platform, preference rank, and compute/storage prices.
+At startup the controller reads each zone's available CPU platforms from GCP
+and saves the map in state. A restart refreshes it. This zone inventory does not
+prove platform support for a particular shape: small C4 Granite Rapids launches
+are additionally limited to Google's documented minimum-platform zones.
+For manual provisioning, `--min-cpu-platform` can select a compatible platform;
+omitting it defaults to the family's first preference.
+
+Before provisioning, the manager logs project-wide costs for the rolling last
+24 hours, 7 days, and 30 days, both before credits and after credits. This requires
+a standard or detailed [Cloud Billing usage export to BigQuery](https://docs.cloud.google.com/billing/docs/how-to/export-data-bigquery-setup).
+Set `GCP_BILLING_EXPORT_TABLE=project.dataset.table` in `.env`, or pass
+`--billing-export-table project.dataset.table` to the controller or manager.
+The current `gcloud` identity needs BigQuery table read access and permission to
+run query jobs in the managed project. Queries use the table's location and a
+1 GiB billed-bytes limit. The lookup uses the BigQuery REST API without requiring
+the `bq` CLI. Missing configuration, empty history, or failed lookups produce an
+unavailable warning and do not prevent provisioning. Export timestamps and
+partial-history warnings accompany totals because reporting can lag and a new
+export may not contain the complete 30-day window. SKU rates cannot substitute
+for historical project spend.
 
 To install a per-user macOS LaunchAgent that starts at login and restarts the
 process if it exits, run:
