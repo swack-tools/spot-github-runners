@@ -61,13 +61,20 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertFalse(any('delete' in call for call in calls))
 
-    def test_foreign_project_or_retained_disk_never_deleted(self):
-        for disk in ({'source': SOURCE.replace('/project/', '/other/'), 'autoDelete': True},
-                     {'source': SOURCE, 'autoDelete': False}):
-            vm = GceVm(self.vm.name, self.vm.zone, 'TERMINATED', self.vm.machine_type, True, disks=(disk,))
-            with patch('lib.vm_recovery.subprocess.run') as command:
-                self.assertFalse(vm_recovery.cleanup_lost_vm(vm, 'project'))
-                command.assert_not_called()
+    def test_foreign_project_disk_is_never_deleted(self):
+        disk = {'source': SOURCE.replace('/project/', '/other/'), 'autoDelete': True}
+        vm = GceVm(self.vm.name, self.vm.zone, 'TERMINATED', self.vm.machine_type, True, disks=(disk,))
+        with patch('lib.vm_recovery.subprocess.run') as command:
+            self.assertFalse(vm_recovery.cleanup_lost_vm(vm, 'project'))
+            command.assert_not_called()
+
+    def test_retained_but_verified_detached_managed_disk_is_deleted(self):
+        self.vm = GceVm(self.vm.name, self.vm.zone, 'TERMINATED', self.vm.machine_type, True,
+                        instance_id='123', disks=({'source': SOURCE, 'autoDelete': False, 'diskId': '456'},))
+        result, calls = self.run_cleanup([], [[{'name': 'root', 'selfLink': SOURCE, 'id': '456',
+                                                'status': 'READY', 'users': []}], []])
+        self.assertTrue(result)
+        self.assertTrue(any('disks' in call and 'delete' in call for call in calls))
 
     def test_changed_attachments_and_unrecorded_disk_identity_are_retained(self):
         current = {'name': self.vm.name, 'id': '123', 'status': 'TERMINATED',
