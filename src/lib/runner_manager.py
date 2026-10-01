@@ -261,6 +261,11 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
         script_path = temp.name
     try:
         if vm:
+            for boot_disk in vm.get("disks", []):
+                if boot_disk.get("boot"):
+                    gcloud(["compute", "instances", "set-disk-auto-delete", args.instance_name,
+                            f"--zone={zone}", f"--device-name={boot_disk['deviceName']}",
+                            "--auto-delete", "--quiet"])
             attached = {disk.get("deviceName") for disk in vm.get("disks", [])}
             if args.disk_device_name not in attached:
                 gcloud(["compute", "instances", "attach-disk", args.instance_name, f"--zone={zone}",
@@ -286,8 +291,9 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                            if args.boot_disk_type == 'hyperdisk-balanced' else "--network=default")
                 gcloud(["compute", "instances", "create", args.instance_name, f"--zone={zone}",
                         f"--machine-type={args.instance_type}", "--provisioning-model=SPOT",
-                        "--instance-termination-action=STOP", "--maintenance-policy=TERMINATE",
+                        "--instance-termination-action=DELETE", "--maintenance-policy=TERMINATE",
                         f"--boot-disk-type={args.boot_disk_type}", "--boot-disk-size=40GB",
+                        "--boot-disk-auto-delete",
                         f"--boot-disk-interface={args.disk_interface}", *boot_performance,
                         "--image-family=debian-13", "--image-project=debian-cloud",
                         f"--disk=name={args.disk_device_name},device-name={args.disk_device_name},mode=rw,auto-delete=yes,interface={args.disk_interface}",
@@ -460,7 +466,7 @@ def main() -> int:
     hourly = verify_price_and_capacity(args, zone)
     if args.existing_instance:
         args.deployment_vm = observed_deployment_vm(args, zone)
-    LOG.info(f"Plan: {deployment_details(args)}; {args.runner_count} runners, {args.runner_cpu} vCPU/{args.runner_memory_gb} GiB each; {args.disk_size_gb} GiB retained disk.")
+    LOG.info(f"Plan: {deployment_details(args)}; {args.runner_count} runners, {args.runner_cpu} vCPU/{args.runner_memory_gb} GiB each; {args.disk_size_gb} GiB auto-delete data disk.")
     if not args.apply:
         LOG.info("Preview only. Add --apply to provision through GCE startup metadata and register the runners.")
         return 0
