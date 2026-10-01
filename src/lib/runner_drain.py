@@ -44,7 +44,8 @@ def isolated_group(operation, org, save):
     group = api(org, 'GET', path)
     repositories = pages(api(org, 'GET', path + '/repositories', paginate=True), 'repositories')
     if (group.get('name') != name or group.get('visibility') != 'selected'
-            or group.get('default') or group.get('inherited') or repositories):
+            or group.get('default') or group.get('inherited')
+            or group.get('allows_public_repositories') is not False or repositories):
         raise RuntimeError('Drain group is not an isolated group with zero repository access')
     return path
 

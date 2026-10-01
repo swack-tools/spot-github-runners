@@ -67,7 +67,8 @@ class RunnerDrainTests(unittest.TestCase):
                 body=json.loads(kwargs['input'])
                 self.assertEqual(body['visibility'], 'selected')
                 self.assertEqual(body['selected_repository_ids'], [])
-                self.group={'id':99,'name':body['name'],'visibility':'selected','default':False,'inherited':False}
+                self.group={'id':99,'name':body['name'],'visibility':'selected','default':False,'inherited':False,
+                            'allows_public_repositories':False}
                 data=self.group
             else:
                 data=[{'runner_groups':[self.group] if self.group else []}]
@@ -159,6 +160,18 @@ class RunnerDrainTests(unittest.TestCase):
 
     def test_group_with_repository_access_blocks_deregistration(self):
         self.begin();self.repo_access=[{'id':999}]
+        self.reconcile()
+        self.assertEqual(len(self.live),8)
+        self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
+
+    def test_group_with_public_repository_access_blocks_deregistration(self):
+        self.begin();self.group['allows_public_repositories']=True
+        self.reconcile()
+        self.assertEqual(len(self.live),8)
+        self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
+
+    def test_group_with_unknown_public_repository_access_blocks_deregistration(self):
+        self.begin();self.group.pop('allows_public_repositories')
         self.reconcile()
         self.assertEqual(len(self.live),8)
         self.assertFalse(any(c[0]=='gcloud' for c in self.commands))
