@@ -175,6 +175,14 @@ class RunnerDrainTests(unittest.TestCase):
         docker=GitHubRunner(88,'unrelated-docker-1','online',False,('docker',))
         self.assertEqual(controller.removable_spot_vms([self.vm,self.other], self.runners[:7]+[docker],0,0),[])
 
+    def test_custom_runner_prefix_with_all_eight_slots_can_be_drained(self):
+        assigned=[replace(r,name=r.name.replace('gha-','oxidex-example-',1)) for r in self.runners]
+        self.assertEqual(controller.removable_spot_vms([self.vm,self.other],assigned,0,0),[self.vm])
+
+    def test_two_incomplete_prefixes_do_not_prove_all_slots_registered(self):
+        assigned=[replace(r,name=r.name.replace('gha-','first-' if r.runner_id<=4 else 'second-',1)) for r in self.runners]
+        self.assertEqual(controller.removable_spot_vms([self.vm,self.other],assigned,0,0),[])
+
     def test_changed_provider_identity_blocks_deletion_without_intent(self):
         self.begin();self.reconcile();self.provider_id='999';self.reconcile()
         self.assertFalse(any(c[:4]==['gcloud','compute','instances','delete'] for c in self.commands))

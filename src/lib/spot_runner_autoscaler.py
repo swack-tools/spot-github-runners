@@ -120,8 +120,12 @@ def removable_spot_vms(vms: list[GceVm], runners: list[GitHubRunner],
     fleet = spot_instances(vms)
     for vm in fleet:
         assigned = host_runners(vm, runners, fleet)
-        expected = {f"gha-{vm.name}-{slot}" for slot in range(1, 9)}
-        if (not vm.instance_id or not expected.issubset({runner.name for runner in assigned})
+        names = {runner.name for runner in assigned}
+        marker = f"-{vm.name}-"
+        prefixes = {name.rsplit(marker, 1)[0] for name in names if marker in name}
+        complete = any(prefix and {f"{prefix}-{vm.name}-{slot}" for slot in range(1, 9)}.issubset(names)
+                       for prefix in prefixes)
+        if (not vm.instance_id or not complete
                 or any(not runner.online or runner.busy for runner in assigned)):
             continue
         remaining_docker = [runner for runner in runners
