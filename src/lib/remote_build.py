@@ -67,8 +67,11 @@ def main(argv=None):
         subprocess.run(ssh(command),check=True)
         receipt['sync_seconds']=time.monotonic()-start;save()
         # Dependencies are fetched separately; compile time excludes downloads.
-        for stage,command in [('fetch','cargo fetch --locked --target x86_64-unknown-linux-gnu'),
-                              ('compile','cargo build '+('--release ' if args.profile=='release' else '')+'--locked --bin oxidex')]:
+        stages=[('fetch','cargo fetch --locked --target x86_64-unknown-linux-gnu')]
+        if args.profile=='release':
+            stages.append(('header','just cbindgen-check'))
+        stages.append(('compile','cargo build '+('--release ' if args.profile=='release' else '')+'--locked --bin oxidex'))
+        for stage,command in stages:
             start=time.monotonic()
             remote=f'sudo /usr/local/bin/oxidex-remote-build {project} {command}'
             with (evidence/f'{stage}.log').open('w') as log:

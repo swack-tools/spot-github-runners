@@ -129,7 +129,9 @@ python3 src/remote_rust_build.py \
 The client packages current tracked working files, excludes credentials, agent
 configuration and build caches, transfers with `gcloud compute scp`, verifies
 the archive checksum, and fetches dependencies before timing
-`cargo build --release --locked --bin oxidex`. Evidence includes source hashes,
+`cargo build --release --locked --bin oxidex`. Release builds also run the
+pinned `just cbindgen-check` inside the container before compiling; a header
+mismatch stops the build. Evidence includes source hashes,
 Git revision/status, transfer/fetch/build wall times and GNU time output. Use a
 new worktree identifier for a cold build; reusing one retains its target cache.
 It compiles Linux artifacts, not macOS executables. Git registration and full
