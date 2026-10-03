@@ -15,8 +15,12 @@ def main():
     parser.add_argument('--profile', choices=['debug','release'],required=True)
     args=parser.parse_args()
     source=Path(subprocess.check_output(['git','rev-parse','--show-toplevel'],text=True).strip())
-    settings=tomllib.loads((source/'.cargo/config.toml').read_text())['env']
-    project=os.environ.get('OXIDEX_REMOTE_PROJECT',settings['OXIDEX_REMOTE_PROJECT'])
+    settings=tomllib.loads((source/'.cargo/config.toml').read_text()).get('env',{})
+    project=os.environ.get('OXIDEX_REMOTE_PROJECT') or settings.get('OXIDEX_REMOTE_PROJECT')
+    if not project:
+        project=subprocess.check_output(['gcloud','config','get-value','project'],text=True).strip()
+    if not project or project=='(unset)':
+        raise RuntimeError('Set OXIDEX_REMOTE_PROJECT or configure a gcloud project')
     vm,sample=select_worker(project)
     env=dict(os.environ,OXIDEX_REMOTE_INSTANCE=vm.name,OXIDEX_REMOTE_ZONE=vm.zone,
              OXIDEX_REMOTE_PROJECT=project)
