@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Prove the checkout's compiler pin before executing an unprivileged build."""
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+def main():
+    text = Path('/src/rust-toolchain.toml').read_text()
+    match = re.search(r'^channel\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text, re.M)
+    if not match:
+        raise RuntimeError('A numeric Rust toolchain pin is required')
+    pin = match[1]
+    compiler = subprocess.check_output(['rustup', 'which', '--toolchain', pin, 'rustc'], text=True).strip()
+    cargo = subprocess.check_output(['rustup', 'which', '--toolchain', pin, 'cargo'], text=True).strip()
+    env = dict(os.environ, RUSTC=compiler)
+    # Pin PATH as well, for just recipes, subprocesses and rustdoc.
+    env['PATH'] = str(Path(compiler).parent) + ':' + env['PATH']
+    env['RUSTDOC'] = str(Path(compiler).with_name('rustdoc'))
+    env['RUSTUP_TOOLCHAIN'] = pin
+    print(subprocess.check_output([compiler, '-vV'], text=True), flush=True)
+    print(subprocess.check_output([cargo, '-V'], text=True), flush=True)
+    command = sys.argv[1:] or ['cargo', 'build', '--release', '--locked', '--bin', 'oxidex']
+    if command[0] == 'cargo':
+        command[0] = cargo
+    os.execvpe(command[0], command, env)
+
+
+if __name__ == '__main__':
+    main()

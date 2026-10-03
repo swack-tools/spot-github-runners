@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -18,7 +19,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
 
-from .autoscaling_policy import affordable_offers
+from .autoscaling_policy import affordable_offers, resource_decision
+from .resource_metrics import read_utilization
 from .machine_profiles import MINIMUM_RAM_GIB, machine_profile, CpuOffer, platform_preferences, cpu_platform_satisfies
 from .compute_api import get_auth
 from .environment import load_env
@@ -113,7 +115,7 @@ def fleet_summary(vms, runners, state: dict) -> str:
         pending = f"pending {operation['kind']} of {operation['vm']['name']}"
         if operation["kind"] == "launch" and "started_at" in operation:
             minutes, seconds = divmod(int(now() - operation["started_at"]), 60)
-            pending += f" for {minutes}m {seconds}s of the {LAUNCH_DEADLINE_SECONDS // 60}m limit"
+            pending += f" for {minutes}m {seconds}s of the {operation.get('deadline_seconds', LAUNCH_DEADLINE_SECONDS) // 60}m limit"
     return (f"Fleet: GitHub runners {len(online)} online ({sum(runner.busy for runner in online)} busy), "
             f"{len(managed_online_runners(runners))} on Spot VMs, {len(runners) - len(online)} offline; "
             f"Spot VMs {len(fleet)}{': ' + hosts if hosts else ''}; {pending}")
@@ -260,6 +262,11 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                          drain_mode="label_only")
         write_scale_state(state_path, state)
     if operation["kind"] == "drain":
+        if (getattr(args, 'scaling_mode', 'legacy') == 'resource'
+                and operation.get('drain_mode') == 'label_only'):
+            operation.update(drain_mode='isolated_group', runners_isolated=False)
+            operation.setdefault('drain_group_name', f'spot-drain-{vm.name}-{vm.instance_id}')
+            write_scale_state(state_path, state)
         if current and current.running:
             try:
                 from .runner_drain import drain_runners
@@ -267,6 +274,8 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                 assigned = host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]])
                 if drain_runners(operation, vm, args, state,
                                  lambda: write_scale_state(state_path, state), assigned):
+                    if getattr(args, 'remote_builder', False) and not quiesce_remote_builder(vm, args):
+                        return True
                     def before_delete():
                         operation.update(kind="delete", drained=True)
                         key = f"{vm.zone}/{vm.name}"
@@ -320,9 +329,10 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
             write_scale_state(state_path, state)
             return True
         # A manager-confirmed host keeps its jobs even if one runner briefly restarts later.
-        if not operation.get("registered") and now() - operation["started_at"] >= LAUNCH_DEADLINE_SECONDS:
+        deadline = operation.get('deadline_seconds', LAUNCH_DEADLINE_SECONDS)
+        if not operation.get("registered") and now() - operation["started_at"] >= deadline:
             operation.setdefault("abandon", f"all eight runners did not register within "
-                                            f"{LAUNCH_DEADLINE_SECONDS // 60} minutes")
+                                            f"{deadline // 60} minutes")
         if operation.get("abandon"):
             try:
                 abandon_launch(args, state, state_path)
@@ -459,6 +469,22 @@ def delete_drained_vm(vm, args, before_delete=None):
     LOG.info("Deleted drained Spot VM %s and its attached disks", vm_details(vm))
 
 
+def quiesce_remote_builder(vm, args):
+    """Hold new builds off a host only after its running builds have finished."""
+    script = ('if [ -n "$(docker ps -q --filter label=oxidex.remote-build=true)" ]; '
+              'then exit 75; fi; touch /run/oxidex-build-draining')
+    command = 'sudo flock -n -E 75 /run/oxidex-build.lock sh -c ' + shlex.quote(script)
+    try:
+        result = subprocess.run(['gcloud', 'compute', 'ssh', vm.name, f'--zone={vm.zone}',
+                                 f'--project={args.project}', '--quiet', '--command='+command],
+                                text=True, capture_output=True, timeout=60)
+        if result.returncode:
+            LOG.info('Drain waits: remote builder active or inaccessible on %s', vm_details(vm))
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace,
                state: dict | None = None, state_path: Path | None = None) -> int:
     """Drain one idle host, then wait for CI completion and deregistration before deletion."""
@@ -470,11 +496,16 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
     if not candidates:
         LOG.info("Scale-down waits: no complete idle host is available")
         return 0
-    vm = candidates[0]
+    vm = next((vm for vm in candidates if not getattr(args, 'remote_builder', False)
+               or quiesce_remote_builder(vm, args)), None)
+    if vm is None:
+        return 0
     assigned = host_runners(vm, runners, vms)
     begin_host_operation("drain", vm, runners, vms, state, state_path,
                          runner_names={str(runner.runner_id): runner.name for runner in assigned},
-                         drain_mode="label_only")
+                         drain_group_name=f'spot-drain-{vm.name}-{vm.instance_id}',
+                         drain_mode=('isolated_group' if getattr(args, 'scaling_mode', 'legacy') == 'resource'
+                                     else 'label_only'))
     reconcile_host_operation(vms, runners, args, state, state_path)
     return 0  # Host removal is counted only after the drain completes.
 
@@ -754,6 +785,10 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             "--runner-prefix", runner_prefix,
             "--runner-label", args.label, "--apply",
         ]
+        if getattr(args, 'remote_builder', False):
+            command.append('--remote-builder')
+        if getattr(args, 'scaling_mode', 'resource') == 'resource':
+            command.append('--resource-monitoring')
         if getattr(args, 'billing_export_table', None):
             command.extend(['--billing-export-table', args.billing_export_table])
         profile = machine_profile(offer.machine_type)
@@ -773,18 +808,20 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
                  offer.region, vm_details(vm), cpu_rank + 1, offer.hourly_usd * 24,
                  storage_daily, Decimal(str(offer.hourly_usd)) * 24 + storage_daily)
         receipt = state_path.parent / f"{instance_name}-{uuid.uuid4().hex}-deployment.json"
+        deadline = 2400 if getattr(args, 'remote_builder', False) else LAUNCH_DEADLINE_SECONDS
         command.extend(["--deployment-receipt", str(receipt),
-                        "--registration-timeout-seconds", str(LAUNCH_DEADLINE_SECONDS)])
+                        "--registration-timeout-seconds", str(deadline)])
         begin_host_operation("launch", vm, [], [], state, state_path,
                              requested_cpu_platform=cpu_platform, deployment_receipt=str(receipt),
                              candidate_key=f"{zone}/{offer.machine_type}/{cpu_platform}",
-                             data_disk_name=f"runner-data-{suffix}", started_at=now())
+                             data_disk_name=f"runner-data-{suffix}", started_at=now(),
+                             deadline_seconds=deadline)
         started = time.monotonic()
         manager_hung = False
         try:
             # The manager enforces the registration deadline; this backstop covers a hung manager.
             result = subprocess.run(command, check=False, text=True, capture_output=True,
-                                    timeout=LAUNCH_DEADLINE_SECONDS + 120)
+                                    timeout=deadline + 120)
         except subprocess.TimeoutExpired:
             manager_hung = True
             result = SimpleNamespace(returncode=-9, stdout="",
@@ -862,7 +899,7 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
                for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")):
             return False
     elif (operation.get("outcome_uncertain")
-          and now() - operation.get("started_at", now()) < LAUNCH_DEADLINE_SECONDS):
+          and now() - operation.get("started_at", now()) < operation.get('deadline_seconds', LAUNCH_DEADLINE_SECONDS)):
         LOG.info("Launch cleanup waits until the deadline confirms %s was never created: %s",
                  vm.name, reason)
         write_scale_state(state_path, state)
@@ -923,6 +960,8 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
     }
     for repo in args.job_repository or []:
         plist["ProgramArguments"].extend(["--job-repository", repo])
+    plist['ProgramArguments'].extend(['--scaling-mode', args.scaling_mode, '--maximum-hosts', str(args.maximum_hosts)])
+    plist['ProgramArguments'].append('--remote-builder' if args.remote_builder else '--no-remote-builder')
     if getattr(args, 'billing_export_table', None):
         plist['ProgramArguments'].extend(['--billing-export-table', args.billing_export_table])
     plist_path.write_bytes(plistlib.dumps(plist))
@@ -939,6 +978,11 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-daily-usd", type=Decimal, default=Decimal("10"),
                         help='Maximum daily compute plus boot/data storage cost per VM')
     parser.add_argument("--interval-seconds", type=int, default=300)
+    parser.add_argument('--scaling-mode', choices=('resource', 'legacy'), default='resource',
+                        help='Resource: two 5-minute checks above/below 75%% CPU/memory; legacy: runner occupancy')
+    parser.add_argument('--maximum-hosts', type=int, default=4)
+    parser.add_argument('--remote-builder', action=argparse.BooleanOptionalAction, default=True,
+                        help='Install dedicated remote Rust builders on new nodes (default enabled)')
     parser.add_argument("--disk-size-gb", type=int, default=100)
     parser.add_argument('--billing-export-table', help='Billing export project.dataset.table for launch cost logs (or GCP_BILLING_EXPORT_TABLE)')
     parser.add_argument("--log-file", type=Path, default=Path.home() / "spot-ghrunner.log")
@@ -959,6 +1003,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("runner floors, interval, and disk size must be positive")
     if args.max_daily_usd <= 0:
         raise ValueError("max daily VM cost must be positive")
+    if args.maximum_hosts < 1 or (args.scaling_mode == 'resource' and args.interval_seconds != 300):
+        raise ValueError('Resource mode requires 300-second checks and a positive maximum host count')
     load_env(ROOT / ".env")
     args.billing_export_table = args.billing_export_table or os.environ.get('GCP_BILLING_EXPORT_TABLE')
     if args.install_launch_agent:
@@ -1024,9 +1070,27 @@ def _run_controller(args: argparse.Namespace) -> int:
         current, busy = utilization_counts(runners)
         LOG.info("Managed GCP runners: %d online, %d busy; %d Spot VMs",
                  current, busy, len(fleet_vms))
-        action, host_count, idle_loops, scale_up_active = scaling_decision(
-            current, busy, len(fleet_vms), state["idle_loops"],
-            state["scale_up_active"], args.minimum_runners)
+        if args.scaling_mode == 'resource':
+            roster = sorted(f'{vm.zone}/{vm.instance_id}' for vm in fleet_vms)
+            if state.get('resource_roster') != roster:
+                state['resource_evidence'] = {}
+                state['resource_roster'] = roster
+            try:
+                observed = read_utilization(args.project, fleet_vms)
+            except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                LOG.warning('Resource metrics unavailable; optimization waits: %s', error_detail(exc))
+                observed = None
+            action = resource_decision(observed, state.setdefault('resource_evidence', {}), time.time())
+            LOG.info('Resource check: CPU/memory fractions=%s; decision=%s; threshold=75%%, two 5-minute checks', observed, action)
+            if action == 'up' and len(fleet_vms) >= args.maximum_hosts:
+                action = 'wait'
+            if action == 'down' and len(fleet_vms) <= 1:
+                action = 'wait'
+            host_count, idle_loops, scale_up_active = (1 if action in ('up', 'down') else 0), 0, False
+        else:
+            action, host_count, idle_loops, scale_up_active = scaling_decision(
+                current, busy, len(fleet_vms), state["idle_loops"],
+                state["scale_up_active"], args.minimum_runners)
         if state["scale_up_active"] and not scale_up_active and action == "hold":
             LOG.info("Scale-up complete: online capacity is above %d runners", args.minimum_runners)
         state["scale_up_active"] = scale_up_active
@@ -1042,7 +1106,7 @@ def _run_controller(args: argparse.Namespace) -> int:
                     LOG.error("Could not launch Spot capacity below $%s/day", args.max_daily_usd)
         elif action == "down":
             state["idle_loops"] = idle_loops
-            LOG.info("Low usage persisted for two checks; removing up to %d Spot hosts", host_count)
+            LOG.info("Low usage persisted for two checks; draining up to %d Spot hosts", host_count)
             removed = scale_down(vms, runners, args, state=state, state_path=state_path)
             LOG.info("Scale-down step removed %d hosts", removed)
         else:

@@ -29,6 +29,7 @@ from .log_format import configure_logging, error_detail, single_line
 from .runner_labels import DEFAULT_RUNNER_LABELS
 from .runner_assets import (CLEAN_TARGET, JOB_COMPLETED, RUNNER_DOCKERFILE,
                             RUNNER_ENTRYPOINT, STARTUP_SCRIPT)
+from .builder_assets import BUILDER_DOCKERFILE, BUILDER_ENTRYPOINT, HOST_LAUNCHER
 
 ROOT = Path(__file__).resolve().parents[2]
 PROJECT = "homelab-424523"
@@ -100,6 +101,8 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--registration-timeout-seconds", type=int, default=1200,
                         help="Fail when bootstrap has not finished this long after deployment starts")
     parser.add_argument("--apply", action="store_true", help="Run provisioning and startup-script deployment")
+    parser.add_argument('--remote-builder', action='store_true', help='Install dedicated Rust 1.97.1 remote builder and CI tools')
+    parser.add_argument('--resource-monitoring', action='store_true', help='Install metrics-only Ops Agent memory monitoring')
     return parser
 
 
@@ -231,6 +234,13 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
         "RUNNER_CPU_LIMIT": str(args.runner_cpu) if getattr(args, "fixed_runner_sizing", False) else "",
         "INSTANCE_NAME": args.instance_name,
         "DEPLOYMENT_ID": deployment_id,
+        "REMOTE_BUILDER": '1' if getattr(args, 'remote_builder', False) else '0',
+        "RESOURCE_MONITORING": '1' if getattr(args, 'resource_monitoring', False) else '0',
+        "BUILDER_DOCKERFILE_B64": base64.b64encode(BUILDER_DOCKERFILE.encode()).decode('ascii'),
+        "BUILDER_ENTRYPOINT_B64": base64.b64encode(BUILDER_ENTRYPOINT.encode()).decode('ascii'),
+        "HOST_LAUNCHER_B64": base64.b64encode(HOST_LAUNCHER.encode()).decode('ascii'),
+        "BUILDER_CPUS": str(max(1, getattr(args, 'cpu', 32) - 4)),
+        "BUILDER_MEMORY_GIB": str(max(1, getattr(args, 'ram', 128) - 24)),
     }
     for key, value in replacements.items():
         source = source.replace("{{" + key + "}}", value)

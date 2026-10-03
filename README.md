@@ -20,25 +20,25 @@ flowchart TD
     P -- No --> R{Loss cleanup or price replacement pending?}
     R -- Yes --> S[Clean, delete or launch one host]
     S --> A
-    R -- No --> B{Busy share above 50% and at most 25 workers?}
+    R -- No --> B{CPU or memory above 75% for two checks?}
     B -- Yes --> C[Launch one host]
     C --> A
-    B -- No --> E{Below 50% busy for two checks?}
-    E -- Yes --> F[Drain one idle host]
+    B -- No --> E{Every host below 75% CPU and memory for two checks?}
+    E -- Yes --> F[Wait for remote builds and safely drain one idle host]
     F --> A
     E -- No --> A
 ```
 
-The autoscaler scales the GCP Spot fleet with observed job usage. Docker builds
+The autoscaler scales the GCP Spot fleet with observed CPU and memory usage. Docker builds
 run on GitHub-hosted workers, so Spot runners no longer receive the `docker`
 label or host Docker socket. GitHub adds the standard `self-hosted`, `Linux`,
 and `X64` labels to Spot runners, which also receive `spot` and optional machine
 and region labels. Separate `oxidex-m4air` runners remain managed by their own
 configuration. The autoscaler changes one host at a time and checks again
-every five minutes. When more than half of the online GCP runners are busy and 25 or fewer are online, it adds one
-Spot VM. It waits for that host's eight runner slots to be online, then checks
-fresh utilization before another change. Lower demand cancels further scale-up.
-When fewer than half are busy for two consecutive checks, it drains one host
+every five minutes. When a host exceeds 75% CPU or memory for two consecutive
+checks, it adds one Spot VM, up to `--maximum-hosts` (default 4). CPU is the
+five-minute mean; memory is the maximum non-cache used percentage in that window.
+When every host is below 75% for both resources for two checks, it drains one host
 and waits for both the VM and its assigned GitHub runner records to be absent.
 It repeats the two-check debounce before another reduction, keeping at least
 one Spot VM. It selects a host only after observing all eight runner slots online
@@ -51,9 +51,89 @@ with all assigned runner records absent and verifies the VM identity before
 deleting it and its attached disks. It removes the empty temporary group after
 confirming VM absence. GitHub group and label management require organization
 self-hosted runner write permissions through `gh`.
+Exactly 75% holds capacity. Missing or stale metrics reset the streak and block
+utilization changes. CPU comes from automatic Compute Engine metrics; memory
+comes from a metrics-only Ops Agent installed on new resource-mode hosts. Existing
+hosts must receive the same agent configuration separately before optimization.
+Loss recovery and price enforcement remain separate. `--scaling-mode legacy`
+explicitly restores the older runner-occupancy rules.
 Each added host contributes eight Spot runner containers. The VM budget includes
 compute and boot/data disk capacity and provisioned performance charges. Network
 use is billed separately.
+
+Memory telemetry requires the VM service account to have
+`roles/monitoring.metricWriter` and the Monitoring write scope. Provisioning
+installs the metrics-only Ops Agent when resource monitoring is enabled; CPU
+utilization comes from the built-in Compute Engine metric.
+
+## Remote Rust builds
+
+Install Cargo command shims directly from this checkout:
+
+```bash
+python3 src/install_remote_commands.py
+```
+
+The shims run `src/auto_remote_build.py` and `src/cargo_remote.py` from this
+repository. Worker selection is in `src/lib/worker_selection.py`; source sync
+and execution are in `src/lib/remote_build.py`. Keep this checkout in place.
+`oxidex-ops` stores build evidence, not executable copies of these scripts.
+
+
+The configured laptop checkout supports `just build-debug` and
+`just build-release`. Both invoke the automatic worker selector, export
+`OXIDEX_REMOTE_INSTANCE`/`OXIDEX_REMOTE_ZONE` for that invocation, then run
+`cargo remote-build` through SSH. The selector considers running
+`oxidex-runners-*` and `oxidex-buildbench-*` VMs, ranks complete CPU/memory
+windows by the larger fraction, and requires both below 75%. An SSH probe
+verifies that the builder is installed, is not draining, and has no active
+remote build. If no worker qualifies, the command fails with a retry message.
+Selection is an availability check, not an exclusive reservation for multiple
+simultaneous clients. The downloaded binary is checksum verified and stored in
+`target/remote-linux/debug/oxidex` or `target/remote-linux/release/oxidex`.
+These are Linux executables. The original local all-features release recipe is
+available as `just build-release-local` in the configured OxiDex checkout.
+
+
+New autoscaler hosts install a separate `oxidex-remote-builder:1.97.1` image by
+default (`--no-remote-builder` opts out). Manual provisioning enables it with
+`--remote-builder`. It inherits the runner's Linux dependencies and adds Rust
+1.97.1, rustfmt, clippy, just, cargo-nextest, cbindgen 0.29.2, uv, Python 3.11,
+rsync and GNU time. GNU ld remains available, matching OxiDex's checked-in linker
+configuration. Installation reports actual tool versions in the bootstrap log.
+
+SSH lands on the host. The root-owned `/usr/local/bin/oxidex-remote-build`
+launcher accepts simple worktree identifiers and an allowlist of build commands,
+then runs an unprivileged UID 1001 container without a Docker socket, capabilities
+or privilege escalation. CPU is capped at host vCPU minus four and memory at host
+GiB minus 24. The root-owned `/etc/oxidex-remote-build.json` controls those limits.
+Do not set them above observed host capacity.
+
+Source directories, Cargo downloads and separate worktree targets persist below
+`/mnt/runner-data/remote-build/{sources,cargo,targets}`. A shared host lock protects
+active builds from utilization scale-down; draining sets a marker under that
+lock to prevent new builds. The container also carries a label so an orphaned
+build is visible to the drain guard. These safeguards do not prevent Spot loss
+or the existing forced price eviction policy.
+
+From the laptop:
+
+```bash
+python3 src/remote_rust_build.py \
+  --source ~/git/oxidex_refactor \
+  --instance YOUR_INSTANCE --zone YOUR_ZONE --project homelab-424523 \
+  --worktree-id oxidex-refactor-YOUR_BRANCH \
+  --evidence-dir ~/oxidex-ops/evidence/remote-build-YOUR_RUN
+```
+
+The client packages current tracked working files, excludes credentials, agent
+configuration and build caches, transfers with `gcloud compute scp`, verifies
+the archive checksum, and fetches dependencies before timing
+`cargo build --release --locked --bin oxidex`. Evidence includes source hashes,
+Git revision/status, transfer/fetch/build wall times and GNU time output. Use a
+new worktree identifier for a cold build; reusing one retains its target cache.
+It compiles Linux artifacts, not macOS executables. Git registration and full
+ExifTool qualification are independent of this compilation proof.
 
 Every loop fetches current regional Spot prices and checks each running managed
 VM against `--max-daily-usd` (default: $10 per VM per day for compute and attached storage).

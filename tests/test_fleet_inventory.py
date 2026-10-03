@@ -149,6 +149,8 @@ class FleetInventoryTests(unittest.TestCase):
         runner = GitHubRunner(1, f'gha-{vm.name}-1', 'online', False, ('spot',))
         with tempfile.TemporaryDirectory() as directory:
             args = args_parser().parse_args(['--state-file', str(Path(directory) / 'state.json')])
+            args.remote_builder=False
+            args.scaling_mode='legacy'
             state = {'idle_loops': 0, 'scale_up_active': False}
             with patch('lib.spot_runner_autoscaler.removable_spot_vms', return_value=[vm]), \
                     patch('lib.spot_runner_autoscaler.list_github_runners', side_effect=RuntimeError('GitHub unavailable')):

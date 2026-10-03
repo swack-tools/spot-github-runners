@@ -160,7 +160,8 @@ class LaunchFailoverTests(unittest.TestCase):
         self.assertEqual(controller.scale_up(1, [first, second], self.args, state, self.path, refresh=lambda: [first, second]), 0)
         self.assertEqual(state['host_operation']['kind'], 'launch')
         self.assertEqual(self.cloud.launched, ['us-west4-a'])
-        self.clock[0] += controller.LAUNCH_DEADLINE_SECONDS - 60
+        self.assertEqual(state['host_operation']['deadline_seconds'], 2400)
+        self.clock[0] += state['host_operation']['deadline_seconds'] - 60
         self.assertTrue(controller.reconcile_host_operation([], [], self.args, state, self.path))
         self.assertIn('host_operation', state)
         self.clock[0] += 120
