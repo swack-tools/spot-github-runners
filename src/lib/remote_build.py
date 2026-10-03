@@ -9,6 +9,10 @@ import time
 from pathlib import Path
 
 
+def retryable_exit(code):
+    return code in (75, 137, 143, 255)
+
+
 def make_snapshot(source: Path, archive: Path) -> dict:
     names = subprocess.check_output(['git','-C',str(source),'ls-files','-z']).decode().split('\0')
     files=[]
@@ -58,12 +62,13 @@ def main(argv=None):
         project=shlex.quote(args.worktree_id)
         subprocess.run(ssh(f'sudo /usr/local/bin/oxidex-remote-build {project} prepare'),check=True)
         start=time.monotonic()
-        subprocess.run(['gcloud','compute','scp',str(archive),args.instance+':~/oxidex-remote-source.tar.gz',
+        subprocess.run(['gcloud','compute','scp',str(archive),args.instance+':~/oxidex-remote-source-'+args.worktree_id+'.tar.gz',
                         '--zone='+args.zone,'--project='+args.project,'--quiet'],check=True)
         digest=receipt['snapshot']['archive_sha256']
         destination='/mnt/runner-data/remote-build/sources/'+args.worktree_id
-        command=(f"echo '{digest}  oxidex-remote-source.tar.gz' | sha256sum -c - "
-                 f"&& tar -xzf oxidex-remote-source.tar.gz -C {shlex.quote(destination)}")
+        upload='oxidex-remote-source-'+args.worktree_id+'.tar.gz'
+        command=(f"echo '{digest}  {upload}' | sha256sum -c - "
+                 f"&& tar -xzf {upload} -C {shlex.quote(destination)}")
         subprocess.run(ssh(command),check=True)
         receipt['sync_seconds']=time.monotonic()-start;save()
         # Dependencies are fetched separately; compile time excludes downloads.
@@ -77,7 +82,8 @@ def main(argv=None):
             with (evidence/f'{stage}.log').open('w') as log:
                 result=subprocess.run(ssh(remote),stdout=log,stderr=subprocess.STDOUT)
             receipt[stage+'_seconds']=time.monotonic()-start
-            receipt[stage+'_exit_code']=result.returncode;save()
+            receipt[stage+'_exit_code']=result.returncode
+            receipt['retryable']=retryable_exit(result.returncode);save()
             print(stage,receipt[stage+'_seconds'],'seconds; exit',result.returncode,flush=True)
             if result.returncode:
                 raise RuntimeError(f'{stage} failed; see {evidence / (stage+".log")}')
@@ -99,6 +105,9 @@ def main(argv=None):
 
         receipt['verified']=True;save()
     except Exception as exc:
-        receipt['error']=str(exc);save();raise
+        receipt['error']=str(exc)
+        if isinstance(exc,subprocess.CalledProcessError):
+            receipt['retryable']=retryable_exit(exc.returncode)
+        save();raise
     print(json.dumps({k:v for k,v in receipt.items() if k!='snapshot'},indent=2))
     return 0

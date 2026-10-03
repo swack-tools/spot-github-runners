@@ -24,3 +24,8 @@ class WorkerSelectionTests(unittest.TestCase):
              patch('lib.worker_selection.subprocess.run',side_effect=[SimpleNamespace(returncode=75),SimpleNamespace(returncode=0)]):
             vm,sample=select_worker('project')
         self.assertEqual(vm.name,'oxidex-runners-b')
+
+    def test_capacity_wins_over_lower_utilization_percentage(self):
+        rows=[(SimpleNamespace(name='small',cpus=4,memory_gib=16),(.1,.1)),
+              (SimpleNamespace(name='large',cpus=32,memory_gib=128),(.4,.4))]
+        self.assertEqual(rank_workers(rows)[0][0].name,'large')

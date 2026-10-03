@@ -10,25 +10,34 @@ from .resource_metrics import read_utilization
 def rank_workers(rows):
     eligible = [(vm, sample) for vm, sample in rows if sample is not None
                 and len(sample) == 2 and all(math.isfinite(v) and 0 <= v < .75 for v in sample)]
-    return sorted(eligible, key=lambda row: (max(row[1]), sum(row[1]), row[0].name))
+    def capacity(row):
+        vm, sample = row
+        cpu=getattr(vm,'cpus',1)*(1-sample[0])
+        ram=getattr(vm,'memory_gib',4)*(1-sample[1])
+        # Balanced capacity: four GiB per available core; break ties by CPU then RAM.
+        return (-min(cpu,ram/4),-cpu,-ram,vm.name)
+    return sorted(eligible, key=capacity)
 
 
-def select_worker(project):
+def select_worker(project, excluded_ids=()):
     inventory = json.loads(subprocess.check_output([
         'gcloud', 'compute', 'instances', 'list', '--project='+project,
-        '--format=json(name,id,zone,status)'], text=True))
+        '--format=json(name,id,zone,status,machineType)'], text=True))
     observations = []
     for row in inventory:
-        if row.get('status') != 'RUNNING' or not row['name'].startswith(('oxidex-runners-', 'oxidex-buildbench-')):
+        if str(row.get('id')) in excluded_ids or row.get('status') != 'RUNNING' or not row['name'].startswith(('oxidex-runners-', 'oxidex-buildbench-')):
             continue
         vm = SimpleNamespace(name=row['name'], instance_id=str(row['id']), zone=row['zone'].rsplit('/',1)[-1])
+        if row.get('machineType'):
+            machine=row['machineType'].rsplit('/',1)[-1]
+            spec=json.loads(subprocess.check_output(['gcloud','compute','machine-types','describe',machine,
+                '--zone='+vm.zone,'--project='+project,'--format=json(guestCpus,memoryMb)'],text=True))
+            vm.cpus=spec['guestCpus'];vm.memory_gib=spec['memoryMb']/1024
         sample = read_utilization(project, [vm])
         observations.append((vm, sample[0] if sample else None))
     # Probe only candidates with trustworthy low utilization, best first.
     probe = ('test -f /etc/oxidex-remote-build.json && '
-             'test ! -e /run/oxidex-build-draining && '
-             'test -z "$(docker ps -q --filter label=oxidex.remote-build=true)" && '
-             'flock -n -x /run/oxidex-build.lock true')
+             'test ! -e /run/oxidex-build-draining')
     for vm, sample in rank_workers(observations):
         try:
             result = subprocess.run(['gcloud','compute','ssh',vm.name,'--zone='+vm.zone,

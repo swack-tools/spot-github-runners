@@ -40,3 +40,11 @@ class ClientTests(unittest.TestCase):
                     remote_build.main(['--source',str(root),'--instance','vm','--zone','z',
                         '--worktree-id','checkout','--evidence-dir',str(root/'evidence')])
         self.assertFalse(any('cargo build' in value for command in calls for value in command))
+
+    def test_worker_interruption_is_retryable_but_compiler_errors_are_not(self):
+        from lib.remote_build import retryable_exit
+        self.assertTrue(retryable_exit(255))
+        self.assertTrue(retryable_exit(137))
+        self.assertTrue(retryable_exit(143))
+        self.assertFalse(retryable_exit(101))
+        self.assertFalse(retryable_exit(1))

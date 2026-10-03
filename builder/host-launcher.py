@@ -62,8 +62,8 @@ def main():
     with open('/run/oxidex-build.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_SH)
         if Path('/run/oxidex-build-draining').exists():
-            raise RuntimeError('Host is draining; retry on another builder')
-        subprocess.run(container_command(project, command, config['cpus'], config['memory_gib']), check=True)
+            raise SystemExit(75)
+        raise SystemExit(subprocess.run(container_command(project, command, config['cpus'], config['memory_gib'])).returncode)
 
 
 if __name__ == '__main__':

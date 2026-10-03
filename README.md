@@ -85,11 +85,16 @@ The configured laptop checkout supports `just build-debug` and
 `OXIDEX_REMOTE_INSTANCE`/`OXIDEX_REMOTE_ZONE` for that invocation, then run
 `cargo remote-build` through SSH. The selector considers running
 `oxidex-runners-*` and `oxidex-buildbench-*` VMs, ranks complete CPU/memory
-windows by the larger fraction, and requires both below 75%. An SSH probe
-verifies that the builder is installed, is not draining, and has no active
-remote build. If no worker qualifies, the command fails with a retry message.
-Selection is an availability check, not an exclusive reservation for multiple
-simultaneous clients. The downloaded binary is checksum verified and stored in
+windows by available capacity (free cores and free RAM at four GiB per core),
+and requires both utilizations below 75%. An SSH probe verifies the dedicated
+builder is installed and the host is not draining. Job/build counts do not
+influence placement. Every attempt refreshes inventory and CPU/RAM metrics.
+SSH disconnects, killed containers and draining hosts trigger reselection on
+another VM, source resync and a fresh build, with three attempts by default
+(`cargo remote-debug --max-attempts 5` overrides this). Compiler and header
+validation errors stop immediately. Missing metrics or no eligible VM are
+reported explicitly. Selection is not an exclusive capacity reservation.
+The downloaded binary is checksum verified and stored in
 `target/remote-linux/debug/oxidex` or `target/remote-linux/release/oxidex`.
 These are Linux executables. The original local all-features release recipe is
 available as `just build-release-local` in the configured OxiDex checkout.
