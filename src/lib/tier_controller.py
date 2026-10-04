@@ -49,8 +49,8 @@ def evidence_for(vms,runners,args,state):
                     remember_oom(state,key,kind,observed.get('boot_id'),[event['id']])
         except (RuntimeError,OSError,ValueError,KeyError,subprocess.SubprocessError) as exc:
             LOG.warning('Host OOM/readiness evidence missing for %s: %s',vm.name,controller.error_detail(exc))
-    state['host_health']=health
     record_io_pressure(state,evidence,health,time.time())
+    state['host_health']=health
     state['seen_oom_ids']=sorted(seen)[-1000:]
     data=state.get('job_tracking',{})
     repositories=args.job_repository or [args.org+'/oxidex']

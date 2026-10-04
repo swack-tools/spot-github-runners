@@ -33,6 +33,27 @@ def io_status(evidence):
     return 'pressured' if pressured else 'healthy'
 
 
+def last_observation(windows,legacy_tick=None):
+    """Distinguish real latest observations from five-minute bucket anchors."""
+    if not windows:return None
+    anchor=windows[-1]['observed_at']
+    stamp=windows[-1].get('last_observed_at',legacy_tick if legacy_tick is not None else anchor)
+    if (isinstance(stamp,bool) or not isinstance(stamp,(int,float))
+            or not math.isfinite(stamp) or stamp<anchor):return None
+    return stamp
+
+
+def legacy_resource_tick(state,key):
+    rows=[row for row in state.get('latest_resources') or []
+          if isinstance(row,dict) and f"{row.get('zone')}/{row.get('instance_id')}"==key]
+    if len(rows)!=1:return None
+    try:
+        if any(isinstance(rows[0][name],bool) or not math.isfinite(rows[0][name]) or not 0<=rows[0][name]<=1
+               for name in ('cpu_fraction','memory_fraction')):return None
+        return rows[0]['observed_at']
+    except (KeyError,TypeError,ValueError):return None
+
+
 def record_io_pressure(state,evidence,health,timestamp):
     history=state.setdefault('io_history',{})
     identities={f"{row['zone']}/{row['instance_id']}" for row in evidence or []}
@@ -52,14 +73,24 @@ def record_io_pressure(state,evidence,health,timestamp):
             continue
         record=history.setdefault(key,dict(boot_id=observed['boot_id'],windows=[]))
         windows=record['windows'];tick=observed['observed_at']
+        previous=state.get('host_health',{}).get(key,{})
+        legacy_tick=None
+        try:
+            if (previous.get('instance_id')==row['instance_id'] and previous.get('complete') is True
+                    and previous.get('boot_id')==record['boot_id'] and previous.get('io_complete') is True):
+                validate_io_pressure(previous['io_pressure'])
+                legacy_tick=previous['observed_at']
+        except (KeyError,TypeError,ValueError):pass
+        last=last_observation(windows,legacy_tick)
         if (record['boot_id']!=observed['boot_id'] or
-                (windows and not 0<=tick-windows[-1]['observed_at']<=450)):
+                (windows and (last is None or not 0<=tick-last<=450))):
             windows.clear();record['boot_id']=observed['boot_id']
         if not windows or tick-windows[-1]['observed_at']>=300:
             windows.append(dict(observed_at=tick,**{name:values[name] for name in IO_PRESSURE_LIMITS}))
         else:
             for name in IO_PRESSURE_LIMITS:
                 windows[-1][name]=max(windows[-1][name],values[name])
+        windows[-1]['last_observed_at']=tick
         windows[:]=[window for window in windows if timestamp-window['observed_at']<=1800][-7:]
         # Include the current sample even when it arrived within the distinct
         # window interval; an immediate stall cannot hide behind a prior zero.
@@ -90,8 +121,8 @@ def record_resources(state, vms, samples, timestamp):
     observations = []
     for vm, key, (cpu, ram) in zip(vms, identities, samples):
         windows = history.setdefault(key, [])
-        if windows and (timestamp < windows[-1]['observed_at']
-                        or timestamp - windows[-1]['observed_at'] > 450):
+        last=last_observation(windows,legacy_resource_tick(state,key))
+        if windows and (last is None or not 0<=timestamp-last<=450):
             windows.clear()
         if not windows or timestamp - windows[-1]['observed_at'] >= 300:
             windows.append(dict(observed_at=timestamp,cpu_cores=cpu*vm.vcpu,used_ram_gib=ram*vm.ram_gib))
@@ -100,6 +131,7 @@ def record_resources(state, vms, samples, timestamp):
             # Keep the real peak without fabricating another distinct window.
             windows[-1]['cpu_cores']=max(windows[-1]['cpu_cores'],cpu*vm.vcpu)
             windows[-1]['used_ram_gib']=max(windows[-1]['used_ram_gib'],ram*vm.ram_gib)
+        windows[-1]['last_observed_at']=timestamp
         windows[:] = [row for row in windows if timestamp - row['observed_at'] <= 1800][-7:]
         observations.append(dict(instance_id=vm.instance_id, zone=vm.zone,
                                  observed_at=timestamp,cpu_cores=cpu*vm.vcpu,
