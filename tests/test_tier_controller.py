@@ -6,6 +6,35 @@ from lib import spot_runner_autoscaler as controller
 
 
 class TierControllerTests(unittest.TestCase):
+    def test_budget_capacity_recovery_persists_only_reservation_compatible_target(self):
+        import json
+        from lib import tier_controller
+        from lib.runner_fleet import GceVm
+        host=GceVm('oxidex-runners-full','z','RUNNING','n2-standard-32',True,32,128,instance_id='1')
+        sample=dict(instance_id='1',zone='z',windows=6,cpu_cores=1,peak_cpu_cores=1,
+                    used_ram_gib=10,peak_ram_gib=10,cpu_fraction=.03,memory_fraction=.08)
+        for reservation,target in ((15,['bulky','expanded']),(2,['bulky','small']),(1000,None)):
+            with self.subTest(reservation=reservation),tempfile.TemporaryDirectory() as folder:
+                path=Path(folder)/'state.json'
+                args=controller.args_parser().parse_args(['--scaling-mode','tiered',
+                    '--tier-job-memory-gib',str(reservation)])
+                state={'pending_oom':{'z/1':'runner'}}
+                signals=dict(complete=True,container_oom=True,minimum_job_memory_gib=reservation)
+                with patch.object(tier_controller,'evidence_for',return_value=([sample],signals,1000)),\
+                     patch.object(controller,'adjust_admission',return_value='capacity') as adjust,\
+                     patch.object(tier_controller,'reconcile_migration') as reconcile,\
+                     patch.object(controller,'check_running_prices',side_effect=AssertionError('unexpected price path')):
+                    tier_controller.check_tiers([host],[],args,state,path)
+                adjust.assert_called_once_with(host,args,'runner')
+                saved=json.loads(path.read_text())
+                self.assertEqual(saved.get('migration',{}).get('target'),target)
+                self.assertEqual(saved['pending_oom'],{'z/1':'runner'})
+                if target:
+                    self.assertIn('1',saved['migration']['retained_ids'])
+                    reconcile.assert_called_once()
+                else:
+                    reconcile.assert_not_called()
+
     def test_dry_run_cannot_mutate_live_state_or_provider(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'state.json';path.write_text('{"idle_loops":0}')

@@ -7,7 +7,7 @@ import time
 from decimal import Decimal
 from .fleet_evidence import record_resources,record_io_pressure,workload_signals,read_host_events,epoch,remember_jobs
 from .fleet_migration import topology_for,begin_migration,reconcile_migration,expected_slots
-from .tier_policy import plan_capacity,compatible_recovery_tier
+from .tier_policy import plan_capacity,compatible_recovery_tier,reservation_fits
 from .runner_tiers import TIERS,tier_for_shape,next_topology
 
 LOG=logging.getLogger('spot_runner_autoscaler')
@@ -146,11 +146,19 @@ def check_tiers(vms,runners,args,state,state_path):
                     state['pending_oom'].pop(key,None)
                 elif outcome=='capacity':
                     target=next_topology(topology,'up','oom')
+                    reservation=signals.get('minimum_job_memory_gib',getattr(args,'tier_job_memory_gib',15))
+                    while target!=topology and not reservation_fits(target,reservation):
+                        larger=next_topology(target,'up','memory')
+                        if larger==target:
+                            target=topology
+                            break
+                        target=larger
                     if target!=topology:
                         begin_migration(fleet,target,state,state_path,'container cap exceeds measured host envelope',
                                         TIERS[target[-1]].initial_slots)
                         reconcile_migration(vms,runners,args,state,state_path)
                         break
+                    LOG.warning('Budget recovery holds: known workload memory cannot fit an allowed growth tier')
     elif topology and 'legacy' not in topology:
         state.setdefault('desired_topology',list(topology))
         # Price-driven retirement also follows replacement readiness and drain;
