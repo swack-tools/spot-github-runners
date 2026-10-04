@@ -11,12 +11,14 @@ from lib.runner_fleet import GceVm,GitHubRunner
 
 def host(name,cpu,ram,identity):
     return GceVm('oxidex-runners-'+name,'z','RUNNING','n2-standard-'+str(cpu),True,cpu,ram,instance_id=identity,
-        disks=({'source':'disk-'+identity,'diskId':identity+'0','boot':False,'deviceName':'runner-data-'+name,
+        disks=({'source':'https://www.googleapis.com/compute/v1/projects/homelab-424523/zones/z/disks/disk-'+identity,'diskId':identity+'0','boot':False,'deviceName':'runner-data-'+name,
                 'diskType':'pd-balanced','diskSizeGb':100},))
 
 
 class MigrationRetirementBarrierTests(unittest.TestCase):
     def setUp(self):
+        verified_disks=patch('lib.vm_recovery.cleanup_lost_vm',return_value=True)
+        verified_disks.start();self.addCleanup(verified_disks.stop)
         from lib.tier_controller import evidence_for
         self.real_evidence=evidence_for
         self.folder=tempfile.TemporaryDirectory();self.addCleanup(self.folder.cleanup)
@@ -295,7 +297,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
 
     def test_restored_destination_in_drain_phase_requires_fresh_two_windows_and_builder(self):
         self.removal();source=copy.deepcopy(self.state['host_operation']['vm']);self.state.pop('host_operation')
-        self.state['pending_vm_recovery']={'source':dict(source,_cleanup_complete=True)}
+        self.state['pending_vm_recovery']={'source':dict(source,_cleanup_complete=True,_disks_absent=True)}
         self.hosts=[];self.runners=[]
         from decimal import Decimal
         def prices(vms,project,cap,totals):totals.update({vm.name:Decimal('.4') for vm in vms})

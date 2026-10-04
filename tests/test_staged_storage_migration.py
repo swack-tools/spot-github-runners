@@ -14,9 +14,14 @@ from lib.runner_fleet import GceVm,GitHubRunner
 
 class StagedStorageMigrationTests(unittest.TestCase):
     def setUp(self):
+        verified_disks=patch('lib.vm_recovery.cleanup_lost_vm',return_value=True)
+        verified_disks.start();self.addCleanup(verified_disks.stop)
         self.folder=tempfile.TemporaryDirectory();self.addCleanup(self.folder.cleanup)
         self.path=Path(self.folder.name)/'state.json'
         self.hosts,self.state,self.args=fixtures.StorageRetargetTests().fixture(self.path)
+        self.hosts=[replace(vm,disks=tuple({**disk,'source':'https://www.googleapis.com/compute/v1/projects/p/zones/z/disks/disk-'+vm.instance_id} for disk in vm.disks)) for vm in self.hosts]
+        for row in self.state['migration']['sources']:
+            row['disks']=asdict(next(vm for vm in self.hosts if vm.instance_id==row['instance_id']))['disks']
         self.args.__dict__.update(project='p',org='o',disk_size_gb=100,remote_builder=True,scaling_mode='tiered')
         self.state['latest_resources'][0]['peak_cpu_cores']=11.7
         self.state['latest_resources'][1]['peak_cpu_cores']=.98
@@ -28,7 +33,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
 
     def add_destination(self,identity):
         vm=GceVm('oxidex-runners-new'+identity,'z','RUNNING','n2-standard-16',True,16,64,
-                 instance_id=identity,disks=({'source':'disk-'+identity,'diskId':identity+'0','deviceName':'runner-data-new'+identity,
+                 instance_id=identity,disks=({'source':'https://www.googleapis.com/compute/v1/projects/p/zones/z/disks/disk-'+identity,'diskId':identity+'0','deviceName':'runner-data-new'+identity,
                      'boot':False,'diskType':'pd-balanced','diskSizeGb':100},))
         self.hosts.append(vm)
         self.state['migration']['replacement_ids'].append(identity)
@@ -236,7 +241,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
         self.state['pending_vm_recovery']={'old':dict(self.state['migration']['sources'][0],_cleanup_complete=False)}
         with patch.object(controller,'scale_up') as launch:
             self.reconcile(3400);launch.assert_not_called()
-        self.state['pending_vm_recovery']['old']['_cleanup_complete']=True
+        self.state['pending_vm_recovery']['old'].update(_cleanup_complete=True,_disks_absent=True)
         offer=SimpleNamespace(total_daily_usd=Decimal('2.9'))
         def prices(vms,project,cap,totals):totals.update({vm.name:Decimal('4') for vm in vms})
         with patch.object(controller,'check_running_prices',side_effect=prices),\
@@ -323,7 +328,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
         self.retarget()
         self.hosts=self.hosts[1:]
         self.state['latest_resources']=self.state['latest_resources'][1:]
-        self.state['pending_vm_recovery']={'old':dict(self.state['migration']['sources'][0],_cleanup_complete=True)}
+        self.state['pending_vm_recovery']={'old':dict(self.state['migration']['sources'][0],_cleanup_complete=True,_disks_absent=True)}
         self.add_destination('3');self.add_destination('4')
         self.assertNotIn('early_retirement_ids',self.state['migration'])
         self.reconcile(2800);self.assertNotIn('host_operation',self.state)

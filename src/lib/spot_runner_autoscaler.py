@@ -441,8 +441,14 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                 LOG.warning("Deregistration pending for %s: %s", runner.name, error_detail(exc))
                 break
         return True  # Require another inventory proving the records are absent.
-    if operation["kind"] == "recovery":
-        state["pending_vm_recovery"][operation["recovery_key"]]["_cleanup_complete"] = True
+    from .fleet_migration import confirm_migration_source_drives
+    try:
+        if not confirm_migration_source_drives(operation,args,state):
+            LOG.warning("Migration completion waits for recorded disk absence: %s", vm_details(vm))
+            return True
+    except (RuntimeError, ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
+        LOG.warning("Migration source disk verification remains pending: %s", error_detail(exc))
+        return True
     if operation.get("drain_group_id"):
         from .runner_drain import cleanup_group
         try:
@@ -450,6 +456,11 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.warning("Drain group cleanup remains pending: %s", error_detail(exc))
             return True
+    if operation["kind"] == "recovery":
+        record=state["pending_vm_recovery"][operation["recovery_key"]]
+        record["_cleanup_complete"] = True
+        if operation.get('migration_source_disks_absent') is True:
+            record['_disks_absent']=True
     from .fleet_migration import record_retirement_completion
     record_retirement_completion(operation,state)
     state.pop("host_operation")

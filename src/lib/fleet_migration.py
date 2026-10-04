@@ -668,8 +668,8 @@ def source_absence_proven(source,state):
     migration=state.get('migration',{})
     retired=migration.get('completed_retirements',{}).get(source['instance_id'],{})
     return ((migration.get('started_at') is not None and retired.get('started_at')==migration.get('started_at')
-            and retired.get('absence_confirmed') is True and same_source_inventory(source,retired.get('vm',{})))
-        or any(row.get('_cleanup_complete') is True and same_source_inventory(source,row)
+            and retired.get('absence_confirmed') is True and retired.get('disks_absence_confirmed') is True and same_source_inventory(source,retired.get('vm',{})))
+        or any(row.get('_cleanup_complete') is True and row.get('_disks_absent') is True and same_source_inventory(source,row)
             for row in state.get('pending_vm_recovery',{}).values()))
 
 
@@ -687,9 +687,10 @@ def record_retirement_completion(operation,state):
     migration=state.get('migration',{});scope=operation.get('staged_retirement') or operation.get('migration_retirement',{})
     source=next((row for row in migration.get('sources',[]) if same_source_inventory(row,operation.get('vm',{}))),None)
     if (source and migration.get('started_at') is not None and scope.get('started_at')==migration.get('started_at')
-            and operation.get('kind') in ('delete','delete_cleanup') and operation.get('drained') is True):
+            and operation.get('kind') in ('delete','delete_cleanup') and operation.get('drained') is True
+            and operation.get('migration_source_disks_absent') is True):
         migration.setdefault('completed_retirements',{})[source['instance_id']]=dict(
-            vm=copy.deepcopy(source),started_at=migration['started_at'],absence_confirmed=True)
+            vm=copy.deepcopy(source),started_at=migration['started_at'],absence_confirmed=True,disks_absence_confirmed=True)
 
 
 def record_missing_sources(vms,state):
@@ -701,7 +702,13 @@ def record_missing_sources(vms,state):
         # A completed exact receipt can legitimately explain this disappearance.
         if source_absence_proven(source,state):continue
         pending=state.setdefault('pending_vm_recovery',{})
-        if any(same_source_inventory(source,row) for row in pending.values()):continue
+        existing=next((row for row in pending.values() if same_source_inventory(source,row)),None)
+        if existing is not None:
+            # Old completion markers without disk proof require exact cleanup
+            # again; never turn an unsupported marker into permanent deadlock.
+            if existing.get('_cleanup_complete') and existing.get('_disks_absent') is not True:
+                existing['_cleanup_complete']=False
+            continue
         vm=vm_from_record(source);key=recovery_key(f'{vm.zone}/{vm.name}',vm,pending)
         pending.setdefault(key,copy.deepcopy(source))
 
@@ -716,4 +723,27 @@ def staged_replacement_receipts(fleet,state):
         receipt=state.get('host_deployments',{}).get(f'{vm.zone}/{identity}',{})
         if ((vm.vcpu,vm.ram_gib)!=(16,64) or receipt.get('tier')!='large'
                 or receipt.get('runner_memory_gib',0)<15):return False
+    return True
+
+
+def confirm_migration_source_drives(operation,args,state):
+    """Refresh every original disk's identity-scoped absence, including cached cleanup retries."""
+    from .fleet_logging import vm_from_record
+    from .vm_recovery import cleanup_lost_vm,DISK_SOURCE
+    record=operation.get('vm',{})
+    source=next((row for row in state.get('migration',{}).get('sources',[])
+                 if row.get('instance_id')==record.get('instance_id')),None)
+    if source is None:return True
+    operation.pop('migration_source_disks_absent',None)
+    if not same_source_inventory(source,record):return False
+    # The cleanup primitive compares exact provider selfLinks. Aliases cannot
+    # prove absence against that inventory, even when their path names match.
+    for disk in source['disks']:
+        if disk.get('type')=='SCRATCH':continue
+        value=disk.get('source')
+        match=DISK_SOURCE.fullmatch(value) if isinstance(value,str) else None
+        if (not match or value!=f'https://www.googleapis.com/compute/v1/projects/{match[1]}/{match[2]}/{match[3]}/disks/{match[4]}'):
+            return False
+    if not cleanup_lost_vm(vm_from_record(source),args.project):return False
+    operation['migration_source_disks_absent']=True
     return True
