@@ -62,6 +62,9 @@ def reconcile_migration(vms,runners,args,state,state_path):
         pending=migration['awaiting_launch']
         vm=next((vm for vm in fleet if vm.name==pending['name'] and vm.zone==pending['zone']),None)
         if vm:
+            if pending.get('instance_id') and vm.instance_id!=pending['instance_id']:
+                LOG.error('Migration holds: replacement provider identity changed')
+                return True
             tier=tier_for_shape(vm.vcpu,vm.ram_gib)
             if not tier or tier.name!=migration['pending_tiers'][0]:
                 raise RuntimeError('Replacement shape differs from requested tier')
@@ -73,12 +76,18 @@ def reconcile_migration(vms,runners,args,state,state_path):
         # Count provisioning/stopped managed identities too; the hard ceiling
         # cannot be bypassed by an incomplete running-only inventory.
         managed=[vm for vm in vms if vm.spot and vm.name.startswith('oxidex-runners-')]
-        if len(managed)>=min(5,args.maximum_hosts):
+        tier=TIERS[migration['pending_tiers'][0]]
+        slots=migration.get('slots') or tier.initial_slots
+        overlap_blocked=(len(managed)>=min(5,args.maximum_hosts)
+            or sum(vm.vcpu or 80 for vm in managed)+tier.vcpu>80
+            or sum(expected_slots(vm,state) for vm in managed)+slots>100)
+        if overlap_blocked:
             remaining=[vm for vm in fleet if vm.instance_id not in {row['instance_id'] for row in migration['sources']}]
             topology=topology_for(remaining)
-            if (not remaining or 'legacy' in topology
+            if (state.get('latest_workload',{}).get('complete') is not True
+                    or not remaining or 'legacy' in topology
                     or not fits(topology,state.get('latest_resources'))):
-                LOG.info('Migration holds at five hosts: no safe capacity for overlap')
+                LOG.info('Migration holds at overlap ceiling: no safe remaining capacity')
                 return True
             migration['phase']='drain-first'
         else:
@@ -149,6 +158,13 @@ def reconcile_migration(vms,runners,args,state,state_path):
         controller.write_scale_state(state_path,state)
         if not healthy:
             LOG.info('Migration waits for two healthy complete replacement windows')
+            return True
+        resources=state.get('latest_resources') or []
+        identities={(vm.zone,vm.instance_id) for vm in fleet}
+        observed={(row.get('zone'),row.get('instance_id')) for row in resources}
+        if (state.get('latest_workload',{}).get('complete') is not True
+                or observed!=identities or not fits(migration['target'],resources)):
+            LOG.info('Migration keeps source: fresh complete workload/peak demand does not fit target')
             return True
         migration['phase']='drain'
     if migration['phase'] in ('drain','drain-first'):

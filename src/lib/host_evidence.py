@@ -21,7 +21,7 @@ def classify_events(journal, docker, boot_id, timestamp):
             continue
         kind = 'container' if re.search(r'(cgroup|CONSTRAINT_MEMCG)',message,re.I) else 'host'
         event_id = hashlib.sha256(f'{boot_id}:{observed}:{message}'.encode()).hexdigest()
-        events.append(dict(id=event_id,kind=kind,at=observed))
+        events.append(dict(id=event_id,kind=kind,workload='unknown',at=observed))
     for row in docker:
         if row.get('Action') != 'oom':
             continue
@@ -31,7 +31,10 @@ def classify_events(journal, docker, boot_id, timestamp):
             continue
         if timestamp - 1800 <= observed <= timestamp:
             event_id = hashlib.sha256(f"{boot_id}:{observed}:{row.get('id')}:docker-oom".encode()).hexdigest()
-            events.append(dict(id=event_id,kind='container',at=observed))
+            attributes=row.get('Actor',{}).get('Attributes',{})
+            workload=('builder' if attributes.get('oxidex.remote-build')=='true' else
+                      'runner' if attributes.get('name','').startswith('gha-oxidex-runners-') else 'unknown')
+            events.append(dict(id=event_id,kind='container',workload=workload,at=observed))
     return sorted(events,key=lambda row:row['at'])
 
 

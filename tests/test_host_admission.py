@@ -47,3 +47,19 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(budget['concurrency'],5)
         self.assertLessEqual(budget['work_gib']+budget['reserve_gib'],16)
         with self.assertRaises(ValueError):admission_budget(TIERS['starting'],15,2,slots=8)
+
+    def test_unknown_runner_docker_state_retains_existing_reservation(self):
+        import subprocess
+        with patch('lib.host_admission.subprocess.run',side_effect=subprocess.TimeoutExpired('docker',10)):
+            self.assertTrue(owner_alive('container:abc:start'))
+
+    def test_reused_builder_pid_retains_reservation_while_container_survives(self):
+        with patch('lib.host_admission.process_identity',return_value='host:999:2'),\
+             patch('lib.host_admission.builders_running',return_value=True):
+            self.assertTrue(owner_alive('host:999:1'))
+
+    def test_complete_inventory_proves_removed_runner_lease_can_be_reclaimed(self):
+        import subprocess
+        with patch('lib.host_admission.subprocess.run',side_effect=[
+            subprocess.CalledProcessError(1,'docker',stderr='No such object'),SimpleNamespace(stdout='other\n')]):
+            self.assertFalse(owner_alive('container:abc:start'))

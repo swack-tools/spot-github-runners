@@ -87,13 +87,24 @@ def docker_identity(container):
 def owner_alive(owner):
     try:
         kind,identity,start = owner.split(':',2)
-        return process_identity(int(identity)) == owner if kind == 'host' else docker_identity(identity)[0] == owner
-    except (OSError,ValueError,KeyError,subprocess.SubprocessError):
+        if kind == 'host':
+            if process_identity(int(identity)) == owner:
+                return True
+            return builders_running()  # PID reuse cannot free a surviving build.
+        row=json.loads(subprocess.run(['/usr/bin/docker','inspect',identity],
+            check=True,capture_output=True,text=True,timeout=10).stdout)[0]
+        return (row['State']['Running'] and row['Id']==identity
+                and row['State']['StartedAt']==start)
+    except (OSError,ValueError,KeyError,IndexError,subprocess.SubprocessError):
         if owner.startswith('host:'):
-            # SSH or the Docker CLI can die while its container survives. Keep
-            # orphaned build reservations until every dedicated build is gone.
             return builders_running()
-        return False
+        try:
+            rows=subprocess.run(['/usr/bin/docker','ps','-a','--no-trunc','--format','{{.ID}}'],
+                check=True,capture_output=True,text=True,timeout=10).stdout.splitlines()
+            # Only a complete successful ID inventory can prove absence.
+            return owner.split(':',2)[1] in rows
+        except (OSError,ValueError,subprocess.SubprocessError):
+            return True  # Unknown state cannot reclaim a live runner lease.
 
 
 def builders_running():

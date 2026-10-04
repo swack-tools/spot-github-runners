@@ -49,7 +49,8 @@ class MigrationTests(unittest.TestCase):
             runners=[GitHubRunner(i,f'gha-{new.name}-{i}','online',False,('spot','X64')) for i in range(1,9)]
             args=SimpleNamespace(org='org',remote_builder=False,maximum_hosts=5,scaling_mode='tiered')
             for tick in (1000,1300):
-                state['latest_resources']=[dict(instance_id='2',zone='z',observed_at=tick,cpu_fraction=.1,memory_fraction=.2)]
+                state['latest_resources']=[dict(instance_id=identity,zone='z',observed_at=tick,cpu_fraction=.1,memory_fraction=.2,peak_cpu_cores=.1,peak_ram_gib=.5) for identity in ('1','2')]
+                state['latest_workload']={'complete':True}
                 state['host_health']={'z/2':{'complete':True,'observed_at':tick,'events':[]}}
                 with patch('lib.fleet_migration.time.time',return_value=tick), patch('lib.spot_runner_autoscaler.begin_host_operation') as drain:
                     reconcile_migration([old,new],runners,args,state,path)
@@ -68,3 +69,56 @@ class MigrationTests(unittest.TestCase):
             with patch('lib.spot_runner_autoscaler.scale_up') as launch:
                 reconcile_migration([old]+[vm(str(i),16,64,str(i+2)) for i in range(4)],[],args,state,path)
                 launch.assert_not_called()
+
+    def test_launch_intent_is_linked_before_provider_submission(self):
+        from lib.spot_runner_autoscaler import begin_host_operation
+        host=vm('new',8,16,'')
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'state.json'
+            state={'migration':{'pending_tiers':['starting']}}
+            begin_host_operation('launch',host,[],[],state,path)
+            self.assertEqual(state['migration']['awaiting_launch']['name'],host.name)
+
+    def test_awaiting_launch_reused_identity_holds_without_accepting_replacement(self):
+        old,new=vm('old',16,64,'1'),vm('new',8,16,'different')
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'state.json';state={}
+            begin_migration([old],('starting',),state,path,'migration')
+            state['migration']['awaiting_launch']={**asdict(new),'instance_id':'recorded'}
+            with patch('lib.spot_runner_autoscaler.scale_up',side_effect=AssertionError('launch')):
+                reconcile_migration([old,new],[],SimpleNamespace(maximum_hosts=5),state,path)
+            self.assertEqual(state['migration']['pending_tiers'],['starting'])
+            self.assertEqual(state['migration']['replacement_ids'],[])
+
+    def test_failed_tier_canary_switches_to_drain_instead_of_force_delete(self):
+        from lib.spot_runner_autoscaler import abandon_launch
+        host=vm('new',8,16,'1')
+        state={'host_operation':{'kind':'launch','vm':asdict(host),'abandon':'partial registration'}}
+        with tempfile.TemporaryDirectory() as folder:
+            with patch('lib.spot_runner_autoscaler.list_gcloud_vms',return_value=[host]),\
+                 patch('lib.spot_runner_autoscaler.list_github_runners',return_value=[]),\
+                 patch('lib.spot_runner_autoscaler.subprocess.run',side_effect=AssertionError('delete')):
+                self.assertFalse(abandon_launch(SimpleNamespace(project='p',org='o',scaling_mode='tiered'),state,Path(folder)/'state.json'))
+        self.assertEqual(state['host_operation']['kind'],'drain')
+
+    def test_failed_tier_launch_cannot_adopt_a_reused_identity(self):
+        from lib.spot_runner_autoscaler import abandon_launch
+        host=vm('new',8,16,'1');changed=vm('new',8,16,'2')
+        state={'host_operation':{'kind':'launch','vm':asdict(host),'abandon':'failed'}}
+        with tempfile.TemporaryDirectory() as folder:
+            with patch('lib.spot_runner_autoscaler.list_gcloud_vms',return_value=[changed]),\
+                 patch('lib.spot_runner_autoscaler.subprocess.run',side_effect=AssertionError('delete')):
+                self.assertFalse(abandon_launch(SimpleNamespace(project='p',org='o',scaling_mode='tiered'),state,Path(folder)/'state.json'))
+        self.assertEqual(state['host_operation']['vm']['instance_id'],'1')
+
+    def test_cpu_overlap_boundary_uses_safe_drain_first_below_five_hosts(self):
+        hosts=[vm('a',32,128,'1'),vm('b',32,128,'2'),vm('c',16,64,'3')]
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'state.json';state={}
+            begin_migration(hosts,('bulky','bulky','expanded'),state,path,'shrink')
+            state['latest_workload']={'complete':True}
+            state['latest_resources']=[dict(peak_cpu_cores=1,peak_ram_gib=2)]*3
+            with patch('lib.spot_runner_autoscaler.begin_host_operation') as drain,\
+                 patch('lib.spot_runner_autoscaler.check_running_prices',side_effect=AssertionError('launch pricing')):
+                reconcile_migration(hosts,[],SimpleNamespace(maximum_hosts=5),state,path)
+                self.assertEqual(drain.call_args.args[1].instance_id,'3')

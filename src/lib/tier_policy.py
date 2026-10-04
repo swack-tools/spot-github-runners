@@ -33,9 +33,11 @@ def plan_capacity(topology, evidence, workload, state, timestamp):
     if workload.get('complete') is False:
         state.pop('streak',None)
         return {**hold,'reason':'incomplete compatible job inventory'}
-    host_oom = (workload.get('host_oom',False) or (workload.get('container_oom')
+    if workload.get('unknown_oom') and not (workload.get('host_oom') or workload.get('container_oom') or workload.get('builder_oom')):
+        return {**hold,'reason':'unattributed container OOM needs identity evidence'}
+    host_oom = (workload.get('host_oom',False) or ((workload.get('container_oom') or workload.get('builder_oom'))
                 and any(row['memory_fraction']>.75 for row in evidence)))
-    if workload.get('container_oom') and not host_oom:
+    if (workload.get('container_oom') or workload.get('builder_oom')) and not host_oom:
         return {**hold,'action':'budget','reason':'container OOM with host headroom'}
     if not host_oom and timestamp - state.get('changed_at',-math.inf) < 900:
         return {**hold,'reason':'cooldown'}

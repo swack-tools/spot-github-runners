@@ -212,6 +212,9 @@ def begin_host_operation(kind, vm, runners, vms, state, state_path, **metadata):
         raise RuntimeError("A previous host operation is still pending")
     state["host_operation"] = {"kind": kind, "vm": asdict(vm),
                                "runner_ids": [runner.runner_id for runner in host_runners(vm, runners, vms)], **metadata}
+    if kind == 'launch' and state.get('migration'):
+        # Persist the migration/launch link in the same write as provider intent.
+        state['migration']['awaiting_launch']=asdict(vm)
     if kind == "delete":
         key = f"{vm.zone}/{vm.name}"
         if key not in state.setdefault("intentional_deletions", []):
@@ -243,6 +246,9 @@ def import_deployment_receipt(state, state_path):
         state.setdefault('host_deployments',{})[f'{actual.zone}/{actual.instance_id}']={
             key:record.get(key) for key in ('tier','expected_runner_count','admission_work_gib','runner_memory_gib','price')}
     operation["vm"] = asdict(actual)
+    awaiting=state.get('migration',{}).get('awaiting_launch',{})
+    if awaiting.get('name')==actual.name and awaiting.get('zone')==actual.zone:
+        state['migration']['awaiting_launch']=asdict(actual)
     operation["receipt_imported"] = True
     state.setdefault("observed_vms", {})[f"{actual.zone}/{actual.name}"] = asdict(actual)
     write_scale_state(state_path, state)
@@ -263,6 +269,9 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         return True
     if current and not vm.instance_id:
         operation["vm"] = asdict(current)
+        awaiting=state.get('migration',{}).get('awaiting_launch',{})
+        if awaiting.get('name')==current.name and awaiting.get('zone')==current.zone:
+            state['migration']['awaiting_launch']=asdict(current)
         vm = current
         write_scale_state(state_path, state)
     assigned = host_runners(vm, runners, [vm, *[item for item in vms if item.name != vm.name]])
@@ -515,34 +524,50 @@ def builder_ready(vm,args):
     import hashlib
     from .builder_assets import HOST_LAUNCHER
     digest=hashlib.sha256(HOST_LAUNCHER.encode()).hexdigest()
+    setup = """from pathlib import Path
+p=Path('/mnt/runner-data/remote-build/sources/admission-canary')
+(p/'rust-toolchain.toml').write_text('[toolchain]\\nchannel = "1.97.1"\\n')
+(p/'Cargo.toml').write_text('[package]\\nname="oxidex-admission-canary"\\nversion="0.1.0"\\nedition="2021"\\n')
+(p/'Cargo.lock').write_text('version = 4\\n\\n[[package]]\\nname="oxidex-admission-canary"\\nversion="0.1.0"\\n')
+(p/'src').mkdir(exist_ok=True)
+(p/'src'/'main.rs').write_text('fn main() { println!("builder-ready"); }\\n')
+"""
     command=(f'test -S /run/gha-admission/socket && test -f /etc/oxidex-remote-build.json && '
         f'test "$(sha256sum /usr/local/bin/oxidex-remote-build | cut -d" " -f1)" = {digest} && '
         'test ! -e /run/oxidex-build-draining && '
         'test "$(command -v docker)" = /usr/local/bin/docker && '
         'docker image inspect oxidex-remote-builder:1.97.1 >/dev/null && '
         '/usr/local/bin/oxidex-remote-build admission-canary prepare >/dev/null && '
-        'printf \'[toolchain]\\nchannel = "1.97.1"\\n\' > /mnt/runner-data/remote-build/sources/admission-canary/rust-toolchain.toml && '
-        '/usr/local/bin/oxidex-remote-build admission-canary cargo --version >/dev/null')
+        'python3 -c '+shlex.quote(setup)+' && '
+        '/usr/local/bin/oxidex-remote-build admission-canary cargo run --locked >/dev/null')
     result=subprocess.run(['gcloud','compute','ssh',vm.name,f'--zone={vm.zone}',
         f'--project={args.project}','--quiet','--command=sudo sh -c '+shlex.quote(command)],
-        capture_output=True,text=True,timeout=60)
+        capture_output=True,text=True,timeout=120)
     return result.returncode==0
 
 
-def adjust_admission(vm,args):
+def adjust_admission(vm,args,kind='runner'):
     """Increase a constrained runner's cap only while all leases are absent."""
-    program='''import json, subprocess
+    if kind not in ('runner','builder'):return False
+    program='kind='+repr(kind)+'\n'+'''import json, subprocess, sys
 from pathlib import Path
+sys.path.insert(0,'/opt/gha-runners')
+from host_admission import observed_envelope
 p=Path('/etc/gha-admission.json')
 config=json.loads(p.read_text())
 leases=Path('/var/lib/gha-admission/leases.json')
 if leases.exists() and json.loads(leases.read_text()): raise SystemExit(75)
-next_limit=min(config['runner_gib']*2,config['work_gib'])
-if next_limit==config['runner_gib']: raise SystemExit(75)
-config['runner_gib']=next_limit
+next_limit=min(config[kind+'_gib']*2,int(observed_envelope(config)*.95))
+if next_limit<=config[kind+'_gib']: raise SystemExit(76)
+config[kind+'_gib']=next_limit
 tmp=p.with_suffix('.tmp'); tmp.write_text(json.dumps(config)); tmp.replace(p)
-for name in config['runner_names']:
-    subprocess.run(['docker','update','--memory='+str(next_limit)+'g','--memory-swap='+str(next_limit)+'g',name],check=True,capture_output=True)
+if kind=='builder':
+    builder=Path('/etc/oxidex-remote-build.json')
+    limits=json.loads(builder.read_text());limits['memory_gib']=next_limit
+    tmp=builder.with_suffix('.tmp');tmp.write_text(json.dumps(limits));tmp.replace(builder)
+else:
+    for name in config['runner_names']:
+        subprocess.run(['docker','update','--memory='+str(next_limit)+'g','--memory-swap='+str(next_limit)+'g',name],check=True,capture_output=True)
 '''
     # Stop admission during this atomic budget update. Existing jobs remain
     # bounded; acquiring hooks wait for the service to restart.
@@ -550,7 +575,7 @@ for name in config['runner_names']:
     result=subprocess.run(['gcloud','compute','ssh',vm.name,f'--zone={vm.zone}',
         f'--project={args.project}','--quiet','--command=sudo sh -c '+shlex.quote(shell)],
         capture_output=True,text=True,timeout=60)
-    return result.returncode==0
+    return 'capacity' if result.returncode==76 else result.returncode==0
 
 
 def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Namespace,
@@ -996,6 +1021,37 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
     key = f"{vm.zone}/{vm.name}"
     current = next((item for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
                     if item.zone == vm.zone and item.name == vm.name), None)
+    if getattr(args,'scaling_mode','resource')=='tiered':
+        if current:
+            if not vm.instance_id or current.instance_id!=vm.instance_id:
+                LOG.error('Tier launch cleanup holds: missing or changed provider identity')
+                return False
+            assigned=host_runners(vm,list_github_runners(args.org),[vm])
+            operation.update(kind='drain',runner_ids=[r.runner_id for r in assigned],
+                runner_names={str(r.runner_id):r.name for r in assigned},
+                drain_mode='isolated_group',drain_group_name=f'spot-drain-{vm.name}-{vm.instance_id}')
+            write_scale_state(state_path,state)
+            LOG.warning('Failed tier launch will isolate and drain before deleting %s',vm.name)
+            return False
+        if (operation.get('outcome_uncertain') and now()-operation.get('started_at',now())
+                <operation.get('deadline_seconds',LAUNCH_DEADLINE_SECONDS)):
+            return False
+        # Missing hosts use the same recorded disk-ID cleanup as Spot recovery.
+        if not vm.instance_id:
+            names={vm.name,operation.get('data_disk_name') or vm.name.replace('oxidex-runners-','runner-data-',1)}
+            inventory=subprocess.run(['gcloud','compute','disks','list',f'--project={args.project}',
+                f'--zones={vm.zone}','--format=json(name,id)'],check=True,text=True,capture_output=True,timeout=60)
+            if (any(row.get('name') in names for row in json.loads(inventory.stdout))
+                    or host_runners(vm,list_github_runners(args.org),[vm])):
+                LOG.warning('Tier launch cleanup holds until receipt proves orphan resource identity')
+                return False
+            state.pop('host_operation')
+            write_scale_state(state_path,state)
+            return True  # Failed create proven absent; no deletion was authorized.
+
+        operation.update(kind='delete_cleanup')
+        write_scale_state(state_path,state)
+        return False
     if current:
         if key not in state.setdefault("intentional_deletions", []):
             state["intentional_deletions"].append(key)
@@ -1073,6 +1129,7 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
         plist["ProgramArguments"].extend(["--job-repository", repo])
     plist['ProgramArguments'].extend(['--scaling-mode', args.scaling_mode, '--maximum-hosts', str(args.maximum_hosts)])
     plist['ProgramArguments'].append('--remote-builder' if args.remote_builder else '--no-remote-builder')
+    if getattr(args,'github_user',None):plist['ProgramArguments'].extend(['--github-user',args.github_user])
     if getattr(args,'migrate_oversized',False):plist['ProgramArguments'].append('--migrate-oversized')
     if getattr(args, 'billing_export_table', None):
         plist['ProgramArguments'].extend(['--billing-export-table', args.billing_export_table])
@@ -1084,6 +1141,7 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
 def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--org", default="swack-tools")
+    parser.add_argument("--github-user",help="Select an existing gh account without persisting its credential")
     parser.add_argument("--project", default="homelab-424523")
     parser.add_argument("--minimum-runners", type=int, default=25)
     parser.add_argument("--label", default="spot")
@@ -1121,6 +1179,10 @@ def main(argv: list[str] | None = None) -> int:
             or (args.scaling_mode=='tiered' and args.maximum_hosts>5)):
         raise ValueError('Resource mode requires 300-second checks and a positive maximum host count')
     load_env(ROOT / ".env")
+    if args.github_user:
+        secret=subprocess.check_output(["gh","auth","token","--user",args.github_user],text=True).strip()
+        if not secret:raise RuntimeError("Missing requested GitHub account credential")
+        os.environ["GH_TOKEN"]=secret
     args.billing_export_table = args.billing_export_table or os.environ.get('GCP_BILLING_EXPORT_TABLE')
     if args.install_launch_agent:
         print(f"Installed LaunchAgent at {install_launch_agent(args)}")

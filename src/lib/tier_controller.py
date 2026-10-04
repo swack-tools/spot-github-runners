@@ -8,7 +8,7 @@ from decimal import Decimal
 from .fleet_evidence import record_resources,workload_signals,read_host_events,epoch,remember_jobs
 from .fleet_migration import topology_for,begin_migration,reconcile_migration,expected_slots
 from .tier_policy import plan_capacity
-from .runner_tiers import TIERS,tier_for_shape
+from .runner_tiers import TIERS,tier_for_shape,next_topology
 
 LOG=logging.getLogger('spot_runner_autoscaler')
 
@@ -37,7 +37,9 @@ def evidence_for(vms,runners,args,state):
             for event in observed['events']:
                 if event['id'] not in seen:
                     seen.add(event['id'])
-                    pending[key]=event['kind']
+                    kind='host' if event['kind']=='host' else event.get('workload','unknown')
+                    priority={'unknown':0,'container':0,'runner':1,'builder':2,'host':3}
+                    if priority[kind]>=priority.get(pending.get(key),-1):pending[key]=kind
         except (RuntimeError,OSError,ValueError,KeyError,subprocess.SubprocessError) as exc:
             LOG.warning('Host OOM/readiness evidence missing for %s: %s',vm.name,controller.error_detail(exc))
     state['host_health']=health
@@ -52,7 +54,10 @@ def evidence_for(vms,runners,args,state):
                              timestamp,group_ids={10})
     signals['complete']=complete
     signals['host_oom']=any(kind=='host' for key,kind in pending.items() if key in health)
-    signals['container_oom']=any(kind=='container' for key,kind in pending.items() if key in health)
+    signals['container_oom']=any(kind=='runner' for key,kind in pending.items() if key in health)
+    signals['builder_oom']=any(kind=='builder' for key,kind in pending.items() if key in health)
+    signals['unknown_oom']=any(kind in ('unknown','container') for key,kind in pending.items() if key in health)
+    state['latest_workload']=signals
     return evidence,signals,timestamp
 
 
@@ -103,9 +108,18 @@ def check_tiers(vms,runners,args,state,state_path):
         # changed under a lease; retain the pending OOM until confirmed.
         for vm in fleet:
             key=f'{vm.zone}/{vm.instance_id}'
-            if state.get('pending_oom',{}).get(key)=='container':
-                if controller.adjust_admission(vm,args):
+            kind=state.get('pending_oom',{}).get(key)
+            if kind in ('runner','builder'):
+                outcome=controller.adjust_admission(vm,args,kind)
+                if outcome is True:
                     state['pending_oom'].pop(key,None)
+                elif outcome=='capacity':
+                    target=next_topology(topology,'up','oom')
+                    if target!=topology:
+                        begin_migration(fleet,target,state,state_path,'container cap exceeds measured host envelope',
+                                        TIERS[target[-1]].initial_slots)
+                        reconcile_migration(vms,runners,args,state,state_path)
+                        break
     elif topology and 'legacy' not in topology:
         state.setdefault('desired_topology',list(topology))
         # Price-driven retirement also follows replacement readiness and drain;
