@@ -122,6 +122,8 @@ class JobRecovery:
         for repository in self.repositories:
             try:
                 runs, jobs = self._scan(repository, now)
+                from .fleet_evidence import remember_jobs
+                remember_jobs(self.data, repository, runs, jobs, now)
                 self._remember(repository, jobs, current, previous, now)
                 self.save()
                 for key, record in list(self.data['jobs'].items()):
@@ -154,6 +156,7 @@ class JobRecovery:
         # In-progress enumeration includes older runs; tracked jobs keep their
         # run IDs even when the run completes outside the discovery window.
         queries = [{'status': 'in_progress', 'per_page': 100},
+                   {'status': 'queued', 'per_page': 100},
                    {'status': 'completed', 'per_page': 100,
                     'created': '>=' + (instant(lookback) - timedelta(minutes=10)).isoformat()}]
         runs = {}
