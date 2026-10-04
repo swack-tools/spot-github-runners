@@ -14,6 +14,19 @@ def retryable_exit(code):
     return code in (75, 137, 143, 255)
 
 
+def stopped_builder_reconciliation_command():
+    """Embed current reconciliation for legacy hosts under the transaction SH lock."""
+    from . import host_admission
+    source=Path(host_admission.__file__).read_text()
+    program=("namespace={'__name__':'oxidex_transaction_reconcile'}\n"
+             "exec("+repr(source)+",namespace)\n"
+             "try:\n"
+             " namespace['reconcile_stopped_builders']()\n"
+             "except (OSError,ValueError,KeyError,TypeError,namespace['subprocess'].SubprocessError):\n"
+             " raise SystemExit(75)\n")
+    return '/usr/bin/python3 -I -c '+shlex.quote(program)
+
+
 def transaction_script(project,upload,digest,profile,run,instance_id=None):
     """Serialize source replacement, builds, and immutable artifact export."""
     root='/mnt/runner-data/remote-build'
@@ -31,6 +44,11 @@ def transaction_script(project,upload,digest,profile,run,instance_id=None):
         *([identity_guard(instance_id)] if instance_id else []),
         'trap '+shlex.quote('rm -f -- '+shlex.quote(upload))+' EXIT',
         'test ! -e /run/oxidex-build-draining || exit 75',
+        # A stopped owned orphan must not veto the transaction before the
+        # launcher has an opportunity to reconcile it. The root reconciler
+        # takes each active-cache lock nonblocking and never removes running
+        # or unknown identities; the fresh inventory below still rejects them.
+        stopped_builder_reconciliation_command(),
         f'flock -n -E 75 /run/oxidex-cache-active-{project}.lock true',
         'ids=$(/usr/bin/docker ps -aq --filter label=oxidex.remote-build=true) || exit 75',
         'for id in $ids; do',

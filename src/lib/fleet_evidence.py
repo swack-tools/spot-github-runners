@@ -160,9 +160,11 @@ def read_host_events(project, vm, cursor=None):
     # bootstrap or restarting runner containers. New hosts install this file.
     source = Path(__file__).with_name('host_evidence.py').read_bytes()
     program = 'import base64;exec(compile(base64.b64decode(' + repr(base64.b64encode(source).decode()) + "),'host-evidence','exec'))"
+    from .remote_build import identity_guard
+    command='sudo sh -c '+shlex.quote(identity_guard(vm.instance_id)+'; python3 -c '+shlex.quote(program))
     result = subprocess.run(['gcloud','compute','ssh',vm.name,f'--zone={vm.zone}',
                               f'--project={project}','--quiet',
-                              '--command=sudo python3 -c '+shlex.quote(program)],
+                              '--command='+command],
                              check=True,text=True,capture_output=True,timeout=60)
     data = json.loads(result.stdout)
     data['instance_id'] = vm.instance_id

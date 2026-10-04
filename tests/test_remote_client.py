@@ -27,7 +27,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(tar.extractfile('Cargo.toml').read(), b'working change')
             self.assertEqual(receipt['file_count'],1)
 
-    def execute_transaction(self,profile,header_failure=False,artifact_symlink=False):
+    def execute_transaction(self,profile,header_failure=False,artifact_symlink=False,stopped_orphan=False):
         from lib.remote_build import transaction_script
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory).resolve();source=root/'remote/sources/checkout';source.mkdir(parents=True)
@@ -42,6 +42,34 @@ class ClientTests(unittest.TestCase):
             body=shlex.split(command)[-1].replace('/mnt/runner-data/remote-build',str(root/'remote'))
             body=body.replace('/run/oxidex-',str(root/'lock-'))
             docker=root/'docker';docker.write_text('#!/bin/sh\nexit 0\n');docker.chmod(0o755)
+            if stopped_orphan:
+                identity='a'*64;run='run-'+'b'*32;present=root/'orphan';present.touch()
+                record=dict(Id=identity,Name='/oxidex-run-'+run,
+                    Config=dict(Labels={'oxidex.remote-build':'true','oxidex.cache-project':'checkout','oxidex.run-id':run}),
+                    State=dict(Running=False,Paused=False,Restarting=False,Pid=0,Status='created'),
+                    Mounts=[dict(Type='bind',Destination='/src',Source=str(source)),
+                            dict(Type='bind',Destination='/target',Source=str(target.parent))])
+                docker.write_text('#!'+__import__('sys').executable+'\nimport json,sys\nfrom pathlib import Path\n'
+                    'present=Path('+repr(str(present))+')\n'
+                    'record='+repr(record)+'\n'
+                    'if sys.argv[1]=="ps":print(record["Id"] if present.exists() else "")\n'
+                    'elif sys.argv[1]=="inspect":\n'
+                    ' if "--format" in sys.argv:print(record["Mounts"][1]["Source"])\n'
+                    ' else:print(json.dumps([record]))\n'
+                    'elif sys.argv[1]=="rm":\n'
+                    ' assert sys.argv[2:]==[record["Id"]]\n'
+                    ' present.unlink()\n'
+                    'else:raise SystemExit(1)\n')
+                # Redirect only the generated embedded reconciler's cache locks
+                # into this fixture. Exercise the complete shell transaction,
+                # including the inventory gate before source replacement.
+                tokens=shlex.split(body)
+                programs=[tokens[i+1] for i,x in enumerate(tokens[:-1]) if x=='-c']
+                if programs:
+                    program=programs[0]
+                    adjusted=program.replace("namespace['reconcile_stopped_builders']()",
+                        "namespace['LOCK_ROOT']=namespace['Path']("+repr(str(root))+")\n namespace['reconcile_stopped_builders']()")
+                    body=body.replace(shlex.quote(program),shlex.quote(adjusted))
             body=body.replace('/usr/bin/docker',str(docker))
             launcher=root/'launcher'
             launcher.write_text('#!/bin/sh\n'
@@ -58,6 +86,7 @@ class ClientTests(unittest.TestCase):
             # propagation; Linux lock/cancellation behavior has a live canary.
             body=body.replace('flock -n -E 75 '+str(root/'lock-cache-active-checkout.lock')+' true','true')
             result=subprocess.run(['sh','-c',body],capture_output=True,text=True)
+            if stopped_orphan:self.assertFalse(present.exists(),result.stderr)
             self.assertFalse((source/'deleted.rs').exists())
             self.assertEqual((source/'new.rs').read_text(),'new snapshot')
             self.assertEqual((target/'retained.cache').read_text(),'retained')
@@ -77,6 +106,9 @@ class ClientTests(unittest.TestCase):
 
     def test_deleted_snapshot_source_does_not_survive_cache_reuse(self):
         self.execute_transaction('debug')
+
+    def test_stopped_orphan_is_reconciled_before_transaction_inventory_gate(self):
+        self.execute_transaction('debug',stopped_orphan=True)
 
     def test_symlinked_artifact_is_not_exported(self):
         self.execute_transaction('debug',artifact_symlink=True)
@@ -116,7 +148,7 @@ class ClientTests(unittest.TestCase):
                         if outcome=='download_failure':raise subprocess.CalledProcessError(255,command)
                     return subprocess.CompletedProcess(command,0)
                 shell=next(value[len('--command='):] for value in command if value.startswith('--command='))
-                if 'python3 -I -c' not in shell and not shell.startswith('test "$(curl'):
+                if 'export=Path(' not in shell and not shell.startswith('test "$(curl'):
                     kwargs['stdout'].write(digest+'  artifact\n');return subprocess.CompletedProcess(command,0)
                 # Execute the actual cleanup body against local fixture paths.
                 body=(shlex.split(shell)[-1] if 'python3 -I -c' in shell else shell)
