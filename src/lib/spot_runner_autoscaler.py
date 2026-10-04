@@ -566,6 +566,7 @@ sys.path.insert(0,'/opt/gha-runners')
 from host_admission import observed_envelope, request
 GIB=1024**3
 changed=[]
+pending_runner_ids=[]
 ledger_deadline=None
 envelope=next_limit=reserved=None
 def docker_timeout():
@@ -650,6 +651,8 @@ try:
                 for name,before in records.items():
                     identity=before['Id']
                     if any(owner.startswith('container:'+identity+':') for owner in rows):
+                        if before['HostConfig']['Memory']<next_limit*GIB:
+                            pending_runner_ids.append(identity)
                         continue  # Preserve active/stale lease amounts and caps.
                     row=inspect(identity,name)
                     if (row['Id']!=identity or row['State']['StartedAt']!=before['State']['StartedAt']
@@ -664,14 +667,16 @@ try:
                         or after['HostConfig']['MemorySwap']!=next_limit*GIB):
                         raise ValueError('Runner limit update was not observed')
                     changed.append(identity)
-            print(json.dumps(dict(kind=kind,status='updated' if changed else 'waiting-for-lease-free-runner',
+            print(json.dumps(dict(kind=kind,status='waiting-for-lease-free-runner' if pending_runner_ids or not changed else 'updated',
                 reservation_gib=next_limit,observed_work_gib=envelope,
-                reserved_gib=reserved,unreserved_gib=max(0,envelope-reserved),updated=changed)))
-            if not changed:raise SystemExit(75)
+                reserved_gib=reserved,unreserved_gib=max(0,envelope-reserved),updated=changed,pending_runner_ids=pending_runner_ids)))
+            # Success clears the controller's already-seen OOM obligation.
+            # Keep it pending until every skipped lagging cap has caught up.
+            if pending_runner_ids or not changed:raise SystemExit(75)
 except (OSError,ValueError,KeyError,TypeError,RuntimeError,subprocess.SubprocessError) as error:
     # Never roll back a higher reservation after a potentially applied Docker
     # update. Unknown/partial updates stay over-reserved for safe retries.
-    print(json.dumps(dict(kind=kind,status='deferred',updated=changed,error=str(error)[:200],
+    print(json.dumps(dict(kind=kind,status='deferred',updated=changed,pending_runner_ids=pending_runner_ids,error=str(error)[:200],
         reservation_gib=next_limit,observed_work_gib=envelope,reserved_gib=reserved,
         unreserved_gib=max(0,envelope-reserved) if reserved is not None else None)))
     raise SystemExit(75)

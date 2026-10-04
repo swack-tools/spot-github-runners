@@ -18,17 +18,19 @@ GIB=1024**3
 
 
 class AdmissionCapRecoveryTests(unittest.TestCase):
-    def run_program(self,*,leases=None,barrier=None,fail_update=None,envelope=32,kind='runner',fail_limits=False,reservation=2,docker_delay=0):
+    def run_program(self,*,leases=None,barrier=None,fail_update=None,envelope=32,kind='runner',fail_limits=False,reservation=2,docker_delay=0,resume=None):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);config_path=root/'admission.json';ledger=root/'leases.json'
             builder=root/'builder.json'
             config=dict(work_gib=32,runner_gib=reservation,builder_gib=6,runner_names=['r1','r2'])
-            config_path.write_text(json.dumps(config));ledger.write_text(json.dumps(leases or {}))
-            builder.write_text(json.dumps(dict(memory_gib=6,cpus=4)))
+            if resume:config=copy.deepcopy(resume['config'])
+            config_path.write_text(json.dumps(config));ledger.write_text(json.dumps(leases if leases is not None else (resume['ledger'] if resume else {})))
+            builder.write_text(json.dumps(resume['builder'] if resume else dict(memory_gib=6,cpus=4)))
             records={name:dict(Id=letter*64,Name='/'+name,
                 State=dict(Running=True,StartedAt='2026-10-04T00:00:00Z'),
                 HostConfig=dict(Memory=2*GIB,MemorySwap=4*GIB))
                 for name,letter in [('r1','a'),('r2','b')]}
+            if resume:records=copy.deepcopy(resume['records'])
             updates=[];events=[];elapsed=[0]
             host=GceVm('vm','z','RUNNING','n2-standard-32',True,32,128,instance_id='12345')
             with patch('lib.spot_runner_autoscaler.subprocess.run',return_value=SimpleNamespace(returncode=75,stdout='')) as ssh:
@@ -90,13 +92,42 @@ class AdmissionCapRecoveryTests(unittest.TestCase):
     def test_active_job_keeps_original_cap_and_reservation_while_idle_runner_grows(self):
         leases={self.owner('a'):2,'host:999:1':6}
         result=self.run_program(leases=leases)
-        self.assertEqual(result['status'],0)
+        self.assertEqual(result['status'],75)
         self.assertEqual(result['ledger'],leases)
         self.assertEqual(result['records']['r1']['HostConfig'],dict(Memory=2*GIB,MemorySwap=4*GIB))
         self.assertEqual(result['records']['r2']['HostConfig']['Memory'],4*GIB)
         self.assertEqual(result['updates'],['b'*64])
         self.assertEqual(result['config']['runner_gib'],4)
         self.assertEqual(result['receipt']['reserved_gib'],8)
+        self.assertEqual(result['receipt']['pending_runner_ids'],['a'*64])
+
+    def test_controller_retains_seen_oom_until_a_second_pass_observes_all_caps(self):
+        from lib import spot_runner_autoscaler as controller
+        from lib import tier_controller
+        vm=GceVm('vm','z','RUNNING','n2-standard-32',True,32,128,instance_id='12345')
+        state={'pending_oom':{'z/12345':'runner'},'seen_oom_ids':['already-seen']}
+        previous=[]
+        def remote_adjust(*args):
+            result=self.run_program(leases={self.owner('a'):2} if not previous else {},
+                                    resume=previous[-1] if previous else None)
+            previous.append(result)
+            return result['status']==0
+        with tempfile.TemporaryDirectory() as folder,patch.object(controller,'spot_instances',return_value=[vm]),\
+             patch.object(tier_controller,'evidence_for',return_value=([],{},1000)),\
+             patch.object(tier_controller,'plan_capacity',return_value=dict(action='budget',target=('bulky',),reason='pending cap repair')),\
+             patch.object(controller,'adjust_admission',side_effect=remote_adjust) as adjust:
+            path=Path(folder)/'state.json';args=SimpleNamespace(project='p',migrate_oversized=False)
+            tier_controller.check_tiers([vm],[],args,state,path)
+            self.assertEqual(previous[0]['updates'],['b'*64])
+            self.assertEqual(state['pending_oom'],{'z/12345':'runner'})
+            self.assertEqual(json.loads(path.read_text())['pending_oom'],state['pending_oom'])
+            tier_controller.check_tiers([vm],[],args,state,path)
+            self.assertEqual(adjust.call_count,2)
+            self.assertEqual(previous[1]['updates'],['a'*64])
+            self.assertEqual(previous[1]['config']['runner_gib'],4)
+            self.assertTrue(all(row['HostConfig']['Memory']==4*GIB for row in previous[1]['records'].values()))
+            self.assertEqual(state['pending_oom'],{})
+            self.assertEqual(state['seen_oom_ids'],['already-seen'])
 
     def test_old_config_acquiring_hook_finishes_at_barrier_and_its_container_is_not_raised(self):
         leases={self.owner('a'):2}
