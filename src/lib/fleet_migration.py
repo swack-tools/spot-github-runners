@@ -312,7 +312,7 @@ def reconcile_migration(vms,runners,args,state,state_path):
             assigned=controller.host_runners(vm,runners,fleet)
             metadata={}
             if migration.get('storage_staged_bad_id'):
-                stage='early' if migration['pending_tiers'] else 'final'
+                stage='early' if record['instance_id']==migration['storage_staged_bad_id'] else 'final'
                 metadata['staged_retirement']=dict(started_at=migration['started_at'],stage=stage,
                     survivor_ids=[item.instance_id for item in fleet if item.instance_id!=vm.instance_id])
                 proposal=dict(vm=record,staged_retirement=metadata['staged_retirement'])
@@ -343,9 +343,10 @@ def replacements_healthy(fleet,runners,args,state,state_path):
     migration=state['migration']
     by_id={vm.instance_id:vm for vm in fleet}
     rows={f"{row['zone']}/{row['instance_id']}":row for row in state.get('latest_resources') or []}
-    healthy=bool(migration['replacement_ids'])
+    destinations=list(dict.fromkeys(migration['replacement_ids']+migration.get('retained_ids',[])))
+    healthy=bool(destinations)
     checks=migration.setdefault('healthy_checks',{})
-    for identity in migration['replacement_ids']:
+    for identity in destinations:
         vm=by_id.get(identity)
         if not vm:
             # Lost canary: restore its allowed tier, never delete the source.
@@ -355,7 +356,8 @@ def replacements_healthy(fleet,runners,args,state,state_path):
                 counts=migration.setdefault('pending_slots',[
                     migration.get('slots') or TIERS[name].initial_slots for name in migration['pending_tiers'][:-1]])
                 counts.append(receipt.get('expected_runner_count') or TIERS[receipt['tier']].initial_slots)
-                migration['replacement_ids'].remove(identity)
+                cohort='replacement_ids' if identity in migration['replacement_ids'] else 'retained_ids'
+                migration[cohort].remove(identity)
                 controller.write_scale_state(state_path,state)
             return False
         key=f'{vm.zone}/{vm.instance_id}'

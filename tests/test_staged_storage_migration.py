@@ -317,4 +317,20 @@ class StagedStorageMigrationTests(unittest.TestCase):
             self.assertFalse(migration.retarget_unhealthy_storage_canary(self.hosts,self.args,self.state,self.path))
         self.assertEqual(self.state['migration']['target'],['bulky'])
 
+    def test_good_source_loss_before_early_intent_retires_bad_after_two_recovered_canaries(self):
+        self.retarget()
+        self.hosts=self.hosts[1:]
+        self.state['latest_resources']=self.state['latest_resources'][1:]
+        self.state['pending_vm_recovery']={'old':dict(instance_id='1',_cleanup_complete=True)}
+        self.add_destination('3');self.add_destination('4')
+        self.assertNotIn('early_retirement_ids',self.state['migration'])
+        self.reconcile(2800);self.assertNotIn('host_operation',self.state)
+        self.state=json.loads(self.path.read_text())
+        self.reconcile(3100)
+        self.assertIn('host_operation',self.state,'recovered two-large capacity must permit retiring the bad source')
+        operation=self.state['host_operation']
+        self.assertEqual(operation['vm']['instance_id'],'2')
+        self.assertEqual(operation['staged_retirement']['stage'],'early')
+        self.assertEqual(self.state['migration']['replacement_ids'],['3','4'])
+
 if __name__=='__main__':unittest.main()

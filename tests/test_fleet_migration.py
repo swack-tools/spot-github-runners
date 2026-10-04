@@ -15,6 +15,76 @@ def vm(name,cpu,ram,id):
 
 
 class MigrationTests(unittest.TestCase):
+    def test_removal_only_migration_validates_retained_destination_then_drains_only_small(self):
+        import json
+        from lib import spot_runner_autoscaler as controller
+        large,small=vm('retained',16,64,'1'),vm('small',4,16,'2')
+        args=SimpleNamespace(org='org',remote_builder=True,maximum_hosts=5,scaling_mode='tiered',tier_job_memory_gib=15)
+        runners=[GitHubRunner(i,f'gha-{large.name}-{i}','online',False,()) for i in range(1,21)]
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'state.json';state={}
+            begin_migration([large,small],('large',),state,path,'consolidation')
+            self.assertEqual(state['migration']['replacement_ids'],[])
+            self.assertEqual(state['migration']['retained_ids'],['1'])
+            state['host_deployments']={'z/1':dict(tier='large',expected_runner_count=20,runner_memory_gib=15)}
+            for tick in (1000,1300):
+                state['latest_workload']={'complete':True}
+                state['latest_resources']=[dict(instance_id=identity,zone='z',observed_at=tick,cpu_fraction=.1,
+                    memory_fraction=.1,peak_cpu_cores=1,peak_ram_gib=2,io_complete=True,
+                    io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0)) for identity in ('1','2')]
+                state['host_health']={f'z/{identity}':dict(instance_id=identity,boot_id='boot-'+identity,
+                    complete=True,boot_oom_complete=True,boot_host_oom_ids=[],observed_at=tick,events=[]) for identity in ('1','2')}
+                with patch('lib.fleet_migration.time.time',return_value=tick),patch.object(controller,'builder_ready',return_value=True) as canary:
+                    reconcile_migration([large,small],runners,args,state,path)
+                canary.assert_called_once_with(large,args)
+                if tick==1000:
+                    self.assertNotIn('host_operation',state)
+                    state=json.loads(path.read_text())
+                else:
+                    self.assertEqual(state['host_operation']['vm']['instance_id'],'2')
+                    self.assertEqual(state['migration']['healthy_checks']['z/1']['count'],2)
+
+    def test_removal_only_retained_destination_holds_incomplete_or_unsafe_evidence(self):
+        from lib import spot_runner_autoscaler as controller
+        for defect in ('missing_boot','host_oom','unknown_oom','incomplete_io','incomplete_jobs','peak_demand','builder'):
+            with self.subTest(defect=defect),tempfile.TemporaryDirectory() as folder:
+                large,small=vm('retained',16,64,'1'),vm('small',4,16,'2')
+                args=SimpleNamespace(org='org',remote_builder=True,maximum_hosts=5,scaling_mode='tiered',tier_job_memory_gib=15)
+                runners=[GitHubRunner(i,f'gha-{large.name}-{i}','online',False,()) for i in range(1,21)]
+                path=Path(folder)/'state.json';state={}
+                begin_migration([large,small],('large',),state,path,'consolidation')
+                state['host_deployments']={'z/1':dict(tier='large',expected_runner_count=20,runner_memory_gib=15)}
+                state['latest_workload']={'complete':defect!='incomplete_jobs'}
+                for tick in (1000,1300):
+                    state['latest_resources']=[dict(instance_id=identity,zone='z',observed_at=tick,cpu_fraction=.1,
+                        memory_fraction=.1,peak_cpu_cores=20 if defect=='peak_demand' else 1,peak_ram_gib=2,
+                        io_complete=defect!='incomplete_io',io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0))
+                        for identity in ('1','2')]
+                    state['host_health']={'z/1':dict(instance_id='1',boot_id=None if defect=='missing_boot' else 'boot',
+                        complete=True,boot_oom_complete=True,boot_host_oom_ids=['oom'] if defect=='host_oom' else [],observed_at=tick,events=[])}
+                    if defect=='unknown_oom':state['pending_oom']={'z/1':'unknown'}
+                    with patch('lib.fleet_migration.time.time',return_value=tick),patch.object(controller,'builder_ready',return_value=defect!='builder'):
+                        reconcile_migration([large,small],runners,args,state,path)
+                    self.assertNotIn('host_operation',state)
+                    self.assertIn('migration',state)
+
+    def test_lost_retained_destination_restores_receipted_tier_before_source_retirement(self):
+        from lib import spot_runner_autoscaler as controller
+        large,small=vm('retained',16,64,'1'),vm('small',4,16,'2')
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'state.json';state={}
+            begin_migration([large,small],('large',),state,path,'consolidation')
+            state['host_deployments']={'z/1':dict(tier='large',expected_runner_count=20,runner_memory_gib=15)}
+            state['pending_vm_recovery']={'large':dict(instance_id='1',_cleanup_complete=True)}
+            args=SimpleNamespace(remote_builder=True,maximum_hosts=5,scaling_mode='tiered',tier_job_memory_gib=15)
+            with patch.object(controller,'begin_host_operation') as drain,patch('lib.fleet_migration.time.time',return_value=1000):
+                reconcile_migration([small],[],args,state,path)
+            drain.assert_not_called()
+            self.assertEqual(state['migration']['pending_tiers'],['large'])
+            self.assertEqual(state['migration']['pending_slots'],[20])
+            self.assertEqual(state['migration']['retained_ids'],[])
+            self.assertEqual(state['migration']['replacement_ids'],[])
+
     def test_completion_retains_unresolved_ooms_on_retained_or_unrelated_hosts(self):
         import json
         old,new=vm('old',32,128,'1'),vm('retained',16,64,'2')
