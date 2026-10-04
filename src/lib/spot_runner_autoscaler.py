@@ -1390,9 +1390,11 @@ def _run_controller(args: argparse.Namespace) -> int:
                  current, busy, len(fleet_vms))
         if args.scaling_mode=='tiered':
             from .tier_controller import check_tiers
+            from .poll_cadence import tier_poll_delay
+            check_started_at = time.time()
             check_tiers(vms,runners,args,state,state_path)
             if args.once:return 0
-            time.sleep(args.interval_seconds)
+            time.sleep(tier_poll_delay(state,args.interval_seconds,check_started_at,time.time()))
             continue
         if args.scaling_mode == 'resource':
             roster = sorted(f'{vm.zone}/{vm.instance_id}' for vm in fleet_vms)
