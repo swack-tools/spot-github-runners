@@ -3,6 +3,7 @@ import math
 import statistics
 import base64
 import json
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -163,8 +164,16 @@ def remember_jobs(data, repository, runs, jobs, observed_at):
 def read_host_events(project, vm, cursor=None):
     # Execute the same bounded sampler on legacy hosts without rewriting their
     # bootstrap or restarting runner containers. New hosts install this file.
+    attribution_ids=() if cursor is None else cursor
+    if (not isinstance(attribution_ids,(list,tuple)) or len(attribution_ids)>1000
+        or any(not isinstance(value,str) or not re.fullmatch(r'[0-9a-f]{64}',value) for value in attribution_ids)):
+        raise ValueError('Invalid pending OOM attribution IDs')
+    if not isinstance(vm.name,str) or not re.fullmatch(r'[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?',vm.name):
+        raise ValueError('An exact provider VM name is required')
     source = Path(__file__).with_name('host_evidence.py').read_bytes()
-    program = 'import base64;exec(compile(base64.b64decode(' + repr(base64.b64encode(source).decode()) + "),'host-evidence','exec'))"
+    program = ('import base64;OOM_ATTRIBUTION_IDS='+repr(tuple(attribution_ids))+
+               ';HOST_INSTANCE_NAME='+repr(vm.name)+
+               ';exec(compile(base64.b64decode(' + repr(base64.b64encode(source).decode()) + "),'host-evidence','exec'))")
     from .remote_build import identity_guard
     command='sudo sh -c '+shlex.quote(identity_guard(vm.instance_id)+'; python3 -c '+shlex.quote(program))
     result = subprocess.run(['gcloud','compute','ssh',vm.name,f'--zone={vm.zone}',

@@ -1,5 +1,8 @@
 """Independent OOM obligations with compatible legacy kind/origin projections."""
 import copy
+import math
+import re
+import time
 
 PRIORITY={'unknown':0,'container':0,'runner':1,'builder':2,'host':3}
 
@@ -51,3 +54,54 @@ def clear_oom(state,key,kind=None):
     state['pending_oom'].pop(key,None)
     state['pending_oom_origins'].pop(key,None)
     sync_pending(state)
+
+
+def promote_attributed_ooms(state,key,observed):
+    """Transfer proven exact-ID unknown events into still-pending cap repair."""
+    if (not isinstance(observed,dict) or observed.get('complete') is not True
+        or observed.get('instance_id')!=key.rsplit('/',1)[-1]):return []
+    timestamp=observed.get('observed_at');boot=observed.get('boot_id')
+    if (not isinstance(timestamp,(int,float)) or isinstance(timestamp,bool) or not math.isfinite(timestamp)
+        or not 0<=time.time()-timestamp<=450 or not isinstance(boot,str) or not boot):return []
+    rows=obligations_for(state,key)
+    events=list(observed.get('events') or [])
+    if observed.get('reclassification_complete') is True:
+        events.extend(observed.get('reclassified_events') or [])
+    claims={}
+    for event in events:
+        if not isinstance(event,dict):continue
+        identity=event.get('id');kind=event.get('kind');workload=event.get('workload')
+        if not isinstance(identity,str) or not re.fullmatch(r'[0-9a-f]{64}',identity):continue
+        if not isinstance(kind,str) or not isinstance(workload,str):kind,workload='invalid','invalid'
+        claims.setdefault(identity,set()).add((kind,workload))
+    promoted=[]
+    for unknown in ('unknown','container'):
+        origin=rows.get(unknown)
+        if (not isinstance(origin,dict) or origin.get('kind')!=unknown
+            or origin.get('boot_id')!=boot or origin.get('quarantined') is not False):continue
+        origin_ids=origin.get('event_ids')
+        if not isinstance(origin_ids,list) or any(not isinstance(identity,str) for identity in origin_ids):continue
+        remaining=set(origin_ids)
+        for identity in sorted(remaining):
+            claim=claims.get(identity,set())
+            if len(claim)!=1:continue
+            kind,workload=next(iter(claim))
+            if kind!='container' or workload not in ('runner','builder'):continue
+            destination=rows.get(workload)
+            if destination is not None and (not isinstance(destination,dict) or destination.get('kind')!=workload or destination.get('boot_id')!=boot
+                or destination.get('quarantined') is not False or not isinstance(destination.get('event_ids'),list)
+                or any(not isinstance(value,str) for value in destination['event_ids'])):continue
+            if destination is None:
+                destination=rows[workload]=dict(kind=workload,boot_id=boot,event_ids=[],quarantined=False)
+            destination['event_ids']=sorted(set(destination.get('event_ids') or [])|{identity})
+            remaining.remove(identity);promoted.append(identity)
+        if remaining:origin['event_ids']=sorted(remaining)
+        elif origin.get('event_ids'):rows.pop(unknown)
+    if promoted:
+        state.setdefault('pending_oom_obligations',{})[key]=rows
+        # Remove only this host's derived legacy projection before syncing;
+        # otherwise importing it would resurrect the transferred unknown IDs.
+        state.get('pending_oom',{}).pop(key,None)
+        state.get('pending_oom_origins',{}).pop(key,None)
+        sync_pending(state)
+    return sorted(set(promoted))
