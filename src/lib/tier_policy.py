@@ -54,7 +54,7 @@ def plan_capacity(topology, evidence, workload, state, timestamp):
         return {**hold,'reason':'waiting for distinct resource window'}
     memory = any(row['memory_fraction'] > .75 for row in evidence)
     cpu = any(row['cpu_fraction'] > .75 for row in evidence)
-    delayed = workload.get('queue_delayed',False)
+    delayed = workload.get('queue_delayed',False) or workload.get('duration_regression',False)
     direction = 'up' if host_oom or memory or cpu or delayed else 'down'
     if direction=='down' and workload.get('pending'):
         state.update(timestamp=timestamp,direction='wait',streak=0)

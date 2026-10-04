@@ -64,3 +64,11 @@ class TierPolicyTests(unittest.TestCase):
         result = plan_capacity(('legacy',),[sample(cores=11,ram=50)],{}, {},1000)
         self.assertEqual(result['target'],('bulky',))
         self.assertEqual(plan_capacity((),None,{}, {},1000)['target'],('starting',))
+
+    def test_compatible_duration_regression_blocks_shrink_and_grows_capacity(self):
+        state={}
+        workload={'duration_regression':True,'slots':8}
+        plan_capacity(('starting',),[sample()],workload,state,1000)
+        result=plan_capacity(('starting',),[sample()],workload,state,1300)
+        self.assertEqual(result['target'],('expanded',))
+        self.assertEqual(result['action'],'topology')
