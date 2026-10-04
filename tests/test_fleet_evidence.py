@@ -14,6 +14,22 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(state['resource_history'],{})
         self.assertIsNone(record_resources(state,[vm],[(float('nan'),.1)],1600))
 
+    def test_early_poll_retains_real_peak_without_creating_an_extra_window(self):
+        from lib.tier_policy import fits
+        vm=GceVm('oxidex-runners-a','z','RUNNING','n4-standard-32',True,32,128,instance_id='1')
+        state={}
+        record_resources(state,[vm],[(.1,.1)],1000)
+        spike=record_resources(state,[vm],[(.5,.5)],1100)
+        self.assertEqual(spike[0]['windows'],1)
+        self.assertEqual(spike[0]['peak_cpu_cores'],16)
+        self.assertEqual(spike[0]['peak_ram_gib'],64)
+        self.assertFalse(fits(('large',),spike),'an early CPU/RAM spike must veto consolidation')
+        later=record_resources(state,[vm],[(.05,.05)],1300)
+        self.assertEqual(later[0]['windows'],2)
+        self.assertEqual(later[0]['peak_cpu_cores'],16)
+        self.assertEqual(later[0]['peak_ram_gib'],64)
+        self.assertFalse(fits(('large',),later),'a lower distinct poll must retain the observed spike')
+
     def test_changed_vm_id_cannot_reuse_memory_peak(self):
         old = GceVm('oxidex-runners-a','z','RUNNING','n2-standard-4',True,4,16,instance_id='1')
         new = GceVm('oxidex-runners-a','z','RUNNING','n2-standard-4',True,4,16,instance_id='2')

@@ -94,6 +94,11 @@ def record_resources(state, vms, samples, timestamp):
             windows.clear()
         if not windows or timestamp - windows[-1]['observed_at'] >= 300:
             windows.append(dict(observed_at=timestamp,cpu_cores=cpu*vm.vcpu,used_ram_gib=ram*vm.ram_gib))
+        else:
+            # A controller restart or early read cannot hide fresh demand.
+            # Keep the real peak without fabricating another distinct window.
+            windows[-1]['cpu_cores']=max(windows[-1]['cpu_cores'],cpu*vm.vcpu)
+            windows[-1]['used_ram_gib']=max(windows[-1]['used_ram_gib'],ram*vm.ram_gib)
         windows[:] = [row for row in windows if timestamp - row['observed_at'] <= 1800][-7:]
         observations.append(dict(instance_id=vm.instance_id, zone=vm.zone,
                                  observed_at=timestamp,cpu_cores=cpu*vm.vcpu,
