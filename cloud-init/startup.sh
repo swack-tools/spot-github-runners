@@ -111,6 +111,39 @@ printf '%s' '{{DOCKERFILE_B64}}' | base64 -d >/opt/gha-runners/build/Dockerfile
 printf '%s' '{{ENTRYPOINT_B64}}' | base64 -d >/opt/gha-runners/build/entrypoint.sh
 printf '%s' '{{JOB_COMPLETED_B64}}' | base64 -d >/opt/gha-runners/build/job-completed.sh
 printf '%s' '{{CLEAN_TARGET_B64}}' | base64 -d >/opt/gha-runners/build/clean_target.py
+printf '%s' '{{ADMISSION_B64}}' | base64 -d >/opt/gha-runners/build/host_admission.py
+printf '%s' '{{JOB_STARTED_B64}}' | base64 -d >/opt/gha-runners/build/job-started.sh
+printf '%s' '{{EVIDENCE_B64}}' | base64 -d >/opt/gha-runners/host_evidence.py
+TIERED={{TIERED}}
+if [[ "$TIERED" == 1 ]]; then
+  install -d -m 0755 /run/gha-admission
+  cp /opt/gha-runners/build/host_admission.py /opt/gha-runners/host_admission.py
+  printf '%s' '{{DOCKER_ADMISSION_B64}}' | base64 -d >/usr/local/bin/docker
+  chmod 0755 /usr/local/bin/docker
+  python3 - <<'ADMISSION_CONFIG'
+import json, socket
+names = ['{{RUNNER_PREFIX}}-'+socket.gethostname().split('.')[0]+'-'+str(i) for i in range(1,{{RUNNER_COUNT}}+1)]
+with open('/etc/gha-admission.json','w') as target:
+    json.dump(dict(work_gib={{ADMISSION_WORK_GIB}},runner_gib={{RUNNER_MEMORY_GB}},builder_gib={{BUILDER_MEMORY_GIB}},runner_names=names),target)
+ADMISSION_CONFIG
+  chmod 0644 /etc/gha-admission.json
+  cat >/etc/systemd/system/gha-admission.service <<'ADMISSION_SERVICE'
+[Unit]
+Description=Shared runner and builder memory admission
+After=docker.service
+Requires=docker.service
+[Service]
+ExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+ADMISSION_SERVICE
+  systemctl daemon-reload
+  systemctl enable --now gha-admission
+  for attempt in $(seq 1 30); do [[ ! -S /run/gha-admission/socket ]] || break; sleep 1; done
+  [[ -S /run/gha-admission/socket ]] || exit 1
+fi
 chmod 0755 /opt/gha-runners/build/entrypoint.sh
 docker build --pull -t oxidex-self-hosted-runner:{{RUNNER_VERSION}} /opt/gha-runners/build
 
@@ -162,6 +195,9 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     --name "$name" -e RUNNER_NAME="$name" -e RUNNER_LABELS="$runner_labels" \
     -e RUNNER_GROUP_NAME="$RUNNER_GROUP" -e GITHUB_RUNNER_URL="$ORG_URL" \
     -e RUNNER_STATE=/runner-state -v "$state:/runner-state" -v "$work:/work")
+  if [[ "$TIERED" == 1 ]]; then
+    docker_args+=(-e GHA_ADMISSION_REQUIRED=1 -v /run/gha-admission:/run/gha-admission:ro)
+  fi
   [[ -z "$RUNNER_CPU_LIMIT" ]] || docker_args+=(--cpus="$RUNNER_CPU_LIMIT")
   docker_args+=(oxidex-self-hosted-runner:{{RUNNER_VERSION}})
   docker run "${docker_args[@]}"

@@ -53,7 +53,7 @@ def sample():
               for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith(('MemTotal:','MemAvailable:'))}
     return dict(observed_at=timestamp,boot_id=boot,ram_gib=memory['MemTotal'],
                 used_ram_gib=memory['MemTotal']-memory['MemAvailable'],
-                events=classify_events(journal,docker,boot,timestamp),complete=True)
+                events=classify_events(journal,docker,boot,timestamp),complete=len(journal)<2000)
 
 
 if __name__ == '__main__':

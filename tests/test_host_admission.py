@@ -2,11 +2,24 @@ import tempfile
 import unittest
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from lib.host_admission import LeasePool, admission_budget
+from lib.host_admission import LeasePool, admission_budget, owner_alive, memory_envelope
+from unittest.mock import patch
+from types import SimpleNamespace
 from lib.runner_tiers import TIERS
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_measured_host_overhead_reduces_admission_without_raising_configured_budget(self):
+        config=dict(work_gib=12,runner_names=['r']*8)
+        self.assertEqual(memory_envelope(config,16,10,['4GiB / 16GiB']),8)
+        self.assertEqual(memory_envelope(config,16,4,['3GiB / 16GiB']),12)
+        with self.assertRaises(ValueError):memory_envelope(config,16,4,['invalid'])
+
+    def test_lost_builder_process_retains_lease_while_container_survives(self):
+        with patch('lib.host_admission.process_identity',side_effect=FileNotFoundError),\
+             patch('lib.host_admission.subprocess.run',return_value=SimpleNamespace(stdout='container-id\n')):
+            self.assertTrue(owner_alive('host:999:1'))
+
     def test_parallel_requests_never_exceed_memory_budget(self):
         with tempfile.TemporaryDirectory() as folder:
             pool = LeasePool(Path(folder)/'leases.json', 6, alive=lambda identity:True)

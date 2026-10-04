@@ -89,7 +89,41 @@ def owner_alive(owner):
         kind,identity,start = owner.split(':',2)
         return process_identity(int(identity)) == owner if kind == 'host' else docker_identity(identity)[0] == owner
     except (OSError,ValueError,KeyError,subprocess.SubprocessError):
+        if owner.startswith('host:'):
+            # SSH or the Docker CLI can die while its container survives. Keep
+            # orphaned build reservations until every dedicated build is gone.
+            return builders_running()
         return False
+
+
+def builders_running():
+    try:
+        result=subprocess.run(['/usr/bin/docker','ps','-q','--filter','label=oxidex.remote-build=true'],
+                              check=True,capture_output=True,text=True,timeout=10)
+        return bool(result.stdout.strip())
+    except (OSError,subprocess.SubprocessError):
+        return True  # Unknown container state cannot reclaim memory.
+
+
+def memory_envelope(config,total_gib,used_gib,container_usage):
+    working=0.
+    for usage in container_usage:
+        match=re.fullmatch(r'\s*([0-9.]+)\s*(B|kB|MB|GB|TB|KiB|MiB|GiB|TiB)\s*',usage.split('/')[0])
+        if not match:raise ValueError('Unrecognized Docker memory usage')
+        scales={'B':1,'kB':1000,'MB':1000**2,'GB':1000**3,'TB':1000**4,
+                'KiB':1024,'MiB':1024**2,'GiB':1024**3,'TiB':1024**4}
+        working+=float(match[1])*scales[match[2]]/1024**3
+    reserve=max(2,used_gib-working)+.25*len(config['runner_names'])
+    return max(0,min(config['work_gib'],total_gib-reserve))
+
+
+def observed_envelope(config):
+    memory={line.split(':')[0]:int(line.split()[1])/1024/1024
+            for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith(('MemTotal:','MemAvailable:'))}
+    result=subprocess.run(['/usr/bin/docker','stats','--no-stream','--format','{{json .}}'],
+                           check=True,capture_output=True,text=True,timeout=15)
+    usage=[json.loads(line)['MemUsage'] for line in result.stdout.splitlines() if line.strip()]
+    return memory_envelope(config,memory['MemTotal'],memory['MemTotal']-memory['MemAvailable'],usage)
 
 
 def peer_owner(pid,uid,config):
@@ -142,6 +176,8 @@ def serve():
         os.chown(path,0,1001)
         path.chmod(0o660)
         server.listen(128)
+        envelope=0
+        measured_at=0
         while True:
             client,_ = server.accept()
             with client:
@@ -154,14 +190,25 @@ def serve():
                     message = json.loads(raw)
                     if message.get('kind','runner') != kind:
                         raise ValueError('Admission kind does not match peer identity')
+                    limit=config['work_gib']
+                    if message['action']=='acquire':
+                        if time.time()-measured_at>=60:
+                            try:
+                                envelope=observed_envelope(config)
+                                measured_at=time.time()
+                            except (OSError,ValueError,KeyError,subprocess.SubprocessError):
+                                envelope=0
+                        limit=min(limit,envelope)
                     pool = LeasePool(ledger/'leases.json',config['work_gib'],alive=owner_alive)
                     if message['action'] == 'release':
-                        pool.release(owner)
+                        if kind!='builder' or not builders_running():
+                            pool.release(owner)
                         accepted = True
                     elif message['action'] == 'acquire':
-                        if kind == 'builder' and Path('/run/oxidex-build-draining').exists():
+                        if limit<config[kind+'_gib'] or (kind == 'builder' and Path('/run/oxidex-build-draining').exists()):
                             accepted = False
                         else:
+                            pool.limit=limit
                             accepted = pool.acquire(owner,config[kind+'_gib'])
                     else:
                         raise ValueError('Unknown admission action')
@@ -181,7 +228,13 @@ if __name__ == '__main__':
     elif action == 'acquire':
         # A GitHub-assigned job is already busy during its pre-job hook. Let it
         # finish admission even after isolation; drain waits for busy to clear.
-        while not request('acquire'):
+        while True:
+            try:
+                if request('acquire'):
+                    break
+            except OSError:
+                # A root-controlled service restart must not fail an assigned job.
+                pass
             time.sleep(5)
     elif action == 'release':
         request('release')

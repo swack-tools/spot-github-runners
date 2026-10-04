@@ -8,6 +8,21 @@ def sample(cpu=.1, memory=.1, cores=.8, ram=1.6, windows=6):
 
 
 class TierPolicyTests(unittest.TestCase):
+    def test_queued_low_checks_do_not_accumulate_a_shrink_streak(self):
+        state={}
+        for t in range(1000,2800,300):
+            plan_capacity(('starting',),[sample()],{'pending':True},state,t)
+        self.assertEqual(plan_capacity(('starting',),[sample()],{},state,2800)['target'],('starting',))
+
+    def test_queue_with_headroom_increases_density_before_topology(self):
+        state={}
+        workload={'pending':True,'queue_delayed':True,'slots':8}
+        plan_capacity(('expanded',),[sample()],workload,state,1000)
+        result=plan_capacity(('expanded',),[sample()],workload,state,1300)
+        self.assertEqual(result['target'],('expanded',))
+        self.assertEqual(result['action'],'density')
+        self.assertEqual(result['slots'],12)
+
     def test_two_hot_checks_and_memory_reason(self):
         state = {}
         evidence = [sample(memory=.8,ram=12.8)]
@@ -47,5 +62,5 @@ class TierPolicyTests(unittest.TestCase):
         result = plan_capacity(('legacy',),[sample(cores=1,ram=3)],{}, {},1000)
         self.assertEqual(result['target'],('starting',))
         result = plan_capacity(('legacy',),[sample(cores=11,ram=50)],{}, {},1000)
-        self.assertEqual(result['target'],('large','small'))
+        self.assertEqual(result['target'],('bulky',))
         self.assertEqual(plan_capacity((),None,{}, {},1000)['target'],('starting',))

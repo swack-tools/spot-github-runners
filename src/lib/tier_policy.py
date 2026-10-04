@@ -33,7 +33,8 @@ def plan_capacity(topology, evidence, workload, state, timestamp):
     if workload.get('complete') is False:
         state.pop('streak',None)
         return {**hold,'reason':'incomplete compatible job inventory'}
-    host_oom = workload.get('host_oom',False)
+    host_oom = (workload.get('host_oom',False) or (workload.get('container_oom')
+                and any(row['memory_fraction']>.75 for row in evidence)))
     if workload.get('container_oom') and not host_oom:
         return {**hold,'action':'budget','reason':'container OOM with host headroom'}
     if not host_oom and timestamp - state.get('changed_at',-math.inf) < 900:
@@ -55,6 +56,9 @@ def plan_capacity(topology, evidence, workload, state, timestamp):
     cpu = any(row['cpu_fraction'] > .75 for row in evidence)
     delayed = workload.get('queue_delayed',False)
     direction = 'up' if host_oom or memory or cpu or delayed else 'down'
+    if direction=='down' and workload.get('pending'):
+        state.update(timestamp=timestamp,direction='wait',streak=0)
+        return {**hold,'reason':'compatible jobs pending'}
     streak = state.get('streak',0) + 1 if (state.get('direction') == direction and previous is not None
                                         and 300 <= timestamp - previous <= 450) else 1
     state.update(timestamp=timestamp,direction=direction,streak=streak)
@@ -62,6 +66,11 @@ def plan_capacity(topology, evidence, workload, state, timestamp):
     required = 1 if host_oom else 2 if direction == 'up' else 6
     if streak < required:
         return {**hold,'reason':f'{direction} evidence {streak}/{required}'}
+    slots=workload.get('slots',0)
+    if (delayed and not memory and not cpu and not host_oom and slots
+            and slots<TIERS[topology[-1]].maximum_slots and fits(topology,evidence)):
+        return dict(target=topology,action='density',reason='compatible queue with resource headroom',
+                    slots=min(TIERS[topology[-1]].maximum_slots,slots+4))
     if direction == 'down' and (workload.get('pending') or any(row['windows'] < 6 for row in evidence)):
         return {**hold,'reason':'pending job or insufficient consolidation history'}
     target = next_topology(topology,direction,reason)
