@@ -293,7 +293,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                 assigned = host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]])
                 if drain_runners(operation, vm, args, state,
                                  lambda: write_scale_state(state_path, state), assigned):
-                    if getattr(args, 'remote_builder', False) and not quiesce_remote_builder(vm, args):
+                    if not quiesce_remote_builder(vm, args):
                         return True
                     def before_delete():
                         operation.update(kind="delete", drained=True)
@@ -704,8 +704,8 @@ def scale_down(vms: list[GceVm], runners: list[GitHubRunner], args: argparse.Nam
     if not candidates:
         LOG.info("Scale-down waits: no complete idle host is available")
         return 0
-    vm = next((vm for vm in candidates if not getattr(args, 'remote_builder', False)
-               or quiesce_remote_builder(vm, args)), None)
+    # Existing builder presence is independent of future installation settings.
+    vm = next((vm for vm in candidates if quiesce_remote_builder(vm, args)), None)
     if vm is None:
         return 0
     assigned = host_runners(vm, runners, vms)
@@ -1073,7 +1073,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
                  offer.region, vm_details(vm), cpu_rank + 1, offer.hourly_usd * 24,
                  storage_daily, Decimal(str(offer.hourly_usd)) * 24 + storage_daily)
         receipt = state_path.parent / f"{instance_name}-{uuid.uuid4().hex}-deployment.json"
-        deadline = 2400 if getattr(args, 'remote_builder', False) else LAUNCH_DEADLINE_SECONDS
+        deadline = 2400 if tier and getattr(args, 'remote_builder', False) else LAUNCH_DEADLINE_SECONDS
         command.extend(["--deployment-receipt", str(receipt),
                         "--registration-timeout-seconds", str(deadline)])
         begin_host_operation("launch", vm, [], [], state, state_path,

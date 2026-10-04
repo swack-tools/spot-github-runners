@@ -27,7 +27,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(tar.extractfile('Cargo.toml').read(), b'working change')
             self.assertEqual(receipt['file_count'],1)
 
-    def execute_transaction(self,profile,header_failure=False,artifact_symlink=False,stopped_orphan=False):
+    def execute_transaction(self,profile,header_failure=False,artifact_symlink=False,stopped_orphan=False,probe_source_lock=False):
         from lib.remote_build import transaction_script
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory).resolve();source=root/'remote/sources/checkout';source.mkdir(parents=True)
@@ -82,10 +82,31 @@ class ClientTests(unittest.TestCase):
                 'fi\n'
                 'if [ "$2 $3" = "cargo run" ]; then touch '+shlex.quote(str(root/'container-verified'))+'; fi\n')
             launcher.chmod(0o755);body=body.replace('/usr/local/bin/oxidex-remote-build',str(launcher))
-            # This local fixture exercises ordering, extraction and shell failure
-            # propagation; Linux lock/cancellation behavior has a live canary.
-            body=body.replace('flock -n -E 75 '+str(root/'lock-cache-active-checkout.lock')+' true','true')
+            # Use real OS locks for the generated shell's inherited descriptor.
+            flock=root/'flock'
+            flock.write_text('#!'+__import__('sys').executable+'\nimport fcntl,sys\n'
+                'if sys.argv[-1]=="true":\n'
+                ' with open(sys.argv[-2],"a") as handle:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)\n'
+                ' raise SystemExit(0)\n'
+                'try:fcntl.flock(int(sys.argv[-1]),fcntl.LOCK_EX|fcntl.LOCK_NB)\n'
+                'except BlockingIOError:raise SystemExit(75)\n')
+            flock.chmod(0o755)
+            if probe_source_lock:
+                probe=root/'probe'
+                probe.write_text('#!'+__import__('sys').executable+'\nimport fcntl,sys\n'
+                    'from pathlib import Path\n'
+                    'with open('+repr(str(root/'lock-cache-active-checkout.lock'))+',"a") as handle:\n'
+                    ' try:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB);status="unlocked"\n'
+                    ' except BlockingIOError:status="locked"\n'
+                    'Path(sys.argv[1]).write_text(status)\n')
+                probe.chmod(0o755)
+                body=body.replace('tar -xzf ',str(probe)+' '+str(root/'during-extraction')+'; tar -xzf ')
+                body=body.replace(str(launcher)+' checkout cargo fetch',str(probe)+' '+str(root/'before-build')+'; '+str(launcher)+' checkout cargo fetch')
+            body=body.replace('flock ',str(flock)+' ')
             result=subprocess.run(['sh','-c',body],capture_output=True,text=True)
+            if probe_source_lock:
+                self.assertEqual((root/'during-extraction').read_text(),'locked')
+                self.assertEqual((root/'before-build').read_text(),'unlocked')
             if stopped_orphan:self.assertFalse(present.exists(),result.stderr)
             self.assertFalse((source/'deleted.rs').exists())
             self.assertEqual((source/'new.rs').read_text(),'new snapshot')
@@ -106,6 +127,9 @@ class ClientTests(unittest.TestCase):
 
     def test_deleted_snapshot_source_does_not_survive_cache_reuse(self):
         self.execute_transaction('debug')
+
+    def test_source_extraction_holds_cache_lock_until_before_build(self):
+        self.execute_transaction('debug',probe_source_lock=True)
 
     def test_stopped_orphan_is_reconciled_before_transaction_inventory_gate(self):
         self.execute_transaction('debug',stopped_orphan=True)

@@ -40,6 +40,9 @@ class RunnerDrainTests(unittest.TestCase):
         self.external.start()
         self.addCleanup(self.external.stop)
         self.inventory = patch('lib.spot_runner_autoscaler.list_github_runners', side_effect=lambda *a, **k: tuple(self.live))
+        self.builder_guard=patch('lib.spot_runner_autoscaler.quiesce_remote_builder',return_value=True)
+        self.builder_guard.start()
+        self.addCleanup(self.builder_guard.stop)
         self.inventory.start()
         self.addCleanup(self.inventory.stop)
 
@@ -139,6 +142,19 @@ class RunnerDrainTests(unittest.TestCase):
             self.reconcile()
         guard.assert_called_once()
         self.assertEqual(self.state['host_operation']['kind'], 'drain')
+        self.assertFalse(any(c[:4]==['gcloud','compute','instances','delete'] for c in self.commands))
+
+    def test_disabled_future_builder_install_still_blocks_active_source_drain(self):
+        self.args.remote_builder=False
+        with patch('lib.spot_runner_autoscaler.quiesce_remote_builder',return_value=False) as guard:
+            self.begin()
+            self.assertNotIn('host_operation',self.state)
+        guard.assert_called_once()
+        self.begin();self.reconcile()
+        with patch('lib.spot_runner_autoscaler.quiesce_remote_builder',return_value=False) as guard:
+            self.reconcile()
+        guard.assert_called_once()
+        self.assertEqual(self.state['host_operation']['kind'],'drain')
         self.assertFalse(any(c[:4]==['gcloud','compute','instances','delete'] for c in self.commands))
 
     def test_labels_are_removed_before_waiting_and_deletion_requires_fresh_absence(self):

@@ -153,6 +153,7 @@ class FleetInventoryTests(unittest.TestCase):
             args.scaling_mode='legacy'
             state = {'idle_loops': 0, 'scale_up_active': False}
             with patch('lib.spot_runner_autoscaler.removable_spot_vms', return_value=[vm]), \
+                    patch('lib.spot_runner_autoscaler.quiesce_remote_builder',return_value=True), \
                     patch('lib.spot_runner_autoscaler.list_github_runners', side_effect=RuntimeError('GitHub unavailable')):
                 scale_down([vm, other], [runner], args, state)
             persisted = read_scale_state(args.state_file)

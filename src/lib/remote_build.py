@@ -49,7 +49,10 @@ def transaction_script(project,upload,digest,profile,run,instance_id=None):
         # takes each active-cache lock nonblocking and never removes running
         # or unknown identities; the fresh inventory below still rejects them.
         stopped_builder_reconciliation_command(),
-        f'flock -n -E 75 /run/oxidex-cache-active-{project}.lock true',
+        # Keep ownership across source replacement; a direct launcher does not
+        # acquire the outer project lock and must not see a half-extracted tree.
+        f'exec 9>/run/oxidex-cache-active-{project}.lock',
+        'flock -n -E 75 9',
         'ids=$(/usr/bin/docker ps -aq --filter label=oxidex.remote-build=true) || exit 75',
         'for id in $ids; do',
         "  mounts=$(/usr/bin/docker inspect --format '{{range .Mounts}}{{if eq .Destination \"/target\"}}{{.Source}}{{end}}{{end}}' \"$id\") || exit 75",
@@ -60,6 +63,9 @@ def transaction_script(project,upload,digest,profile,run,instance_id=None):
         # The validated source is replaceable; Cargo and target caches are separate.
         f'find {shlex.quote(source)} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +',
         f'tar -xzf {shlex.quote(upload)} -C {shlex.quote(source)}',
+        # The adapter takes this same lock for each build. Close our descriptor
+        # before launching it; source replacement is now complete.
+        'exec 9>&-',
         *stages,
         # Build output is untrusted executable code; verification runs inside
         # the same unprivileged container, never through the root SSH shell.
