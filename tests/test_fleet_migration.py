@@ -9,7 +9,9 @@ from lib.fleet_migration import begin_migration, reconcile_migration, expected_s
 
 
 def vm(name,cpu,ram,id):
-    return GceVm('oxidex-runners-'+name,'z','RUNNING',f'n2-standard-{cpu}',True,cpu,ram,instance_id=id)
+    return GceVm('oxidex-runners-'+name,'z','RUNNING',f'n2-standard-{cpu}',True,cpu,ram,instance_id=id,
+        disks=({'source':'disk-'+id,'diskId':id+'0','boot':False,'deviceName':'runner-data-'+name,
+                'diskType':'pd-balanced','diskSizeGb':100},))
 
 
 class MigrationTests(unittest.TestCase):
@@ -68,7 +70,8 @@ class MigrationTests(unittest.TestCase):
                 state['latest_resources']=[dict(instance_id=identity,zone='z',observed_at=tick,cpu_fraction=.1,memory_fraction=.2,peak_cpu_cores=.1,peak_ram_gib=.5,
                     io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0)) for identity in ('1','2')]
                 state['latest_workload']={'complete':True}
-                state['host_health']={'z/2':{'complete':True,'observed_at':tick,'events':[]}}
+                state['host_health']={'z/2':{'instance_id':'2','boot_id':'boot','boot_oom_complete':True,'boot_host_oom_ids':[],
+                    'complete':True,'observed_at':tick,'events':[]}}
                 with patch('lib.fleet_migration.time.time',return_value=tick), patch('lib.spot_runner_autoscaler.begin_host_operation') as drain:
                     reconcile_migration([old,new],runners,args,state,path)
                     self.assertEqual(drain.call_count,0 if tick==1000 else 1)

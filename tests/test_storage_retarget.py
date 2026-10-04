@@ -11,7 +11,8 @@ from lib.runner_fleet import GceVm,GitHubRunner
 class StorageRetargetTests(unittest.TestCase):
     def fixture(self,path):
         hosts=[GceVm('oxidex-runners-'+name,'z','RUNNING','n2-standard-32',True,32,128,
-                      instance_id=identity,disks=({'source':'disk-'+identity,'diskId':identity+'0'},))
+                      instance_id=identity,disks=({'source':'disk-'+identity,'diskId':identity+'0','deviceName':'runner-data-'+name,
+                          'boot':False,'diskType':'pd-balanced','diskSizeGb':100},))
                for name,identity in (('old','1'),('bad','2'))]
         state={}
         fleet_migration.begin_migration(hosts[:1],('bulky',),state,path,'oversized migration',force_ids=['1'])
@@ -67,7 +68,7 @@ class StorageRetargetTests(unittest.TestCase):
                 if variant=='quarantined_host':
                     state['pending_oom']={'z/2':'host'}
                     state['pending_oom_origins']={'z/2':dict(kind='host',quarantined=True)}
-                if variant=='big_ram':state['latest_resources'][0]['peak_ram_gib']=50
+                if variant=='big_ram':state['latest_resources'][0]['peak_ram_gib']=100
                 if variant=='reservation_two':args.tier_job_memory_gib=2
                 if variant=='incomplete_jobs':state['latest_workload']['complete']=False
                 before=copy.deepcopy(state)
@@ -79,7 +80,8 @@ class StorageRetargetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'state.json';hosts,state,args=self.fixture(path)
             with patch('lib.fleet_migration.time.time',return_value=2500):self.retarget(hosts,args,state,path)
-            new=GceVm('oxidex-runners-good','z','RUNNING','n2-standard-16',True,16,64,instance_id='3')
+            new=GceVm('oxidex-runners-good','z','RUNNING','n2-standard-16',True,16,64,instance_id='3',disks=({'source':'disk-3','diskId':'30','deviceName':'runner-data-good',
+                'boot':False,'diskType':'pd-balanced','diskSizeGb':100},))
             state['migration'].update(pending_tiers=[],pending_slots=[],replacement_ids=['3'],phase='healthy')
             state['host_deployments']['z/3']=dict(expected_runner_count=20,runner_memory_gib=15)
             row=copy.deepcopy(state['latest_resources'][0]);row.update(instance_id='3',io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0))

@@ -9,7 +9,7 @@ from .fleet_evidence import record_resources,record_io_pressure,workload_signals
 from .fleet_migration import topology_for,begin_migration,reconcile_migration,expected_slots
 from .tier_policy import plan_capacity,compatible_recovery_tier,reservation_fits
 from .runner_tiers import TIERS,tier_for_shape,next_topology,validate_topology
-from .oom_obligations import sync_pending,pending_kinds,remember_oom,clear_oom
+from .oom_obligations import sync_pending,pending_kinds,remember_oom,clear_oom,obligations_for,promote_attributed_ooms
 
 LOG=logging.getLogger('spot_runner_autoscaler')
 
@@ -31,9 +31,16 @@ def evidence_for(vms,runners,args,state):
     for vm in fleet:
         key=f'{vm.zone}/{vm.instance_id}'
         try:
-            observed=read_host_events(args.project,vm)
+            previous_boot=state.get('host_health',{}).get(key,{}).get('boot_id')
+            attribution_ids=sorted({identity for kind,origin in obligations_for(state,key).items()
+                if kind in ('unknown','container') and origin.get('quarantined') is False
+                and previous_boot and origin.get('boot_id')==previous_boot
+                for identity in origin.get('event_ids',[])})
+            observed=read_host_events(args.project,vm,attribution_ids)
             if not observed.get('complete') or abs(time.time()-observed['observed_at'])>450:
                 raise RuntimeError('Incomplete or stale host event window')
+            if pending_kinds(state,key) & {'unknown','container'}:
+                promote_attributed_ooms(state,key,observed)
             health[key]=observed
             for event in observed['events']:
                 if event['id'] not in seen:

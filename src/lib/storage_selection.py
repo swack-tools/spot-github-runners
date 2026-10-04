@@ -98,3 +98,24 @@ def observed_storage_monthly(disks, rates: dict) -> Decimal:
                                    iops=int(disk.get('provisionedIops', 3000)),
                                    throughput=int(disk.get('provisionedThroughput', 140)))
     return total
+
+
+def observed_data_storage(disks,device_name,minimum_size_gib):
+    """Return healthy / incompatible / incomplete from exact attached data evidence."""
+    data=[disk for disk in disks or [] if disk.get('deviceName')==device_name and disk.get('boot') is False]
+    if len(data)!=1:return 'incomplete'
+    disk=data[0]
+    if not disk.get('source') or not disk.get('diskId'):return 'incomplete'
+    kind=disk.get('diskType')
+    try:
+        size=int(disk['diskSizeGb'])
+        if size<=0:return 'incomplete'
+        if kind not in ('pd-standard','pd-balanced','pd-ssd','hyperdisk-balanced','hyperdisk-throughput'):
+            return 'incomplete'
+        if size<minimum_size_gib or kind in ('pd-standard','hyperdisk-throughput'):
+            return 'incompatible'
+        if kind=='hyperdisk-balanced':
+            if 'provisionedIops' not in disk or 'provisionedThroughput' not in disk:return 'incomplete'
+            if int(disk['provisionedIops'])<3000 or int(disk['provisionedThroughput'])<140:return 'incompatible'
+    except (KeyError,TypeError,ValueError,OverflowError):return 'incomplete'
+    return 'healthy'

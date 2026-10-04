@@ -6,6 +6,39 @@ from lib import spot_runner_autoscaler as controller
 
 
 class TierControllerTests(unittest.TestCase):
+    def test_already_seen_unknown_id_is_promoted_but_budget_obligation_survives_partial_repair(self):
+        import json
+        from lib import tier_controller
+        from lib.runner_fleet import GceVm
+        identity='a'*64
+        host=GceVm('oxidex-runners-full','z','RUNNING','n2-standard-32',True,32,128,instance_id='1')
+        args=controller.args_parser().parse_args(['--scaling-mode','tiered'])
+        state=dict(seen_oom_ids=[identity],host_health={'z/1':dict(boot_id='boot')},
+            pending_oom={'z/1':'unknown'},pending_oom_origins={'z/1':dict(kind='unknown',boot_id='boot',
+            event_ids=[identity],quarantined=False)},
+            job_tracking={'last_poll_by_repository':{args.org+'/oxidex':'1970-01-01T00:16:40Z'}})
+        observed=dict(instance_id='1',boot_id='boot',observed_at=1000,complete=True,events=[],
+            io_complete=True,io_pressure=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0),
+            reclassification_complete=True,reclassified_events=[dict(id=identity,kind='container',workload='runner')])
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'state.json'
+            for tick,outcome in ((1000,False),(1300,True)):
+                observed['observed_at']=tick
+                with patch('lib.tier_controller.time.time',return_value=tick),\
+                     patch.object(controller,'read_utilization',return_value=[(.1,.06)]),\
+                     patch('lib.tier_controller.read_host_events',return_value=observed) as sample,\
+                     patch.object(controller,'adjust_admission',return_value=outcome) as adjust:
+                    tier_controller.check_tiers([host],[],args,state,path)
+                self.assertEqual(sample.call_args.args[2],[identity] if tick==1000 else [])
+                adjust.assert_called_once_with(host,args,'runner')
+                saved=json.loads(path.read_text())
+                self.assertEqual(saved['seen_oom_ids'],[identity])
+                self.assertEqual(saved['pending_oom'],{'z/1':'runner'} if tick==1000 else {})
+                if tick==1000:
+                    self.assertEqual(saved['pending_oom_obligations']['z/1']['runner']['event_ids'],[identity])
+                    self.assertNotIn('unknown',saved['pending_oom_obligations']['z/1'])
+                state=saved
+
     def test_runner_and_builder_ooms_survive_independently_through_composed_repair(self):
         import json
         from lib import tier_controller

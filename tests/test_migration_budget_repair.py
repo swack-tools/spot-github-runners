@@ -11,7 +11,9 @@ from lib.runner_fleet import GceVm, GitHubRunner
 class MigrationBudgetRepairTests(unittest.TestCase):
     def fixture(self, path, workload='runner', busy=False):
         old=GceVm('oxidex-runners-old','z','RUNNING','n2-standard-32',True,32,128,instance_id='1')
-        new=GceVm('oxidex-runners-new','z','RUNNING','n2-standard-32',True,32,128,instance_id='2')
+        new=GceVm('oxidex-runners-new','z','RUNNING','n2-standard-32',True,32,128,instance_id='2',
+            disks=({'source':'disk','diskId':'d','boot':False,'deviceName':'runner-data-new',
+                    'diskType':'pd-balanced','diskSizeGb':100},))
         state={}
         begin_migration([old],('bulky',),state,path,'replacement',force_ids=['1'])
         state['migration'].update(pending_tiers=[],pending_slots=[],replacement_ids=['2'],phase='healthy')
@@ -19,7 +21,8 @@ class MigrationBudgetRepairTests(unittest.TestCase):
         state['latest_resources']=[dict(zone='z',instance_id='2',observed_at=1000,
             cpu_fraction=.1,memory_fraction=.06,peak_cpu_cores=3,peak_ram_gib=7.7,
             io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0))]
-        state['host_health']={'z/2':dict(instance_id='2',observed_at=1000,complete=True,
+        state['host_health']={'z/2':dict(instance_id='2',boot_id='boot',observed_at=1000,complete=True,
+            boot_oom_complete=True,boot_host_oom_ids=[],
             events=[dict(id='oom1',kind='container',workload=workload,at=999)])}
         state['pending_oom']={'z/2':workload}
         runners=[GitHubRunner(i,f'gha-{new.name}-{i}','online',busy if i==1 else False,()) for i in range(1,17)]

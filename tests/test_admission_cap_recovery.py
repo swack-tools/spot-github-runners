@@ -148,7 +148,9 @@ class AdmissionCapRecoveryTests(unittest.TestCase):
         from lib.fleet_migration import begin_migration,reconcile_migration
         from lib.runner_fleet import GitHubRunner
         old=GceVm('oxidex-runners-old','z','RUNNING','n2-standard-32',True,32,128,instance_id='old')
-        new=GceVm('oxidex-runners-new','z','RUNNING','n2-standard-32',True,32,128,instance_id='12345')
+        new=GceVm('oxidex-runners-new','z','RUNNING','n2-standard-32',True,32,128,instance_id='12345',
+            disks=({'source':'disk','diskId':'d','boot':False,'deviceName':'runner-data-new',
+                    'diskType':'pd-balanced','diskSizeGb':100},))
         runners=[GitHubRunner(i,f'gha-{new.name}-{i}','online',i==1,()) for i in (1,2)]
         previous=[]
         def remote_adjust(host,args,kind):
@@ -169,6 +171,7 @@ class AdmissionCapRecoveryTests(unittest.TestCase):
                 io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0))
                 for identity in ('old','12345')]
             state['host_health']={'z/12345':dict(instance_id='12345',boot_id='boot',observed_at=1000,complete=True,
+                boot_oom_complete=True,boot_host_oom_ids=[],
                 events=[dict(id='oom-r',kind='container',workload='runner',at=999)])}
             for index,tick in enumerate((1000,3100,3400)):
                 for sample in state['latest_resources']:sample['observed_at']=tick

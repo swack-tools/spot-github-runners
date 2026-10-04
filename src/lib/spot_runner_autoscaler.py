@@ -287,6 +287,9 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
             operation.setdefault('drain_group_name', f'spot-drain-{vm.name}-{vm.instance_id}')
             write_scale_state(state_path, state)
         if current and current.running:
+            from .fleet_migration import guard_staged_retirement
+            if not guard_staged_retirement(vms,runners,args,state,state_path):
+                return True
             try:
                 from .runner_drain import drain_runners
                 fresh = list_github_runners(args.org)
@@ -294,6 +297,8 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                 if drain_runners(operation, vm, args, state,
                                  lambda: write_scale_state(state_path, state), assigned):
                     if not quiesce_remote_builder(vm, args):
+                        return True
+                    if not guard_staged_retirement(vms,runners,args,state,state_path):
                         return True
                     def before_delete():
                         operation.update(kind="delete", drained=True)
@@ -408,6 +413,9 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                 delete_overpriced_vm(current, args.project)
             else:
                 if operation.get("drained"):
+                    from .fleet_migration import guard_staged_retirement
+                    if not guard_staged_retirement(vms,runners,args,state,state_path):
+                        return True
                     fresh = list_github_runners(args.org)
                     if host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]]):
                         LOG.warning("Deletion waits: runner records reappeared for %s", vm_details(vm))
