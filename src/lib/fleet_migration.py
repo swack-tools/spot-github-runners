@@ -9,7 +9,7 @@ from dataclasses import asdict
 from decimal import Decimal
 from .runner_tiers import TIERS,tier_for_shape,validate_topology
 from .tier_policy import fits,reservation_fits
-from .fleet_evidence import io_status,epoch
+from .fleet_evidence import io_status,current_job_coverage
 from .host_evidence import validate_io_pressure
 from .storage_selection import observed_data_storage
 from .oom_obligations import obligations_for,pending_kinds,remember_oom,clear_oom
@@ -206,8 +206,10 @@ def defer_unused_low_plan(entry,vms,runners,args,state,state_path,discovery):
                 or len(managed)>min(5,args.maximum_hosts) or sum(vm.vcpu or 80 for vm in managed)>80
                 or sum(expected_slots(vm,state) for vm in managed)>100
                 or state.get('desired_topology',list(topology))!=list(topology)
-                or not sum(TIERS[name].vcpu for name in target)<sum(vm.vcpu for vm in managed)
-                or not sum(TIERS[name].ram_gib for name in target)<sum(vm.ram_gib for vm in managed)):return False
+                or sum(TIERS[name].vcpu for name in target)>sum(vm.vcpu for vm in managed)
+                or sum(TIERS[name].ram_gib for name in target)>sum(vm.ram_gib for vm in managed)
+                or (sum(TIERS[name].vcpu for name in target)==sum(vm.vcpu for vm in managed)
+                    and sum(TIERS[name].ram_gib for name in target)==sum(vm.ram_gib for vm in managed))):return False
         remaining=Counter(target)
         for record in entry.get('retained_records',[]):remaining[tier_for_shape(record['vcpu'],record['ram_gib']).name]-=1
         if (any(count<0 for count in remaining.values()) or not entry['pending_tiers']
@@ -232,9 +234,7 @@ def defer_unused_low_plan(entry,vms,runners,args,state,state_path,discovery):
         if (state.get('latest_workload',{}).get('complete') is not True or len(resources)!=len(managed)
                 or {(row['zone'],row['instance_id']) for row in resources}!={(vm.zone,vm.instance_id) for vm in managed}
                 or io_status(resources)=='incomplete'):return False
-        polls=state.get('job_tracking',{}).get('last_poll_by_repository',{})
-        for repo in args.job_repository or [args.org+'/oxidex']:
-            if not fresh(epoch(polls[repo])):return False
+        if not current_job_coverage(state.get('job_tracking',{}),args.job_repository or [args.org+'/oxidex'],timestamp):return False
         for vm in managed:
             key=f'{vm.zone}/{vm.instance_id}';record=next(row for row in records if row['instance_id']==vm.instance_id)
             if (not same_source_inventory(record,asdict(vm))
@@ -295,6 +295,9 @@ def reconcile_migration(vms,runners,args,state,state_path):
     if any(not row.get('_cleanup_complete') for row in state.get('pending_vm_recovery',{}).values()):
         return True
     if migration.get('awaiting_launch'):
+        if migration.get('reason')=='low' and migration.get('launch_attempted') is not True:
+            migration['launch_attempted']=True
+            controller.write_scale_state(state_path,state)
         pending=migration['awaiting_launch']
         vm=next((vm for vm in fleet if vm.name==pending['name'] and vm.zone==pending['zone']),None)
         if vm:

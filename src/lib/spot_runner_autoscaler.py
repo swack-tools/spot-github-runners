@@ -930,17 +930,32 @@ def eligible_tier_offers(offers, tier, prices, disk_size_gb=100, job_memory_gib=
 
 def discover_tier_offers(project,tier,disk_size_gb=100,job_memory_gib=15,*,status=None):
     if status is not None:status['complete']=False
+    discovery={}
     clear_catalog_cache()
     offers,_,_,errors = asyncio.run(find(get_auth(project),min_vcpu=tier.vcpu,
         min_ram=tier.ram_gib,top=None,concurrency=200,
-        catalog_rates=parse_component_rates(catalog_skus())))
+        catalog_rates=parse_component_rates(catalog_skus()),status=discovery))
     if errors:
         LOG.warning('Tier discovery has %d incomplete price results',len(errors))
     prices = {region:storage_rates(region) for region in {row.region for row in offers
               if (row.vcpu,row.ram_gib) == (tier.vcpu,tier.ram_gib)}}
     ranked = eligible_tier_offers(offers,tier,prices,disk_size_gb,job_memory_gib)
     candidates,skipped = launchable_candidates(ranked,load_launch_inventory(project),disk_size_gb)
-    if status is not None:status['complete']=not errors
+    if status is not None:
+        def required(machine,vcpu,ram):
+            return ((vcpu,ram)==(tier.vcpu,tier.ram_gib) and machine_profile(machine) is not None
+                    and bool(platform_preferences(machine)))
+        missing=any(required(row['machine_type'],row['vcpu'],row['ram_gib'])
+                    for row in discovery.get('missing_compute_scopes',[]))
+        quotes_complete=True
+        for offer in offers:
+            if not required(offer.machine_type,offer.vcpu,offer.ram_gib):continue
+            kinds=('hyperdisk-balanced',) if machine_profile(offer.machine_type).disk_type=='hyperdisk-balanced' else ('pd-standard','pd-balanced','pd-ssd')
+            try:
+                values=[Decimal(str(prices[offer.region][kind+':capacity'])) for kind in kinds]
+                quotes_complete &= all(value.is_finite() and value>=0 for value in values)
+            except (KeyError,ValueError,ArithmeticError):quotes_complete=False
+        status['complete']=(discovery.get('inventory_complete') is True and not errors and not missing and quotes_complete)
     LOG.info('Tier %s: %d launchable candidates strictly below $%s/day with40+%d GiB disks',
              tier.name,len(candidates),tier.max_daily_usd,disk_size_gb)
     return candidates

@@ -259,7 +259,8 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
 
     def fresh_evidence(self,tick):
         from datetime import datetime,timezone
-        self.state['job_tracking']={'last_poll_by_repository':{self.args.org+'/oxidex':datetime.fromtimestamp(tick,timezone.utc).isoformat()},'capacity_jobs':{}}
+        from job_coverage_fixtures import complete_job_tracking
+        self.state['job_tracking']=complete_job_tracking(self.args.org+'/oxidex',datetime.fromtimestamp(tick,timezone.utc).isoformat())
         def health(project,vm,ids):
             return dict(instance_id=vm.instance_id,boot_id='boot-'+vm.instance_id,complete=True,
                 boot_oom_complete=True,boot_host_oom_ids=[],observed_at=tick,events=[],io_complete=True,

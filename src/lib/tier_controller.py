@@ -5,7 +5,7 @@ import logging
 import subprocess
 import time
 from decimal import Decimal
-from .fleet_evidence import record_resources,record_io_pressure,workload_signals,read_host_events,epoch,remember_jobs
+from .fleet_evidence import record_resources,record_io_pressure,workload_signals,read_host_events,remember_jobs,current_job_coverage
 from .fleet_migration import topology_for,begin_migration,reconcile_migration,expected_slots
 from .tier_policy import plan_capacity,compatible_recovery_tier,reservation_fits
 from .runner_tiers import TIERS,tier_for_shape,next_topology,validate_topology
@@ -54,8 +54,7 @@ def evidence_for(vms,runners,args,state):
     state['seen_oom_ids']=sorted(seen)[-1000:]
     data=state.get('job_tracking',{})
     repositories=args.job_repository or [args.org+'/oxidex']
-    polled=data.get('last_poll_by_repository',{})
-    complete=(all(repo in polled and 0<=timestamp-epoch(polled[repo])<=450 for repo in repositories)
+    complete=(current_job_coverage(data,repositories,timestamp)
               and len(health)==len(fleet))
     signals=workload_signals(list(data.get('capacity_jobs',{}).values()),
                              [set(row.labels) for row in runners if controller.runner_is_managed(row)],
@@ -184,9 +183,11 @@ def dry_run(args,saved):
     for repo in tracker.repositories:
         try:
             observed=utc_now()
+            tracker.begin_scan(repo,observed)
             runs,jobs=tracker._scan(repo,observed)
             remember_jobs(tracker.data,repo,runs,jobs,observed)
             tracker.data['last_poll_by_repository'][repo]=observed
+            tracker.finish_scan(repo)
         except (RuntimeError,OSError,ValueError,KeyError,subprocess.SubprocessError):
             tracker.data['last_poll_by_repository'].pop(repo,None)
     evidence,signals,timestamp=evidence_for(vms,runners,args,state)

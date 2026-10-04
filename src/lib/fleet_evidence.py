@@ -15,6 +15,24 @@ from .host_evidence import validate_io_pressure
 # moves at 10% full/10s or 5% full/60s; also hold broad partial stalls of 50%/10s
 # or 25%/60s. Peaks persist for the same bounded 30-minute demand window.
 IO_PRESSURE_LIMITS=dict(full_avg10=10,full_avg60=5,some_avg10=50,some_avg60=25)
+ACTIVE_RUN_STATUSES=('in_progress','queued','waiting','pending','requested')
+
+
+def current_job_coverage(data,repositories,timestamp):
+    """Explicit current API coverage; poll recency alone is not completeness."""
+    try:
+        if isinstance(timestamp,bool) or not math.isfinite(timestamp):return False
+        for repository in repositories:
+            receipt=data['active_coverage_by_repository'][repository]
+            if (type(receipt.get('schema')) is not int or receipt['schema']!=1
+                    or receipt.get('complete') is not True
+                    or receipt.get('enumerated_statuses')!=list(ACTIVE_RUN_STATUSES)
+                    or receipt.get('unavailable_run_ids')!=[]
+                    or receipt.get('inventory_truncated',False) is not False
+                    or not 0<=timestamp-epoch(receipt['observed_at'])<=450
+                    or not 0<=timestamp-epoch(data['last_poll_by_repository'][repository])<=450):return False
+        return bool(repositories)
+    except (KeyError,TypeError,ValueError,AttributeError,OverflowError):return False
 
 
 def io_status(evidence):
@@ -152,7 +170,7 @@ def workload_signals(jobs, runner_labels, timestamp, *, group_ids=None):
                     and job['runner_group_id'] not in group_ids)):
             continue
         try:
-            if job.get('status') in ('queued','waiting','pending'):
+            if job.get('status') in ('queued','waiting','pending','requested'):
                 result['pending'] = True
                 created = job.get('created_at') or job.get('run_created_at')
                 if created and timestamp - epoch(created) > 120:
@@ -190,6 +208,11 @@ def remember_jobs(data, repository, runs, jobs, observed_at):
             del history[key]
     if len(history) > 5000:
         keep = sorted(history,key=lambda key:history[key]['observed_at'],reverse=True)[:5000]
+        for key in history.keys()-set(keep):
+            job=history[key]
+            if job.get('status') in ACTIVE_RUN_STATUSES:
+                receipt=data.get('active_coverage_by_repository',{}).get(job.get('repository'))
+                if receipt is not None:receipt.update(complete=False,inventory_truncated=True)
         data['capacity_jobs'] = {key:history[key] for key in keep}
 
 

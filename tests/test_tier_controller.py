@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from lib import spot_runner_autoscaler as controller
+from job_coverage_fixtures import complete_job_tracking
 
 
 class TierControllerTests(unittest.TestCase):
@@ -16,7 +17,7 @@ class TierControllerTests(unittest.TestCase):
         state=dict(seen_oom_ids=[identity],host_health={'z/1':dict(boot_id='boot')},
             pending_oom={'z/1':'unknown'},pending_oom_origins={'z/1':dict(kind='unknown',boot_id='boot',
             event_ids=[identity],quarantined=False)},
-            job_tracking={'last_poll_by_repository':{args.org+'/oxidex':'1970-01-01T00:16:40Z'}})
+            job_tracking=complete_job_tracking(args.org+'/oxidex','1970-01-01T00:16:40Z'))
         observed=dict(instance_id='1',boot_id='boot',observed_at=1000,complete=True,events=[],
             io_complete=True,io_pressure=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0),
             reclassification_complete=True,reclassified_events=[dict(id=identity,kind='container',workload='runner')])
@@ -45,7 +46,7 @@ class TierControllerTests(unittest.TestCase):
         from lib.runner_fleet import GceVm
         host=GceVm('oxidex-runners-full','z','RUNNING','n2-standard-32',True,32,128,instance_id='1')
         args=controller.args_parser().parse_args(['--scaling-mode','tiered'])
-        state={'job_tracking':{'last_poll_by_repository':{args.org+'/oxidex':'1970-01-01T00:16:40+00:00'}}}
+        state={'job_tracking':complete_job_tracking(args.org+'/oxidex','1970-01-01T00:16:40+00:00')}
         observed=dict(instance_id='1',boot_id='boot',observed_at=1000,complete=True,
             events=[dict(id=kind+'-oom',kind='container',workload=kind,at=999) for kind in ('runner','builder')])
         with tempfile.TemporaryDirectory() as folder:

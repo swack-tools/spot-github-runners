@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from datetime import datetime,timezone
 from pathlib import Path
 from unittest.mock import patch
+from job_coverage_fixtures import complete_job_tracking
 from lib import spot_runner_autoscaler as controller
 from lib.fleet_evidence import record_resources,record_io_pressure
 from lib.fleet_migration import begin_migration
@@ -68,7 +69,7 @@ class ObservationContinuityTests(unittest.TestCase):
             class Jobs:
                 def __init__(self,state,save,*_):self.state=state;self.save=save
                 def poll(self,vms):
-                    self.state['job_tracking']={'last_poll_by_repository':{args.org+'/oxidex':datetime.fromtimestamp(clock[0],timezone.utc).isoformat()},'capacity_jobs':{}}
+                    self.state['job_tracking']=complete_job_tracking(args.org+'/oxidex',datetime.fromtimestamp(clock[0],timezone.utc).isoformat())
                     self.save()
             def utilization(project,vms,tick):observations.append(tick);return [(.01,.01)]*len(vms)
             def guest(project,vm,ids):clock[0]+=5;return health(vm,clock[0])
@@ -188,7 +189,7 @@ class ObservationContinuityTests(unittest.TestCase):
                         cursors.append((vm.instance_id,cursor));result=health(vm,tick)
                         result.update(reclassification_complete=bool(cursor),reclassified_events=[dict(id=identity,kind='container',workload='runner',at=100) for identity in cursor])
                         return result
-                    state['job_tracking']={'last_poll_by_repository':{args.org+'/oxidex':datetime.fromtimestamp(tick,timezone.utc).isoformat()},'capacity_jobs':{}}
+                    state['job_tracking']=complete_job_tracking(args.org+'/oxidex',datetime.fromtimestamp(tick,timezone.utc).isoformat())
                     with patch('lib.tier_controller.read_host_events',side_effect=guest),patch('lib.tier_controller.time.time',return_value=tick):
                         check_tiers(hosts,runners,args,state,path)
                     self.assertEqual(dict(cursors)['2'],ids if tick==1000 else [])

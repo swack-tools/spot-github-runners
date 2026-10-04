@@ -45,7 +45,10 @@ class LowMigrationDeferralTests(unittest.TestCase):
         self.entry=json.loads(json.dumps(self.state['migration']))
 
     def polls(self):
-        self.state['job_tracking']={'last_poll_by_repository':{'org/oxidex':datetime.fromtimestamp(self.tick,timezone.utc).isoformat()},'capacity_jobs':{}}
+        observed=datetime.fromtimestamp(self.tick,timezone.utc).isoformat()
+        self.state['job_tracking']={'last_poll_by_repository':{'org/oxidex':observed},'capacity_jobs':{},
+            'active_coverage_by_repository':{'org/oxidex':dict(schema=1,observed_at=observed,complete=True,
+                enumerated_statuses=['in_progress','queued','waiting','pending','requested'],unavailable_run_ids=[])}}
 
     def health(self):
         return dict(instance_id='721',boot_id='boot',complete=True,observed_at=self.tick,
@@ -115,6 +118,23 @@ class LowMigrationDeferralTests(unittest.TestCase):
         self.state['migration']['awaiting_launch']=dict(name='absent-attempt',zone='z')
         self.check();self.assertIn('migration',self.state)
         self.assertNotIn('migration_history',self.state)
+        self.restart();self.check();self.restart()
+        self.assertIn('migration',self.state)
+        self.assertTrue(self.state['migration'].get('launch_attempted'))
+        self.assertNotIn('migration_history',self.state)
+
+    def test_low_downsize_with_equal_cpu_or_equal_ram_can_defer(self):
+        for source,target in (('expanded','starting'),('starting','small')):
+            with self.subTest(source=source,target=target):
+                tier=migration.TIERS[source];self.vm=replace(self.vm,vcpu=tier.vcpu,ram_gib=tier.ram_gib,machine_type=f'n2-standard-{tier.vcpu}')
+                self.vms=[self.vm];self.args.tier_job_memory_gib=2
+                self.runners=[GitHubRunner(i,f'gha-{self.vm.name}-{i}','online',False,('X64',self.vm.machine_type)) for i in range(1,tier.initial_slots+1)]
+                self.state.pop('migration',None);self.state.pop('migration_history',None)
+                self.state['desired_topology']=[source]
+                self.state['host_deployments']['z/721']=dict(tier=source,expected_runner_count=tier.initial_slots,runner_memory_gib=2)
+                migration.begin_migration(self.vms,(target,),self.state,self.path,'low')
+                self.check();self.restart();self.assertNotIn('migration',self.state)
+                self.assertEqual(self.state['desired_topology'],[source])
 
     def test_invalid_current_evidence_or_recorded_effects_hold(self):
         baseline=copy.deepcopy(self.state)
@@ -122,7 +142,7 @@ class LowMigrationDeferralTests(unittest.TestCase):
                        'missing_runner','runner_name','partial_jobs','stale_jobs','extra_repository','health','boot','kernel',
                        'future_metric','stale_metric','negative_metric','invalid_io','unknown','deployment','desired','receipt',
                        'deletion_name','deletion_id','active_scaling','failed_candidate','completed_migration','later_history',
-                       'retained_ids','duplicate_record','extra_nonspot'):
+                       'retained_ids','duplicate_record','extra_nonspot','coverage','coverage_scope','coverage_unavailable'):
             with self.subTest(defect=defect):
                 self.state=copy.deepcopy(baseline);self.vms=[self.vm];self.runners=[GitHubRunner(i,f'gha-{self.vm.name}-{i}','online',False,('X64','n4-standard-16')) for i in range(1,21)]
                 self.args.job_repository=['org/oxidex'];extra=[]
@@ -140,6 +160,9 @@ class LowMigrationDeferralTests(unittest.TestCase):
                 if defect=='partial_jobs':self.state['job_tracking']['last_poll_by_repository']={}
                 if defect=='stale_jobs':self.state['job_tracking']['last_poll_by_repository']['org/oxidex']=datetime.fromtimestamp(0,timezone.utc).isoformat()
                 if defect=='extra_repository':self.args.job_repository=['org/oxidex','org/second']
+                if defect=='coverage':self.state['job_tracking'].pop('active_coverage_by_repository')
+                if defect=='coverage_scope':self.state['job_tracking']['active_coverage_by_repository']['org/oxidex']['enumerated_statuses']=['in_progress','queued']
+                if defect=='coverage_unavailable':self.state['job_tracking']['active_coverage_by_repository']['org/oxidex']['unavailable_run_ids']=[7]
                 if defect=='deployment':self.state['host_deployments']['z/721']['runner_memory_gib']=8
                 if defect=='desired':self.state['desired_topology']=['bulky']
                 if defect=='receipt':self.state['migration']['completed_retirements']={'721':{'started_at':1000}}
@@ -233,13 +256,17 @@ class LowMigrationDeferralTests(unittest.TestCase):
 
 class DiscoveryCompletenessTests(unittest.TestCase):
     def run_discovery(self, errors=(), inventory_error=False):
-        status={};offer=type('Offer',(),dict(vcpu=8,ram_gib=32,region='r'))()
+        status={};offer=type('Offer',(),dict(vcpu=8,ram_gib=32,region='r',machine_type='n2-standard-8'))()
+        def find(*_args,**kwargs):
+            kwargs['status'].update(inventory_complete=True,missing_compute_scopes=[])
+            return 'metadata-scan'
         with ExitStack() as stack:
             for name,value in (('clear_catalog_cache',None),('get_auth',None),('parse_component_rates',None),
-                    ('catalog_skus',[]),('find','metadata-scan'),('storage_rates',{}),('eligible_tier_offers',[]),
+                    ('catalog_skus',[]),('find','metadata-scan'),('storage_rates',{kind+':capacity':Decimal('.1') for kind in ('pd-standard','pd-balanced','pd-ssd')}),('eligible_tier_offers',[]),
                     ('launchable_candidates',([],[]))):
                 stack.enter_context(patch.object(controller,name,new=Mock(return_value=value)))
             stack.enter_context(patch.object(controller.asyncio,'run',return_value=([offer],None,None,errors)))
+            stack.enter_context(patch.object(controller,'find',new=Mock(side_effect=find)))
             stack.enter_context(patch.object(controller,'load_launch_inventory',side_effect=RuntimeError('partial inventory') if inventory_error else None,return_value=None))
             stack.enter_context(patch.object(controller.subprocess,'run',side_effect=AssertionError('provider operation forbidden')))
             try:

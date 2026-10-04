@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from decimal import Decimal
 from dataclasses import asdict
 from unittest.mock import patch
+from job_coverage_fixtures import complete_job_tracking
 
 from lib import fleet_evidence,host_evidence
 from lib.runner_fleet import GceVm,GitHubRunner
@@ -144,7 +145,7 @@ class IoPolicyTests(unittest.TestCase):
         vm=GceVm('oxidex-runners-a','z','RUNNING','n2-standard-8',True,8,32,instance_id='1')
         args=controller.args_parser().parse_args(['--scaling-mode','tiered'])
         for guest_tick in (1010,1030):
-            state={'job_tracking':{'last_poll_by_repository':{args.org+'/oxidex':'1970-01-01T00:16:40Z'}}}
+            state={'job_tracking':complete_job_tracking(args.org+'/oxidex','1970-01-01T00:16:40Z')}
             health=dict(instance_id='1',boot_id='boot',observed_at=guest_tick,complete=True,
                         events=[],io_complete=True,io_pressure=pressure())
             with patch('lib.tier_controller.time.time',side_effect=[1000,1011,1011]),\
