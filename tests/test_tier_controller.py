@@ -6,6 +6,49 @@ from lib import spot_runner_autoscaler as controller
 
 
 class TierControllerTests(unittest.TestCase):
+    def test_runner_and_builder_ooms_survive_independently_through_composed_repair(self):
+        import json
+        from lib import tier_controller
+        from lib.runner_fleet import GceVm
+        host=GceVm('oxidex-runners-full','z','RUNNING','n2-standard-32',True,32,128,instance_id='1')
+        args=controller.args_parser().parse_args(['--scaling-mode','tiered'])
+        state={'job_tracking':{'last_poll_by_repository':{args.org+'/oxidex':'1970-01-01T00:16:40+00:00'}}}
+        observed=dict(instance_id='1',boot_id='boot',observed_at=1000,complete=True,
+            events=[dict(id=kind+'-oom',kind='container',workload=kind,at=999) for kind in ('runner','builder')])
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'state.json'
+            for tick,outcomes in ((1000,[False,True]),(1300,[True])):
+                observed['observed_at']=tick
+                if tick==1300:observed['events']=[]
+                with patch('lib.tier_controller.time.time',return_value=tick),\
+                     patch.object(controller,'read_utilization',return_value=[(.1,.06)]),\
+                     patch('lib.tier_controller.read_host_events',return_value=observed),\
+                     patch.object(controller,'adjust_admission',side_effect=outcomes) as adjust:
+                    tier_controller.check_tiers([host],[],args,state,path)
+                self.assertEqual([call.args[2] for call in adjust.call_args_list],['runner','builder'] if tick==1000 else ['runner'])
+                saved=json.loads(path.read_text())
+                self.assertEqual(saved['pending_oom'],{'z/1':'runner'} if tick==1000 else {})
+                self.assertEqual(set(saved['seen_oom_ids']),{'runner-oom','builder-oom'})
+                if tick==1000:
+                    self.assertEqual(saved['pending_oom_obligations']['z/1']['runner']['event_ids'],['runner-oom'])
+
+    def test_aggregate_loss_recovery_boundary_retains_receipts_without_exception(self):
+        import copy,json
+        from lib import tier_controller
+        args=controller.args_parser().parse_args(['--scaling-mode','tiered','--tier-job-memory-gib','60'])
+        receipts={str(i):dict(instance_id=str(i),zone='z',vcpu=16,ram_gib=64,_cleanup_complete=True) for i in range(3)}
+        state=dict(pending_vm_recovery=copy.deepcopy(receipts),desired_topology=['large']*3,price_replacement_target=3)
+        with tempfile.TemporaryDirectory() as folder,\
+             patch.object(tier_controller,'evidence_for',return_value=([],dict(minimum_job_memory_gib=60),1000)),\
+             patch.object(tier_controller,'reconcile_migration') as reconcile:
+            path=Path(folder)/'state.json'
+            tier_controller.check_tiers([],[],args,state,path)
+            saved=json.loads(path.read_text())
+        self.assertEqual(saved['pending_vm_recovery'],receipts)
+        self.assertEqual(saved['price_replacement_target'],3)
+        self.assertNotIn('migration',saved)
+        reconcile.assert_not_called()
+
     def test_budget_capacity_recovery_persists_only_reservation_compatible_target(self):
         import json
         from lib import tier_controller

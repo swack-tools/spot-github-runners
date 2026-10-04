@@ -7,6 +7,7 @@ import hashlib
 import math
 import re
 from datetime import datetime
+from .oom_obligations import clear_oom,obligations_for
 
 
 def dispose_false_context(state, provider, guest, journal, timestamp):
@@ -28,10 +29,10 @@ def dispose_false_context(state, provider, guest, journal, timestamp):
         raise ValueError('Cannot establish the original deployment boot')
     original = state.get('host_health', {}).get(key, {})
     boot = guest['boot_id']
+    origin = obligations_for(state,key).get('host')
     if (not boot or original.get('instance_id') != identity or original.get('boot_id') != boot
-            or state.get('pending_oom', {}).get(key) != 'host'):
+            or origin is None):
         raise ValueError('Original flag identity or boot changed')
-    origin = state.get('pending_oom_origins', {}).get(key)
     if origin and (origin.get('kind') != 'host' or origin.get('quarantined') is not True
                    or origin.get('boot_id') not in (None, boot)):
         raise ValueError('A genuine or different-boot origin cannot be disposed')
@@ -63,6 +64,5 @@ def dispose_false_context(state, provider, guest, journal, timestamp):
                  false_context_ids=sorted(recorded | origin_ids),
                  reason='38ab sampler classified diagnostic invoked oom-killer context as host OOM')
     state.setdefault('oom_dispositions', {})[key] = audit
-    state['pending_oom'].pop(key)
-    state.get('pending_oom_origins', {}).pop(key, None)
+    clear_oom(state,key,'host')
     return audit

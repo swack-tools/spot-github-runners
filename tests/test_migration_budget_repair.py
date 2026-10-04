@@ -42,12 +42,12 @@ class MigrationBudgetRepairTests(unittest.TestCase):
                     reconcile_migration([old,new],runners,args,state,path)
                     self.assertEqual(adjust.call_count,1,'same OOM must not repeatedly double the cap')
 
-    def test_busy_or_incomplete_or_unattributed_windows_cannot_change_caps(self):
-        variants=('busy','missing_identity','stale','high_memory','incomplete','unattributed','host_oom')
+    def test_incomplete_or_unattributed_windows_cannot_change_caps(self):
+        variants=('missing_identity','stale','high_memory','incomplete','unattributed','host_oom')
         for variant in variants:
             with self.subTest(variant=variant),tempfile.TemporaryDirectory() as folder:
                 path=Path(folder)/'state.json'
-                old,new,state,runners,args=self.fixture(path,busy=variant=='busy')
+                old,new,state,runners,args=self.fixture(path,busy=True)
                 health=state['host_health']['z/2'];sample=state['latest_resources'][0]
                 if variant=='missing_identity':health['instance_id']='another'
                 if variant=='stale':sample['observed_at']=500
@@ -70,6 +70,26 @@ class MigrationBudgetRepairTests(unittest.TestCase):
                 reconcile_migration([old,new],runners,args,state,path)
                 self.assertEqual(adjust.call_count,2)
                 self.assertEqual(state['pending_oom']['z/2'],'runner')
+
+    def test_builder_success_does_not_discard_runner_partial_retry_after_event_expiry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'state.json'
+            old,new,state,runners,args=self.fixture(path,'builder',busy=True)
+            state['host_health']['z/2']['events'].append(dict(id='runner-oom',kind='container',workload='runner',at=999))
+            with patch('lib.fleet_migration.time.time',return_value=1000),\
+                 patch('lib.spot_runner_autoscaler.adjust_admission',side_effect=[False,True]) as adjust:
+                reconcile_migration([old,new],runners,args,state,path)
+            self.assertEqual([call.args[2] for call in adjust.call_args_list],['runner','builder'])
+            self.assertEqual(state['pending_oom'],{'z/2':'runner'})
+            self.assertEqual(state['migration']['oom_budget_repairs'],['oom1'])
+            state['host_health']['z/2'].update(observed_at=3100,events=[])
+            state['latest_resources'][0]['observed_at']=3100
+            with patch('lib.fleet_migration.time.time',return_value=3100),\
+                 patch('lib.spot_runner_autoscaler.adjust_admission',return_value=True) as adjust:
+                reconcile_migration([old,new],runners,args,state,path)
+            adjust.assert_called_once_with(new,args,'runner')
+            self.assertEqual(state['pending_oom'],{})
+            self.assertEqual(set(state['migration']['oom_budget_repairs']),{'oom1','runner-oom'})
 
     def test_repaired_replacement_still_needs_two_new_event_free_windows(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -13,6 +13,22 @@ def vm(name,cpu,ram,id):
 
 
 class MigrationTests(unittest.TestCase):
+    def test_completion_retains_unresolved_ooms_on_retained_or_unrelated_hosts(self):
+        import json
+        old,new=vm('old',32,128,'1'),vm('retained',16,64,'2')
+        for kind in ('runner','builder','host'):
+            with self.subTest(kind=kind),tempfile.TemporaryDirectory() as folder:
+                path=Path(folder)/'state.json';state={}
+                begin_migration([old,new],('large',),state,path,'shrink')
+                state['migration'].update(pending_tiers=[],phase='drain')
+                state['pending_oom']={'z/1':'runner','z/2':kind,'other/99':'builder'}
+                state['seen_oom_ids']=['unresolved-on-retained']
+                reconcile_migration([new],[],SimpleNamespace(),state,path)
+                saved=json.loads(path.read_text())
+                self.assertEqual(saved.get('pending_oom'),{'z/2':kind,'other/99':'builder'})
+                self.assertNotIn('migration',saved)
+                self.assertEqual(saved['seen_oom_ids'],['unresolved-on-retained'])
+
     def test_invalid_tier_receipt_cannot_be_marked_imported(self):
         import json
         from lib.spot_runner_autoscaler import import_deployment_receipt

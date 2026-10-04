@@ -8,7 +8,8 @@ from decimal import Decimal
 from .fleet_evidence import record_resources,record_io_pressure,workload_signals,read_host_events,epoch,remember_jobs
 from .fleet_migration import topology_for,begin_migration,reconcile_migration,expected_slots
 from .tier_policy import plan_capacity,compatible_recovery_tier,reservation_fits
-from .runner_tiers import TIERS,tier_for_shape,next_topology
+from .runner_tiers import TIERS,tier_for_shape,next_topology,validate_topology
+from .oom_obligations import sync_pending,pending_kinds,remember_oom,clear_oom
 
 LOG=logging.getLogger('spot_runner_autoscaler')
 
@@ -25,19 +26,8 @@ def evidence_for(vms,runners,args,state):
     evidence=record_resources(state,fleet,samples,timestamp)
     state['latest_resources']=evidence
     health={}
-    previous_health=state.get('host_health',{})
     seen=set(state.get('seen_oom_ids',[]))
-    pending=state.setdefault('pending_oom',{})
-    origins=state.setdefault('pending_oom_origins',{})
-    for key in list(origins):
-        if key not in pending or origins[key].get('kind')!=pending[key]:origins.pop(key)
-    for key,kind in pending.items():
-        if key not in origins:
-            # A legacy flat flag may already span a reboot. Pin its first known
-            # boot once, but never infer that this was the event's actual boot.
-            origins[key]=dict(kind=kind,boot_id=previous_health.get(key,{}).get('boot_id'),
-                              event_ids=[],quarantined=True)
-    priority={'unknown':0,'container':0,'runner':1,'builder':2,'host':3}
+    sync_pending(state)
     for vm in fleet:
         key=f'{vm.zone}/{vm.instance_id}'
         try:
@@ -49,13 +39,7 @@ def evidence_for(vms,runners,args,state):
                 if event['id'] not in seen:
                     seen.add(event['id'])
                     kind='host' if event['kind']=='host' else event.get('workload','unknown')
-                    if priority[kind]>=priority.get(pending.get(key),-1):
-                        if pending.get(key)!=kind:
-                            origins[key]=dict(kind=kind,boot_id=observed.get('boot_id'),
-                                              event_ids=[event['id']],quarantined=not bool(observed.get('boot_id')))
-                        elif origins[key].get('boot_id')==observed.get('boot_id') and not origins[key].get('quarantined'):
-                            origins[key]['event_ids']=sorted(set(origins[key]['event_ids'])|{event['id']})
-                        pending[key]=kind
+                    remember_oom(state,key,kind,observed.get('boot_id'),[event['id']])
         except (RuntimeError,OSError,ValueError,KeyError,subprocess.SubprocessError) as exc:
             LOG.warning('Host OOM/readiness evidence missing for %s: %s',vm.name,controller.error_detail(exc))
     state['host_health']=health
@@ -71,10 +55,11 @@ def evidence_for(vms,runners,args,state):
                              timestamp,group_ids={10})
     signals['complete']=complete
     signals['minimum_job_memory_gib']=getattr(args,'tier_job_memory_gib',15)
-    signals['host_oom']=any(kind=='host' for key,kind in pending.items() if key in health)
-    signals['container_oom']=any(kind=='runner' for key,kind in pending.items() if key in health)
-    signals['builder_oom']=any(kind=='builder' for key,kind in pending.items() if key in health)
-    signals['unknown_oom']=any(kind in ('unknown','container') for key,kind in pending.items() if key in health)
+    kinds=set().union(*(pending_kinds(state,key) for key in health))
+    signals['host_oom']='host' in kinds
+    signals['container_oom']='runner' in kinds
+    signals['builder_oom']='builder' in kinds
+    signals['unknown_oom']=bool(kinds & {'unknown','container'})
     state['latest_workload']=signals
     return evidence,signals,timestamp
 
@@ -110,6 +95,12 @@ def check_tiers(vms,runners,args,state,state_path):
             controller.write_scale_state(state_path,state)
             return
         target=tuple(compatible[name] for name in target)
+        try:
+            validate_topology(target)
+        except ValueError as exc:
+            LOG.warning('Loss recovery holds at aggregate topology boundary: %s',exc)
+            controller.write_scale_state(state_path,state)
+            return
         state['pending_vm_recovery']={}
         state['price_replacement_target']=0
         if topology!=target:
@@ -139,11 +130,11 @@ def check_tiers(vms,runners,args,state,state_path):
         # changed under a lease; retain the pending OOM until confirmed.
         for vm in fleet:
             key=f'{vm.zone}/{vm.instance_id}'
-            kind=state.get('pending_oom',{}).get(key)
-            if kind in ('runner','builder'):
+            for kind in ('runner','builder'):
+                if kind not in pending_kinds(state,key):continue
                 outcome=controller.adjust_admission(vm,args,kind)
                 if outcome is True:
-                    state['pending_oom'].pop(key,None)
+                    clear_oom(state,key,kind)
                 elif outcome=='capacity':
                     target=next_topology(topology,'up','oom')
                     reservation=signals.get('minimum_job_memory_gib',getattr(args,'tier_job_memory_gib',15))
@@ -159,6 +150,7 @@ def check_tiers(vms,runners,args,state,state_path):
                         reconcile_migration(vms,runners,args,state,state_path)
                         break
                     LOG.warning('Budget recovery holds: known workload memory cannot fit an allowed growth tier')
+            if state.get('migration'):break
     elif topology and 'legacy' not in topology:
         state.setdefault('desired_topology',list(topology))
         # Price-driven retirement also follows replacement readiness and drain;

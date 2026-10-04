@@ -10,6 +10,7 @@ from decimal import Decimal
 from .runner_tiers import TIERS,tier_for_shape,validate_topology
 from .tier_policy import fits,reservation_fits
 from .fleet_evidence import io_status
+from .oom_obligations import obligations_for,pending_kinds,remember_oom,clear_oom
 
 LOG=logging.getLogger('spot_runner_autoscaler')
 
@@ -73,7 +74,7 @@ def retirement_io_safe(migration,resources,state):
                     or not 0<=time.time()-row['observed_at']<=450
                     or health.get('boot_oom_complete') is not True or health.get('boot_host_oom_ids')!=[]
                     or any(event.get('kind') in ('host','unknown') for event in health.get('events',[]))
-                    or state.get('pending_oom',{}).get(key)=='host'):
+                    or 'host' in pending_kinds(state,key)):
                 return False
         except (KeyError,TypeError,ValueError):
             return False
@@ -126,7 +127,7 @@ def retarget_unhealthy_storage_canary(vms,args,state,state_path):
                     or not health.get('boot_id') or not 0<=timestamp-health['observed_at']<=450
                     or health.get('boot_oom_complete') is not True or health.get('boot_host_oom_ids')!=[]
                     or any(event.get('kind') in ('host','unknown') for event in health.get('events',[]))
-                    or state.get('pending_oom',{}).get(key)=='host'):
+                    or 'host' in pending_kinds(state,key)):
                 return False
         bad=next(vm for vm in managed if vm.instance_id==bad_id);key=f'{bad.zone}/{bad.instance_id}'
         history=state.get('io_history',{}).get(key,{})
@@ -268,19 +269,24 @@ def reconcile_migration(vms,runners,args,state,state_path):
             observed=time.time()
             # Replacement validation owns the lifecycle barrier, so the normal
             # budget policy cannot repair a constrained container here. Repair
-            # only an identified, idle deployment with fresh host headroom.
+            # only identified containers with fresh host headroom. The remote
+            # adjustment owns per-container lease checks and partial outcomes.
             if (ready and sample and sample.get('instance_id')==vm.instance_id
                     and health.get('instance_id')==vm.instance_id and health.get('complete') is True
                     and 0<=observed-sample.get('observed_at',0)<=450
                     and 0<=observed-health.get('observed_at',0)<=450
                     and sample['memory_fraction']<.75
-                    and not any(runner.busy for runner in assigned)
+                    and 'host' not in pending_kinds(state,key)
                     and not any(event.get('kind')=='host' for event in health.get('events',[]))):
                 repaired=set(migration.get('oom_budget_repairs',[]))
                 for kind in ('runner','builder'):
                     ids={event['id'] for event in health.get('events',[])
                          if event.get('kind')=='container' and event.get('workload')==kind
                          and event.get('id') and event['id'] not in repaired}
+                    if ids:remember_oom(state,key,kind,health.get('boot_id'),ids)
+                    # Already-seen attributed events can leave the bounded
+                    # telemetry window before busy siblings release their leases.
+                    ids|=set(obligations_for(state,key).get(kind,{}).get('event_ids',[]))-repaired
                     if not ids:continue
                     try:
                         outcome=controller.adjust_admission(vm,args,kind)
@@ -290,10 +296,10 @@ def reconcile_migration(vms,runners,args,state,state_path):
                     if outcome is True:
                         repaired.update(ids)
                         migration['oom_budget_repairs']=sorted(repaired)
-                        if state.get('pending_oom',{}).get(key)==kind:
-                            state['pending_oom'].pop(key)
+                        clear_oom(state,key,kind)
                         LOG.info('Repaired idle %s memory cap on replacement %s; fresh healthy windows still required',kind,vm.name)
-            good=(ready and sample and sample['cpu_fraction']<.75 and sample['memory_fraction']<.75
+            good=(ready and sample and not pending_kinds(state,key)
+                  and sample['cpu_fraction']<.75 and sample['memory_fraction']<.75
                   and io_status([sample])=='healthy'
                   and health.get('complete') and not health.get('events')
                   and time.time()-health.get('observed_at',0)<=450)
@@ -339,7 +345,10 @@ def reconcile_migration(vms,runners,args,state,state_path):
         state.setdefault('tier_policy',{})['changed_at']=time.time()
         state['desired_topology']=migration['target']
         state['migration_completed_at']=time.time()
-        state.pop('pending_oom',None)
+        present_ids={vm.instance_id for vm in vms}
+        for source in migration['sources']:
+            if source['instance_id'] not in present_ids:
+                clear_oom(state,f"{source['zone']}/{source['instance_id']}")
         state.pop('migration')
         controller.write_scale_state(state_path,state)
         LOG.info('Tier migration completed: %s',state['desired_topology'])

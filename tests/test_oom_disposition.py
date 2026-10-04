@@ -30,6 +30,17 @@ class OomDispositionTests(unittest.TestCase):
         self.assertEqual(state['oom_dispositions']['z/123'],audit)
         self.assertEqual(audit['instance_id'],'123')
 
+    def test_false_host_disposition_preserves_independent_runner_and_builder_obligations(self):
+        from lib.oom_obligations import remember_oom
+        state,provider,guest,journal=self.fixture()
+        remember_oom(state,'z/123','runner','initial-boot',['runner-oom'])
+        remember_oom(state,'z/123','builder','initial-boot',['builder-oom'])
+        audit=dispose_false_context(state,provider,guest,journal,110)
+        self.assertEqual(state['pending_oom'],{'z/123':'builder','other/456':'host'})
+        self.assertEqual(set(state['pending_oom_obligations']['z/123']),{'runner','builder'})
+        self.assertEqual(state['pending_oom_origins']['z/123']['event_ids'],['builder-oom'])
+        self.assertEqual(state['oom_dispositions']['z/123'],audit)
+
     def test_uncertain_or_real_evidence_cannot_mutate_state(self):
         variants=('global','unknown','earlier_boot','identity','stale','incomplete',
                   'unmatched','genuine_origin','origin_boot','truncated','future')

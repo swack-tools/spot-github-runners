@@ -138,9 +138,65 @@ class AdmissionCapRecoveryTests(unittest.TestCase):
         result=self.run_program(leases=leases,barrier=old_request)
         self.assertEqual(result['status'],75)
         self.assertEqual(result['updates'],[])
+
         self.assertEqual(result['ledger'],{self.owner('a'):2,self.owner('b'):2})
         self.assertEqual(result['records']['r2']['HostConfig']['Memory'],2*GIB)
         self.assertEqual(result['config']['runner_gib'],4)
+
+    def test_migration_repairs_idle_caps_with_busy_sibling_and_retries_expired_event(self):
+        from lib import spot_runner_autoscaler as controller
+        from lib.fleet_migration import begin_migration,reconcile_migration
+        from lib.runner_fleet import GitHubRunner
+        old=GceVm('oxidex-runners-old','z','RUNNING','n2-standard-32',True,32,128,instance_id='old')
+        new=GceVm('oxidex-runners-new','z','RUNNING','n2-standard-32',True,32,128,instance_id='12345')
+        runners=[GitHubRunner(i,f'gha-{new.name}-{i}','online',i==1,()) for i in (1,2)]
+        previous=[]
+        def remote_adjust(host,args,kind):
+            self.assertEqual((host,kind),(new,'runner'))
+            result=self.run_program(leases={self.owner('a'):2} if len(previous)<2 else {},
+                                    resume=previous[-1] if previous else None)
+            previous.append(result)
+            return result['status']==0
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'state.json';state={}
+            begin_migration([old],('bulky',),state,path,'replacement',force_ids=['old'])
+            state['migration'].update(pending_tiers=[],pending_slots=[],replacement_ids=['12345'],phase='healthy')
+            state['host_deployments']={'z/12345':dict(expected_runner_count=2)}
+            state['pending_oom']={'z/12345':'runner'};state['seen_oom_ids']=['oom-r']
+            state['latest_workload']={'complete':True}
+            state['latest_resources']=[dict(zone='z',instance_id=identity,observed_at=1000,
+                cpu_fraction=.1,memory_fraction=.06,peak_cpu_cores=1,peak_ram_gib=3,
+                io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0))
+                for identity in ('old','12345')]
+            state['host_health']={'z/12345':dict(instance_id='12345',boot_id='boot',observed_at=1000,complete=True,
+                events=[dict(id='oom-r',kind='container',workload='runner',at=999)])}
+            for index,tick in enumerate((1000,3100,3400)):
+                for sample in state['latest_resources']:sample['observed_at']=tick
+                state['host_health']['z/12345']['observed_at']=tick
+                if index:state['host_health']['z/12345']['events']=[]
+                with patch('lib.fleet_migration.time.time',return_value=tick),\
+                     patch.object(controller,'adjust_admission',side_effect=remote_adjust) as adjust,\
+                     patch.object(controller,'begin_host_operation') as drain:
+                    reconcile_migration([old,new],runners,SimpleNamespace(remote_builder=False),state,path)
+                adjust.assert_called_once()
+                drain.assert_not_called()
+                saved=json.loads(path.read_text())
+                if index<2:
+                    self.assertEqual(previous[-1]['status'],75)
+                    self.assertEqual(saved['pending_oom'],{'z/12345':'runner'})
+                    self.assertNotIn('oom-r',state['migration'].get('oom_budget_repairs',[]))
+                    self.assertEqual(state['migration']['healthy_checks']['z/12345']['count'],0)
+                else:
+                    self.assertEqual(previous[-1]['status'],0)
+                    self.assertEqual(saved['pending_oom'],{})
+                    self.assertIn('oom-r',state['migration']['oom_budget_repairs'])
+                    self.assertEqual(state['migration']['healthy_checks']['z/12345']['count'],1)
+            self.assertEqual(previous[0]['updates'],['b'*64])
+            self.assertEqual(previous[1]['updates'],[])
+            self.assertEqual(previous[2]['updates'],['a'*64])
+            self.assertEqual(previous[2]['config']['runner_gib'],4)
+            self.assertTrue(all(row['HostConfig']['Memory']==4*GIB for row in previous[2]['records'].values()))
+            self.assertEqual(state['seen_oom_ids'],['oom-r'])
 
     def test_partial_docker_failure_keeps_higher_reservation_and_all_lease_rows(self):
         result=self.run_program(fail_update='b'*64)
