@@ -65,6 +65,36 @@ def identity_guard(instance_id):
             +shlex.quote(str(instance_id))+' || exit 75')
 
 
+def cleanup_script(project,upload,run,instance_id):
+    """Remove only this run's upload and root-owned canonical export tree."""
+    import re
+    if (not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}',project)
+            or not re.fullmatch(r'run-[0-9a-f]{32}',run)
+            or upload!='oxidex-remote-source-'+run+'.tar.gz'):
+        raise ValueError('Invalid remote cleanup identity')
+    export='/mnt/runner-data/remote-build/exports/'+run
+    code='\n'.join([
+        'import os, shutil, stat',
+        'from pathlib import Path',
+        'export=Path('+repr(export)+')',
+        # Every ancestor is checked so replacing a parent cannot redirect root
+        # cleanup into a writable tree. The run name was generated locally.
+        'for path in (export,*export.parents):',
+        '    if path.is_symlink(): raise RuntimeError("Symlinked export path")',
+        '    if not path.exists(): continue',
+        '    info=path.lstat()',
+        '    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:',
+        '        raise RuntimeError("Export cleanup requires root-owned private directories")',
+        'if export.exists():',
+        '    if export.resolve()!=export: raise RuntimeError("Noncanonical export path")',
+        '    shutil.rmtree(export)',
+    ])
+    body='set -eu; '+identity_guard(instance_id)+'; rm -f -- '+shlex.quote(upload)+'; /usr/bin/python3 -I -c '+shlex.quote(code)
+    # Serialize with a transaction that may still be finishing after SSH loss.
+    return ('sudo flock --shared /run/oxidex-build.lock flock --exclusive '
+            f'/run/oxidex-project-{project}.lock sh -c '+shlex.quote(body))
+
+
 def make_snapshot(source: Path, archive: Path) -> dict:
     names = subprocess.check_output(['git','-C',str(source),'ls-files','-z']).decode().split('\0')
     files=[]
@@ -104,7 +134,7 @@ def main(argv=None):
     def ssh(command):
         return ['gcloud','compute','ssh',args.instance,'--zone='+args.zone,'--project='+args.project,
                 '--quiet','--command='+command]
-    upload=None;instance_id=None
+    upload=None;instance_id=None;run=None
     try:
         instance_id=subprocess.check_output(['gcloud','compute','instances','describe',args.instance,
             '--zone='+args.zone,'--project='+args.project,'--format=value(id)'],text=True).strip()
@@ -155,14 +185,16 @@ def main(argv=None):
         save();raise
     finally:
         if upload and instance_id:
-            # Covers partial SCP and SSH failures too. A reused VM name is not
-            # authorization to mutate its home directory. Retain unknown state.
+            # Covers partial SCP and SSH failures too, including receipt-only
+            # builds. A reused VM name never authorizes upload/export deletion.
             try:
-                cleanup=identity_guard(instance_id)+'; rm -f -- '+shlex.quote(upload)
+                cleanup=cleanup_script(args.worktree_id,upload,run,instance_id)
                 result=subprocess.run(ssh(cleanup),capture_output=True,text=True,timeout=45)
                 receipt['upload_cleanup_confirmed']=result.returncode==0
+                receipt['export_cleanup_confirmed']=result.returncode==0
             except (OSError,subprocess.SubprocessError):
                 receipt['upload_cleanup_confirmed']=False
+                receipt['export_cleanup_confirmed']=False
             save()
     print(json.dumps({k:v for k,v in receipt.items() if k!='snapshot'},indent=2))
     return 0

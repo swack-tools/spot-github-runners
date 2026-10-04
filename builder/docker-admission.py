@@ -69,9 +69,11 @@ def stop_owned(name,project,run):
     if len(records)!=1:
         raise RuntimeError('Incomplete Docker identity')
     record=records[0];labels=record.get('Config',{}).get('Labels') or {}
+    mounts=record.get('Mounts',[])
     if (record.get('Name')!='/'+name or labels.get('oxidex.remote-build')!='true'
         or labels.get('oxidex.cache-project')!=project or labels.get('oxidex.run-id')!=run
-        or not any(m.get('Destination')=='/target' and m.get('Source')==f'{ROOT}/targets/{project}' for m in record.get('Mounts',[]))):
+        or [m.get('Source') for m in mounts if m.get('Destination')=='/target']!=[f'{ROOT}/targets/{project}']
+        or [m.get('Source') for m in mounts if m.get('Destination')=='/src']!=[f'{ROOT}/sources/{project}']):
         raise RuntimeError('Refusing to stop a different builder')
     subprocess.run(['/usr/bin/docker','rm','--force',identity],check=True,
                    text=True,capture_output=True,timeout=60)
@@ -83,24 +85,28 @@ def run_build(arguments,admission):
         project,run,name=build_identity(arguments)
     except (ValueError,KeyError,TypeError):
         return 78
-    try:
-        admission.acquire_build()
-    except (OSError,RuntimeError,SystemExit):
-        return 75
-    previous={};cancelled=[]
+    previous={};cancelled=[];acquired=False
     def cancel(signum,frame):
         cancelled.append(signum)
     try:
         with ExitStack() as stack:
-            global_lock=stack.enter_context(open('/run/oxidex-build.lock','a'))
-            fcntl.flock(global_lock,fcntl.LOCK_SH)
-            active=stack.enter_context(open(f'/run/oxidex-cache-active-{project}.lock','a'))
             try:
+                global_lock=stack.enter_context(open('/run/oxidex-build.lock','a'))
+                fcntl.flock(global_lock,fcntl.LOCK_SH|fcntl.LOCK_NB)
+                # Reconcile before taking our own cache lock: otherwise that
+                # lock could protect a stopped orphan whose old lease blocks us.
+                admission.reconcile_stopped_builders()
+                active=stack.enter_context(open(f'/run/oxidex-cache-active-{project}.lock','a'))
                 fcntl.flock(active,fcntl.LOCK_EX|fcntl.LOCK_NB)
                 if os.path.exists('/run/oxidex-build-draining') or container_id(name):
                     return 75
-            except (OSError,RuntimeError,subprocess.SubprocessError):
+            except (OSError,ValueError,KeyError,TypeError,RuntimeError,subprocess.SubprocessError):
                 return 75
+            try:
+                admission.acquire_build()
+            except (OSError,RuntimeError,SystemExit):
+                return 75
+            acquired=True
             for signum in (signal.SIGHUP,signal.SIGTERM,signal.SIGINT):
                 previous[signum]=signal.signal(signum,cancel)
             # Split creation from execution. If killed while the daemon creates
@@ -109,12 +115,17 @@ def run_build(arguments,admission):
                      '--label=oxidex.cache-project='+project,'--label=oxidex.run-id='+run,*arguments[1:]]
             child=None;startup_failed=False
             try:
-                subprocess.run(command,check=True,text=True,capture_output=True,timeout=60)
+                # No ordinary create timeout: killing the client cannot cancel
+                # a daemon request. An orphaned client keeps both locks until
+                # it exits, just as start --attach does below.
+                subprocess.run(command,check=True,text=True,capture_output=True,
+                               pass_fds=(global_lock.fileno(),active.fileno()))
                 child=None if cancelled else subprocess.Popen(['/usr/bin/docker','start','--attach',name],
                     pass_fds=(global_lock.fileno(),active.fileno()))
             except (OSError,subprocess.SubprocessError):
-                # A create timeout can leave a stopped daemon-owned container.
-                # Confirm its removal before unwinding locks or reservation.
+                # A disconnected create can still complete in the daemon later.
+                # Refresh/drain reconcile stopped orphans once no client owns
+                # the cache lock; present containers are removed below first.
                 startup_failed=True
             stopped=False
             while child is not None and child.poll() is None:
@@ -134,6 +145,8 @@ def run_build(arguments,admission):
             while True:
                 try:
                     if container_id(name) is None:
+                        # Current absence is not proof a failed create cannot
+                        # finish later. Host reconciliation covers that case.
                         break
                     stop_owned(name,project,run)
                 except (OSError,ValueError,RuntimeError,subprocess.SubprocessError):
@@ -143,12 +156,13 @@ def run_build(arguments,admission):
     finally:
         for signum,handler in previous.items():
             signal.signal(signum,handler)
-        try:
-            admission.release_build()
-        except (OSError,RuntimeError,SystemExit):
-            # A completed container no longer writes the cache. The admission
-            # ledger reclaims the dead wrapper's identity on its next refresh.
-            print('Builder finished; admission lease release deferred',file=sys.stderr)
+        if acquired:
+            try:
+                admission.release_build()
+            except (OSError,RuntimeError,SystemExit):
+                # A completed container no longer writes the cache. The admission
+                # ledger reclaims the dead wrapper's identity on its next refresh.
+                print('Builder finished; admission lease release deferred',file=sys.stderr)
 
 
 def main():

@@ -56,7 +56,7 @@ class RemoteBuildTests(unittest.TestCase):
         vm=GceVm('test','zone-a','RUNNING','n4-standard-32',True,instance_id='1')
         with patch('subprocess.run', return_value=SimpleNamespace(returncode=75)) as run:
             self.assertFalse(quiesce_remote_builder(vm, SimpleNamespace(project='p')))
-            self.assertIn('oxidex.remote-build=true',run.call_args.args[0][-1])
+            self.assertIn('reconcile-builders --global-lock-held',run.call_args.args[0][-1])
 
 
 if __name__ == '__main__':

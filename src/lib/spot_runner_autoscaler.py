@@ -508,9 +508,8 @@ def quiesce_remote_builder(vm, args):
     if not vm.instance_id:return False
     script = ('test "$(curl -fsS -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
               +shlex.quote(vm.instance_id)+' || exit 75; '
-              'builders=$(/usr/bin/docker ps -aq --filter label=oxidex.remote-build=true) || exit 75; '
-              'if [ -n "$builders" ]; '
-              'then exit 75; fi; touch /run/oxidex-build-draining')
+              '/usr/bin/python3 /opt/gha-runners/host_admission.py reconcile-builders '
+              '--global-lock-held || exit 75; touch /run/oxidex-build-draining')
     command = 'sudo flock -n -E 75 /run/oxidex-build.lock sh -c ' + shlex.quote(script)
     try:
         result = subprocess.run(['gcloud', 'compute', 'ssh', vm.name, f'--zone={vm.zone}',

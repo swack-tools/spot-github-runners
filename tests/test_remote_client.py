@@ -4,6 +4,9 @@ import subprocess
 import tarfile
 import hashlib
 import shlex
+import json
+import shutil
+from unittest.mock import patch
 from pathlib import Path
 from lib.remote_build import make_snapshot
 
@@ -85,3 +88,69 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(retryable_exit(143))
         self.assertFalse(retryable_exit(101))
         self.assertFalse(retryable_exit(1))
+
+    def execute_client_cleanup(self,outcome,wrong_identity=False,symlink=False):
+        from lib import remote_build
+        actual_run=subprocess.run
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();remote=root/'remote';remote.mkdir()
+            source=root/'source';source.mkdir();evidence=root/'evidence'
+            run='run-'+'a'*32;upload='oxidex-remote-source-'+run+'.tar.gz'
+            export=remote/'exports'/run;export.mkdir(parents=True)
+            (export/'oxidex').write_bytes(b'binary')
+            retained=remote/'targets'/'cache';retained.mkdir(parents=True)
+            (retained/'keep').write_text('retained')
+            if symlink:
+                outside=root/'outside';outside.mkdir();(outside/'keep').write_text('safe')
+                shutil.rmtree(export);export.symlink_to(outside,target_is_directory=True)
+            digest=hashlib.sha256(b'binary').hexdigest()
+            def snapshot(path,archive):
+                archive.write_bytes(b'snapshot');return dict(archive_sha256='b'*64)
+            def invoke(command,**kwargs):
+                if command[2]=='scp':
+                    if ':~/' in command[4]:
+                        (root/upload).write_bytes(b'snapshot')
+                        if outcome=='upload_failure':raise subprocess.CalledProcessError(255,command)
+                    else:
+                        Path(command[4]).write_bytes(b'binary')
+                        if outcome=='download_failure':raise subprocess.CalledProcessError(255,command)
+                    return subprocess.CompletedProcess(command,0)
+                shell=next(value[len('--command='):] for value in command if value.startswith('--command='))
+                if 'python3 -I -c' not in shell and not shell.startswith('test "$(curl'):
+                    kwargs['stdout'].write(digest+'  artifact\n');return subprocess.CompletedProcess(command,0)
+                # Execute the actual cleanup body against local fixture paths.
+                body=(shlex.split(shell)[-1] if 'python3 -I -c' in shell else shell)
+                body=body.replace('/mnt/runner-data/remote-build',str(remote))
+                body=body.replace(remote_build.identity_guard('123'),'test '+('0' if wrong_identity else '123')+' = 123 || exit 75')
+                body=body.replace('st_uid != 0','st_uid != os.getuid()')
+                # The fixture's remote directory is its ownership boundary;
+                # Darwin temporary-directory ancestors are user/sticky owned.
+                body=body.replace('(export,*export.parents)','(export,export.parent,export.parent.parent)')
+                return actual_run(['sh','-c',body],cwd=root,capture_output=True,text=True)
+            args=['--source',str(source),'--instance','worker','--zone','zone','--worktree-id','cache',
+                  '--evidence-dir',str(evidence)]
+            if outcome!='no_artifact':args+=['--artifact-dir',str(root/'artifacts')]
+            with patch.object(remote_build,'make_snapshot',side_effect=snapshot),\
+                 patch.object(remote_build.secrets,'token_hex',return_value='a'*32),\
+                 patch.object(remote_build.subprocess,'check_output',side_effect=['123\n','commit\n','']),\
+                 patch.object(remote_build.subprocess,'run',side_effect=invoke):
+                if outcome.endswith('_failure'):
+                    with self.assertRaises(subprocess.CalledProcessError):remote_build.main(args)
+                else:self.assertEqual(remote_build.main(args),0)
+            receipt=json.loads((evidence/'remote-build.json').read_text())
+            self.assertEqual((root/upload).exists(),wrong_identity)
+            self.assertEqual(export.exists(),wrong_identity or symlink)
+            self.assertEqual(receipt['export_cleanup_confirmed'],not (wrong_identity or symlink))
+            self.assertEqual((retained/'keep').read_text(),'retained')
+            if outcome!='upload_failure':self.assertEqual(receipt['binary_sha256'],digest)
+            if symlink:self.assertEqual((outside/'keep').read_text(),'safe')
+
+    def test_client_reclaims_exports_after_download_or_receipt_only_verification(self):
+        for outcome in ('success','no_artifact','upload_failure','download_failure'):
+            with self.subTest(outcome=outcome):self.execute_client_cleanup(outcome)
+
+    def test_cleanup_holds_on_vm_identity_mismatch(self):
+        self.execute_client_cleanup('success',wrong_identity=True)
+
+    def test_cleanup_refuses_symlinked_export_directory(self):
+        self.execute_client_cleanup('no_artifact',symlink=True)

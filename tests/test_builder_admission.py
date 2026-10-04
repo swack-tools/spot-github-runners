@@ -9,6 +9,9 @@ from types import SimpleNamespace
 
 
 class BuilderAdmissionTests(unittest.TestCase):
+    def admission(self,**kwargs):
+        return SimpleNamespace(reconcile_stopped_builders=lambda:False,**kwargs)
+
     def arguments(self,payload=None):
         args=['run','--label=oxidex.remote-build=true','-v',
               '/mnt/runner-data/remote-build/sources/cache:/src','-v',
@@ -26,13 +29,45 @@ class BuilderAdmissionTests(unittest.TestCase):
 
     def test_full_host_returns_retryable_without_starting_docker(self):
         module=self.module()
-        admission=SimpleNamespace(acquire_build=lambda:(_ for _ in ()).throw(SystemExit(75)),release_build=lambda:None)
-        with patch.object(module.subprocess,'run',side_effect=AssertionError('started without capacity')):
+        admission=self.admission(acquire_build=lambda:(_ for _ in ()).throw(SystemExit(75)),release_build=lambda:None)
+        with patch('builtins.open',mock_open()),patch.object(module.fcntl,'flock'),\
+             patch.object(module,'container_id',return_value=None),\
+             patch.object(module.subprocess,'run',side_effect=AssertionError('started without capacity')):
             self.assertEqual(module.run_build(self.arguments(),admission),75)
+
+    def test_lock_contention_never_acquires_or_releases_memory_lease(self):
+        for busy_lock in (1,2):
+            with self.subTest(busy_lock=busy_lock):
+                module=self.module();admission=MagicMock()
+                locks=[None]*(busy_lock-1)+[BlockingIOError('held')]
+                with patch('builtins.open',mock_open()),\
+                     patch.object(module.fcntl,'flock',side_effect=locks),\
+                     patch.object(module.subprocess,'run',side_effect=AssertionError('started contending build')):
+                    self.assertEqual(module.run_build(self.arguments(),admission),75)
+                admission.acquire_build.assert_not_called()
+                admission.release_build.assert_not_called()
+
+    def test_create_and_start_clients_both_inherit_locks_without_create_timeout(self):
+        module=self.module();admission=MagicMock();events=[]
+        lock_files=[MagicMock(),MagicMock()]
+        for index,handle in enumerate(lock_files,10):
+            handle.__enter__.return_value=handle;handle.fileno.return_value=index
+        admission.acquire_build.side_effect=lambda:events.append('acquire')
+        child=MagicMock();child.poll.return_value=0;child.returncode=0
+        with patch('builtins.open',side_effect=lock_files),\
+             patch.object(module.fcntl,'flock',side_effect=lambda *args:events.append('lock')),\
+             patch.object(module,'container_id',return_value=None),\
+             patch.object(module.subprocess,'run') as create,\
+             patch.object(module.subprocess,'Popen',return_value=child) as start:
+            self.assertEqual(module.run_build(self.arguments(),admission),0)
+        self.assertEqual(events,['lock','lock','acquire'])
+        self.assertEqual(create.call_args.kwargs['pass_fds'],(10,11))
+        self.assertNotIn('timeout',create.call_args.kwargs)
+        self.assertEqual(start.call_args.kwargs['pass_fds'],(10,11))
 
     def test_builder_result_propagates_and_lease_always_released(self):
         module=self.module();events=[]
-        admission=SimpleNamespace(acquire_build=lambda:events.append('acquire'),release_build=lambda:events.append('release'))
+        admission=self.admission(acquire_build=lambda:events.append('acquire'),release_build=lambda:events.append('release'))
         child=MagicMock();child.poll.return_value=137;child.returncode=137
         with patch('builtins.open',mock_open()),patch.object(module.fcntl,'flock'),\
              patch.object(module,'container_id',return_value=None),\
@@ -52,7 +87,7 @@ class BuilderAdmissionTests(unittest.TestCase):
 
     def test_unknown_inventory_keeps_lease_and_locks_until_absent(self):
         module=self.module();events=[]
-        admission=SimpleNamespace(acquire_build=lambda:events.append('acquire'),release_build=lambda:events.append('release'))
+        admission=self.admission(acquire_build=lambda:events.append('acquire'),release_build=lambda:events.append('release'))
         child=MagicMock();child.poll.return_value=0;child.returncode=0
         def inventory(name):
             events.append('inventory')
@@ -66,7 +101,7 @@ class BuilderAdmissionTests(unittest.TestCase):
              patch.object(module.subprocess,'run',return_value=SimpleNamespace(returncode=0)),\
              patch.object(module.subprocess,'Popen',return_value=child):
             self.assertEqual(module.run_build(self.arguments(),admission),0)
-        self.assertEqual(events,['acquire','inventory','inventory','inventory','release'])
+        self.assertEqual(events,['inventory','acquire','inventory','inventory','release'])
 
     def test_signal_stops_exact_container_and_reaps_cli_before_release(self):
         module=self.module();events=[];handlers={}
@@ -77,7 +112,7 @@ class BuilderAdmissionTests(unittest.TestCase):
                 raise module.subprocess.TimeoutExpired('docker',1)
             events.append('reaped');return 143
         child.wait.side_effect=wait
-        admission=SimpleNamespace(acquire_build=lambda:None,release_build=lambda:events.append('release'))
+        admission=self.admission(acquire_build=lambda:None,release_build=lambda:events.append('release'))
         def register(signum,handler):handlers[signum]=handler;return signal.SIG_DFL
         def stop(*args):events.append('stop');return True
         with patch('builtins.open',mock_open()),patch.object(module.fcntl,'flock'),\
@@ -92,7 +127,7 @@ class BuilderAdmissionTests(unittest.TestCase):
 
     def test_cancel_during_create_never_starts_container(self):
         module=self.module();handlers={}
-        admission=SimpleNamespace(acquire_build=lambda:None,release_build=lambda:None)
+        admission=self.admission(acquire_build=lambda:None,release_build=lambda:None)
         def register(signum,handler):handlers[signum]=handler;return signal.SIG_DFL
         def create(*args,**kwargs):
             self.assertEqual(args[0][1],'create')
@@ -110,7 +145,7 @@ class BuilderAdmissionTests(unittest.TestCase):
         for stage in ('create', 'start'):
             with self.subTest(stage=stage):
                 module=self.module();events=[]
-                admission=SimpleNamespace(acquire_build=lambda:None,
+                admission=self.admission(acquire_build=lambda:None,
                     release_build=lambda:events.append('release'))
                 def stop(*args):events.append('stop');return True
                 error=module.subprocess.TimeoutExpired('docker create',60)
@@ -124,7 +159,7 @@ class BuilderAdmissionTests(unittest.TestCase):
 
     def test_release_failure_preserves_completed_build_exit(self):
         module=self.module()
-        admission=SimpleNamespace(acquire_build=lambda:None,release_build=lambda:(_ for _ in ()).throw(OSError('socket restarted')))
+        admission=self.admission(acquire_build=lambda:None,release_build=lambda:(_ for _ in ()).throw(OSError('socket restarted')))
         child=MagicMock();child.poll.return_value=0;child.returncode=0
         with patch('builtins.open',mock_open()),patch.object(module.fcntl,'flock'),\
              patch.object(module,'container_id',return_value=None),\

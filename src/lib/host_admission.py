@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+BUILD_ROOT = Path('/mnt/runner-data/remote-build')
+LOCK_ROOT = Path('/run')
 
 def admission_budget(tier, observed_overhead_gib, workload_peak_gib, *, slots=None):
     slots = tier.initial_slots if slots is None else slots
@@ -107,14 +109,86 @@ def owner_alive(owner):
             return True  # Unknown state cannot reclaim a live runner lease.
 
 
-def builders_running():
+def builder_cache_identity(record):
+    """Recognize only the root adapter's exact name, labels and bind mounts."""
+    config=record.get('Config') or {}
+    if not isinstance(config,dict):return None
+    labels=config.get('Labels') or {}
+    if not isinstance(labels,dict):return None
+    project=labels.get('oxidex.cache-project','')
+    run=labels.get('oxidex.run-id','')
+    if (not isinstance(project,str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}',project)
+        or not isinstance(run,str) or not re.fullmatch(r'run-[0-9a-f]{32}',run)
+        or labels.get('oxidex.remote-build')!='true'
+        or record.get('Name')!='/oxidex-run-'+run):
+        return None
+    mounts=record.get('Mounts',[])
+    if not isinstance(mounts,list) or any(not isinstance(mount,dict) for mount in mounts):
+        return None
+    for destination,folder in (('/src','sources'),('/target','targets')):
+        matching=[mount for mount in mounts if mount.get('Destination')==destination]
+        if (len(matching)!=1 or matching[0].get('Type')!='bind'
+            or matching[0].get('Source')!=str(BUILD_ROOT/folder/project)):
+            return None
+    return project,run
+
+
+def stopped_builder(record):
+    state=record.get('State') or {}
+    if not isinstance(state,dict):return False
+    return (state.get('Running') is False and state.get('Paused') is False
+            and state.get('Restarting') is False and state.get('Pid')==0
+            and state.get('Status') in ('created','exited','dead'))
+
+
+def reconcile_stopped_builders():
+    """Called under global SH/EX; never force-remove a container or take a wait lock."""
+    result=subprocess.run(['/usr/bin/docker','ps','-aq','--no-trunc',
+                           '--filter','label=oxidex.remote-build=true'],
+                          check=True,capture_output=True,text=True,timeout=10)
+    ids=result.stdout.split()
+    if len(set(ids))!=len(ids) or any(not re.fullmatch(r'[0-9a-f]{64}',value) for value in ids):
+        raise ValueError('Incomplete builder container inventory')
+    remaining=False
+    for identity in ids:
+        def inspect():
+            rows=json.loads(subprocess.run(['/usr/bin/docker','inspect',identity],
+                check=True,capture_output=True,text=True,timeout=10).stdout)
+            if not isinstance(rows,list) or len(rows)!=1 or not isinstance(rows[0],dict) or rows[0].get('Id')!=identity:
+                raise ValueError('Builder identity changed')
+            return rows[0]
+        record=inspect()
+        cache=builder_cache_identity(record)
+        if cache is None or not stopped_builder(record):
+            remaining=True
+            continue
+        with (LOCK_ROOT/f'oxidex-cache-active-{cache[0]}.lock').open('a') as active:
+            try:
+                fcntl.flock(active,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                remaining=True
+                continue
+            # A start can complete between the first inspect and lock acquire.
+            # No protocol client survives this exclusive lock, but recheck state
+            # and identity before rm, which also refuses a now-running container.
+            current=inspect()
+            if builder_cache_identity(current)!=cache or not stopped_builder(current):
+                remaining=True
+                continue
+            subprocess.run(['/usr/bin/docker','rm',identity],check=True,
+                           capture_output=True,text=True,timeout=10)
+    return remaining
+
+
+def builders_running(*,global_lock_held=False):
     try:
-        # Created containers may have a start request in flight after their
-        # wrapper dies. Keep the lease until complete inventory proves absence.
-        result=subprocess.run(['/usr/bin/docker','ps','-aq','--filter','label=oxidex.remote-build=true'],
-                              check=True,capture_output=True,text=True,timeout=10)
-        return bool(result.stdout.strip())
-    except (OSError,subprocess.SubprocessError):
+        if global_lock_held:
+            # Only the root drain CLI calls this, under its inherited global EX.
+            return reconcile_stopped_builders()
+        with (LOCK_ROOT/'oxidex-build.lock').open('a') as global_lock:
+            fcntl.flock(global_lock,fcntl.LOCK_SH|fcntl.LOCK_NB)
+            return reconcile_stopped_builders()
+    except (OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError):
         return True  # Unknown container state cannot reclaim memory.
 
 
@@ -212,9 +286,13 @@ def serve():
                             except (OSError,ValueError,KeyError,subprocess.SubprocessError):
                                 envelope=0
                         limit=min(limit,envelope)
+                    # A late stopped create may appear after its lease was
+                    # pruned on an earlier empty inventory. Always reconcile
+                    # refreshes, even when no dead host owner remains to query.
+                    builders_present=builders_running()
                     pool = LeasePool(ledger/'leases.json',config['work_gib'],alive=owner_alive)
                     if message['action'] == 'release':
-                        if kind!='builder' or not builders_running():
+                        if kind!='builder' or not builders_present:
                             pool.release(owner)
                         accepted = True
                     elif message['action'] == 'acquire':
@@ -253,5 +331,9 @@ if __name__ == '__main__':
             time.sleep(5)
     elif action == 'release':
         request('release')
+    elif action == 'reconcile-builders':
+        if os.geteuid()!=0 or sys.argv[2:]!=['--global-lock-held']:
+            raise SystemExit('Root drain requires its held global lock')
+        raise SystemExit(75 if builders_running(global_lock_held=True) else 0)
     else:
         raise SystemExit('Unknown admission command')
