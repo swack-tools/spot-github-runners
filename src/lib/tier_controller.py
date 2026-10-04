@@ -28,6 +28,15 @@ def evidence_for(vms,runners,args,state):
     previous_health=state.get('host_health',{})
     seen=set(state.get('seen_oom_ids',[]))
     pending=state.setdefault('pending_oom',{})
+    origins=state.setdefault('pending_oom_origins',{})
+    for key in list(origins):
+        if key not in pending or origins[key].get('kind')!=pending[key]:origins.pop(key)
+    for key,kind in pending.items():
+        if key not in origins:
+            # A legacy flat flag may already span a reboot. Pin its first known
+            # boot once, but never infer that this was the event's actual boot.
+            origins[key]=dict(kind=kind,boot_id=previous_health.get(key,{}).get('boot_id'),
+                              event_ids=[],quarantined=True)
     priority={'unknown':0,'container':0,'runner':1,'builder':2,'host':3}
     for vm in fleet:
         key=f'{vm.zone}/{vm.instance_id}'
@@ -36,23 +45,17 @@ def evidence_for(vms,runners,args,state):
             if not observed.get('complete') or abs(time.time()-observed['observed_at'])>450:
                 raise RuntimeError('Incomplete or stale host event window')
             health[key]=observed
-            previous_boot=previous_health.get(key,{}).get('boot_id')
-            if (pending.get(key)=='host' and observed.get('instance_id')==vm.instance_id
-                    and previous_boot and previous_boot==observed.get('boot_id')
-                    and observed.get('boot_oom_complete') is True
-                    and observed.get('boot_host_oom_ids')==[]
-                    and not any(event['kind']=='host' for event in observed['events'])):
-                # Reclassify even previously seen container events: the flat
-                # legacy host flag may have come from "invoked oom-killer".
-                kinds=[event.get('workload','unknown') for event in observed['events']]
-                if kinds:pending[key]=max(kinds,key=lambda kind:priority.get(kind,0))
-                else:pending.pop(key)
-                LOG.info('Retired false global OOM classification for %s using complete same-boot decision evidence',vm.name)
             for event in observed['events']:
                 if event['id'] not in seen:
                     seen.add(event['id'])
                     kind='host' if event['kind']=='host' else event.get('workload','unknown')
-                    if priority[kind]>=priority.get(pending.get(key),-1):pending[key]=kind
+                    if priority[kind]>=priority.get(pending.get(key),-1):
+                        if pending.get(key)!=kind:
+                            origins[key]=dict(kind=kind,boot_id=observed.get('boot_id'),
+                                              event_ids=[event['id']],quarantined=not bool(observed.get('boot_id')))
+                        elif origins[key].get('boot_id')==observed.get('boot_id') and not origins[key].get('quarantined'):
+                            origins[key]['event_ids']=sorted(set(origins[key]['event_ids'])|{event['id']})
+                        pending[key]=kind
         except (RuntimeError,OSError,ValueError,KeyError,subprocess.SubprocessError) as exc:
             LOG.warning('Host OOM/readiness evidence missing for %s: %s',vm.name,controller.error_detail(exc))
     state['host_health']=health

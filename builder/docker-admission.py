@@ -107,9 +107,15 @@ def run_build(arguments,admission):
             # a container, a late orphan is stopped and cannot write this cache.
             command=['/usr/bin/docker','create','--name='+name,
                      '--label=oxidex.cache-project='+project,'--label=oxidex.run-id='+run,*arguments[1:]]
-            subprocess.run(command,check=True,text=True,capture_output=True,timeout=60)
-            child=None if cancelled else subprocess.Popen(['/usr/bin/docker','start','--attach',name],
-                pass_fds=(global_lock.fileno(),active.fileno()))
+            child=None;startup_failed=False
+            try:
+                subprocess.run(command,check=True,text=True,capture_output=True,timeout=60)
+                child=None if cancelled else subprocess.Popen(['/usr/bin/docker','start','--attach',name],
+                    pass_fds=(global_lock.fileno(),active.fileno()))
+            except (OSError,subprocess.SubprocessError):
+                # A create timeout can leave a stopped daemon-owned container.
+                # Confirm its removal before unwinding locks or reservation.
+                startup_failed=True
             stopped=False
             while child is not None and child.poll() is None:
                 if cancelled:
@@ -132,7 +138,8 @@ def run_build(arguments,admission):
                     stop_owned(name,project,run)
                 except (OSError,ValueError,RuntimeError,subprocess.SubprocessError):
                     time.sleep(1)
-            return 128+cancelled[0] if cancelled else child.returncode
+            if cancelled:return 128+cancelled[0]
+            return 75 if startup_failed else child.returncode
     finally:
         for signum,handler in previous.items():
             signal.signal(signum,handler)

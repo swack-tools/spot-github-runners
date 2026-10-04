@@ -106,6 +106,22 @@ class BuilderAdmissionTests(unittest.TestCase):
             self.assertEqual(module.run_build(self.arguments(),admission),143)
         stop.assert_called_once()
 
+    def test_startup_failures_clean_created_container_before_releasing(self):
+        for stage in ('create', 'start'):
+            with self.subTest(stage=stage):
+                module=self.module();events=[]
+                admission=SimpleNamespace(acquire_build=lambda:None,
+                    release_build=lambda:events.append('release'))
+                def stop(*args):events.append('stop');return True
+                error=module.subprocess.TimeoutExpired('docker create',60)
+                with patch('builtins.open',mock_open()),patch.object(module.fcntl,'flock'), \
+                     patch.object(module,'container_id',side_effect=[None,'a'*12,None]), \
+                     patch.object(module,'stop_owned',side_effect=stop), \
+                     patch.object(module.subprocess,'run',side_effect=error if stage=='create' else None), \
+                     patch.object(module.subprocess,'Popen',side_effect=OSError('unable to start client')):
+                    self.assertEqual(module.run_build(self.arguments(),admission),75)
+                self.assertEqual(events,['stop','release'])
+
     def test_release_failure_preserves_completed_build_exit(self):
         module=self.module()
         admission=SimpleNamespace(acquire_build=lambda:None,release_build=lambda:(_ for _ in ()).throw(OSError('socket restarted')))

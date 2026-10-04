@@ -14,7 +14,7 @@ def retryable_exit(code):
     return code in (75, 137, 143, 255)
 
 
-def transaction_script(project,upload,digest,profile,run):
+def transaction_script(project,upload,digest,profile,run,instance_id=None):
     """Serialize source replacement, builds, and immutable artifact export."""
     root='/mnt/runner-data/remote-build'
     source=f'{root}/sources/{project}'
@@ -24,8 +24,12 @@ def transaction_script(project,upload,digest,profile,run):
     stages=[f'{launcher} cargo fetch --locked --target x86_64-unknown-linux-gnu']
     if profile=='release':stages.append(f'{launcher} just cbindgen-check')
     stages.append(f'{launcher} cargo build '+('--release ' if profile=='release' else '')+'--locked --bin oxidex')
+    binary=target+'/'+profile+'/oxidex'
+    stages.append(f'{launcher} cargo run '+('--release ' if profile=='release' else '')+'--locked --bin oxidex -- --readonly --version')
     body='\n'.join([
         'set -eu',
+        *([identity_guard(instance_id)] if instance_id else []),
+        'trap '+shlex.quote('rm -f -- '+shlex.quote(upload))+' EXIT',
         'test ! -e /run/oxidex-build-draining || exit 75',
         f'flock -n -E 75 /run/oxidex-cache-active-{project}.lock true',
         'ids=$(/usr/bin/docker ps -aq --filter label=oxidex.remote-build=true) || exit 75',
@@ -39,13 +43,26 @@ def transaction_script(project,upload,digest,profile,run):
         f'find {shlex.quote(source)} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +',
         f'tar -xzf {shlex.quote(upload)} -C {shlex.quote(source)}',
         *stages,
-        f'{shlex.quote(target+"/"+profile+"/oxidex")} --version',
+        # Build output is untrusted executable code; verification runs inside
+        # the same unprivileged container, never through the root SSH shell.
+        f'test -f {shlex.quote(binary)} && test ! -L {shlex.quote(binary)}',
+        f'test "$(readlink -f -- {shlex.quote(binary)})" = {shlex.quote(binary)}',
         f'install -d -m 0755 {shlex.quote(str(Path(export).parent))}',
-        f'install -m 0755 {shlex.quote(target+"/"+profile+"/oxidex")} {shlex.quote(export)}',
+        f'install -m 0755 {shlex.quote(binary)} {shlex.quote(export)}',
         f'sha256sum {shlex.quote(export)}',
     ])
     return ('sudo flock --shared /run/oxidex-build.lock flock --exclusive '
             f'/run/oxidex-project-{project}.lock sh -c '+shlex.quote(body)),export
+
+
+def identity_guard(instance_id):
+    import re
+    if not re.fullmatch('[0-9]+',str(instance_id)):
+        raise ValueError('A provider-observed VM identity is required')
+    return ('test "$(curl --fail --silent --show-error --max-time 10 '
+            '-H Metadata-Flavor:Google '
+            'http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
+            +shlex.quote(str(instance_id))+' || exit 75')
 
 
 def make_snapshot(source: Path, archive: Path) -> dict:
@@ -87,7 +104,11 @@ def main(argv=None):
     def ssh(command):
         return ['gcloud','compute','ssh',args.instance,'--zone='+args.zone,'--project='+args.project,
                 '--quiet','--command='+command]
+    upload=None;instance_id=None
     try:
+        instance_id=subprocess.check_output(['gcloud','compute','instances','describe',args.instance,
+            '--zone='+args.zone,'--project='+args.project,'--format=value(id)'],text=True).strip()
+        identity_guard(instance_id);receipt['instance_id']=instance_id
         start=time.monotonic();archive=evidence/'remote-source.tar.gz'
         receipt['snapshot']=make_snapshot(source,archive)
         receipt['packaging_seconds']=time.monotonic()-start
@@ -101,7 +122,7 @@ def main(argv=None):
                         '--zone='+args.zone,'--project='+args.project,'--quiet'],check=True)
         digest=receipt['snapshot']['archive_sha256']
         receipt['upload_seconds']=time.monotonic()-start;receipt['run_id']=run;save()
-        command,binary=transaction_script(args.worktree_id,upload,digest,args.profile,run)
+        command,binary=transaction_script(args.worktree_id,upload,digest,args.profile,run,instance_id)
         start=time.monotonic();log_path=evidence/'transaction.log'
         with log_path.open('w') as log:
             result=subprocess.run(ssh(command),stdout=log,stderr=subprocess.STDOUT)
@@ -132,5 +153,16 @@ def main(argv=None):
         if isinstance(exc,subprocess.CalledProcessError):
             receipt['retryable']=retryable_exit(exc.returncode)
         save();raise
+    finally:
+        if upload and instance_id:
+            # Covers partial SCP and SSH failures too. A reused VM name is not
+            # authorization to mutate its home directory. Retain unknown state.
+            try:
+                cleanup=identity_guard(instance_id)+'; rm -f -- '+shlex.quote(upload)
+                result=subprocess.run(ssh(cleanup),capture_output=True,text=True,timeout=45)
+                receipt['upload_cleanup_confirmed']=result.returncode==0
+            except (OSError,subprocess.SubprocessError):
+                receipt['upload_cleanup_confirmed']=False
+            save()
     print(json.dumps({k:v for k,v in receipt.items() if k!='snapshot'},indent=2))
     return 0

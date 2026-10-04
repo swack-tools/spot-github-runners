@@ -27,7 +27,8 @@ class AdmissionTests(unittest.TestCase):
                 results = list(workers.map(lambda i:pool.acquire(str(i),2), range(8)))
             self.assertEqual(sum(results),3)
             self.assertFalse(pool.acquire('0',3))
-            pool.release('0')
+            owner=next(str(i) for i,acquired in enumerate(results) if acquired)
+            pool.release(owner)
             self.assertTrue(pool.acquire('new',2))
 
     def test_dead_identity_reclaimed_and_oversized_request_rejected(self):

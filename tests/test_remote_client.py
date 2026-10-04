@@ -24,10 +24,10 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(tar.extractfile('Cargo.toml').read(), b'working change')
             self.assertEqual(receipt['file_count'],1)
 
-    def execute_transaction(self,profile,header_failure=False):
+    def execute_transaction(self,profile,header_failure=False,artifact_symlink=False):
         from lib.remote_build import transaction_script
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);source=root/'remote/sources/checkout';source.mkdir(parents=True)
+            root=Path(directory).resolve();source=root/'remote/sources/checkout';source.mkdir(parents=True)
             target=root/'remote/targets/checkout'/profile;target.mkdir(parents=True)
             (source/'deleted.rs').write_text('stale source')
             (target/'retained.cache').write_text('retained')
@@ -45,8 +45,11 @@ class ClientTests(unittest.TestCase):
                 'if [ "$2" = just ]; then exit '+('1' if header_failure else '0')+'; fi\n'
                 'if [ "$2 $3" = "cargo build" ]; then\n'
                 ' touch '+shlex.quote(str(root/'compiled'))+'\n'
-                ' printf "#!/bin/sh\\necho version\\n" >'+shlex.quote(str(target/'oxidex'))+'\n'
-                ' chmod +x '+shlex.quote(str(target/'oxidex'))+'\nfi\n')
+                ' printf "#!/bin/sh\\ntouch '+str(root/'root-executed')+'\\n" >'+shlex.quote(str(target/'oxidex'))+'\n'
+                ' chmod +x '+shlex.quote(str(target/'oxidex'))+'\n'+
+                (' ln -sf '+shlex.quote(str(new))+' '+shlex.quote(str(target/'oxidex'))+'\n' if artifact_symlink else '')+
+                'fi\n'
+                'if [ "$2 $3" = "cargo run" ]; then touch '+shlex.quote(str(root/'container-verified'))+'; fi\n')
             launcher.chmod(0o755);body=body.replace('/usr/local/bin/oxidex-remote-build',str(launcher))
             # This local fixture exercises ordering, extraction and shell failure
             # propagation; Linux lock/cancellation behavior has a live canary.
@@ -55,11 +58,14 @@ class ClientTests(unittest.TestCase):
             self.assertFalse((source/'deleted.rs').exists())
             self.assertEqual((source/'new.rs').read_text(),'new snapshot')
             self.assertEqual((target/'retained.cache').read_text(),'retained')
-            if header_failure:
+            self.assertFalse(archive.exists())
+            self.assertFalse((root/'root-executed').exists())
+            if header_failure or artifact_symlink:
                 self.assertNotEqual(result.returncode,0)
-                self.assertFalse((root/'compiled').exists())
+                if header_failure:self.assertFalse((root/'compiled').exists())
             else:
                 self.assertEqual(result.returncode,0,result.stderr)
+                self.assertTrue((root/'container-verified').exists())
                 exported=root/'remote/exports/run-test/oxidex'
                 self.assertEqual(exported.read_bytes(),(target/'oxidex').read_bytes())
 
@@ -68,6 +74,9 @@ class ClientTests(unittest.TestCase):
 
     def test_deleted_snapshot_source_does_not_survive_cache_reuse(self):
         self.execute_transaction('debug')
+
+    def test_symlinked_artifact_is_not_exported(self):
+        self.execute_transaction('debug',artifact_symlink=True)
 
     def test_worker_interruption_is_retryable_but_compiler_errors_are_not(self):
         from lib.remote_build import retryable_exit
