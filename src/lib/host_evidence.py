@@ -4,7 +4,42 @@ import json
 import re
 import subprocess
 import time
+import math
 from pathlib import Path
+
+
+def validate_io_pressure(values):
+    keys={f'{scope}_{name}' for scope in ('some','full') for name in ('avg10','avg60','avg300','total')}
+    if not isinstance(values,dict) or set(values)!=keys:
+        raise ValueError('Incomplete IO pressure evidence')
+    for key,value in values.items():
+        if isinstance(value,bool) or not isinstance(value,(int,float)):
+            raise ValueError('Invalid IO pressure number')
+        if key.endswith('_total'):
+            if not isinstance(value,int) or not 0<=value<2**64:
+                raise ValueError('Invalid IO pressure counter')
+        elif not 0<=value<=100 or not math.isfinite(value):
+            raise ValueError('IO pressure percentage outside bounds')
+    return values
+
+
+def parse_io_pressure(text):
+    """Parse the two kernel PSI lines, bounded independently of OOM telemetry."""
+    if not isinstance(text,str) or len(text)>1024:
+        raise ValueError('IO pressure sample exceeds bounded size')
+    values={};scopes=set()
+    for line in text.splitlines():
+        parts=line.split()
+        if len(parts)!=5 or parts[0] not in ('some','full') or parts[0] in scopes:
+            raise ValueError('Malformed IO pressure line')
+        scope=parts[0];scopes.add(scope)
+        for item in parts[1:]:
+            key,separator,value=item.partition('=')
+            name=scope+'_'+key
+            if not separator or name in values:
+                raise ValueError('Malformed IO pressure field')
+            values[name]=int(value) if key=='total' else float(value)
+    return validate_io_pressure(values)
 
 
 def classify_events(journal, docker, boot_id, timestamp, *, window_start=None):
@@ -78,8 +113,13 @@ def sample():
     global_events=classify_events(globals_journal,[],boot,timestamp,window_start=0)
     memory = {line.split(':')[0]:int(line.split()[1])/1024/1024
               for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith(('MemTotal:','MemAvailable:'))}
+    try:
+        io_pressure=parse_io_pressure(Path('/proc/pressure/io').read_text())
+    except (OSError,ValueError):
+        io_pressure=None  # Kernels without PSI still provide valid OOM evidence.
     return dict(observed_at=timestamp,boot_id=boot,ram_gib=memory['MemTotal'],
                 used_ram_gib=memory['MemTotal']-memory['MemAvailable'],
+                io_pressure=io_pressure,io_complete=io_pressure is not None,
                 events=classify_events(journal,docker,boot,timestamp),complete=len(journal)<2000,
                 boot_oom_complete=(len(globals_journal)<2000 and len(global_events)==len(globals_journal)
                                    and all(event['kind']=='host' for event in global_events)),

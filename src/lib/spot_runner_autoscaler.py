@@ -506,10 +506,18 @@ def delete_drained_vm(vm, args, before_delete=None):
 def quiesce_remote_builder(vm, args):
     """Hold new builds off a host only after its running builds have finished."""
     if not vm.instance_id:return False
+    from . import host_admission
+    # The source is embedded here because older supported hosts may not have
+    # the latest admission CLI (or any installed admission module). Execute
+    # only its definitions and reconciler under the inherited global EX lock.
+    source = Path(host_admission.__file__).read_text()
+    code = ("namespace={'__name__':'oxidex_drain'}\n"
+            "exec("+repr(source)+",namespace)\n"
+            "raise SystemExit(75 if namespace['builders_running'](global_lock_held=True) else 0)\n")
     script = ('test "$(curl -fsS -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
               +shlex.quote(vm.instance_id)+' || exit 75; '
-              '/usr/bin/python3 /opt/gha-runners/host_admission.py reconcile-builders '
-              '--global-lock-held || exit 75; touch /run/oxidex-build-draining')
+              '/usr/bin/python3 -I -c '+shlex.quote(code)+
+              ' || exit 75; touch /run/oxidex-build-draining')
     command = 'sudo flock -n -E 75 /run/oxidex-build.lock sh -c ' + shlex.quote(script)
     try:
         result = subprocess.run(['gcloud', 'compute', 'ssh', vm.name, f'--zone={vm.zone}',
@@ -550,36 +558,133 @@ p=Path('/mnt/runner-data/remote-build/sources/admission-canary')
 
 
 def adjust_admission(vm,args,kind='runner'):
-    """Increase a constrained runner's cap only while all leases are absent."""
+    """Raise future reservations, then update only lease-free container caps."""
     if kind not in ('runner','builder') or not vm.instance_id:return False
-    program='kind='+repr(kind)+'\n'+'''import json, subprocess, sys
+    program='kind='+repr(kind)+'\n'+'''import fcntl, json, math, os, re, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0,'/opt/gha-runners')
-from host_admission import observed_envelope
-p=Path('/etc/gha-admission.json')
-config=json.loads(p.read_text())
-leases=Path('/var/lib/gha-admission/leases.json')
-if leases.exists() and json.loads(leases.read_text()): raise SystemExit(75)
-next_limit=min(config[kind+'_gib']*2,int(observed_envelope(config)*.95))
-if next_limit<=config[kind+'_gib']: raise SystemExit(76)
-config[kind+'_gib']=next_limit
-tmp=p.with_suffix('.tmp'); tmp.write_text(json.dumps(config)); tmp.replace(p)
-if kind=='builder':
-    builder=Path('/etc/oxidex-remote-build.json')
-    limits=json.loads(builder.read_text());limits['memory_gib']=next_limit
-    tmp=builder.with_suffix('.tmp');tmp.write_text(json.dumps(limits));tmp.replace(builder)
-else:
-    for name in config['runner_names']:
-        subprocess.run(['docker','update','--memory='+str(next_limit)+'g','--memory-swap='+str(next_limit)+'g',name],check=True,capture_output=True)
+from host_admission import observed_envelope, request
+GIB=1024**3
+changed=[]
+ledger_deadline=None
+envelope=next_limit=reserved=None
+def docker_timeout():
+    if ledger_deadline is None:return 5
+    remaining=ledger_deadline-time.monotonic()
+    if remaining<=0:raise RuntimeError('Budget update slice exhausted; remaining caps deferred')
+    return min(5,remaining)
+def write_config(path,value):
+    temporary=path.with_suffix('.tmp')
+    with temporary.open('w') as target:
+        json.dump(value,target);target.flush();os.fsync(target.fileno())
+    temporary.replace(path)
+def inspect(identity,name=None):
+    rows=json.loads(subprocess.run(['/usr/bin/docker','inspect',identity],
+        check=True,capture_output=True,text=True,timeout=docker_timeout()).stdout)
+    if not isinstance(rows,list) or len(rows)!=1:raise ValueError('Incomplete runner inventory')
+    row=rows[0]
+    if (not re.fullmatch('[0-9a-f]{64}',row['Id']) or row['State']['Running'] is not True
+        or not row['State']['StartedAt'] or (name is not None and row['Name']!='/'+name)
+        or (name is None and row['Id']!=identity)):
+        raise ValueError('Runner identity changed')
+    if not isinstance(row['HostConfig']['Memory'],int) or row['HostConfig']['Memory']<=0:
+        raise ValueError('Runner memory must have an existing finite cap')
+    return row
+try:
+    # Serialize budget changes independently of the lease lock. The service
+    # must remain available to finish hooks and to process the config barrier.
+    fd=os.open('/run/gha-admission-adjust.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'a') as operation:
+        fcntl.flock(operation,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        p=Path('/etc/gha-admission.json');config=json.loads(p.read_text())
+        current=config[kind+'_gib']
+        if not math.isfinite(current) or current<=0:raise ValueError('Invalid reservation')
+        envelope=observed_envelope(config)
+        if not math.isfinite(envelope) or envelope<=0:raise ValueError('Unknown memory envelope')
+        ceiling=int(min(config['work_gib'],envelope)*.95)
+        builder=Path('/etc/oxidex-remote-build.json')
+        if kind=='builder':
+            limits=json.loads(builder.read_text())
+            existing=limits['memory_gib']
+            if not math.isfinite(existing) or existing<=0 or existing>current:
+                raise ValueError('Builder limit exceeds its reservation')
+            lagging=existing<current
+        else:
+            names=config['runner_names']
+            if not isinstance(names,list) or not names or len(set(names))!=len(names):
+                raise ValueError('Invalid runner deployment inventory')
+            records={name:inspect(name,name) for name in names}
+            if len({row['Id'] for row in records.values()})!=len(names):
+                raise ValueError('Runner identities are not unique')
+            if any(row['HostConfig']['Memory']>current*GIB for row in records.values()):
+                raise ValueError('Runner limit exceeds its reservation')
+            lagging=any(row['HostConfig']['Memory']<current*GIB for row in records.values())
+        next_limit=current if lagging else min(current*2,ceiling)
+        if next_limit>ceiling or (not lagging and next_limit<=current):
+            print(json.dumps(dict(kind=kind,status='capacity',reservation_gib=current,observed_work_gib=envelope)))
+            raise SystemExit(76)
+        if next_limit>current:
+            config[kind+'_gib']=next_limit
+            write_config(p,config)
+        # serve() is single-threaded and reads config before locking leases.
+        # Its root release reply guarantees every old-config request has
+        # finished. New requests reserve the higher amount before any cap rises.
+        if not request('release','builder'):raise RuntimeError('Admission barrier rejected')
+        leases=Path('/var/lib/gha-admission/leases.json')
+        fd=os.open(str(leases)+'.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'a') as ledger_lock:
+            fcntl.flock(ledger_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            # Hooks wait at most30 seconds. Bound this critical section so a
+            # large deployment cannot strand releases while Docker is slow.
+            ledger_deadline=time.monotonic()+10
+            if json.loads(p.read_text())!=config:raise ValueError('Admission config changed')
+            rows=json.loads(leases.read_text()) if leases.exists() else {}
+            if not isinstance(rows,dict) or any(not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0 for value in rows.values()):
+                raise ValueError('Invalid reservation ledger')
+            reserved=sum(rows.values())
+            if kind=='builder':
+                if json.loads(builder.read_text())!=limits:raise ValueError('Builder config changed')
+                limits['memory_gib']=next_limit;write_config(builder,limits)
+                changed.append('future-builder')
+            else:
+                for name,before in records.items():
+                    identity=before['Id']
+                    if any(owner.startswith('container:'+identity+':') for owner in rows):
+                        continue  # Preserve active/stale lease amounts and caps.
+                    row=inspect(identity,name)
+                    if (row['Id']!=identity or row['State']['StartedAt']!=before['State']['StartedAt']
+                        or row['HostConfig']['Memory']!=before['HostConfig']['Memory']):
+                        raise ValueError('Runner changed during budget update')
+                    if row['HostConfig']['Memory']>=next_limit*GIB:continue
+                    subprocess.run(['/usr/bin/docker','update','--memory='+str(next_limit)+'g',
+                        '--memory-swap='+str(next_limit)+'g',identity],check=True,capture_output=True,timeout=docker_timeout())
+                    after=inspect(identity,name)
+                    if (after['Id']!=identity or after['State']['StartedAt']!=before['State']['StartedAt']
+                        or after['HostConfig']['Memory']!=next_limit*GIB
+                        or after['HostConfig']['MemorySwap']!=next_limit*GIB):
+                        raise ValueError('Runner limit update was not observed')
+                    changed.append(identity)
+            print(json.dumps(dict(kind=kind,status='updated' if changed else 'waiting-for-lease-free-runner',
+                reservation_gib=next_limit,observed_work_gib=envelope,
+                reserved_gib=reserved,unreserved_gib=max(0,envelope-reserved),updated=changed)))
+            if not changed:raise SystemExit(75)
+except (OSError,ValueError,KeyError,TypeError,RuntimeError,subprocess.SubprocessError) as error:
+    # Never roll back a higher reservation after a potentially applied Docker
+    # update. Unknown/partial updates stay over-reserved for safe retries.
+    print(json.dumps(dict(kind=kind,status='deferred',updated=changed,error=str(error)[:200],
+        reservation_gib=next_limit,observed_work_gib=envelope,reserved_gib=reserved,
+        unreserved_gib=max(0,envelope-reserved) if reserved is not None else None)))
+    raise SystemExit(75)
 '''
-    # Stop admission during this atomic budget update. Existing jobs remain
-    # bounded; acquiring hooks wait for the service to restart.
     shell=('test "$(curl -fsS -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
            +shlex.quote(vm.instance_id)+' || exit 75; '
-           'systemctl stop gha-admission || exit 75; trap "systemctl start gha-admission" EXIT; python3 -c '+shlex.quote(program))
-    result=subprocess.run(['gcloud','compute','ssh',vm.name,f'--zone={vm.zone}',
-        f'--project={args.project}','--quiet','--command=sudo sh -c '+shlex.quote(shell)],
-        capture_output=True,text=True,timeout=60)
+           'python3 -c '+shlex.quote(program))
+    try:
+        result=subprocess.run(['gcloud','compute','ssh',vm.name,f'--zone={vm.zone}',
+            f'--project={args.project}','--quiet','--command=sudo sh -c '+shlex.quote(shell)],
+            capture_output=True,text=True,timeout=60)
+    except (OSError,subprocess.SubprocessError):return False
+    if getattr(result,'stdout','').strip():LOG.info('Admission budget update on %s: %s',vm_details(vm),result.stdout.strip())
     return 'capacity' if result.returncode==76 else result.returncode==0
 
 
@@ -775,7 +880,10 @@ def load_launch_inventory(project: str) -> LaunchInventory:
         global_quotas=quotas(gcloud_json('project-info', 'describe', '--format=json(quotas)').get('quotas')))
 
 
-def eligible_tier_offers(offers, tier, prices, disk_size_gb=100):
+def eligible_tier_offers(offers, tier, prices, disk_size_gb=100, job_memory_gib=15):
+    from .tier_policy import reservation_fits
+    if not reservation_fits((tier.name,),job_memory_gib):
+        return []
     candidates = []
     for offer in offers:
         if (offer.vcpu,offer.ram_gib) != (tier.vcpu,tier.ram_gib) or machine_profile(offer.machine_type) is None:
@@ -784,6 +892,8 @@ def eligible_tier_offers(offers, tier, prices, disk_size_gb=100):
             boot,data,monthly = cheapest_storage(offer.machine_type,disk_size_gb,prices.get(offer.region,{}))
         except RuntimeError:
             continue
+        if data not in ('pd-balanced','pd-ssd','hyperdisk-balanced'):
+            continue  # Tier build caches require SSD-backed random-IO storage.
         for rank,platform in platform_preferences(offer.machine_type):
             candidate = CpuOffer(offer.region,offer.machine_type,offer.vcpu,offer.ram_gib,
                                  offer.hourly_usd,platform,rank,boot,data,monthly,zones=offer.zones)
@@ -792,7 +902,7 @@ def eligible_tier_offers(offers, tier, prices, disk_size_gb=100):
     return sorted(candidates,key=lambda row:(row.cpu_rank,row.total_daily_usd,row.region,row.machine_type))
 
 
-def discover_tier_offers(project,tier,disk_size_gb=100):
+def discover_tier_offers(project,tier,disk_size_gb=100,job_memory_gib=15):
     clear_catalog_cache()
     offers,_,_,errors = asyncio.run(find(get_auth(project),min_vcpu=tier.vcpu,
         min_ram=tier.ram_gib,top=None,concurrency=200,
@@ -801,7 +911,7 @@ def discover_tier_offers(project,tier,disk_size_gb=100):
         LOG.warning('Tier discovery has %d incomplete price results',len(errors))
     prices = {region:storage_rates(region) for region in {row.region for row in offers
               if (row.vcpu,row.ram_gib) == (tier.vcpu,tier.ram_gib)}}
-    ranked = eligible_tier_offers(offers,tier,prices,disk_size_gb)
+    ranked = eligible_tier_offers(offers,tier,prices,disk_size_gb,job_memory_gib)
     candidates,skipped = launchable_candidates(ranked,load_launch_inventory(project),disk_size_gb)
     LOG.info('Tier %s: %d launchable candidates strictly below $%s/day with40+%d GiB disks',
              tier.name,len(candidates),tier.max_daily_usd,disk_size_gb)
@@ -876,6 +986,14 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             raise RuntimeError('Automatic tier launch rejects forbidden or mismatched shape')
         if not tier.affordable(getattr(offer,'total_daily_usd',None)):
             raise RuntimeError('Tier launch requires a strict full-disk quote')
+    if tier:
+        from math import isfinite
+        try:
+            job_memory=float(getattr(args,'tier_job_memory_gib',getattr(args,'launch_job_memory_gib',15)))
+        except (TypeError,ValueError) as error:
+            raise RuntimeError('Tier job memory must be finite and positive') from error
+        if not isfinite(job_memory) or job_memory<=0:
+            raise RuntimeError('Tier job memory must be finite and positive')
     daily_limit = tier.max_daily_usd if tier else args.max_daily_usd
     slots = getattr(args,'launch_slots',tier.initial_slots) if tier else 8
     hourly_limit = daily_limit / Decimal(24)
@@ -925,7 +1043,8 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             "--runner-label", args.label, "--apply",
         ]
         if tier:
-            command.extend(['--tier',tier.name,'--tier-slots',str(slots)])
+            command.extend(['--tier',tier.name,'--tier-slots',str(slots),
+                            '--tier-job-memory-gib',str(job_memory)])
         if tier and getattr(args, 'remote_builder', False):
             command.append('--remote-builder')
         if getattr(args, 'scaling_mode', 'resource') in ('resource','tiered'):
@@ -1133,6 +1252,7 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
     for repo in args.job_repository or []:
         plist["ProgramArguments"].extend(["--job-repository", repo])
     plist['ProgramArguments'].extend(['--scaling-mode', args.scaling_mode, '--maximum-hosts', str(args.maximum_hosts)])
+    plist['ProgramArguments'].extend(['--tier-job-memory-gib',str(getattr(args,'tier_job_memory_gib',15))])
     plist['ProgramArguments'].append('--remote-builder' if args.remote_builder else '--no-remote-builder')
     if getattr(args,'github_user',None):plist['ProgramArguments'].extend(['--github-user',args.github_user])
     if getattr(args,'migrate_oversized',False):plist['ProgramArguments'].append('--migrate-oversized')
@@ -1156,6 +1276,14 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument('--scaling-mode', choices=('tiered','resource', 'legacy'), default='resource',
                         help='Resource: two 5-minute checks above/below 75%% CPU/memory; legacy: runner occupancy')
     parser.add_argument('--maximum-hosts', type=int, default=5)
+    def job_memory(value):
+        from math import isfinite
+        value=float(value)
+        if not isfinite(value) or value<=0:
+            raise argparse.ArgumentTypeError('Job memory must be finite and positive')
+        return value
+    parser.add_argument('--tier-job-memory-gib',type=job_memory,default=15,
+                        help='Per-job cap/reservation; default 15 GiB is a verified compatible workload cap, not a measured peak')
     parser.add_argument('--dry-run',action='store_true',help='Read-only tier decision; never mutate providers or controller state')
     parser.add_argument('--migrate-oversized',action='store_true',help='Gradually replace existing oversized owned hosts')
     parser.add_argument('--remote-builder', action=argparse.BooleanOptionalAction, default=True,

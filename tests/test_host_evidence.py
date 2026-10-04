@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from lib.host_evidence import classify_events, sample
 
+IDLE_IO='some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'
+
 
 class HostEvidenceTests(unittest.TestCase):
     def test_real_cgroup_kernel_sequence_never_promotes_context_to_host_oom(self):
@@ -28,7 +30,7 @@ class HostEvidenceTests(unittest.TestCase):
         global_row={'__REALTIME_TIMESTAMP':'1000000000','MESSAGE':
                     'oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),global_oom,task=rustc,pid=42,uid=1001'}
         with patch('lib.host_evidence.time.time',return_value=10000), \
-             patch('lib.host_evidence.Path.read_text',side_effect=['boot','MemTotal: 131072000 kB\nMemAvailable: 123000000 kB\n']), \
+             patch('lib.host_evidence.Path.read_text',side_effect=['boot','MemTotal: 131072000 kB\nMemAvailable: 123000000 kB\n',IDLE_IO]), \
              patch('lib.host_evidence.command_json_lines',side_effect=[[],[],[global_row]]):
             observed=sample()
         self.assertEqual(observed['events'],[])
@@ -39,7 +41,7 @@ class HostEvidenceTests(unittest.TestCase):
     def test_unparseable_boot_global_row_cannot_prove_absence(self):
         row={'__REALTIME_TIMESTAMP':'invalid','MESSAGE':'Out of memory: Killed process 42 (rustc)'}
         with patch('lib.host_evidence.time.time',return_value=10000), \
-             patch('lib.host_evidence.Path.read_text',side_effect=['boot','MemTotal: 131072000 kB\nMemAvailable: 123000000 kB\n']), \
+             patch('lib.host_evidence.Path.read_text',side_effect=['boot','MemTotal: 131072000 kB\nMemAvailable: 123000000 kB\n',IDLE_IO]), \
              patch('lib.host_evidence.command_json_lines',side_effect=[[],[],[row]]):
             observed=sample()
         self.assertFalse(observed['boot_oom_complete'])
@@ -52,7 +54,7 @@ class HostEvidenceTests(unittest.TestCase):
                 raise subprocess.CalledProcessError(result.returncode,command,output=result.stdout,stderr=result.stderr)
             return result
         with patch('lib.host_evidence.time.time',return_value=10000), \
-             patch('lib.host_evidence.Path.read_text',side_effect=['boot','MemTotal: 131072000 kB\nMemAvailable: 123000000 kB\n']), \
+             patch('lib.host_evidence.Path.read_text',side_effect=['boot','MemTotal: 131072000 kB\nMemAvailable: 123000000 kB\n',IDLE_IO]), \
              patch('lib.host_evidence.subprocess.run',side_effect=run):
             try:observed=sample()
             except subprocess.CalledProcessError:self.fail('confirmed empty journal grep exit 1 must be accepted')

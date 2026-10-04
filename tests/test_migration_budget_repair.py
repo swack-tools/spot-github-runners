@@ -17,7 +17,8 @@ class MigrationBudgetRepairTests(unittest.TestCase):
         state['migration'].update(pending_tiers=[],pending_slots=[],replacement_ids=['2'],phase='healthy')
         state['host_deployments']={'z/2':{'tier':'bulky','expected_runner_count':16}}
         state['latest_resources']=[dict(zone='z',instance_id='2',observed_at=1000,
-            cpu_fraction=.1,memory_fraction=.06,peak_cpu_cores=3,peak_ram_gib=7.7)]
+            cpu_fraction=.1,memory_fraction=.06,peak_cpu_cores=3,peak_ram_gib=7.7,
+            io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0))]
         state['host_health']={'z/2':dict(instance_id='2',observed_at=1000,complete=True,
             events=[dict(id='oom1',kind='container',workload=workload,at=999)])}
         state['pending_oom']={'z/2':workload}
@@ -79,7 +80,8 @@ class MigrationBudgetRepairTests(unittest.TestCase):
                 reconcile_migration([old,new],runners,args,state,path)
             state['latest_workload']={'complete':True}
             state['latest_resources'].append(dict(zone='z',instance_id='1',observed_at=3000,
-                cpu_fraction=.1,memory_fraction=.06,peak_cpu_cores=3,peak_ram_gib=7.7))
+                cpu_fraction=.1,memory_fraction=.06,peak_cpu_cores=3,peak_ram_gib=7.7,
+                io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0)))
             for tick in (3000,3300):
                 for sample in state['latest_resources']:sample['observed_at']=tick
                 state['host_health']['z/2'].update(observed_at=tick,events=[])

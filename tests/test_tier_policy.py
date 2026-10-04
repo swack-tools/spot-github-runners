@@ -4,7 +4,8 @@ from lib.tier_policy import plan_capacity
 
 def sample(cpu=.1, memory=.1, cores=.8, ram=1.6, windows=6):
     return dict(instance_id='1',zone='z',cpu_fraction=cpu,memory_fraction=memory,
-                cpu_cores=cores,peak_cpu_cores=cores,used_ram_gib=ram,peak_ram_gib=ram,windows=windows)
+                cpu_cores=cores,peak_cpu_cores=cores,used_ram_gib=ram,peak_ram_gib=ram,windows=windows,
+                io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0))
 
 
 class TierPolicyTests(unittest.TestCase):

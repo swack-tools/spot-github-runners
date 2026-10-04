@@ -49,7 +49,8 @@ class MigrationTests(unittest.TestCase):
             runners=[GitHubRunner(i,f'gha-{new.name}-{i}','online',False,('spot','X64')) for i in range(1,9)]
             args=SimpleNamespace(org='org',remote_builder=False,maximum_hosts=5,scaling_mode='tiered')
             for tick in (1000,1300):
-                state['latest_resources']=[dict(instance_id=identity,zone='z',observed_at=tick,cpu_fraction=.1,memory_fraction=.2,peak_cpu_cores=.1,peak_ram_gib=.5) for identity in ('1','2')]
+                state['latest_resources']=[dict(instance_id=identity,zone='z',observed_at=tick,cpu_fraction=.1,memory_fraction=.2,peak_cpu_cores=.1,peak_ram_gib=.5,
+                    io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0)) for identity in ('1','2')]
                 state['latest_workload']={'complete':True}
                 state['host_health']={'z/2':{'complete':True,'observed_at':tick,'events':[]}}
                 with patch('lib.fleet_migration.time.time',return_value=tick), patch('lib.spot_runner_autoscaler.begin_host_operation') as drain:
@@ -117,7 +118,8 @@ class MigrationTests(unittest.TestCase):
             path=Path(folder)/'state.json';state={}
             begin_migration(hosts,('bulky','bulky','expanded'),state,path,'shrink')
             state['latest_workload']={'complete':True}
-            state['latest_resources']=[dict(peak_cpu_cores=1,peak_ram_gib=2)]*3
+            state['latest_resources']=[dict(peak_cpu_cores=1,peak_ram_gib=2,
+                io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0))]*3
             with patch('lib.spot_runner_autoscaler.begin_host_operation') as drain,\
                  patch('lib.spot_runner_autoscaler.check_running_prices',side_effect=AssertionError('launch pricing')):
                 reconcile_migration(hosts,[],SimpleNamespace(maximum_hosts=5),state,path)

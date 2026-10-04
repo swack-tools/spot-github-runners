@@ -7,6 +7,63 @@ import shlex
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from .host_evidence import validate_io_pressure
+
+
+# PSI percentages describe stalled task time, not disk utilization. Hold risky
+# moves at 10% full/10s or 5% full/60s; also hold broad partial stalls of 50%/10s
+# or 25%/60s. Peaks persist for the same bounded 30-minute demand window.
+IO_PRESSURE_LIMITS=dict(full_avg10=10,full_avg60=5,some_avg10=50,some_avg60=25)
+
+
+def io_status(evidence):
+    if not evidence:
+        return 'incomplete'
+    pressured=False
+    for row in evidence:
+        peaks=row.get('io_pressure_peaks',{})
+        if row.get('io_complete') is not True:
+            return 'incomplete'
+        for name,limit in IO_PRESSURE_LIMITS.items():
+            value=peaks.get(name)
+            if isinstance(value,bool) or not isinstance(value,(int,float)) or not 0<=value<=100 or not math.isfinite(value):
+                return 'incomplete'
+            pressured=pressured or value>=limit
+    return 'pressured' if pressured else 'healthy'
+
+
+def record_io_pressure(state,evidence,health,timestamp):
+    history=state.setdefault('io_history',{})
+    identities={f"{row['zone']}/{row['instance_id']}" for row in evidence or []}
+    for key in list(history):
+        if key not in identities:history.pop(key)
+    for row in evidence or []:
+        key=f"{row['zone']}/{row['instance_id']}";observed=health.get(key,{})
+        row['io_complete']=False;row.pop('io_pressure_peaks',None)
+        try:
+            if (observed.get('instance_id')!=row['instance_id'] or not observed.get('boot_id')
+                    or observed.get('io_complete') is not True
+                    or not 0<=timestamp-observed['observed_at']<=450):
+                raise ValueError('Missing fresh IO pressure identity')
+            values=validate_io_pressure(observed['io_pressure'])
+        except (KeyError,TypeError,ValueError):
+            history.pop(key,None)
+            continue
+        record=history.setdefault(key,dict(boot_id=observed['boot_id'],windows=[]))
+        windows=record['windows'];tick=observed['observed_at']
+        if (record['boot_id']!=observed['boot_id'] or
+                (windows and not 0<=tick-windows[-1]['observed_at']<=450)):
+            windows.clear();record['boot_id']=observed['boot_id']
+        if not windows or tick-windows[-1]['observed_at']>=300:
+            windows.append(dict(observed_at=tick,**{name:values[name] for name in IO_PRESSURE_LIMITS}))
+        else:
+            for name in IO_PRESSURE_LIMITS:
+                windows[-1][name]=max(windows[-1][name],values[name])
+        windows[:]=[window for window in windows if timestamp-window['observed_at']<=1800][-7:]
+        # Include the current sample even when it arrived within the distinct
+        # window interval; an immediate stall cannot hide behind a prior zero.
+        row.update(io_complete=True,io_pressure_peaks={
+            name:max(values[name],*(window[name] for window in windows)) for name in IO_PRESSURE_LIMITS})
 
 
 def epoch(value):

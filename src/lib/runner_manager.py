@@ -105,7 +105,8 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument('--resource-monitoring', action='store_true', help='Install metrics-only Ops Agent memory monitoring')
     parser.add_argument('--tier', choices=('small','starting','expanded','large','bulky'))
     parser.add_argument('--tier-slots',type=int)
-    parser.add_argument('--tier-job-memory-gib',type=float,default=2)
+    parser.add_argument('--tier-job-memory-gib',type=float,default=15,
+                        help='Per-job cap/reservation; default 15 GiB is a verified compatible workload cap, not a measured peak')
     parser.add_argument('--host-overhead-gib',type=float,default=2)
     return parser
 

@@ -24,9 +24,10 @@ class BudgetAdjustmentTests(unittest.TestCase):
                 shell=shlex.split(outer)[-1]
                 program=shlex.split(shell.split('python3 -c ',1)[1])[0]
                 program=program.replace('/etc/gha-admission.json',str(admission)).replace('/etc/oxidex-remote-build.json',str(builder)).replace('/var/lib/gha-admission/leases.json',str(root/'leases.json'))
+                program=program.replace('/run/gha-admission-adjust.lock',str(root/'adjust.lock'))
                 import lib.host_admission as module
                 import sys
-                with patch.dict(sys.modules,{'host_admission':module}),patch.object(module,'observed_envelope',return_value=11.5):
+                with patch.dict(sys.modules,{'host_admission':module}),patch.object(module,'observed_envelope',return_value=11.5),patch.object(module,'request',return_value=True):
                     exec(program,{})
                 return SimpleNamespace(returncode=0)
             with patch('lib.spot_runner_autoscaler.subprocess.run',side_effect=command):

@@ -21,8 +21,8 @@ class StorageSelectionTests(unittest.TestCase):
         boot, data, monthly = cheapest_storage('n4-standard-32', 100, rates)
         self.assertEqual((boot, data, monthly), ('hyperdisk-balanced', 'hyperdisk-balanced', Decimal('15.680')))
         boot, data, monthly = cheapest_storage('n4-standard-32', 2048, rates)
-        self.assertEqual((boot, data), ('hyperdisk-balanced', 'hyperdisk-throughput'))
-        self.assertEqual(monthly, Decimal('25.816'))
+        self.assertEqual((boot, data), ('hyperdisk-balanced', 'hyperdisk-balanced'))
+        self.assertEqual(monthly, Decimal('233.856'))
         rates['hyperdisk-throughput:throughput'] = Decimal('20')
         self.assertEqual(cheapest_storage('n4-standard-32', 2048, rates)[1], 'hyperdisk-balanced')
 

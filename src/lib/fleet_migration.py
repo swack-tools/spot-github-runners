@@ -1,12 +1,15 @@
 """Persist one tier replacement; existing identity-guarded drain owns deletion."""
 import logging
+import copy
+import math
 import subprocess
 import time
 from collections import Counter
 from dataclasses import asdict
 from decimal import Decimal
 from .runner_tiers import TIERS,tier_for_shape,validate_topology
-from .tier_policy import fits
+from .tier_policy import fits,reservation_fits
+from .fleet_evidence import io_status
 
 LOG=logging.getLogger('spot_runner_autoscaler')
 
@@ -21,7 +24,7 @@ def topology_for(vms):
     return tuple(sorted(names,key=rank.__getitem__))
 
 
-def begin_migration(vms,target,state,state_path,reason,slots=None,force_ids=(),slot_counts=()):
+def begin_migration(vms,target,state,state_path,reason,slots=None,force_ids=(),slot_counts=(),io_pressure_sources=()):
     from .spot_runner_autoscaler import write_scale_state
     validate_topology(target)
     if state.get('migration') or state.get('host_operation'):
@@ -45,10 +48,107 @@ def begin_migration(vms,target,state,state_path,reason,slots=None,force_ids=(),s
         recorded_slots.setdefault(name,[]).append(count)
     pending_slots=[recorded_slots[name].pop(0) if recorded_slots.get(name)
                    else slots or TIERS[name].initial_slots for name in pending_tiers]
+    if io_pressure_sources and (reason!='storage-pressure canary replacement'
+                               or set(io_pressure_sources)!={row['instance_id'] for row in sources}):
+        raise ValueError('Storage relief exemption requires exact retiring sources')
     state['migration']=dict(target=list(target),sources=sources,retained_ids=retained,
         pending_tiers=pending_tiers,pending_slots=pending_slots,replacement_ids=[],phase='launch',reason=reason,
         started_at=time.time(),slots=slots)
+    if io_pressure_sources:
+        state['migration']['io_pressure_source_ids']=sorted(io_pressure_sources)
     write_scale_state(state_path,state)
+
+
+def retirement_io_safe(migration,resources,state):
+    if migration.get('reason')!='storage-pressure canary replacement':
+        return io_status(resources)=='healthy'
+    allowed=set(migration.get('io_pressure_source_ids',[]))
+    if not allowed or allowed!={row['instance_id'] for row in migration['sources']}:
+        return False
+    for row in resources or []:
+        key=f"{row.get('zone')}/{row.get('instance_id')}";health=state.get('host_health',{}).get(key,{})
+        try:
+            if (health.get('instance_id')!=row['instance_id'] or health.get('complete') is not True
+                    or not health.get('boot_id') or not 0<=time.time()-health['observed_at']<=450
+                    or not 0<=time.time()-row['observed_at']<=450
+                    or health.get('boot_oom_complete') is not True or health.get('boot_host_oom_ids')!=[]
+                    or any(event.get('kind') in ('host','unknown') for event in health.get('events',[]))
+                    or state.get('pending_oom',{}).get(key)=='host'):
+                return False
+        except (KeyError,TypeError,ValueError):
+            return False
+    destinations=[row for row in resources or [] if row.get('instance_id') not in allowed]
+    # Source stalls are the explicit reason for replacement. They cannot veto
+    # retirement once every destination has healthy IO; missing source evidence
+    # still holds because measured demand and pressure must remain complete.
+    return io_status(resources)!='incomplete' and io_status(destinations)=='healthy'
+
+
+def retarget_unhealthy_storage_canary(vms,args,state,state_path):
+    """Safely replace the exact stalled two-32-vCPU canary with one 16/64 host."""
+    migration=state.get('migration',{})
+    if (migration.get('phase')!='healthy' or migration.get('pending_tiers')
+            or migration.get('awaiting_launch') or state.get('host_operation')
+            or len(migration.get('sources',[]))!=1 or len(migration.get('replacement_ids',[]))!=1
+            or migration.get('target')!=['bulky']):
+        return False
+    managed=[vm for vm in vms if vm.spot and vm.name.startswith('oxidex-runners-')]
+    recorded=migration['sources'][0];source_id=recorded['instance_id'];bad_id=migration['replacement_ids'][0]
+    identities={source_id,bad_id}
+    if (len(managed)!=2 or len(identities)!=2 or {vm.instance_id for vm in managed}!=identities
+            or any(not vm.running or (vm.vcpu,vm.ram_gib)!=(32,128) for vm in managed)):
+        return False
+    source=next(vm for vm in managed if vm.instance_id==source_id)
+    if (source.name!=recorded['name'] or source.zone!=recorded['zone']
+            or tuple(source.disks)!=tuple(recorded.get('disks',[]))
+            or not source.disks or any(not disk.get('diskId') for disk in source.disks)):
+        return False
+    if (any(f'{vm.zone}/{vm.name}' in state.get('intentional_deletions',[]) for vm in managed)
+            or identities & set(state.get('intentional_deletion_ids',{}).values())):
+        return False
+    job_memory=getattr(args,'tier_job_memory_gib',15)
+    if (not isinstance(job_memory,(int,float)) or isinstance(job_memory,bool) or job_memory<15
+            or not reservation_fits(('large',),job_memory)
+            or state.get('latest_workload',{}).get('complete') is not True):
+        return False
+    timestamp=time.time();resources=state.get('latest_resources') or []
+    try:
+        if ({(row['zone'],row['instance_id']) for row in resources}!={(vm.zone,vm.instance_id) for vm in managed}
+                or len(resources)!=2 or io_status(resources)=='incomplete'
+                or any(row['windows']<6 or not 0<=timestamp-row['observed_at']<=450
+                       or any(not math.isfinite(row[name]) or row[name]<0 for name in ('peak_cpu_cores','peak_ram_gib'))
+                       for row in resources)
+                or not fits(('large',),resources)):
+            return False
+        for vm in managed:
+            key=f'{vm.zone}/{vm.instance_id}';health=state.get('host_health',{}).get(key,{})
+            if (health.get('instance_id')!=vm.instance_id or health.get('complete') is not True
+                    or not health.get('boot_id') or not 0<=timestamp-health['observed_at']<=450
+                    or health.get('boot_oom_complete') is not True or health.get('boot_host_oom_ids')!=[]
+                    or any(event.get('kind') in ('host','unknown') for event in health.get('events',[]))
+                    or state.get('pending_oom',{}).get(key)=='host'):
+                return False
+        bad=next(vm for vm in managed if vm.instance_id==bad_id);key=f'{bad.zone}/{bad.instance_id}'
+        history=state.get('io_history',{}).get(key,{})
+        windows=history.get('windows',[])
+        if (history.get('boot_id')!=state['host_health'][key]['boot_id'] or len(windows)<2
+                or not 300<=windows[-1]['observed_at']-windows[-2]['observed_at']<=450
+                or not 0<=timestamp-windows[-1]['observed_at']<=450
+                or any(io_status([dict(io_complete=True,io_pressure_peaks=row)])!='pressured' for row in windows[-2:])):
+            return False
+    except (KeyError,TypeError,ValueError,OverflowError):
+        return False
+    candidate=copy.deepcopy(state)
+    candidate['migration_history']=(candidate.get('migration_history',[])+[
+        dict(retargeted_at=timestamp,reason='sustained storage pressure',migration=copy.deepcopy(migration))])[-3:]
+    candidate.pop('migration')
+    begin_migration(managed,('large',),candidate,state_path,'storage-pressure canary replacement',
+                    slots=TIERS['large'].initial_slots,io_pressure_sources=identities)
+    # Existing job trackers hold references into other state subtrees.
+    state['migration']=candidate['migration']
+    state['migration_history']=candidate['migration_history']
+    LOG.info('Retargeted exact stalled storage canary: preserve both 32-vCPU sources until a healthy 16/64 replacement')
+    return True
 
 
 def reconcile_migration(vms,runners,args,state,state_path):
@@ -96,6 +196,7 @@ def reconcile_migration(vms,runners,args,state,state_path):
             topology=topology_for(remaining)
             if (state.get('latest_workload',{}).get('complete') is not True
                     or not remaining or 'legacy' in topology
+                    or io_status(state.get('latest_resources'))!='healthy'
                     or not fits(topology,state.get('latest_resources'))):
                 LOG.info('Migration holds at overlap ceiling: no safe remaining capacity')
                 return True
@@ -119,7 +220,7 @@ def reconcile_migration(vms,runners,args,state,state_path):
                     migration['overlap_allowance_daily_usd']=str(allowance)
                 migration['spend_ceiling']=str(max(Decimal('15'),current+allowance))
                 controller.write_scale_state(state_path,state)
-            offers=controller.discover_tier_offers(args.project,tier,args.disk_size_gb)
+            offers=controller.discover_tier_offers(args.project,tier,args.disk_size_gb,getattr(args,'tier_job_memory_gib',15))
             offers=[offer for offer in offers if current+offer.total_daily_usd<Decimal(migration['spend_ceiling'])]
             slots=(migration.get('pending_slots') or [migration.get('slots') or tier.initial_slots])[0]
             if (sum(vm.vcpu or 80 for vm in managed)+tier.vcpu>80
@@ -132,7 +233,7 @@ def reconcile_migration(vms,runners,args,state,state_path):
             args.launch_tier=tier.name
             args.launch_slots=slots
             controller.scale_up(1,offers,args,state,state_path,
-                refresh=lambda: [row for row in controller.discover_tier_offers(args.project,tier,args.disk_size_gb)
+                refresh=lambda: [row for row in controller.discover_tier_offers(args.project,tier,args.disk_size_gb,getattr(args,'tier_job_memory_gib',15))
                                   if current+row.total_daily_usd<Decimal(migration['spend_ceiling'])])
             if state.get('host_operation',{}).get('kind')=='launch':
                 migration['awaiting_launch']=state['host_operation']['vm']
@@ -140,6 +241,8 @@ def reconcile_migration(vms,runners,args,state,state_path):
             return True
     if not migration['pending_tiers'] and migration['phase']!='drain':
         migration['phase']='healthy'
+        if retarget_unhealthy_storage_canary(vms,args,state,state_path):
+            return True
         rows={f"{row['zone']}/{row['instance_id']}":row for row in state.get('latest_resources') or []}
         healthy=True
         checks=migration.setdefault('healthy_checks',{})
@@ -191,6 +294,7 @@ def reconcile_migration(vms,runners,args,state,state_path):
                             state['pending_oom'].pop(key)
                         LOG.info('Repaired idle %s memory cap on replacement %s; fresh healthy windows still required',kind,vm.name)
             good=(ready and sample and sample['cpu_fraction']<.75 and sample['memory_fraction']<.75
+                  and io_status([sample])=='healthy'
                   and health.get('complete') and not health.get('events')
                   and time.time()-health.get('observed_at',0)<=450)
             if good and getattr(args,'remote_builder',False):
@@ -212,11 +316,14 @@ def reconcile_migration(vms,runners,args,state,state_path):
         identities={(vm.zone,vm.instance_id) for vm in fleet}
         observed={(row.get('zone'),row.get('instance_id')) for row in resources}
         if (state.get('latest_workload',{}).get('complete') is not True
-                or observed!=identities or not fits(migration['target'],resources)):
+                or observed!=identities or not retirement_io_safe(migration,resources,state) or not fits(migration['target'],resources)):
             LOG.info('Migration keeps source: fresh complete workload/peak demand does not fit target')
             return True
         migration['phase']='drain'
     if migration['phase'] in ('drain','drain-first'):
+        if any(row['instance_id'] in by_id for row in migration['sources']) and not retirement_io_safe(migration,state.get('latest_resources'),state):
+            LOG.info('Migration retirement holds: incomplete or pressured IO evidence')
+            return True
         for record in migration['sources']:
             vm=by_id.get(record['instance_id'])
             if not vm:continue

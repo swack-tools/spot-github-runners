@@ -1,6 +1,30 @@
 """Evidence-led, conservative topology decisions; no provider side effects."""
 import math
 from .runner_tiers import TIERS, next_topology
+from .fleet_evidence import io_status
+from .host_admission import admission_budget
+
+
+def reservation_fits(topology,job_memory_gib,slots=None):
+    if not topology or isinstance(job_memory_gib,bool) or not isinstance(job_memory_gib,(int,float)):
+        return False
+    try:
+        for index,name in enumerate(topology):
+            admission_budget(TIERS[name],2,job_memory_gib,
+                slots=slots if slots is not None and index==len(topology)-1 else TIERS[name].initial_slots)
+    except (KeyError,ValueError,TypeError,OverflowError):
+        return False
+    return True
+
+
+def compatible_recovery_tier(name,job_memory_gib):
+    candidate=(name,)
+    while not reservation_fits(candidate,job_memory_gib):
+        next_candidate=next_topology(candidate,'up','memory')
+        if next_candidate==candidate or len(next_candidate)!=1:
+            return None
+        candidate=next_candidate
+    return candidate[0]
 
 
 def fits(target, evidence):
@@ -16,8 +40,15 @@ def fits(target, evidence):
 def plan_capacity(topology, evidence, workload, state, timestamp):
     topology = tuple(topology)
     hold = dict(target=topology,action='hold',reason='stable')
+    reservation=workload.get('minimum_job_memory_gib',2)
     if not topology:
-        return dict(target=('starting',),action='topology',reason='empty')
+        candidate=('starting',)
+        while not reservation_fits(candidate,reservation):
+            next_candidate=next_topology(candidate,'up','memory')
+            if next_candidate==candidate:
+                return {**hold,'reason':'known workload reservation does not fit allowed tiers'}
+            candidate=next_candidate
+        return dict(target=candidate,action='topology',reason='empty')
     valid = bool(evidence)
     try:
         valid = valid and all(row['windows'] >= 1 and all(math.isfinite(row[key]) and row[key] >= 0
@@ -39,13 +70,23 @@ def plan_capacity(topology, evidence, workload, state, timestamp):
                 and any(row['memory_fraction']>.75 for row in evidence)))
     if (workload.get('container_oom') or workload.get('builder_oom')) and not host_oom:
         return {**hold,'action':'budget','reason':'container OOM with host headroom'}
+    io=io_status(evidence)
+    # Storage stalls can inflate queue and duration signals while CPU stays
+    # idle. Require healthy IO before increasing density or consolidating;
+    # actual memory pressure/global OOM can still receive capacity relief.
+    memory=any(row['memory_fraction']>.75 for row in evidence)
+    if io!='healthy' and not host_oom and not memory:
+        state.pop('streak',None);state.pop('direction',None);state.pop('timestamp',None)
+        return {**hold,'reason':'incomplete IO pressure evidence' if io=='incomplete' else 'IO pressure requires storage relief'}
     if not host_oom and timestamp - state.get('changed_at',-math.inf) < 900:
         return {**hold,'reason':'cooldown'}
     if 'legacy' in topology:
+        if io!='healthy':
+            return {**hold,'reason':'legacy consolidation requires healthy IO pressure evidence'}
         if any(row['windows'] < 2 for row in evidence) or workload.get('pending'):
             return {**hold,'reason':'legacy migration needs complete history and no compatible queue'}
         candidate = ('starting',)
-        while not fits(candidate,evidence):
+        while not fits(candidate,evidence) or not reservation_fits(candidate,reservation):
             next_candidate = next_topology(candidate,'up','memory')
             if candidate == next_candidate:
                 return {**hold,'reason':'demand exceeds allowed replacement fleet'}
@@ -71,13 +112,26 @@ def plan_capacity(topology, evidence, workload, state, timestamp):
     slots=workload.get('slots',0)
     if (delayed and not memory and not cpu and not host_oom and slots
             and slots<TIERS[topology[-1]].maximum_slots and fits(topology,evidence)):
-        return dict(target=topology,action='density',reason='compatible queue with resource headroom',
-                    slots=min(TIERS[topology[-1]].maximum_slots,slots+4))
+        next_slots=min(TIERS[topology[-1]].maximum_slots,slots+4)
+        tier=TIERS[topology[-1]]
+        if reservation_fits(topology,reservation,next_slots):
+            current=admission_budget(tier,2,reservation,slots=slots)['concurrency']
+            future=admission_budget(tier,2,reservation,slots=next_slots)['concurrency']
+            if future>current:
+                return dict(target=topology,action='density',reason='compatible queue with resource headroom',slots=next_slots)
     if direction == 'down' and (workload.get('pending') or any(row['windows'] < 6 for row in evidence)):
         return {**hold,'reason':'pending job or insufficient consolidation history'}
     target = next_topology(topology,direction,reason)
     if target == topology:
         return {**hold,'reason':'capacity boundary'}
+    if direction=='up':
+        while not reservation_fits(target,reservation):
+            next_target=next_topology(target,'up','memory')
+            if next_target==target:
+                return {**hold,'reason':'known workload reservation does not fit allowed growth tiers'}
+            target=next_target
+    if not reservation_fits(target,reservation):
+        return {**hold,'reason':'known workload reservation does not fit target topology'}
     if direction == 'down' and not fits(target,evidence):
         return {**hold,'reason':'projected CPU/RAM peaks do not fit smaller topology'}
     decision = dict(target=target,action='topology',reason=reason)

@@ -9,7 +9,7 @@ class TierBootstrapTests(unittest.TestCase):
         for tier,cpu,ram,slots in [('starting',8,16,8),('expanded',8,32,16),('large',16,64,20),('bulky',32,128,16)]:
             args = args_parser().parse_args(['--max-cost','.125','--tier',tier,'--tier-slots',str(slots),
                 '--cpu',str(cpu),'--ram',str(ram),'--instance-type',f'n2-standard-{cpu}',
-                '--remote-builder','--runner-prefix','gha'])
+                '--remote-builder','--runner-prefix','gha','--tier-job-memory-gib','2'])
             select_sizing(args)
             self.assertEqual(args.runner_count,slots)
             self.assertLess(args.admission_work_gib,ram)

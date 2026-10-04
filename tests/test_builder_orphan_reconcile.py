@@ -162,7 +162,20 @@ class BuilderOrphanReconcileTests(unittest.TestCase):
         self.assertIn('sudo flock -n -E 75 /run/oxidex-build.lock',command)
         self.assertIn('metadata.google.internal/computeMetadata/v1/instance/id',command)
         self.assertIn('= 12345 || exit 75;',command)
-        self.assertIn('/opt/gha-runners/host_admission.py reconcile-builders --global-lock-held || exit 75;',command)
+        self.assertIn('/usr/bin/python3 -I -c',command)
+        self.assertNotIn('/opt/gha-runners/host_admission.py reconcile-builders',command)
+        # Extract and execute the embedded program without an installed CLI.
+        import shlex
+        outer=shlex.split(command.removeprefix('--command='))
+        shell=outer[-1]
+        tokens=shlex.split(shell)
+        index=tokens.index('-c')
+        program=tokens[index+1]
+        with patch('subprocess.run',return_value=SimpleNamespace(stdout='')) as docker:
+            with self.assertRaises(SystemExit) as result:
+                exec(compile(program,'<embedded-drain>','exec'),{})
+        self.assertEqual(result.exception.code,0)
+        docker.assert_called_once()
         self.assertNotIn('docker rm',command)
 
 

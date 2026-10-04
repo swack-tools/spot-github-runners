@@ -1,4 +1,4 @@
-"""Compare compatible boot and runner disks using full monthly charges."""
+"""Price the cheapest boot disk and SSD-backed build data within strict caps."""
 from decimal import Decimal
 from .billing_catalog import catalog_skus, unit_price
 from .machine_profiles import machine_profile
@@ -62,9 +62,9 @@ def cheapest_storage(machine_type: str, size_gib: int, rates: dict) -> tuple[str
         raise RuntimeError(f'Unsupported storage machine type {machine_type}')
     modern = profile.disk_type == 'hyperdisk-balanced'
     boot_types = ['hyperdisk-balanced'] if modern else ['pd-standard', 'pd-balanced', 'pd-ssd']
-    data_types = list(boot_types)
-    if size_gib >= 2048 and machine_type.split('-', 1)[0] in {'c4', 'c4d', 'n4', 'n4d', 'n2', 'n2d'}:
-        data_types.append('hyperdisk-throughput')
+    # Cargo caches and concurrent CI have random IO. Cheap spinning PD and
+    # sequential-throughput Hyperdisk are not substitutes for this data floor.
+    data_types = ['hyperdisk-balanced'] if modern else ['pd-balanced','pd-ssd']
     def choose(kinds, size):
         choices = []
         for kind in kinds:

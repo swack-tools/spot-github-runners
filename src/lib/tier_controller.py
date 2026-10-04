@@ -5,9 +5,9 @@ import logging
 import subprocess
 import time
 from decimal import Decimal
-from .fleet_evidence import record_resources,workload_signals,read_host_events,epoch,remember_jobs
+from .fleet_evidence import record_resources,record_io_pressure,workload_signals,read_host_events,epoch,remember_jobs
 from .fleet_migration import topology_for,begin_migration,reconcile_migration,expected_slots
-from .tier_policy import plan_capacity
+from .tier_policy import plan_capacity,compatible_recovery_tier
 from .runner_tiers import TIERS,tier_for_shape,next_topology
 
 LOG=logging.getLogger('spot_runner_autoscaler')
@@ -59,6 +59,7 @@ def evidence_for(vms,runners,args,state):
         except (RuntimeError,OSError,ValueError,KeyError,subprocess.SubprocessError) as exc:
             LOG.warning('Host OOM/readiness evidence missing for %s: %s',vm.name,controller.error_detail(exc))
     state['host_health']=health
+    record_io_pressure(state,evidence,health,time.time())
     state['seen_oom_ids']=sorted(seen)[-1000:]
     data=state.get('job_tracking',{})
     repositories=args.job_repository or [args.org+'/oxidex']
@@ -69,6 +70,7 @@ def evidence_for(vms,runners,args,state):
                              [set(row.labels) for row in runners if controller.runner_is_managed(row)],
                              timestamp,group_ids={10})
     signals['complete']=complete
+    signals['minimum_job_memory_gib']=getattr(args,'tier_job_memory_gib',15)
     signals['host_oom']=any(kind=='host' for key,kind in pending.items() if key in health)
     signals['container_oom']=any(kind=='runner' for key,kind in pending.items() if key in health)
     signals['builder_oom']=any(kind=='builder' for key,kind in pending.items() if key in health)
@@ -101,6 +103,13 @@ def check_tiers(vms,runners,args,state,state_path):
         # A pre-upgrade multi-32 fleet cannot be recreated as a malformed tail.
         if len(target)>1 and any(name not in ('large','bulky') for name in target[:-1]):
             target=('large',)*min(5,len(target))
+        reservation=signals.get('minimum_job_memory_gib',getattr(args,'tier_job_memory_gib',15))
+        compatible={name:compatible_recovery_tier(name,reservation) for name in target}
+        if any(name is None for name in compatible.values()):
+            LOG.warning('Loss recovery holds: known workload memory cannot fit an allowed tier')
+            controller.write_scale_state(state_path,state)
+            return
+        target=tuple(compatible[name] for name in target)
         state['pending_vm_recovery']={}
         state['price_replacement_target']=0
         if topology!=target:
@@ -109,7 +118,7 @@ def check_tiers(vms,runners,args,state,state_path):
                 tier=tier_for_shape(record.get('vcpu'),record.get('ram_gib'))
                 receipt=state.get('host_deployments',{}).get(f"{record['zone']}/{record['instance_id']}",{})
                 if tier and receipt.get('tier')==tier.name and receipt.get('expected_runner_count') is not None:
-                    slot_counts.append((tier.name,receipt['expected_runner_count']))
+                    slot_counts.append((compatible.get(tier.name,tier.name),receipt['expected_runner_count']))
             begin_migration(fleet,target,state,state_path,'loss recovery',slot_counts=slot_counts)
             reconcile_migration(vms,runners,args,state,state_path)
             return
@@ -181,7 +190,7 @@ def dry_run(args,saved):
         decision=dict(target=topology,action='hold',reason='oversized migration disabled')
     offers={}
     for name in set(decision['target'])-{'legacy'}:
-        candidates=controller.discover_tier_offers(args.project,TIERS[name],args.disk_size_gb)
+        candidates=controller.discover_tier_offers(args.project,TIERS[name],args.disk_size_gb,getattr(args,'tier_job_memory_gib',15))
         offers[name]=[dict(machine=row.machine_type,zone=row.zone,daily_usd=str(row.total_daily_usd),
                            boot_disk=row.boot_disk_type,data_disk=row.data_disk_type) for row in candidates[:10]]
     print(json.dumps(dict(decision=decision,resources=evidence,workload=signals,offers=offers,

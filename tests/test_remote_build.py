@@ -56,7 +56,8 @@ class RemoteBuildTests(unittest.TestCase):
         vm=GceVm('test','zone-a','RUNNING','n4-standard-32',True,instance_id='1')
         with patch('subprocess.run', return_value=SimpleNamespace(returncode=75)) as run:
             self.assertFalse(quiesce_remote_builder(vm, SimpleNamespace(project='p')))
-            self.assertIn('reconcile-builders --global-lock-held',run.call_args.args[0][-1])
+            self.assertIn("builders_running",run.call_args.args[0][-1])
+            self.assertNotIn('/opt/gha-runners/host_admission.py reconcile-builders',run.call_args.args[0][-1])
 
 
 if __name__ == '__main__':
