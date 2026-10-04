@@ -186,6 +186,7 @@ def reconcile_migration(vms,runners,args,state,state_path):
         if reused and reused.instance_id!=record['instance_id']:
             LOG.error('Migration holds: source name has a different provider identity')
             return True
+    record_missing_sources(vms,state)
     # Recovery cleans a real lost identity before replacement can resume.
     if any(not row.get('_cleanup_complete') for row in state.get('pending_vm_recovery',{}).values()):
         return True
@@ -335,6 +336,15 @@ def reconcile_migration(vms,runners,args,state,state_path):
             migration['phase']='launch'
             controller.write_scale_state(state_path,state)
             return True
+        # A persisted drain phase is not a readiness receipt: destinations
+        # may have been lost/replaced while sources were already absent.
+        if ((migration.get('storage_staged_bad_id') and not staged_replacement_receipts(fleet,state))
+                or not missing_sources_clean(fleet,state)
+                or not additive_evidence_complete(vms,args,state)
+                or not replacements_healthy(fleet,runners,args,state,state_path,include_retained=bool(migration['sources']))
+                or (migration['sources'] and (not fits(migration['target'],state.get('latest_resources'))
+                    or not retirement_io_safe(migration,state.get('latest_resources'),state)))):
+            return True
         state.setdefault('tier_policy',{})['changed_at']=time.time()
         state['desired_topology']=migration['target']
         state['migration_completed_at']=time.time()
@@ -451,7 +461,7 @@ def staged_retirement_safe(vms,runners,args,state,state_path,operation):
                         or list(current.disks)!=list(saved.get('disks',[]))
                         or not current.disks or any(not disk.get('diskId') for disk in current.disks)):
             return False
-    if record['instance_id'] not in by_id:return False
+    if record['instance_id'] not in by_id or not missing_sources_clean(managed,state):return False
     replacement_ids=migration.get('replacement_ids',[])
     if len(set(replacement_ids))!=len(replacement_ids):return False
     if (scope['stage']=='final' or any(row['instance_id'] not in by_id for row in sources)):
@@ -476,13 +486,7 @@ def staged_retirement_safe(vms,runners,args,state,state_path,operation):
         if scope['stage']=='final' and (bad_id in by_id or migration.get('pending_tiers')
                                        or not fits(migration['target'],resources)):
             return False
-        for identity in migration['replacement_ids']:
-            vm=by_id.get(identity)
-            if not vm:return False
-            receipt=state.get('host_deployments',{}).get(f'{vm.zone}/{identity}',{})
-            if ((vm.vcpu,vm.ram_gib)!=(16,64) or receipt.get('tier')!='large'
-                    or receipt.get('runner_memory_gib',0)<15):return False
-        if not migration['replacement_ids']:return False
+        if not staged_replacement_receipts(managed,state):return False
         return replacements_healthy(managed,runners,args,state,state_path)
     except (KeyError,TypeError,ValueError,OverflowError):
         return False
@@ -510,6 +514,8 @@ def guard_staged_retirement(vms,runners,args,state,state_path):
         safe=retirement_safe
     try:
         current_vms=controller.list_gcloud_vms(args.project,name_prefix='oxidex-runners-')
+        controller.observe_vms(current_vms,state)
+        record_missing_sources(current_vms,state)
         fresh=controller.list_github_runners(args.org)
         from .tier_controller import evidence_for
         evidence_for(current_vms,fresh,args,state)
@@ -558,6 +564,8 @@ def restore_missing_destinations(fleet,state,state_path):
             count=receipt.get('expected_runner_count') or saved.get('_expected_runner_count') or TIERS[tier_name].initial_slots
             if not isinstance(count,int) or isinstance(count,bool) or not 1<=count<=TIERS[tier_name].maximum_slots:return 'hold'
             migration[cohort].remove(identity)
+            migration['phase']='launch'
+            migration['healthy_checks']={}
             migration['pending_tiers'].append(tier_name)
             migration.setdefault('pending_slots',[]).append(count)
             controller.write_scale_state(state_path,state)
@@ -578,6 +586,11 @@ def retirement_safe(vms,runners,args,state,state_path,operation):
     if (not current or current.name!=record['name'] or current.zone!=record['zone']
             or list(current.disks)!=list(record.get('disks',[])) or not current.disks
             or any(not disk.get('diskId') for disk in current.disks)):return False
+    for saved in migration['sources']:
+        current_source=next((vm for vm in managed if vm.instance_id==saved['instance_id']),None)
+        if any(vm.name==saved['name'] and vm.zone==saved['zone'] and vm.instance_id!=saved['instance_id'] for vm in managed):return False
+        if current_source and not same_source_inventory(saved,asdict(current_source)):return False
+    if not missing_sources_clean(managed,state):return False
     destinations=set(migration['replacement_ids']+migration.get('retained_ids',[]))
     survivors=[vm for vm in managed if vm.instance_id in destinations]
     if len(survivors)!=len(destinations) or not survivors:return False
@@ -643,3 +656,64 @@ def additive_evidence_complete(vms,args,state):
                     and all(math.isfinite(row[name]) and row[name]>=0 for name in ('peak_cpu_cores','peak_ram_gib'))
                     for row in resources))
     except (KeyError,TypeError,ValueError,OverflowError):return False
+
+
+def same_source_inventory(first,second):
+    return (all(first.get(name)==second.get(name) and first.get(name) for name in ('instance_id','zone','name'))
+        and bool(first.get('disks')) and list(first['disks'])==list(second.get('disks',[]))
+        and all(disk.get('diskId') for disk in first['disks']))
+
+
+def source_absence_proven(source,state):
+    migration=state.get('migration',{})
+    retired=migration.get('completed_retirements',{}).get(source['instance_id'],{})
+    return ((migration.get('started_at') is not None and retired.get('started_at')==migration.get('started_at')
+            and retired.get('absence_confirmed') is True and same_source_inventory(source,retired.get('vm',{})))
+        or any(row.get('_cleanup_complete') is True and same_source_inventory(source,row)
+            for row in state.get('pending_vm_recovery',{}).values()))
+
+
+def missing_sources_clean(fleet,state):
+    """Only confirmed lifecycle/recovery completion explains an absent original source."""
+    migration=state.get('migration',{});present={vm.instance_id for vm in fleet}
+    for source in migration.get('sources',[]):
+        if source['instance_id'] in present:continue
+        if not source_absence_proven(source,state):return False
+    return True
+
+
+def record_retirement_completion(operation,state):
+    """Called only after VM, assigned runner and drain-group absence is confirmed."""
+    migration=state.get('migration',{});scope=operation.get('staged_retirement') or operation.get('migration_retirement',{})
+    source=next((row for row in migration.get('sources',[]) if same_source_inventory(row,operation.get('vm',{}))),None)
+    if (source and migration.get('started_at') is not None and scope.get('started_at')==migration.get('started_at')
+            and operation.get('kind') in ('delete','delete_cleanup') and operation.get('drained') is True):
+        migration.setdefault('completed_retirements',{})[source['instance_id']]=dict(
+            vm=copy.deepcopy(source),started_at=migration['started_at'],absence_confirmed=True)
+
+
+def record_missing_sources(vms,state):
+    """Recover unreceipted original sources even when an earlier roster omitted them."""
+    from .fleet_logging import vm_from_record,recovery_key
+    present={vm.instance_id for vm in vms};operation_id=state.get('host_operation',{}).get('vm',{}).get('instance_id')
+    for source in state.get('migration',{}).get('sources',[]):
+        if source['instance_id'] in present or source['instance_id']==operation_id:continue
+        # A completed exact receipt can legitimately explain this disappearance.
+        if source_absence_proven(source,state):continue
+        pending=state.setdefault('pending_vm_recovery',{})
+        if any(same_source_inventory(source,row) for row in pending.values()):continue
+        vm=vm_from_record(source);key=recovery_key(f'{vm.zone}/{vm.name}',vm,pending)
+        pending.setdefault(key,copy.deepcopy(source))
+
+
+def staged_replacement_receipts(fleet,state):
+    migration=state['migration'];identities=migration.get('replacement_ids',[])
+    if not identities or len(set(identities))!=len(identities):return False
+    by_id={vm.instance_id:vm for vm in fleet}
+    for identity in identities:
+        vm=by_id.get(identity)
+        if not vm:return False
+        receipt=state.get('host_deployments',{}).get(f'{vm.zone}/{identity}',{})
+        if ((vm.vcpu,vm.ram_gib)!=(16,64) or receipt.get('tier')!='large'
+                or receipt.get('runner_memory_gib',0)<15):return False
+    return True

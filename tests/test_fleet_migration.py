@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from dataclasses import asdict
 from lib.runner_fleet import GceVm,GitHubRunner
+from lib import spot_runner_autoscaler as controller
 from lib.fleet_migration import begin_migration, reconcile_migration, expected_slots
 
 
@@ -88,7 +89,7 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(state['migration']['retained_ids'],[])
             self.assertEqual(state['migration']['replacement_ids'],[])
 
-    def test_completion_retains_unresolved_ooms_on_retained_or_unrelated_hosts(self):
+    def test_completion_holds_unresolved_ooms_on_retained_or_unrelated_hosts(self):
         import json
         old,new=vm('old',32,128,'1'),vm('retained',16,64,'2')
         for kind in ('runner','builder','host'):
@@ -98,10 +99,11 @@ class MigrationTests(unittest.TestCase):
                 state['migration'].update(pending_tiers=[],phase='drain')
                 state['pending_oom']={'z/1':'runner','z/2':kind,'other/99':'builder'}
                 state['seen_oom_ids']=['unresolved-on-retained']
+                controller.write_scale_state(path,state)
                 reconcile_migration([new],[],SimpleNamespace(),state,path)
                 saved=json.loads(path.read_text())
-                self.assertEqual(saved.get('pending_oom'),{'z/2':kind,'other/99':'builder'})
-                self.assertNotIn('migration',saved)
+                self.assertEqual(saved.get('pending_oom'),{'z/1':'runner','z/2':kind,'other/99':'builder'})
+                self.assertIn('migration',saved)
                 self.assertEqual(saved['seen_oom_ids'],['unresolved-on-retained'])
 
     def test_invalid_tier_receipt_cannot_be_marked_imported(self):

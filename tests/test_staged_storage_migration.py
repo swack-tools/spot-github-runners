@@ -125,8 +125,10 @@ class StagedStorageMigrationTests(unittest.TestCase):
         self.assertNotIn('host_operation',restarted)
 
     def test_confirmed_early_absence_launches_second_within_64_cpu_then_waits_for_both(self):
-        self.staged();self.state.pop('host_operation')
+        self.staged();self.state['host_operation'].update(kind='delete',drained=True)
         self.hosts=[vm for vm in self.hosts if vm.instance_id!='2']
+        controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+        self.assertIn('2',self.state['migration']['completed_retirements'])
         self.state['latest_resources']=[row for row in self.state['latest_resources'] if row['instance_id']!='2']
         offer=SimpleNamespace(total_daily_usd=Decimal('2.9'))
         def prices(vms,project,cap,totals):totals.update({vm.name:Decimal('5') if vm.vcpu==32 else Decimal('2.9') for vm in vms})
@@ -231,7 +233,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
              patch('lib.fleet_migration.time.time',return_value=3100):
             controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
         # A real cleanup receipt remains a barrier until every recorded disk is absent.
-        self.state['pending_vm_recovery']={'old':dict(instance_id='1',_cleanup_complete=False)}
+        self.state['pending_vm_recovery']={'old':dict(self.state['migration']['sources'][0],_cleanup_complete=False)}
         with patch.object(controller,'scale_up') as launch:
             self.reconcile(3400);launch.assert_not_called()
         self.state['pending_vm_recovery']['old']['_cleanup_complete']=True
@@ -321,7 +323,7 @@ class StagedStorageMigrationTests(unittest.TestCase):
         self.retarget()
         self.hosts=self.hosts[1:]
         self.state['latest_resources']=self.state['latest_resources'][1:]
-        self.state['pending_vm_recovery']={'old':dict(instance_id='1',_cleanup_complete=True)}
+        self.state['pending_vm_recovery']={'old':dict(self.state['migration']['sources'][0],_cleanup_complete=True)}
         self.add_destination('3');self.add_destination('4')
         self.assertNotIn('early_retirement_ids',self.state['migration'])
         self.reconcile(2800);self.assertNotIn('host_operation',self.state)
@@ -332,5 +334,30 @@ class StagedStorageMigrationTests(unittest.TestCase):
         self.assertEqual(operation['vm']['instance_id'],'2')
         self.assertEqual(operation['staged_retirement']['stage'],'early')
         self.assertEqual(self.state['migration']['replacement_ids'],['3','4'])
+
+    def test_staged_final_completion_after_json_requires_exact_receipts_and_fresh_destination_readiness(self):
+        for defect in (None,'receipt','jobs','builder','boot','intent_only'):
+            with self.subTest(defect=defect):
+                self.setUp();self.staged();self.state['host_operation'].update(kind='delete',drained=True)
+                self.hosts=[vm for vm in self.hosts if vm.instance_id!='2']
+                self.state['latest_resources']=[row for row in self.state['latest_resources'] if row['instance_id']!='2']
+                controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+                self.add_destination('4');self.reconcile(3400);self.reconcile(3700)
+                self.assertEqual(self.state['host_operation']['vm']['instance_id'],'1')
+                self.state['host_operation'].update(kind='delete',drained=True)
+                self.hosts=[vm for vm in self.hosts if vm.instance_id!='1']
+                self.state['latest_resources']=[row for row in self.state['latest_resources'] if row['instance_id']!='1']
+                controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+                self.state=json.loads(self.path.read_text())
+                self.assertEqual(set(self.state['migration']['completed_retirements']),{'1','2'})
+                self.refresh(4000)
+                if defect=='receipt':self.state['host_deployments']['z/4']['runner_memory_gib']=2
+                if defect=='jobs':self.state['latest_workload']['complete']=False
+                if defect=='boot':self.state['host_health']['z/4']['boot_id']='new-boot'
+                if defect=='intent_only':self.state['migration'].pop('completed_retirements');self.state['intentional_deletions']=['z/oxidex-runners-old','z/oxidex-runners-bad']
+                with patch('lib.fleet_migration.time.time',return_value=4000),patch.object(controller,'builder_ready',return_value=defect!='builder'):
+                    migration.reconcile_migration(self.hosts,self.runners,self.args,self.state,self.path)
+                self.assertEqual('migration' in self.state,defect is not None)
+                if defect is None:self.assertEqual(self.state['desired_topology'],['large','large'])
 
 if __name__=='__main__':unittest.main()

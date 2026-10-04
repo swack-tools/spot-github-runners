@@ -17,6 +17,8 @@ def host(name,cpu,ram,identity):
 
 class MigrationRetirementBarrierTests(unittest.TestCase):
     def setUp(self):
+        from lib.tier_controller import evidence_for
+        self.real_evidence=evidence_for
         self.folder=tempfile.TemporaryDirectory();self.addCleanup(self.folder.cleanup)
         self.path=Path(self.folder.name)/'state.json'
         self.args=controller.args_parser().parse_args(['--scaling-mode','tiered','--state-file',str(self.path)])
@@ -252,5 +254,120 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
         self.assertEqual(self.state['host_operation'],saved)
         self.assertEqual(self.state['migration']['pending_tiers'],[])
         self.assertEqual(self.state['host_operation']['vm']['instance_id'],'2')
+
+    def fresh_evidence(self,tick):
+        from datetime import datetime,timezone
+        self.state['job_tracking']={'last_poll_by_repository':{self.args.org+'/oxidex':datetime.fromtimestamp(tick,timezone.utc).isoformat()},'capacity_jobs':{}}
+        def health(project,vm,ids):
+            return dict(instance_id=vm.instance_id,boot_id='boot-'+vm.instance_id,complete=True,
+                boot_oom_complete=True,boot_host_oom_ids=[],observed_at=tick,events=[],io_complete=True,
+                io_pressure={scope+'_'+name:0 for scope in ('full','some') for name in ('avg10','avg60','avg300','total')})
+        with patch.object(controller,'read_utilization',return_value=[(.01,.01)]*len(self.hosts)),\
+             patch('lib.tier_controller.read_host_events',side_effect=health),\
+             patch('lib.tier_controller.time.time',return_value=tick):
+            return self.real_evidence(self.hosts,self.runners,self.args,self.state)
+
+    def test_fresh_barrier_sibling_loss_before_observe_pauses_with_real_evidence(self):
+        sibling=host('sibling',4,16,'3');self.hosts=[self.small,sibling,self.large]
+        migration.begin_migration([self.small,sibling],('large',),self.state,self.path,'consolidation')
+        self.state['migration'].update(pending_tiers=[],pending_slots=[],replacement_ids=['1'])
+        self.state['host_deployments']={'z/1':dict(tier='large',expected_runner_count=8,runner_memory_gib=15)}
+        controller.observe_vms(self.hosts,self.state)
+        for tick in (1000,1300):
+            self.fresh_evidence(tick)
+            with patch('lib.fleet_migration.time.time',return_value=tick),patch.object(controller,'builder_ready',return_value=True):
+                migration.reconcile_migration(self.hosts,self.runners,self.args,self.state,self.path)
+        self.state['host_operation'].update(kind='delete',drained=True)
+        self.state=json.loads(json.dumps(self.state));stale=list(self.hosts);self.hosts=[self.small,self.large]
+        self.assertFalse(self.state.get('pending_vm_recovery'))
+        def refreshed(vms,runners,args,state):return self.fresh_evidence(1600)
+        with patch.object(controller,'list_gcloud_vms',return_value=self.hosts),\
+             patch.object(controller,'list_github_runners',return_value=self.runners),\
+             patch('lib.tier_controller.evidence_for',side_effect=refreshed),\
+             patch.object(controller,'builder_ready',return_value=True),\
+             patch.object(controller,'delete_drained_vm') as delete,\
+             patch('lib.fleet_migration.time.time',return_value=1600):
+            # refreshed() calls the real evidence function, only provider/SSH inputs are mocked.
+            controller.reconcile_host_operation(stale,self.runners,self.args,self.state,self.path)
+        delete.assert_not_called();self.assertNotIn('host_operation',self.state)
+        self.assertEqual(next(iter(self.state['pending_vm_recovery'].values()))['instance_id'],'3')
+        self.assertEqual(self.state['migration']['paused_retirement']['vm']['instance_id'],'2')
+
+    def test_restored_destination_in_drain_phase_requires_fresh_two_windows_and_builder(self):
+        self.removal();source=copy.deepcopy(self.state['host_operation']['vm']);self.state.pop('host_operation')
+        self.state['pending_vm_recovery']={'source':dict(source,_cleanup_complete=True)}
+        self.hosts=[];self.runners=[]
+        from decimal import Decimal
+        def prices(vms,project,cap,totals):totals.update({vm.name:Decimal('.4') for vm in vms})
+        new=host('restored',16,64,'3')
+        def launched(*args,**kwargs):
+            self.state['host_operation']=dict(kind='launch',vm=asdict(new),expected_runner_count=8)
+        with patch.object(controller,'check_running_prices',side_effect=prices),\
+             patch.object(controller,'discover_tier_offers',return_value=[type('Offer',(),{'total_daily_usd':Decimal('2.9')})()]),\
+             patch.object(controller,'scale_up',side_effect=launched),patch('lib.fleet_migration.time.time',return_value=1600):
+            migration.reconcile_migration(self.hosts,self.runners,self.args,self.state,self.path)
+        self.state=json.loads(json.dumps(self.state));self.hosts=[new]
+        self.runners=[GitHubRunner(i,f'gha-{new.name}-{i}','online',False,()) for i in range(1,9)]
+        self.state['host_deployments']['z/3']=dict(tier='large',expected_runner_count=8,runner_memory_gib=15)
+        controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+        self.state=json.loads(self.path.read_text())
+        for tick,builder in ((1900,False),(2200,True),(2500,True)):
+            self.fresh_evidence(tick)
+            with patch('lib.fleet_migration.time.time',return_value=tick),patch.object(controller,'builder_ready',return_value=builder) as readiness:
+                migration.reconcile_migration(self.hosts,self.runners,self.args,self.state,self.path)
+            if tick<2500:self.assertIn('migration',self.state,'restored destination must complete readiness before topology commit')
+            self.assertGreater(readiness.call_count,0)
+        self.assertNotIn('migration',self.state);self.assertEqual(self.state['desired_topology'],['large'])
+
+    def test_confirmed_retirement_receipt_survives_json_and_rejects_wrong_transaction_or_inventory(self):
+        sibling=host('sibling',4,16,'3');self.hosts=[self.small,sibling,self.large]
+        migration.begin_migration([self.small,sibling],('large',),self.state,self.path,'consolidation')
+        self.state['migration'].update(pending_tiers=[],pending_slots=[],replacement_ids=['1'])
+        self.state['host_deployments']={'z/1':dict(tier='large',expected_runner_count=8,runner_memory_gib=15)}
+        for tick in (1000,1300):
+            self.fresh_evidence(tick)
+            with patch('lib.fleet_migration.time.time',return_value=tick),patch.object(controller,'builder_ready',return_value=True):
+                migration.reconcile_migration(self.hosts,self.runners,self.args,self.state,self.path)
+        operation=self.state['host_operation'];operation.update(kind='delete',drained=True)
+        self.hosts=[sibling,self.large]
+        controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+        self.state=json.loads(self.path.read_text());source=self.state['migration']['sources'][0]
+        saved=copy.deepcopy(self.state)
+        self.assertTrue(migration.source_absence_proven(source,self.state))
+        for defect in ('intent_only','transaction','disk','identity','unconfirmed'):
+            with self.subTest(defect=defect):
+                self.state=copy.deepcopy(saved);receipt=self.state['migration']['completed_retirements']['2']
+                if defect=='intent_only':self.state['migration'].pop('completed_retirements');self.state['intentional_deletion_ids']={'z/'+self.small.name:'2'}
+                if defect=='transaction':receipt['started_at']-=1
+                if defect=='disk':receipt['vm']['disks'][0]['diskId']='wrong'
+                if defect=='identity':receipt['vm']['instance_id']='different'
+                if defect=='unconfirmed':receipt['absence_confirmed']=False
+                self.fresh_evidence(1600)
+                with patch('lib.fleet_migration.time.time',return_value=1600),patch.object(controller,'builder_ready',return_value=True):
+                    migration.reconcile_migration(self.hosts,self.runners,self.args,self.state,self.path)
+                self.assertNotIn('host_operation',self.state)
+                self.assertFalse(migration.source_absence_proven(source,self.state))
+                self.assertTrue(any(row['instance_id']=='2' and not row.get('_cleanup_complete')
+                                    for row in self.state['pending_vm_recovery'].values()))
+        self.state=saved;self.fresh_evidence(1600)
+        with patch('lib.fleet_migration.time.time',return_value=1600),patch.object(controller,'builder_ready',return_value=True):
+            migration.reconcile_migration(self.hosts,self.runners,self.args,self.state,self.path)
+        self.assertEqual(self.state['host_operation']['vm']['instance_id'],'3')
+
+    def test_persisted_drain_with_all_sources_absent_still_checks_final_readiness_and_workload(self):
+        for defect in ('builder','jobs','io','boot','peak'):
+            with self.subTest(defect=defect):
+                self.setUp();self.removal();source=copy.deepcopy(self.state['host_operation']['vm'])
+                self.state['host_operation'].update(kind='delete',drained=True);self.hosts=[self.large]
+                controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
+                self.state=json.loads(self.path.read_text());self.fresh_evidence(1600)
+                if defect=='jobs':self.state['latest_workload']['complete']=False
+                if defect=='io':self.state['latest_resources'][0]['io_complete']=False
+                if defect=='boot':self.state['host_health']['z/1']['boot_id']='changed'
+                if defect=='peak':self.state['latest_resources'][0]['peak_cpu_cores']=20
+                with patch('lib.fleet_migration.time.time',return_value=1600),patch.object(controller,'builder_ready',return_value=defect!='builder'):
+                    migration.reconcile_migration(self.hosts,self.runners,self.args,self.state,self.path)
+                self.assertIn('migration',self.state)
+                self.assertNotIn('desired_topology',self.state)
 
 if __name__=='__main__':unittest.main()

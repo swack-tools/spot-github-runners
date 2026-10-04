@@ -450,6 +450,8 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.warning("Drain group cleanup remains pending: %s", error_detail(exc))
             return True
+    from .fleet_migration import record_retirement_completion
+    record_retirement_completion(operation,state)
     state.pop("host_operation")
     write_scale_state(state_path, state)
     LOG.info("Host operation complete: VM and assigned runner records absent for %s", vm_details(vm))
