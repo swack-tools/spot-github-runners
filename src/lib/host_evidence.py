@@ -7,19 +7,30 @@ import time
 from pathlib import Path
 
 
-def classify_events(journal, docker, boot_id, timestamp):
+def classify_events(journal, docker, boot_id, timestamp, *, window_start=None):
     events = []
+    window_start=timestamp-1800 if window_start is None else window_start
     for row in journal:
         message = row.get('MESSAGE','')
-        if not isinstance(message,str) or not re.search(r'(out of memory|oom-kill|Killed process)',message,re.I):
+        if not isinstance(message,str):
+            continue
+        # "invoked oom-killer" starts the diagnostic dump for either a global
+        # or a cgroup OOM. Only the actual decision/kill identifies its scope.
+        decision=re.search(r'\boom-kill:\s*constraint=(CONSTRAINT_[A-Z_]+)\b',message,re.I)
+        if decision:
+            kind={'CONSTRAINT_NONE':'host','CONSTRAINT_MEMCG':'container'}.get(decision[1].upper(),'unknown')
+        elif re.search(r'\bMemory cgroup out of memory:\s*Killed process\b',message,re.I):
+            kind='container'
+        elif re.search(r'\bOut of memory:\s*Killed process\b',message,re.I):
+            kind='host'
+        else:
             continue
         try:
             observed = int(row['__REALTIME_TIMESTAMP']) / 1e6
         except (KeyError,ValueError,TypeError):
             continue
-        if not timestamp - 1800 <= observed <= timestamp:
+        if not window_start <= observed <= timestamp:
             continue
-        kind = 'container' if re.search(r'(cgroup|CONSTRAINT_MEMCG)',message,re.I) else 'host'
         event_id = hashlib.sha256(f'{boot_id}:{observed}:{message}'.encode()).hexdigest()
         events.append(dict(id=event_id,kind=kind,workload='unknown',at=observed))
     for row in docker:
@@ -29,7 +40,7 @@ def classify_events(journal, docker, boot_id, timestamp):
             observed = int(row['timeNano']) / 1e9
         except (KeyError,ValueError,TypeError):
             continue
-        if timestamp - 1800 <= observed <= timestamp:
+        if window_start <= observed <= timestamp:
             event_id = hashlib.sha256(f"{boot_id}:{observed}:{row.get('id')}:docker-oom".encode()).hexdigest()
             attributes=row.get('Actor',{}).get('Attributes',{})
             workload=('builder' if attributes.get('oxidex.remote-build')=='true' else
@@ -38,8 +49,16 @@ def classify_events(journal, docker, boot_id, timestamp):
     return sorted(events,key=lambda row:row['at'])
 
 
-def command_json_lines(command):
-    raw = subprocess.run(command,check=True,capture_output=True,text=True,timeout=30).stdout
+def command_json_lines(command, *, empty_grep=False):
+    result=subprocess.run(command,check=not empty_grep,capture_output=True,text=True,timeout=30)
+    if empty_grep:
+        if result.returncode==1 and not result.stdout and not result.stderr:
+            return []  # journalctl --grep uses 1 for a confirmed empty match.
+        if result.returncode!=0:
+            raise subprocess.CalledProcessError(result.returncode,command,output=result.stdout,stderr=result.stderr)
+        if result.stderr:
+            raise RuntimeError('Boot OOM journal query emitted diagnostics')
+    raw=result.stdout
     if len(raw) > 4*1024*1024:
         raise RuntimeError('Host evidence exceeds bounded window')
     return [json.loads(line) for line in raw.splitlines() if line.strip()]
@@ -52,11 +71,19 @@ def sample():
                                   '--no-pager','-o','json','-n','2000'])
     docker = command_json_lines(['docker','events','--since',str(int(timestamp-1800)),
                                  '--until',str(int(timestamp)), '--filter','event=oom','--format','{{json .}}'])
+    # Legacy controller state stores only a pending kind. A complete current-
+    # boot decision history distinguishes false context from older real globals.
+    globals_journal=command_json_lines(['journalctl','-k','-b','0','--no-pager','--quiet','-o','json','-n','2000',
+        '--grep=^(oom-kill:constraint=CONSTRAINT_NONE|Out of memory: Killed process)'],empty_grep=True)
+    global_events=classify_events(globals_journal,[],boot,timestamp,window_start=0)
     memory = {line.split(':')[0]:int(line.split()[1])/1024/1024
               for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith(('MemTotal:','MemAvailable:'))}
     return dict(observed_at=timestamp,boot_id=boot,ram_gib=memory['MemTotal'],
                 used_ram_gib=memory['MemTotal']-memory['MemAvailable'],
-                events=classify_events(journal,docker,boot,timestamp),complete=len(journal)<2000)
+                events=classify_events(journal,docker,boot,timestamp),complete=len(journal)<2000,
+                boot_oom_complete=(len(globals_journal)<2000 and len(global_events)==len(globals_journal)
+                                   and all(event['kind']=='host' for event in global_events)),
+                boot_host_oom_ids=sorted(event['id'] for event in global_events if event['kind']=='host'))
 
 
 if __name__ == '__main__':

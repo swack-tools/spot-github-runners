@@ -36,7 +36,7 @@ from .storage_selection import storage_rates, cheapest_storage
 from .billing_catalog import catalog_skus, clear_catalog_cache, monthly_to_daily
 from .launch_candidates import LaunchInventory, candidate_key, launchable_candidates
 from .spot_pricing import parse_component_rates
-from .runner_tiers import TIERS, tier_for_shape
+from .runner_tiers import tier_for_shape
 
 ROOT = Path(__file__).resolve().parents[2]
 LOG = logging.getLogger("spot_runner_autoscaler")
@@ -412,7 +412,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                     if host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]]):
                         LOG.warning("Deletion waits: runner records reappeared for %s", vm_details(vm))
                         return True
-                    delete_drained_vm(current, args)
+                    delete_drained_vm(vm, args)
                 else:
                     terminate_spot_vm(current, args.project, args.org, runners, vms)
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -505,7 +505,11 @@ def delete_drained_vm(vm, args, before_delete=None):
 
 def quiesce_remote_builder(vm, args):
     """Hold new builds off a host only after its running builds have finished."""
-    script = ('if [ -n "$(docker ps -q --filter label=oxidex.remote-build=true)" ]; '
+    if not vm.instance_id:return False
+    script = ('test "$(curl -fsS -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
+              +shlex.quote(vm.instance_id)+' || exit 75; '
+              'builders=$(/usr/bin/docker ps -aq --filter label=oxidex.remote-build=true) || exit 75; '
+              'if [ -n "$builders" ]; '
               'then exit 75; fi; touch /run/oxidex-build-draining')
     command = 'sudo flock -n -E 75 /run/oxidex-build.lock sh -c ' + shlex.quote(script)
     try:
@@ -548,7 +552,7 @@ p=Path('/mnt/runner-data/remote-build/sources/admission-canary')
 
 def adjust_admission(vm,args,kind='runner'):
     """Increase a constrained runner's cap only while all leases are absent."""
-    if kind not in ('runner','builder'):return False
+    if kind not in ('runner','builder') or not vm.instance_id:return False
     program='kind='+repr(kind)+'\n'+'''import json, subprocess, sys
 from pathlib import Path
 sys.path.insert(0,'/opt/gha-runners')
@@ -571,7 +575,9 @@ else:
 '''
     # Stop admission during this atomic budget update. Existing jobs remain
     # bounded; acquiring hooks wait for the service to restart.
-    shell='systemctl stop gha-admission; trap "systemctl start gha-admission" EXIT; python3 -c '+shlex.quote(program)
+    shell=('test "$(curl -fsS -H Metadata-Flavor:Google http://metadata.google.internal/computeMetadata/v1/instance/id)" = '
+           +shlex.quote(vm.instance_id)+' || exit 75; '
+           'systemctl stop gha-admission || exit 75; trap "systemctl start gha-admission" EXIT; python3 -c '+shlex.quote(program))
     result=subprocess.run(['gcloud','compute','ssh',vm.name,f'--zone={vm.zone}',
         f'--project={args.project}','--quiet','--command=sudo sh -c '+shlex.quote(shell)],
         capture_output=True,text=True,timeout=60)
@@ -921,7 +927,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         ]
         if tier:
             command.extend(['--tier',tier.name,'--tier-slots',str(slots)])
-        if getattr(args, 'remote_builder', False):
+        if tier and getattr(args, 'remote_builder', False):
             command.append('--remote-builder')
         if getattr(args, 'scaling_mode', 'resource') in ('resource','tiered'):
             command.append('--resource-monitoring')

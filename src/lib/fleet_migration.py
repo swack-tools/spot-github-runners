@@ -1,5 +1,6 @@
 """Persist one tier replacement; existing identity-guarded drain owns deletion."""
 import logging
+import subprocess
 import time
 from collections import Counter
 from dataclasses import asdict
@@ -20,7 +21,7 @@ def topology_for(vms):
     return tuple(sorted(names,key=rank.__getitem__))
 
 
-def begin_migration(vms,target,state,state_path,reason,slots=None,force_ids=()):
+def begin_migration(vms,target,state,state_path,reason,slots=None,force_ids=(),slot_counts=()):
     from .spot_runner_autoscaler import write_scale_state
     validate_topology(target)
     if state.get('migration') or state.get('host_operation'):
@@ -36,8 +37,16 @@ def begin_migration(vms,target,state,state_path,reason,slots=None,force_ids=()):
         else:
             if not vm.instance_id:raise ValueError('Migration requires provider instance identity')
             sources.append(asdict(vm))
+    pending_tiers=list(remaining.elements())
+    recorded_slots={}
+    for name,count in slot_counts:
+        if name not in TIERS or not isinstance(count,int) or not 1<=count<=TIERS[name].maximum_slots:
+            raise ValueError('Recovery receipt contains unsafe runner density')
+        recorded_slots.setdefault(name,[]).append(count)
+    pending_slots=[recorded_slots[name].pop(0) if recorded_slots.get(name)
+                   else slots or TIERS[name].initial_slots for name in pending_tiers]
     state['migration']=dict(target=list(target),sources=sources,retained_ids=retained,
-        pending_tiers=list(remaining.elements()),replacement_ids=[],phase='launch',reason=reason,
+        pending_tiers=pending_tiers,pending_slots=pending_slots,replacement_ids=[],phase='launch',reason=reason,
         started_at=time.time(),slots=slots)
     write_scale_state(state_path,state)
 
@@ -70,6 +79,7 @@ def reconcile_migration(vms,runners,args,state,state_path):
                 raise RuntimeError('Replacement shape differs from requested tier')
             migration['replacement_ids'].append(vm.instance_id)
             migration['pending_tiers'].pop(0)
+            if migration.get('pending_slots'):migration['pending_slots'].pop(0)
         migration.pop('awaiting_launch')
         controller.write_scale_state(state_path,state)
     if migration['pending_tiers']:
@@ -77,7 +87,7 @@ def reconcile_migration(vms,runners,args,state,state_path):
         # cannot be bypassed by an incomplete running-only inventory.
         managed=[vm for vm in vms if vm.spot and vm.name.startswith('oxidex-runners-')]
         tier=TIERS[migration['pending_tiers'][0]]
-        slots=migration.get('slots') or tier.initial_slots
+        slots=(migration.get('pending_slots') or [migration.get('slots') or tier.initial_slots])[0]
         overlap_blocked=(len(managed)>=min(5,args.maximum_hosts)
             or sum(vm.vcpu or 80 for vm in managed)+tier.vcpu>80
             or sum(expected_slots(vm,state) for vm in managed)+slots>100)
@@ -98,12 +108,20 @@ def reconcile_migration(vms,runners,args,state,state_path):
                 LOG.info('Migration launch holds: incomplete current all-disk pricing')
                 return True
             current=sum(totals.values(),Decimal(0))
-            if 'spend_ceiling' not in migration:
-                migration['spend_ceiling']=str(max(Decimal('15'),current))
+            previous_ceiling=Decimal(migration.get('spend_ceiling','15'))
+            if ('spend_ceiling' not in migration or
+                    ('overlap_baseline_daily_usd' not in migration and current>=previous_ceiling>=Decimal('15'))):
+                allowance=Decimal(0)
+                if current>=Decimal('15'):
+                    retiring=sum((totals.get(row['name'],Decimal(0)) for row in migration['sources']),Decimal(0))
+                    allowance=min(retiring,sum((TIERS[name].max_daily_usd for name in migration['pending_tiers']),Decimal(0)))
+                    migration['overlap_baseline_daily_usd']=str(current)
+                    migration['overlap_allowance_daily_usd']=str(allowance)
+                migration['spend_ceiling']=str(max(Decimal('15'),current+allowance))
                 controller.write_scale_state(state_path,state)
             offers=controller.discover_tier_offers(args.project,tier,args.disk_size_gb)
             offers=[offer for offer in offers if current+offer.total_daily_usd<Decimal(migration['spend_ceiling'])]
-            slots=migration.get('slots') or tier.initial_slots
+            slots=(migration.get('pending_slots') or [migration.get('slots') or tier.initial_slots])[0]
             if (sum(vm.vcpu or 80 for vm in managed)+tier.vcpu>80
                     or sum(expected_slots(vm,state) for vm in managed)+slots>100):
                 LOG.info('Migration holds: overlapping CPU/slot ceiling would be exceeded')
@@ -132,6 +150,9 @@ def reconcile_migration(vms,runners,args,state,state_path):
                 receipt=next((row for key,row in state.get('host_deployments',{}).items() if key.endswith('/'+identity)),{})
                 if receipt.get('tier'):
                     migration['pending_tiers'].append(receipt['tier'])
+                    counts=migration.setdefault('pending_slots',[
+                        migration.get('slots') or TIERS[name].initial_slots for name in migration['pending_tiers'][:-1]])
+                    counts.append(receipt.get('expected_runner_count') or TIERS[receipt['tier']].initial_slots)
                     migration['replacement_ids'].remove(identity)
                     controller.write_scale_state(state_path,state)
                 return True
@@ -141,6 +162,34 @@ def reconcile_migration(vms,runners,args,state,state_path):
             assigned=controller.host_runners(vm,runners,fleet)
             names={runner.name for runner in assigned if runner.online}
             ready={f'gha-{vm.name}-{i}' for i in range(1,expected_slots(vm,state)+1)}<=names
+            observed=time.time()
+            # Replacement validation owns the lifecycle barrier, so the normal
+            # budget policy cannot repair a constrained container here. Repair
+            # only an identified, idle deployment with fresh host headroom.
+            if (ready and sample and sample.get('instance_id')==vm.instance_id
+                    and health.get('instance_id')==vm.instance_id and health.get('complete') is True
+                    and 0<=observed-sample.get('observed_at',0)<=450
+                    and 0<=observed-health.get('observed_at',0)<=450
+                    and sample['memory_fraction']<.75
+                    and not any(runner.busy for runner in assigned)
+                    and not any(event.get('kind')=='host' for event in health.get('events',[]))):
+                repaired=set(migration.get('oom_budget_repairs',[]))
+                for kind in ('runner','builder'):
+                    ids={event['id'] for event in health.get('events',[])
+                         if event.get('kind')=='container' and event.get('workload')==kind
+                         and event.get('id') and event['id'] not in repaired}
+                    if not ids:continue
+                    try:
+                        outcome=controller.adjust_admission(vm,args,kind)
+                    except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as exc:
+                        LOG.warning('Replacement budget repair holds for %s: %s',vm.name,controller.error_detail(exc))
+                        continue
+                    if outcome is True:
+                        repaired.update(ids)
+                        migration['oom_budget_repairs']=sorted(repaired)
+                        if state.get('pending_oom',{}).get(key)==kind:
+                            state['pending_oom'].pop(key)
+                        LOG.info('Repaired idle %s memory cap on replacement %s; fresh healthy windows still required',kind,vm.name)
             good=(ready and sample and sample['cpu_fraction']<.75 and sample['memory_fraction']<.75
                   and health.get('complete') and not health.get('events')
                   and time.time()-health.get('observed_at',0)<=450)

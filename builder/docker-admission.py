@@ -5,20 +5,143 @@ Other Docker commands exec the vendor binary unchanged. Only the dedicated
 remote build's fixed label acquires a host memory reservation before starting.
 Installed only on tier hosts; runner containers never receive a Docker socket.
 """
+import base64
+import fcntl
+import json
 import os
+import re
+import signal
 import subprocess
 import sys
+import time
+import uuid
+from contextlib import ExitStack
+
+
+ROOT='/mnt/runner-data/remote-build'
+
+
+def build_identity(arguments):
+    """Only assign cancellation identities to the launcher's fixed mount pair."""
+    mounts=[arguments[i+1] for i,value in enumerate(arguments[:-1]) if value=='-v']
+    targets=[value for value in mounts if value.endswith(':/target')]
+    if len(targets)!=1:
+        raise ValueError('Expected exactly one builder target mount')
+    match=re.fullmatch(re.escape(ROOT)+r'/targets/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63}):/target',targets[0])
+    if not match:
+        raise ValueError('Unexpected builder target mount')
+    project=match[1]
+    if mounts.count(f'{ROOT}/sources/{project}:/src')!=1:
+        raise ValueError('Builder source and cache must match')
+    if any(value=='--name' or value.startswith('--name=') or
+           value.startswith('--label=oxidex.cache-project=') or
+           value.startswith('--label=oxidex.run-id=') for value in arguments):
+        raise ValueError('Builder identity is assigned by the root adapter')
+    run='run-'+uuid.uuid4().hex
+    marker='/src/tools/remote-build/container_job.py'
+    if marker in arguments:
+        index=arguments.index(marker)
+        if index!=len(arguments)-2:
+            raise ValueError('Unexpected remote transaction payload')
+        payload=json.loads(base64.urlsafe_b64decode(arguments[index+1]))
+        run=payload['run_id']
+        if not isinstance(run,str) or not re.fullmatch(r'run-[0-9a-f]{32}',run):
+            raise ValueError('Invalid remote run identity')
+    return project,run,'oxidex-run-'+run
+
+
+def container_id(name):
+    """A successful complete listing, not an inspect error, proves absence."""
+    result=subprocess.run(['/usr/bin/docker','container','ls','--all',
+        '--filter',f'name=^/{name}$','--format','{{.ID}}'],check=True,
+        text=True,capture_output=True,timeout=30)
+    ids=result.stdout.split()
+    if len(ids)>1 or any(not re.fullmatch('[0-9a-f]{12,64}',value) for value in ids):
+        raise RuntimeError('Unexpected Docker container inventory')
+    return ids[0] if ids else None
+
+
+def stop_owned(name,project,run):
+    identity=container_id(name)
+    if identity is None:
+        return False
+    records=json.loads(subprocess.check_output(['/usr/bin/docker','inspect',identity],text=True,timeout=30))
+    if len(records)!=1:
+        raise RuntimeError('Incomplete Docker identity')
+    record=records[0];labels=record.get('Config',{}).get('Labels') or {}
+    if (record.get('Name')!='/'+name or labels.get('oxidex.remote-build')!='true'
+        or labels.get('oxidex.cache-project')!=project or labels.get('oxidex.run-id')!=run
+        or not any(m.get('Destination')=='/target' and m.get('Source')==f'{ROOT}/targets/{project}' for m in record.get('Mounts',[]))):
+        raise RuntimeError('Refusing to stop a different builder')
+    subprocess.run(['/usr/bin/docker','rm','--force',identity],check=True,
+                   text=True,capture_output=True,timeout=60)
+    return True
 
 
 def run_build(arguments,admission):
     try:
+        project,run,name=build_identity(arguments)
+    except (ValueError,KeyError,TypeError):
+        return 78
+    try:
         admission.acquire_build()
     except (OSError,RuntimeError,SystemExit):
         return 75
+    previous={};cancelled=[]
+    def cancel(signum,frame):
+        cancelled.append(signum)
     try:
-        return subprocess.run(['/usr/bin/docker',*arguments]).returncode
+        with ExitStack() as stack:
+            global_lock=stack.enter_context(open('/run/oxidex-build.lock','a'))
+            fcntl.flock(global_lock,fcntl.LOCK_SH)
+            active=stack.enter_context(open(f'/run/oxidex-cache-active-{project}.lock','a'))
+            try:
+                fcntl.flock(active,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                if os.path.exists('/run/oxidex-build-draining') or container_id(name):
+                    return 75
+            except (OSError,RuntimeError,subprocess.SubprocessError):
+                return 75
+            for signum in (signal.SIGHUP,signal.SIGTERM,signal.SIGINT):
+                previous[signum]=signal.signal(signum,cancel)
+            # Split creation from execution. If killed while the daemon creates
+            # a container, a late orphan is stopped and cannot write this cache.
+            command=['/usr/bin/docker','create','--name='+name,
+                     '--label=oxidex.cache-project='+project,'--label=oxidex.run-id='+run,*arguments[1:]]
+            subprocess.run(command,check=True,text=True,capture_output=True,timeout=60)
+            child=None if cancelled else subprocess.Popen(['/usr/bin/docker','start','--attach',name],
+                pass_fds=(global_lock.fileno(),active.fileno()))
+            stopped=False
+            while child is not None and child.poll() is None:
+                if cancelled:
+                    try:
+                        stopped=stop_owned(name,project,run) or stopped
+                        if stopped:
+                            child.terminate()
+                    except (OSError,ValueError,RuntimeError,subprocess.SubprocessError):
+                        # Keep both locks and the memory lease while Docker state is unknown.
+                        pass
+                try:
+                    child.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+            # Even a failed/disconnected Docker client can leave a daemon container.
+            while True:
+                try:
+                    if container_id(name) is None:
+                        break
+                    stop_owned(name,project,run)
+                except (OSError,ValueError,RuntimeError,subprocess.SubprocessError):
+                    time.sleep(1)
+            return 128+cancelled[0] if cancelled else child.returncode
     finally:
-        admission.release_build()
+        for signum,handler in previous.items():
+            signal.signal(signum,handler)
+        try:
+            admission.release_build()
+        except (OSError,RuntimeError,SystemExit):
+            # A completed container no longer writes the cache. The admission
+            # ledger reclaims the dead wrapper's identity on its next refresh.
+            print('Builder finished; admission lease release deferred',file=sys.stderr)
 
 
 def main():

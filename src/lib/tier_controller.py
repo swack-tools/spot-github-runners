@@ -25,8 +25,10 @@ def evidence_for(vms,runners,args,state):
     evidence=record_resources(state,fleet,samples,timestamp)
     state['latest_resources']=evidence
     health={}
+    previous_health=state.get('host_health',{})
     seen=set(state.get('seen_oom_ids',[]))
     pending=state.setdefault('pending_oom',{})
+    priority={'unknown':0,'container':0,'runner':1,'builder':2,'host':3}
     for vm in fleet:
         key=f'{vm.zone}/{vm.instance_id}'
         try:
@@ -34,11 +36,22 @@ def evidence_for(vms,runners,args,state):
             if not observed.get('complete') or abs(time.time()-observed['observed_at'])>450:
                 raise RuntimeError('Incomplete or stale host event window')
             health[key]=observed
+            previous_boot=previous_health.get(key,{}).get('boot_id')
+            if (pending.get(key)=='host' and observed.get('instance_id')==vm.instance_id
+                    and previous_boot and previous_boot==observed.get('boot_id')
+                    and observed.get('boot_oom_complete') is True
+                    and observed.get('boot_host_oom_ids')==[]
+                    and not any(event['kind']=='host' for event in observed['events'])):
+                # Reclassify even previously seen container events: the flat
+                # legacy host flag may have come from "invoked oom-killer".
+                kinds=[event.get('workload','unknown') for event in observed['events']]
+                if kinds:pending[key]=max(kinds,key=lambda kind:priority.get(kind,0))
+                else:pending.pop(key)
+                LOG.info('Retired false global OOM classification for %s using complete same-boot decision evidence',vm.name)
             for event in observed['events']:
                 if event['id'] not in seen:
                     seen.add(event['id'])
                     kind='host' if event['kind']=='host' else event.get('workload','unknown')
-                    priority={'unknown':0,'container':0,'runner':1,'builder':2,'host':3}
                     if priority[kind]>=priority.get(pending.get(key),-1):pending[key]=kind
         except (RuntimeError,OSError,ValueError,KeyError,subprocess.SubprocessError) as exc:
             LOG.warning('Host OOM/readiness evidence missing for %s: %s',vm.name,controller.error_detail(exc))
@@ -88,7 +101,13 @@ def check_tiers(vms,runners,args,state,state_path):
         state['pending_vm_recovery']={}
         state['price_replacement_target']=0
         if topology!=target:
-            begin_migration(fleet,target,state,state_path,'loss recovery')
+            slot_counts=[]
+            for record in pending.values():
+                tier=tier_for_shape(record.get('vcpu'),record.get('ram_gib'))
+                receipt=state.get('host_deployments',{}).get(f"{record['zone']}/{record['instance_id']}",{})
+                if tier and receipt.get('tier')==tier.name and receipt.get('expected_runner_count') is not None:
+                    slot_counts.append((tier.name,receipt['expected_runner_count']))
+            begin_migration(fleet,target,state,state_path,'loss recovery',slot_counts=slot_counts)
             reconcile_migration(vms,runners,args,state,state_path)
             return
     decision=plan_capacity(topology,evidence,signals,state.setdefault('tier_policy',{}),timestamp)

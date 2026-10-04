@@ -111,6 +111,8 @@ def args_parser() -> argparse.ArgumentParser:
 
 
 def select_sizing(args: argparse.Namespace) -> None:
+    if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
+        raise RuntimeError('Remote builders require a tier host with shared memory admission')
     configure_storage(args)
     configure_cpu_platform(args)
     if getattr(args,'tier',None):
@@ -241,6 +243,8 @@ def cleanup_orphan_runner_disks(zone: str) -> list[str]:
 
 
 def render_startup(args: argparse.Namespace, token: str, group_name: str, deployment_id: str) -> str:
+    if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
+        raise RuntimeError('Remote builders require a tier host with shared memory admission')
     source = STARTUP_SCRIPT
     tiered = bool(getattr(args,'tier',None))
     admission_source = Path(__file__).with_name('host_admission.py').read_bytes()

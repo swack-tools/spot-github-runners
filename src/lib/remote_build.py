@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import secrets
 import shlex
 import subprocess
 import tarfile
@@ -11,6 +12,40 @@ from pathlib import Path
 
 def retryable_exit(code):
     return code in (75, 137, 143, 255)
+
+
+def transaction_script(project,upload,digest,profile,run):
+    """Serialize source replacement, builds, and immutable artifact export."""
+    root='/mnt/runner-data/remote-build'
+    source=f'{root}/sources/{project}'
+    target=f'{root}/targets/{project}'
+    export=f'{root}/exports/{run}/oxidex'
+    launcher=f'/usr/local/bin/oxidex-remote-build {shlex.quote(project)}'
+    stages=[f'{launcher} cargo fetch --locked --target x86_64-unknown-linux-gnu']
+    if profile=='release':stages.append(f'{launcher} just cbindgen-check')
+    stages.append(f'{launcher} cargo build '+('--release ' if profile=='release' else '')+'--locked --bin oxidex')
+    body='\n'.join([
+        'set -eu',
+        'test ! -e /run/oxidex-build-draining || exit 75',
+        f'flock -n -E 75 /run/oxidex-cache-active-{project}.lock true',
+        'ids=$(/usr/bin/docker ps -aq --filter label=oxidex.remote-build=true) || exit 75',
+        'for id in $ids; do',
+        "  mounts=$(/usr/bin/docker inspect --format '{{range .Mounts}}{{if eq .Destination \"/target\"}}{{.Source}}{{end}}{{end}}' \"$id\") || exit 75",
+        f'  test "$mounts" != {shlex.quote(target)} || exit 75',
+        'done',
+        f'{launcher} prepare',
+        f'echo {shlex.quote(digest+"  "+upload)} | sha256sum -c -',
+        # The validated source is replaceable; Cargo and target caches are separate.
+        f'find {shlex.quote(source)} -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +',
+        f'tar -xzf {shlex.quote(upload)} -C {shlex.quote(source)}',
+        *stages,
+        f'{shlex.quote(target+"/"+profile+"/oxidex")} --version',
+        f'install -d -m 0755 {shlex.quote(str(Path(export).parent))}',
+        f'install -m 0755 {shlex.quote(target+"/"+profile+"/oxidex")} {shlex.quote(export)}',
+        f'sha256sum {shlex.quote(export)}',
+    ])
+    return ('sudo flock --shared /run/oxidex-build.lock flock --exclusive '
+            f'/run/oxidex-project-{project}.lock sh -c '+shlex.quote(body)),export
 
 
 def make_snapshot(source: Path, archive: Path) -> dict:
@@ -59,40 +94,28 @@ def main(argv=None):
         receipt['source_commit']=subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()
         receipt['source_status']=subprocess.check_output(['git','-C',str(source),'status','--porcelain'],text=True)
         save()
-        project=shlex.quote(args.worktree_id)
-        subprocess.run(ssh(f'sudo /usr/local/bin/oxidex-remote-build {project} prepare'),check=True)
         start=time.monotonic()
-        subprocess.run(['gcloud','compute','scp',str(archive),args.instance+':~/oxidex-remote-source-'+args.worktree_id+'.tar.gz',
+        run='run-'+secrets.token_hex(16)
+        upload='oxidex-remote-source-'+run+'.tar.gz'
+        subprocess.run(['gcloud','compute','scp',str(archive),args.instance+':~/'+upload,
                         '--zone='+args.zone,'--project='+args.project,'--quiet'],check=True)
         digest=receipt['snapshot']['archive_sha256']
-        destination='/mnt/runner-data/remote-build/sources/'+args.worktree_id
-        upload='oxidex-remote-source-'+args.worktree_id+'.tar.gz'
-        command=(f"echo '{digest}  {upload}' | sha256sum -c - "
-                 f"&& tar -xzf {upload} -C {shlex.quote(destination)}")
-        subprocess.run(ssh(command),check=True)
-        receipt['sync_seconds']=time.monotonic()-start;save()
-        # Dependencies are fetched separately; compile time excludes downloads.
-        stages=[('fetch','cargo fetch --locked --target x86_64-unknown-linux-gnu')]
-        if args.profile=='release':
-            stages.append(('header','just cbindgen-check'))
-        stages.append(('compile','cargo build '+('--release ' if args.profile=='release' else '')+'--locked --bin oxidex'))
-        for stage,command in stages:
-            start=time.monotonic()
-            remote=f'sudo /usr/local/bin/oxidex-remote-build {project} {command}'
-            with (evidence/f'{stage}.log').open('w') as log:
-                result=subprocess.run(ssh(remote),stdout=log,stderr=subprocess.STDOUT)
-            receipt[stage+'_seconds']=time.monotonic()-start
-            receipt[stage+'_exit_code']=result.returncode
-            receipt['retryable']=retryable_exit(result.returncode);save()
-            print(stage,receipt[stage+'_seconds'],'seconds; exit',result.returncode,flush=True)
-            if result.returncode:
-                raise RuntimeError(f'{stage} failed; see {evidence / (stage+".log")}')
-        verify=f'sudo /usr/local/bin/oxidex-remote-build {project} cargo --version'
-        subprocess.run(ssh(verify),check=True)
-        binary=f'/mnt/runner-data/remote-build/targets/{args.worktree_id}/{args.profile}/oxidex'
-        verification=subprocess.check_output(ssh(shlex.quote(binary)+' --version && sha256sum '+shlex.quote(binary)),text=True)
-        print(verification,flush=True)
-        digest=verification.splitlines()[-1].split()[0]
+        receipt['upload_seconds']=time.monotonic()-start;receipt['run_id']=run;save()
+        command,binary=transaction_script(args.worktree_id,upload,digest,args.profile,run)
+        start=time.monotonic();log_path=evidence/'transaction.log'
+        with log_path.open('w') as log:
+            result=subprocess.run(ssh(command),stdout=log,stderr=subprocess.STDOUT)
+        receipt['transaction_seconds']=time.monotonic()-start
+        receipt['transaction_exit_code']=result.returncode
+        receipt['retryable']=retryable_exit(result.returncode);save()
+        if result.returncode:
+            raise RuntimeError(f'Remote transaction failed; see {log_path}')
+        with log_path.open() as log:
+            last_line=''
+            for line in log:last_line=line.strip()
+        digest=last_line.split()[0] if last_line else ''
+        if not re.fullmatch('[0-9a-f]{64}',digest):
+            raise RuntimeError('Remote artifact checksum was missing')
         receipt['binary_sha256']=digest
         if args.artifact_dir:
             output=args.artifact_dir.expanduser().resolve();output.mkdir(parents=True,exist_ok=True)

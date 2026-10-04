@@ -109,7 +109,9 @@ def owner_alive(owner):
 
 def builders_running():
     try:
-        result=subprocess.run(['/usr/bin/docker','ps','-q','--filter','label=oxidex.remote-build=true'],
+        # Created containers may have a start request in flight after their
+        # wrapper dies. Keep the lease until complete inventory proves absence.
+        result=subprocess.run(['/usr/bin/docker','ps','-aq','--filter','label=oxidex.remote-build=true'],
                               check=True,capture_output=True,text=True,timeout=10)
         return bool(result.stdout.strip())
     except (OSError,subprocess.SubprocessError):
@@ -229,6 +231,8 @@ def serve():
                 try:
                     client.sendall(json.dumps(answer).encode())
                 except OSError:
+                    # The disconnected caller can retry; its lease stays in
+                    # the ledger until refreshed against actual owner state.
                     pass
 
 

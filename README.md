@@ -97,22 +97,25 @@ These are Linux executables. The original local all-features release recipe is
 available as `just build-release-local` in the configured OxiDex checkout.
 
 
-New autoscaler hosts install a separate `oxidex-remote-builder:1.97.1` image by
+New tiered autoscaler hosts install a separate `oxidex-remote-builder:1.97.1` image by
 default (`--no-remote-builder` opts out). Manual provisioning enables it with
-`--remote-builder`. It inherits the runner's Linux dependencies and adds Rust
+`--tier` and `--remote-builder`; resource and legacy modes do not install an
+unadmitted builder. It inherits the runner's Linux dependencies and adds Rust
 1.97.1, rustfmt, clippy, just, cargo-nextest, cbindgen 0.29.2, uv, Python 3.11,
 rsync and GNU time. GNU ld remains available, matching OxiDex's checked-in linker
-configuration. Installation reports actual tool versions in the bootstrap log.
+configuration. Checksum-verified Zig 0.15.2 and cargo-zigbuild 0.23.4 support
+x86_64 and ARM64 musl compilation with persistent cross-tool caches. Installation
+reports actual tool versions in the bootstrap log. Darwin SDKs are not installed.
 
 SSH lands on the host. The root-owned `/usr/local/bin/oxidex-remote-build`
 launcher accepts simple worktree identifiers and an allowlist of build commands,
 then runs an unprivileged UID 1001 container without a Docker socket, capabilities
 or privilege escalation. CPU is capped at host vCPU minus four (minimum one). On tier hosts the
-builder memory cap is 40% of RAM, bounded by the admitted work envelope. Manual
-legacy hosts reserve 24 GiB for runners. The root-owned `/etc/oxidex-remote-build.json` controls those limits.
+builder memory cap is 40% of RAM, bounded by the admitted work envelope. The
+root-owned `/etc/oxidex-remote-build.json` controls those limits.
 Do not set them above observed host capacity.
 
-Source directories, Cargo downloads and separate worktree targets persist below
+Source snapshots are replaced before compilation. Cargo downloads and separate worktree targets persist below
 `/mnt/runner-data/remote-build/{sources,cargo,targets}`. A shared host lock protects
 active builds from utilization scale-down; draining sets a marker under that
 lock to prevent new builds. The container also carries a label so an orphaned

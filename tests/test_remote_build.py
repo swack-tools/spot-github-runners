@@ -33,13 +33,20 @@ class RemoteBuildTests(unittest.TestCase):
         self.assertNotIn('/var/run/docker.sock', ' '.join(command))
 
     def test_startup_builder_option_is_opt_in_and_assets_are_embedded(self):
-        from lib.runner_manager import args_parser, render_startup
+        from lib.runner_manager import args_parser, render_startup, select_sizing
         from lib import builder_assets
-        args = args_parser().parse_args(['--max-cost', '.5', '--remote-builder'])
+        args = args_parser().parse_args(['--max-cost', '.5', '--remote-builder','--tier','bulky'])
+        select_sizing(args)
         script = render_startup(args, 'test-token', 'test-group', 'test-deployment')
         self.assertIn('REMOTE_BUILDER=1', script)
         self.assertNotIn('{{', script)
         self.assertIn(builder_assets.BUILDER_DOCKERFILE.splitlines()[0], 'FROM oxidex-self-hosted-runner:2.337.0')
+
+    def test_resource_mode_cannot_install_unadmitted_builder(self):
+        from lib.runner_manager import args_parser,select_sizing
+        args=args_parser().parse_args(['--max-cost','.5','--remote-builder'])
+        with self.assertRaisesRegex(RuntimeError,'shared memory admission'):
+            select_sizing(args)
 
     def test_active_builder_blocks_host_draining(self):
         from lib.spot_runner_autoscaler import quiesce_remote_builder
