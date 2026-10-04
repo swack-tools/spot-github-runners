@@ -82,10 +82,10 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
     && cargo install --locked -j4 --version 0.29.2 cbindgen \
     && cargo install --locked -j4 --path /tmp/cargo-zigbuild-source \
     && rm -rf /tmp/cargo-zigbuild-source \
-    && test "$(cargo zigbuild --version)" = 'cargo-zigbuild 0.23.4' \
+    && test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.4' \
     && rustc -vV && cargo -V && cargo nextest --version && cbindgen --version \
     && just --version && uv --version && python3 --version \
-    && /opt/zig/zig version && cargo zigbuild --version && llvm-strip --version
+    && /opt/zig/zig version && cargo-zigbuild --version && llvm-strip --version
 ENV CARGO_HOME=/cargo
 ENV CARGO_TARGET_DIR=/target
 ENV UV_CACHE_DIR=/cargo/uv-cache
