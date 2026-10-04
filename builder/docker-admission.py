@@ -15,10 +15,18 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack,contextmanager
 
 
 ROOT='/mnt/runner-data/remote-build'
+
+
+@contextmanager
+def build_lock_files(project):
+    """Lexically own both descriptors throughout creation, execution and cleanup."""
+    with open('/run/oxidex-build.lock','a') as global_lock:
+        with open(f'/run/oxidex-cache-active-{project}.lock','a') as active:
+            yield global_lock,active
 
 
 def build_identity(arguments):
@@ -91,12 +99,11 @@ def run_build(arguments,admission):
     try:
         with ExitStack() as stack:
             try:
-                global_lock=stack.enter_context(open('/run/oxidex-build.lock','a'))
+                global_lock,active=stack.enter_context(build_lock_files(project))
                 fcntl.flock(global_lock,fcntl.LOCK_SH|fcntl.LOCK_NB)
                 # Reconcile before taking our own cache lock: otherwise that
                 # lock could protect a stopped orphan whose old lease blocks us.
                 admission.reconcile_stopped_builders()
-                active=stack.enter_context(open(f'/run/oxidex-cache-active-{project}.lock','a'))
                 fcntl.flock(active,fcntl.LOCK_EX|fcntl.LOCK_NB)
                 if os.path.exists('/run/oxidex-build-draining') or container_id(name):
                     return 75
@@ -140,7 +147,9 @@ def run_build(arguments,admission):
                 try:
                     child.wait(timeout=1)
                 except subprocess.TimeoutExpired:
-                    pass
+                    # Poll again so cancellation stays responsive while both
+                    # inherited locks and the memory reservation remain held.
+                    continue
             # Even a failed/disconnected Docker client can leave a daemon container.
             while True:
                 try:

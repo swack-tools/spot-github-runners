@@ -2,6 +2,8 @@ import importlib.util
 import base64
 import json
 import signal
+import tempfile
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch,mock_open,MagicMock
@@ -64,6 +66,31 @@ class BuilderAdmissionTests(unittest.TestCase):
         self.assertEqual(create.call_args.kwargs['pass_fds'],(10,11))
         self.assertNotIn('timeout',create.call_args.kwargs)
         self.assertEqual(start.call_args.kwargs['pass_fds'],(10,11))
+
+    def test_real_lock_descriptors_stay_open_for_clients_and_close_on_every_exit(self):
+        for outcome in ('complete','second-open-fails','contended'):
+            with self.subTest(outcome=outcome),tempfile.TemporaryDirectory() as directory,\
+                 open(Path(directory)/'global.lock','a') as global_handle,\
+                 open(Path(directory)/'active.lock','a') as active_handle:
+                module=self.module();admission=MagicMock();clients=[]
+                handles=[global_handle] if outcome=='second-open-fails' else [global_handle,active_handle]
+                open_results=[*handles,OSError('cache lock unavailable')] if outcome=='second-open-fails' else handles
+                child=MagicMock();child.poll.return_value=0;child.returncode=0
+                def client(argv,**kwargs):
+                    self.assertTrue(all(not handle.closed for handle in handles))
+                    self.assertEqual(kwargs['pass_fds'],tuple(handle.fileno() for handle in handles))
+                    for descriptor in kwargs['pass_fds']:os.fstat(descriptor)
+                    clients.append(argv[1]);return child
+                with patch('builtins.open',side_effect=open_results),\
+                     patch.object(module.fcntl,'flock',side_effect=[None,BlockingIOError('busy')] if outcome=='contended' else None),\
+                     patch.object(module,'container_id',return_value=None),\
+                     patch.object(module.subprocess,'run',side_effect=client),\
+                     patch.object(module.subprocess,'Popen',side_effect=client):
+                    result=module.run_build(self.arguments(),admission)
+                self.assertTrue(all(handle.closed for handle in handles))
+                self.assertEqual(result,0 if outcome=='complete' else 75)
+                if outcome=='complete':self.assertEqual(clients,['create','start'])
+                else:admission.acquire_build.assert_not_called()
 
     def test_builder_result_propagates_and_lease_always_released(self):
         module=self.module();events=[]
