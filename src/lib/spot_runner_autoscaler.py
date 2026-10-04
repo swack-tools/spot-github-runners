@@ -928,7 +928,8 @@ def eligible_tier_offers(offers, tier, prices, disk_size_gb=100, job_memory_gib=
     return sorted(candidates,key=lambda row:(row.cpu_rank,row.total_daily_usd,row.region,row.machine_type))
 
 
-def discover_tier_offers(project,tier,disk_size_gb=100,job_memory_gib=15):
+def discover_tier_offers(project,tier,disk_size_gb=100,job_memory_gib=15,*,status=None):
+    if status is not None:status['complete']=False
     clear_catalog_cache()
     offers,_,_,errors = asyncio.run(find(get_auth(project),min_vcpu=tier.vcpu,
         min_ram=tier.ram_gib,top=None,concurrency=200,
@@ -939,6 +940,7 @@ def discover_tier_offers(project,tier,disk_size_gb=100,job_memory_gib=15):
               if (row.vcpu,row.ram_gib) == (tier.vcpu,tier.ram_gib)}}
     ranked = eligible_tier_offers(offers,tier,prices,disk_size_gb,job_memory_gib)
     candidates,skipped = launchable_candidates(ranked,load_launch_inventory(project),disk_size_gb)
+    if status is not None:status['complete']=not errors
     LOG.info('Tier %s: %d launchable candidates strictly below $%s/day with40+%d GiB disks',
              tier.name,len(candidates),tier.max_daily_usd,disk_size_gb)
     return candidates

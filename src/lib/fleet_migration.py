@@ -9,7 +9,8 @@ from dataclasses import asdict
 from decimal import Decimal
 from .runner_tiers import TIERS,tier_for_shape,validate_topology
 from .tier_policy import fits,reservation_fits
-from .fleet_evidence import io_status
+from .fleet_evidence import io_status,epoch
+from .host_evidence import validate_io_pressure
 from .storage_selection import observed_data_storage
 from .oom_obligations import obligations_for,pending_kinds,remember_oom,clear_oom
 
@@ -63,6 +64,10 @@ def begin_migration(vms,target,state,state_path,reason,slots=None,force_ids=(),s
         retained_records=[dict(asdict(vm),_expected_runner_count=expected_slots(vm,state))
                           for vm in vms if vm.instance_id in retained],phase='launch',reason=reason,
         started_at=time.time(),slots=slots)
+    if reason=='low':
+        state['migration'].update(launch_attempted=False,initial_deployments={
+            f'{vm.zone}/{vm.instance_id}':copy.deepcopy(state.get('host_deployments',{}).get(f'{vm.zone}/{vm.instance_id}'))
+            for vm in vms})
     if reason=='oom':
         state['migration']['source_oom_origins']={f'{vm.zone}/{vm.instance_id}':copy.deepcopy(obligations_for(state,f'{vm.zone}/{vm.instance_id}').get('host',{}))
             for vm in vms if vm.instance_id in {row['instance_id'] for row in sources}}
@@ -173,11 +178,110 @@ def retarget_unhealthy_storage_canary(vms,args,state,state_path):
     return True
 
 
+def defer_unused_low_plan(entry,vms,runners,args,state,state_path,discovery):
+    """Decline an unavailable downsize while retaining all verified current capacity."""
+    from . import spot_runner_autoscaler as controller
+    current=state.get('migration',{});timestamp=time.time()
+    effects=('awaiting_launch','replacement_ids','paused_retirement','storage_staged_bad_id',
+             'early_retirement_ids','completed_retirements','health','io_pressure_source_ids','oom_budget_repairs')
+    if (discovery.get('complete') is not True or entry.get('reason')!='low' or entry.get('phase')!='launch'
+            or entry.get('launch_attempted',False) is not False or current.get('launch_attempted',False) is not False
+            or any(entry.get(name) or current.get(name) for name in effects)
+            or state.get('host_operation') or state.get('paused_retirement') or state.get('pending_vm_recovery')
+            or state.get('scale_up_active')):return False
+    try:
+        fields=('target','sources','retained_ids','retained_records','pending_tiers','pending_slots','slots','started_at','phase','reason')
+        if any(current.get(name)!=entry.get(name) for name in fields):return False
+        target=tuple(entry['target']);validate_topology(target)
+        managed=[vm for vm in vms if vm.name.startswith('oxidex-runners-')]
+        topology=topology_for(managed);validate_topology(topology)
+        records=entry['sources']+entry.get('retained_records',[])
+        if (not entry['sources'] or len(records)!=len(managed) or not all(vm.running and vm.spot and vm.instance_id for vm in managed)
+                or len({vm.instance_id for vm in managed})!=len(managed)
+                or len({row['instance_id'] for row in records})!=len(records)
+                or sorted(entry['retained_ids'])!=sorted(row['instance_id'] for row in entry.get('retained_records',[]))
+                or {row['instance_id'] for row in records}!={vm.instance_id for vm in managed}
+                or any(f'{vm.zone}/{vm.name}' in state.get('intentional_deletions',[]) for vm in managed)
+                or {vm.instance_id for vm in managed}&set(state.get('intentional_deletion_ids',{}).values())
+                or len(managed)>min(5,args.maximum_hosts) or sum(vm.vcpu or 80 for vm in managed)>80
+                or sum(expected_slots(vm,state) for vm in managed)>100
+                or state.get('desired_topology',list(topology))!=list(topology)
+                or not sum(TIERS[name].vcpu for name in target)<sum(vm.vcpu for vm in managed)
+                or not sum(TIERS[name].ram_gib for name in target)<sum(vm.ram_gib for vm in managed)):return False
+        remaining=Counter(target)
+        for record in entry.get('retained_records',[]):remaining[tier_for_shape(record['vcpu'],record['ram_gib']).name]-=1
+        if (any(count<0 for count in remaining.values()) or not entry['pending_tiers']
+                or entry['pending_tiers']!=list(remaining.elements())
+                or entry['pending_slots']!=[entry.get('slots') or TIERS[name].initial_slots for name in entry['pending_tiers']]):return False
+        start=entry['started_at']
+        if isinstance(start,bool) or not isinstance(start,(int,float)) or not math.isfinite(start) or not 0<=start<=timestamp:return False
+        # Older plans lack an attempt marker: require no CURRENT lifecycle effects,
+        # and never reinterpret a recorded later receipt as an untouched plan.
+        effect_ticks=list(state.get('failed_launch_candidates',{}).values())
+        if 'migration_completed_at' in state:effect_ticks.append(state['migration_completed_at'])
+        for archived in state.get('migration_history',[]):
+            ticks=[archived[name] for name in ('retargeted_at','deferred_at') if name in archived]
+            if not ticks:return False
+            effect_ticks.extend(ticks)
+        if any(isinstance(tick,bool) or not isinstance(tick,(int,float)) or not math.isfinite(tick)
+               or not 0<=tick<start for tick in effect_ticks):return False
+        def fresh(value):
+            return (not isinstance(value,bool) and isinstance(value,(int,float)) and math.isfinite(value)
+                    and 0<=timestamp-value<=450)
+        resources=state.get('latest_resources') or []
+        if (state.get('latest_workload',{}).get('complete') is not True or len(resources)!=len(managed)
+                or {(row['zone'],row['instance_id']) for row in resources}!={(vm.zone,vm.instance_id) for vm in managed}
+                or io_status(resources)=='incomplete'):return False
+        polls=state.get('job_tracking',{}).get('last_poll_by_repository',{})
+        for repo in args.job_repository or [args.org+'/oxidex']:
+            if not fresh(epoch(polls[repo])):return False
+        for vm in managed:
+            key=f'{vm.zone}/{vm.instance_id}';record=next(row for row in records if row['instance_id']==vm.instance_id)
+            if (not same_source_inventory(record,asdict(vm))
+                    or any(record.get(name)!=getattr(vm,name) for name in ('machine_type','vcpu','ram_gib','spot'))):return False
+            receipt=state.get('host_deployments',{})[key];tier=tier_for_shape(vm.vcpu,vm.ram_gib)
+            count=receipt['expected_runner_count'];memory=receipt['runner_memory_gib']
+            if (not tier or receipt['tier']!=tier.name or isinstance(count,bool) or not isinstance(count,int)
+                    or not 1<=count<=tier.maximum_slots or isinstance(memory,bool) or not isinstance(memory,(int,float))
+                    or not math.isfinite(memory) or memory<=0
+                    or ('initial_deployments' in entry and entry['initial_deployments'].get(key)!=receipt)):return False
+            assigned=controller.host_runners(vm,runners,managed)
+            if (len(assigned)!=count or {row.name for row in assigned}!={f'gha-{vm.name}-{index}' for index in range(1,count+1)}
+                    or len({row.runner_id for row in assigned})!=count
+                    or any(not row.online or not controller.runner_is_managed(row) for row in assigned)):return False
+            health=state.get('host_health',{})[key]
+            if (health.get('instance_id')!=vm.instance_id or health.get('complete') is not True
+                    or not health.get('boot_id') or not fresh(health['observed_at'])
+                    or health.get('boot_oom_complete') is not True or not isinstance(health.get('boot_host_oom_ids'),list)
+                    or state.get('io_history',{}).get(key,{}).get('boot_id')!=health['boot_id']
+                    or health.get('io_complete') is not True or pending_kinds(state,key)&{'unknown','container'}
+                    or any(event.get('kind')=='unknown' or (event.get('kind')=='container' and event.get('workload') not in ('runner','builder'))
+                           for event in health['events'])):return False
+            validate_io_pressure(health['io_pressure'])
+            row=next(row for row in resources if row['instance_id']==vm.instance_id and row['zone']==vm.zone)
+            if (not fresh(row['observed_at']) or any(isinstance(row[name],bool) or not math.isfinite(row[name]) or row[name]<0
+                    for name in ('cpu_cores','used_ram_gib','peak_cpu_cores','peak_ram_gib','cpu_fraction','memory_fraction'))):return False
+    except (KeyError,TypeError,ValueError,AttributeError,OverflowError):return False
+    candidate=copy.deepcopy(state)
+    candidate['migration_history']=(candidate.get('migration_history',[])+[
+        dict(deferred_at=timestamp,reason='unavailable low-demand plan; current capacity retained',migration=copy.deepcopy(entry))])[-3:]
+    candidate['desired_topology']=list(topology)
+    if candidate.get('tier_policy',{}).get('direction')=='down':candidate['tier_policy']['streak']=0
+    candidate.pop('migration')
+    controller.write_scale_state(state_path,candidate)
+    state['migration_history']=candidate['migration_history'];state['desired_topology']=candidate['desired_topology']
+    if state.get('tier_policy',{}).get('direction')=='down':state['tier_policy']['streak']=0
+    state.pop('migration')
+    LOG.info('Unavailable low-demand plan deferred; current %s capacity retained',topology)
+    return True
+
+
 def reconcile_migration(vms,runners,args,state,state_path):
     from . import spot_runner_autoscaler as controller
     from .fleet_logging import vm_from_record
     migration=state.get('migration')
     if not migration:return False
+    entry=copy.deepcopy(migration)
     if state.get('host_operation'):return True
     fleet=controller.spot_instances(vms)
     by_id={vm.instance_id:vm for vm in fleet}
@@ -268,7 +372,8 @@ def reconcile_migration(vms,runners,args,state,state_path):
                     migration['overlap_allowance_daily_usd']=str(allowance)
                 migration['spend_ceiling']='15' if migration.get('storage_staged_bad_id') else str(max(Decimal('15'),current+allowance))
                 controller.write_scale_state(state_path,state)
-            offers=controller.discover_tier_offers(args.project,tier,args.disk_size_gb,getattr(args,'tier_job_memory_gib',15))
+            discovery={}
+            offers=controller.discover_tier_offers(args.project,tier,args.disk_size_gb,getattr(args,'tier_job_memory_gib',15),status=discovery)
             offers=[offer for offer in offers if current+offer.total_daily_usd<Decimal(migration['spend_ceiling'])]
             slots=(migration.get('pending_slots') or [migration.get('slots') or tier.initial_slots])[0]
             if (sum(vm.vcpu or 80 for vm in managed)+tier.vcpu>80
@@ -276,10 +381,14 @@ def reconcile_migration(vms,runners,args,state,state_path):
                 LOG.info('Migration holds: overlapping CPU/slot ceiling would be exceeded')
                 return True
             if not offers:
+                if defer_unused_low_plan(entry,vms,runners,args,state,state_path,discovery):return True
                 LOG.info('Migration holds: no qualifying %s offer within disk and overlap budget',tier.name)
                 return True
             args.launch_tier=tier.name
             args.launch_slots=slots
+            if migration.get('reason')=='low':
+                migration['launch_attempted']=True
+                controller.write_scale_state(state_path,state)
             controller.scale_up(1,offers,args,state,state_path,
                 refresh=lambda: [row for row in controller.discover_tier_offers(args.project,tier,args.disk_size_gb,getattr(args,'tier_job_memory_gib',15))
                                   if current+row.total_daily_usd<Decimal(migration['spend_ceiling'])])
