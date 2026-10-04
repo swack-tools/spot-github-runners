@@ -36,7 +36,8 @@ class MigrationTests(unittest.TestCase):
                     complete=True,boot_oom_complete=True,boot_host_oom_ids=[],observed_at=tick,events=[]) for identity in ('1','2')}
                 with patch('lib.fleet_migration.time.time',return_value=tick),patch.object(controller,'builder_ready',return_value=True) as canary:
                     reconcile_migration([large,small],runners,args,state,path)
-                canary.assert_called_once_with(large,args)
+                self.assertEqual(canary.call_args.args,(large,args))
+                self.assertEqual(canary.call_count,1 if tick==1000 else 2)
                 if tick==1000:
                     self.assertNotIn('host_operation',state)
                     state=json.loads(path.read_text())
@@ -76,8 +77,10 @@ class MigrationTests(unittest.TestCase):
             begin_migration([large,small],('large',),state,path,'consolidation')
             state['host_deployments']={'z/1':dict(tier='large',expected_runner_count=20,runner_memory_gib=15)}
             state['pending_vm_recovery']={'large':dict(instance_id='1',_cleanup_complete=True)}
-            args=SimpleNamespace(remote_builder=True,maximum_hosts=5,scaling_mode='tiered',tier_job_memory_gib=15)
-            with patch.object(controller,'begin_host_operation') as drain,patch('lib.fleet_migration.time.time',return_value=1000):
+            args=SimpleNamespace(remote_builder=True,maximum_hosts=5,scaling_mode='tiered',tier_job_memory_gib=15,project='p',disk_size_gb=100)
+            with patch.object(controller,'begin_host_operation') as drain,\
+                 patch.object(controller,'check_running_prices') as pricing,\
+                 patch('lib.fleet_migration.time.time',return_value=1000):
                 reconcile_migration([small],[],args,state,path)
             drain.assert_not_called()
             self.assertEqual(state['migration']['pending_tiers'],['large'])
@@ -135,13 +138,13 @@ class MigrationTests(unittest.TestCase):
             state['migration'].update(pending_tiers=[],replacement_ids=['2'],phase='healthy')
             state['host_deployments']={'z/2':{'expected_runner_count':8}}
             runners=[GitHubRunner(i,f'gha-{new.name}-{i}','online',False,('spot','X64')) for i in range(1,9)]
-            args=SimpleNamespace(org='org',remote_builder=False,maximum_hosts=5,scaling_mode='tiered')
+            args=SimpleNamespace(org='org',remote_builder=False,maximum_hosts=5,scaling_mode='tiered',tier_job_memory_gib=2)
             for tick in (1000,1300):
                 state['latest_resources']=[dict(instance_id=identity,zone='z',observed_at=tick,cpu_fraction=.1,memory_fraction=.2,peak_cpu_cores=.1,peak_ram_gib=.5,
                     io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0)) for identity in ('1','2')]
                 state['latest_workload']={'complete':True}
-                state['host_health']={'z/2':{'instance_id':'2','boot_id':'boot','boot_oom_complete':True,'boot_host_oom_ids':[],
-                    'complete':True,'observed_at':tick,'events':[]}}
+                state['host_health']={f'z/{identity}':{'instance_id':identity,'boot_id':'boot-'+identity,'boot_oom_complete':True,
+                    'boot_host_oom_ids':[],'complete':True,'observed_at':tick,'events':[]} for identity in ('1','2')}
                 with patch('lib.fleet_migration.time.time',return_value=tick), patch('lib.spot_runner_autoscaler.begin_host_operation') as drain:
                     reconcile_migration([old,new],runners,args,state,path)
                     self.assertEqual(drain.call_count,0 if tick==1000 else 1)
@@ -207,9 +210,17 @@ class MigrationTests(unittest.TestCase):
             path=Path(folder)/'state.json';state={}
             begin_migration(hosts,('bulky','bulky','expanded'),state,path,'shrink')
             state['latest_workload']={'complete':True}
-            state['latest_resources']=[dict(peak_cpu_cores=1,peak_ram_gib=2,
-                io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0))]*3
-            with patch('lib.spot_runner_autoscaler.begin_host_operation') as drain,\
-                 patch('lib.spot_runner_autoscaler.check_running_prices',side_effect=AssertionError('launch pricing')):
-                reconcile_migration(hosts,[],SimpleNamespace(maximum_hosts=5),state,path)
-                self.assertEqual(drain.call_args.args[1].instance_id,'3')
+            args=SimpleNamespace(maximum_hosts=5,remote_builder=False,tier_job_memory_gib=15)
+            runners=[GitHubRunner(i,f'gha-{host.name}-{i}','online',False,()) for host in hosts[:2] for i in range(1,9)]
+            for tick in (1000,1300):
+                state['latest_resources']=[dict(instance_id=host.instance_id,zone='z',observed_at=tick,
+                    peak_cpu_cores=1,peak_ram_gib=2,cpu_fraction=.1,memory_fraction=.1,
+                    io_complete=True,io_pressure_peaks=dict(full_avg10=0,full_avg60=0,some_avg10=0,some_avg60=0)) for host in hosts]
+                state['host_health']={f'z/{host.instance_id}':dict(instance_id=host.instance_id,boot_id='boot-'+host.instance_id,
+                    complete=True,boot_oom_complete=True,boot_host_oom_ids=[],observed_at=tick,events=[]) for host in hosts}
+                with patch('lib.spot_runner_autoscaler.begin_host_operation') as drain,\
+                     patch('lib.fleet_migration.time.time',return_value=tick),\
+                     patch('lib.spot_runner_autoscaler.check_running_prices',side_effect=AssertionError('launch pricing')):
+                    reconcile_migration(hosts,runners,args,state,path)
+                    self.assertEqual(drain.call_count,0 if tick==1000 else 1)
+                    if tick==1300:self.assertEqual(drain.call_args.args[1].instance_id,'3')

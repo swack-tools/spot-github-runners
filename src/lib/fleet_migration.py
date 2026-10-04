@@ -59,8 +59,14 @@ def begin_migration(vms,target,state,state_path,reason,slots=None,force_ids=(),s
                                or set(io_pressure_sources)!={row['instance_id'] for row in sources}):
         raise ValueError('Storage relief exemption requires exact retiring sources')
     state['migration']=dict(target=list(target),sources=sources,retained_ids=retained,
-        pending_tiers=pending_tiers,pending_slots=pending_slots,replacement_ids=[],phase='launch',reason=reason,
+        pending_tiers=pending_tiers,pending_slots=pending_slots,replacement_ids=[],
+        retained_records=[dict(asdict(vm),_expected_runner_count=expected_slots(vm,state))
+                          for vm in vms if vm.instance_id in retained],phase='launch',reason=reason,
         started_at=time.time(),slots=slots)
+    if reason=='oom':
+        state['migration']['source_oom_origins']={f'{vm.zone}/{vm.instance_id}':copy.deepcopy(obligations_for(state,f'{vm.zone}/{vm.instance_id}').get('host',{}))
+            for vm in vms if vm.instance_id in {row['instance_id'] for row in sources}}
+        state['migration']['oom_capacity_response']=sum(TIERS[name].ram_gib for name in target)>sum(vm.ram_gib or math.inf for vm in vms)
     if io_pressure_sources:
         state['migration']['io_pressure_source_ids']=sorted(io_pressure_sources)
     if staged_bad_id is not None:
@@ -156,7 +162,8 @@ def retarget_unhealthy_storage_canary(vms,args,state,state_path):
         dict(retargeted_at=timestamp,reason='sustained storage pressure',migration=copy.deepcopy(migration))])[-3:]
     candidate.pop('migration')
     target=('large',) if fits(('large',),resources) else ('large','large')
-    begin_migration(managed,target,candidate,state_path,'storage-pressure canary replacement',
+    ordered=sorted(managed,key=lambda vm:vm.instance_id!=bad_id) if len(target)==1 else managed
+    begin_migration(ordered,target,candidate,state_path,'storage-pressure canary replacement',
                     slots=TIERS['large'].initial_slots,io_pressure_sources=identities,
                     staged_bad_id=bad_id if len(target)==2 else None)
     # Existing job trackers hold references into other state subtrees.
@@ -201,22 +208,16 @@ def reconcile_migration(vms,runners,args,state,state_path):
         if not migration['pending_tiers'] and len(set(migration['replacement_ids']))!=2:
             LOG.error('Staged migration holds: final replacement cardinality is incomplete')
             return True
-        for identity in list(migration['replacement_ids']):
-            if identity in by_id:continue
-            receipt=next((row for key,row in state.get('host_deployments',{}).items() if key.endswith('/'+identity)),{})
-            if receipt.get('tier')!='large':return True
-            migration['replacement_ids'].remove(identity)
-            migration['pending_tiers'].append('large')
-            migration.setdefault('pending_slots',[]).append(receipt.get('expected_runner_count') or TIERS['large'].initial_slots)
+    if restore_missing_destinations(fleet,state,state_path)=='hold':return True
+    paused=migration.get('paused_retirement')
+    if paused:
+        source=by_id.get(paused['vm']['instance_id'])
+        safe=staged_retirement_safe if paused.get('staged_retirement') else retirement_safe
+        if source is None or safe(vms,runners,args,state,state_path,paused):
+            state['host_operation']=copy.deepcopy(paused)
+            migration.pop('paused_retirement')
             controller.write_scale_state(state_path,state)
-        paused=migration.get('paused_retirement')
-        if paused:
-            source=by_id.get(paused['vm']['instance_id'])
-            if source is None or staged_retirement_safe(vms,runners,args,state,state_path,paused):
-                state['host_operation']=copy.deepcopy(paused)
-                migration.pop('paused_retirement')
-                controller.write_scale_state(state_path,state)
-                return True
+            return True
     if migration['pending_tiers']:
         # Count provisioning/stopped managed identities too; the hard ceiling
         # cannot be bypassed by an incomplete running-only inventory.
@@ -289,14 +290,17 @@ def reconcile_migration(vms,runners,args,state,state_path):
         migration['phase']='healthy'
         if retarget_unhealthy_storage_canary(vms,args,state,state_path):
             return True
-        if not replacements_healthy(fleet,runners,args,state,state_path):
+        if not replacements_healthy(fleet,runners,args,state,state_path,include_retained=bool(migration['sources'])):
             LOG.info('Migration waits for two healthy complete replacement windows')
             return True
         resources=state.get('latest_resources') or []
         identities={(vm.zone,vm.instance_id) for vm in fleet}
         observed={(row.get('zone'),row.get('instance_id')) for row in resources}
         if (state.get('latest_workload',{}).get('complete') is not True
-                or observed!=identities or not retirement_io_safe(migration,resources,state) or not fits(migration['target'],resources)):
+                or observed!=identities
+                or (migration['sources'] and not retirement_io_safe(migration,resources,state))
+                or (migration['sources'] and not fits(migration['target'],resources))
+                or (not migration['sources'] and not additive_evidence_complete(vms,args,state))):
             LOG.info('Migration keeps source: fresh complete workload/peak demand does not fit target')
             return True
         migration['phase']='drain'
@@ -317,7 +321,12 @@ def reconcile_migration(vms,runners,args,state,state_path):
                     survivor_ids=[item.instance_id for item in fleet if item.instance_id!=vm.instance_id])
                 proposal=dict(vm=record,staged_retirement=metadata['staged_retirement'])
                 if not staged_retirement_safe(vms,runners,args,state,state_path,proposal):return True
-                vm=vm_from_record(record)
+            else:
+                metadata['migration_retirement']=dict(started_at=migration['started_at'],
+                    survivor_ids=[item.instance_id for item in fleet if item.instance_id!=vm.instance_id])
+                proposal=dict(vm=record,migration_retirement=metadata['migration_retirement'])
+                if not retirement_safe(vms,runners,args,state,state_path,proposal):return True
+            vm=vm_from_record(record)
             controller.begin_host_operation('drain',vm,runners,vms,state,state_path,**metadata,
                 runner_names={str(row.runner_id):row.name for row in assigned},
                 drain_mode='isolated_group',drain_group_name=f'spot-drain-{vm.name}-{vm.instance_id}')
@@ -338,28 +347,17 @@ def reconcile_migration(vms,runners,args,state,state_path):
         LOG.info('Tier migration completed: %s',state['desired_topology'])
     return True
 
-def replacements_healthy(fleet,runners,args,state,state_path):
+def replacements_healthy(fleet,runners,args,state,state_path,include_retained=True):
     from . import spot_runner_autoscaler as controller
     migration=state['migration']
     by_id={vm.instance_id:vm for vm in fleet}
     rows={f"{row['zone']}/{row['instance_id']}":row for row in state.get('latest_resources') or []}
-    destinations=list(dict.fromkeys(migration['replacement_ids']+migration.get('retained_ids',[])))
+    destinations=list(dict.fromkeys(migration['replacement_ids']+(migration.get('retained_ids',[]) if include_retained else [])))
     healthy=bool(destinations)
     checks=migration.setdefault('healthy_checks',{})
     for identity in destinations:
         vm=by_id.get(identity)
-        if not vm:
-            # Lost canary: restore its allowed tier, never delete the source.
-            receipt=next((row for key,row in state.get('host_deployments',{}).items() if key.endswith('/'+identity)),{})
-            if receipt.get('tier'):
-                migration['pending_tiers'].append(receipt['tier'])
-                counts=migration.setdefault('pending_slots',[
-                    migration.get('slots') or TIERS[name].initial_slots for name in migration['pending_tiers'][:-1]])
-                counts.append(receipt.get('expected_runner_count') or TIERS[receipt['tier']].initial_slots)
-                cohort='replacement_ids' if identity in migration['replacement_ids'] else 'retained_ids'
-                migration[cohort].remove(identity)
-                controller.write_scale_state(state_path,state)
-            return False
+        if not vm:return False
         key=f'{vm.zone}/{vm.instance_id}'
         sample=rows.get(key)
         health=state.get('host_health',{}).get(key,{})
@@ -491,36 +489,157 @@ def staged_retirement_safe(vms,runners,args,state,state_path,operation):
 
 
 def guard_staged_retirement(vms,runners,args,state,state_path):
-    """Refresh proof at the lifecycle barrier, pausing only for lost survivors."""
+    """Refresh all migration retirement proofs, pausing only for lost survivors."""
     from . import spot_runner_autoscaler as controller
     operation=state.get('host_operation',{})
     migration=state.get('migration',{})
-    if not operation.get('staged_retirement'):
-        return not (migration.get('storage_staged_bad_id') and
-                    operation.get('vm',{}).get('instance_id') in {row['instance_id'] for row in migration.get('sources',[])})
-    if not migration.get('storage_staged_bad_id'):return False
+    source_id=operation.get('vm',{}).get('instance_id')
+    recorded=next((row for row in migration.get('sources',[]) if row['instance_id']==source_id),None)
+    if not recorded:return not bool(operation.get('staged_retirement') or operation.get('migration_retirement'))
+    if migration.get('storage_staged_bad_id'):
+        if not operation.get('staged_retirement'):return False
+        safe=staged_retirement_safe
+    else:
+        # Legacy persisted migration drains acquire scope only from the same
+        # saved original VM/disks, never from the fresh provider attachments.
+        if not operation.get('migration_retirement'):
+            if operation.get('vm')!=recorded:return False
+            operation['migration_retirement']=dict(started_at=migration['started_at'],
+                survivor_ids=[item.instance_id for item in vms if item.spot and item.name.startswith('oxidex-runners-') and item.instance_id!=source_id])
+            controller.write_scale_state(state_path,state)
+        safe=retirement_safe
     try:
         current_vms=controller.list_gcloud_vms(args.project,name_prefix='oxidex-runners-')
         fresh=controller.list_github_runners(args.org)
         from .tier_controller import evidence_for
         evidence_for(current_vms,fresh,args,state)
-        if staged_retirement_safe(current_vms,fresh,args,state,state_path,operation):return True
+        if safe(current_vms,fresh,args,state,state_path,operation):return True
     except (RuntimeError,OSError,ValueError,KeyError,subprocess.SubprocessError) as exc:
-        LOG.warning('Staged retirement proof unavailable: %s',controller.error_detail(exc))
+        LOG.warning('Migration retirement proof unavailable: %s',controller.error_detail(exc))
         return False
     # A real survivor loss must not monopolize the scheduling barrier and
     # prevent normal identity-scoped loss cleanup / replacement. Persist the
     # original isolation/drain receipt before releasing only its active slot.
-    scope=operation['staged_retirement']
+    scope=operation.get('staged_retirement') or operation['migration_retirement']
     alive={vm.instance_id for vm in current_vms if vm.running}
     source_id=operation['vm']['instance_id']
+    blocked_losses={row.get('instance_id') for row in state.get('pending_vm_recovery',{}).values()
+                    if not row.get('_cleanup_complete') and row.get('instance_id')
+                    and row.get('spot') and row.get('name','').startswith('oxidex-runners-')
+                    and row.get('instance_id')!=source_id and row.get('instance_id') not in alive}
     if (scope.get('started_at')==migration.get('started_at') and source_id in alive
-            and set(scope.get('survivor_ids',[]))-alive):
+            and (set(scope.get('survivor_ids',[]))-alive or blocked_losses)):
         saved=migration.get('paused_retirement')
         if saved and saved!=operation:return False
         migration['paused_retirement']=copy.deepcopy(operation)
         controller.write_scale_state(state_path,state)
         state.pop('host_operation')
         controller.write_scale_state(state_path,state)
-        LOG.warning('Paused exact staged retirement while missing survivors recover: %s',source_id)
+        LOG.warning('Paused exact migration retirement while missing survivors recover: %s',source_id)
     return False
+
+
+def restore_missing_destinations(fleet,state,state_path):
+    """Restore exact receipted destinations after normal loss cleanup."""
+    from . import spot_runner_autoscaler as controller
+    migration=state['migration'];by_id={vm.instance_id:vm for vm in fleet}
+    for cohort in ('replacement_ids','retained_ids'):
+        for identity in list(migration.get(cohort,[])):
+            if identity in by_id:continue
+            saved=next((row for row in migration.get('retained_records',[]) if row['instance_id']==identity),{})
+            if saved and any(vm.name==saved['name'] and vm.zone==saved['zone'] and vm.instance_id!=identity for vm in fleet):
+                return 'hold'
+            receipt=next((row for key,row in state.get('host_deployments',{}).items() if key.endswith('/'+identity)),{})
+            tier_name=receipt.get('tier')
+            if not tier_name and saved:
+                tier=tier_for_shape(saved.get('vcpu'),saved.get('ram_gib'))
+                tier_name=tier.name if tier else None
+            if tier_name not in TIERS:return 'hold'
+            count=receipt.get('expected_runner_count') or saved.get('_expected_runner_count') or TIERS[tier_name].initial_slots
+            if not isinstance(count,int) or isinstance(count,bool) or not 1<=count<=TIERS[tier_name].maximum_slots:return 'hold'
+            migration[cohort].remove(identity)
+            migration['pending_tiers'].append(tier_name)
+            migration.setdefault('pending_slots',[]).append(count)
+            controller.write_scale_state(state_path,state)
+    return None
+
+
+def retirement_safe(vms,runners,args,state,state_path,operation):
+    """Recheck real destination health and capacity through every retirement retry."""
+    from . import spot_runner_autoscaler as controller
+    migration=state.get('migration',{});record=operation.get('vm',{})
+    scope=operation.get('migration_retirement',{})
+    if (not migration.get('sources') or scope.get('started_at')!=migration.get('started_at')
+            or not any(row==record for row in migration['sources'])):return False
+    managed=[vm for vm in vms if vm.spot and vm.name.startswith('oxidex-runners-')]
+    if (any(not vm.running for vm in managed) or len(managed)>min(5,getattr(args,'maximum_hosts',5))
+            or sum(vm.vcpu or 80 for vm in managed)>80 or sum(expected_slots(vm,state) for vm in managed)>100):return False
+    current=next((vm for vm in managed if vm.instance_id==record['instance_id']),None)
+    if (not current or current.name!=record['name'] or current.zone!=record['zone']
+            or list(current.disks)!=list(record.get('disks',[])) or not current.disks
+            or any(not disk.get('diskId') for disk in current.disks)):return False
+    destinations=set(migration['replacement_ids']+migration.get('retained_ids',[]))
+    survivors=[vm for vm in managed if vm.instance_id in destinations]
+    if len(survivors)!=len(destinations) or not survivors:return False
+    if any(not row.get('_cleanup_complete') for row in state.get('pending_vm_recovery',{}).values()):return False
+    topology=topology_for(survivors);resources=state.get('latest_resources') or [];timestamp=time.time()
+    try:
+        if (state.get('latest_workload',{}).get('complete') is not True or 'legacy' in topology
+                or len(resources)!=len(managed)
+                or {(row['zone'],row['instance_id']) for row in resources}!={(vm.zone,vm.instance_id) for vm in managed}
+                or any(not 0<=timestamp-row['observed_at']<=450
+                       or any(not math.isfinite(row[name]) or row[name]<0 for name in ('peak_cpu_cores','peak_ram_gib'))
+                       for row in resources)
+                or not retirement_io_safe(migration,resources,state)
+                or not source_oom_proven(migration,current,state,timestamp)
+                or not reservation_fits(topology,getattr(args,'tier_job_memory_gib',15))
+                or not fits(topology,resources)):return False
+        return replacements_healthy(managed,runners,args,state,state_path)
+    except (KeyError,TypeError,ValueError,OverflowError):return False
+
+
+def source_oom_proven(migration,vm,state,timestamp):
+    """Ambiguous source history holds; an exact recorded OOM capacity response can retire it."""
+    key=f'{vm.zone}/{vm.instance_id}';health=state.get('host_health',{}).get(key,{})
+    try:
+        if (health.get('instance_id')!=vm.instance_id or health.get('complete') is not True
+                or not health.get('boot_id') or not 0<=timestamp-health['observed_at']<=450
+                or health.get('boot_oom_complete') is not True
+                or not isinstance(health.get('boot_host_oom_ids'),list)
+                or pending_kinds(state,key) & {'unknown','container'}):return False
+        events=health.get('events',[])
+        if any(event.get('kind')=='unknown' or (event.get('kind')=='container' and event.get('workload') not in ('runner','builder')) for event in events):
+            return False
+        globals=set(health['boot_host_oom_ids'])|{event.get('id') for event in events if event.get('kind')=='host'}
+        origin=migration.get('source_oom_origins',{}).get(key,{})
+        pending=obligations_for(state,key).get('host')
+        if not globals and not pending:return True
+        # Deleting an OOM source is a capacity response only when the original
+        # transaction recorded these exact same-boot decisions and adds RAM.
+        return (migration.get('reason')=='oom' and migration.get('oom_capacity_response') is True
+                and origin.get('boot_id')==health['boot_id'] and origin.get('quarantined') is False
+                and bool(origin.get('event_ids')) and globals<=set(origin['event_ids'])
+                and (pending is None or (pending.get('boot_id')==origin['boot_id']
+                     and pending.get('quarantined') is False and set(pending.get('event_ids',[]))<=set(origin['event_ids']))))
+    except (KeyError,TypeError,ValueError):return False
+
+
+def additive_evidence_complete(vms,args,state):
+    """Growth keeps all existing capacity; settle it so demand can drive the next step."""
+    managed=[vm for vm in vms if vm.spot and vm.name.startswith('oxidex-runners-')]
+    migration=state['migration'];resources=state.get('latest_resources') or [];timestamp=time.time()
+    try:
+        return (state.get('latest_workload',{}).get('complete') is True
+            and all(vm.running and vm.instance_id for vm in managed)
+            and len({vm.instance_id for vm in managed})==len(managed)
+            and len(managed)<=min(5,getattr(args,'maximum_hosts',5))
+            and sum(vm.vcpu or 80 for vm in managed)<=80
+            and sum(expected_slots(vm,state) for vm in managed)<=100
+            and Counter(topology_for(managed))==Counter(migration['target'])
+            and reservation_fits(migration['target'],getattr(args,'tier_job_memory_gib',15))
+            and len(resources)==len(managed)
+            and {(row['zone'],row['instance_id']) for row in resources}=={(vm.zone,vm.instance_id) for vm in managed}
+            and all(row.get('windows',0)>=1 and 0<=timestamp-row['observed_at']<=450
+                    and all(math.isfinite(row[name]) and row[name]>=0 for name in ('peak_cpu_cores','peak_ram_gib'))
+                    for row in resources))
+    except (KeyError,TypeError,ValueError,OverflowError):return False

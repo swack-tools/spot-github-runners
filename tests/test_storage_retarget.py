@@ -44,6 +44,7 @@ class StorageRetargetTests(unittest.TestCase):
                  patch('lib.spot_runner_autoscaler.begin_host_operation',side_effect=AssertionError('drain')):
                 self.assertTrue(self.retarget(hosts,args,state,path))
             self.assertEqual(state['migration']['target'],['large'])
+            self.assertEqual(state['migration']['sources'][0]['instance_id'],'2')
             self.assertEqual(state['migration']['pending_tiers'],['large'])
             self.assertEqual(state['migration']['pending_slots'],[20])
             self.assertEqual({row['instance_id'] for row in state['migration']['sources']},{'1','2'})
