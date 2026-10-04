@@ -20,6 +20,13 @@ def main():
     env['PATH'] = str(Path(compiler).parent) + ':' + env['PATH']
     env['RUSTDOC'] = str(Path(compiler).with_name('rustdoc'))
     env['RUSTUP_TOOLCHAIN'] = pin
+    # Apply to Python/Just as well: the cached router launches a Python job
+    # that invokes Cargo later. Keep Zig caches inside the persistent mounts.
+    env['CARGO_ZIGBUILD_ZIG_PATH'] = '/opt/zig/zig'
+    env['CARGO_ZIGBUILD_CACHE_DIR'] = '/cargo/zigbuild-cache'
+    env['ZIG_GLOBAL_CACHE_DIR'] = '/cargo/zig-global-cache'
+    # Hidden so portable artifact export does not include the compiler cache.
+    env['ZIG_LOCAL_CACHE_DIR'] = '/target/.zig-cache'
     print(subprocess.check_output([compiler, '-vV'], text=True), flush=True)
     print(subprocess.check_output([cargo, '-V'], text=True), flush=True)
     command = sys.argv[1:] or ['cargo', 'build', '--release', '--locked', '--bin', 'oxidex']
