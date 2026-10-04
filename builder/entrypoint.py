@@ -27,6 +27,10 @@ def main():
     env['ZIG_GLOBAL_CACHE_DIR'] = '/cargo/zig-global-cache'
     # Hidden so portable artifact export does not include the compiler cache.
     env['ZIG_LOCAL_CACHE_DIR'] = '/target/.zig-cache'
+    # Zig supplies Darwin libc; only the open-source CF interface stub is added.
+    # Callers append this as a framework search path to their existing flags.
+    env['OXIDEX_DARWIN_FRAMEWORK_DIR'] = '/opt/opensourceDarwinStubs'
+    env.pop('SDKROOT', None)
     print(subprocess.check_output([compiler, '-vV'], text=True), flush=True)
     print(subprocess.check_output([cargo, '-V'], text=True), flush=True)
     command = sys.argv[1:] or ['cargo', 'build', '--release', '--locked', '--bin', 'oxidex']

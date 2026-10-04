@@ -25,6 +25,46 @@ RUN curl --proto '=https' --tlsv1.2 -fsS \
     && tar -xzf /tmp/cargo-zigbuild.crate --strip-components=1 -C /tmp/cargo-zigbuild-source \
     && rm /tmp/cargo-zigbuild.crate \
     && chown -R 1001:1001 /tmp/cargo-zigbuild-source
+# SDK-free Darwin framework interface, derived from core-foundation-sys 0.8.7
+# (MIT), commit 652bab0a62d87df8a974ffad2ad9f7be218a8b56. No implementation
+# or proprietary SDK is included. See builder/DARWIN-STUB-NOTICE.md.
+RUN install -d -m 0755 /opt/opensourceDarwinStubs/CoreFoundation.framework \
+    && printf '%s\n' \
+      '--- !tapi-tbd' \
+      'tbd-version: 4' \
+      'targets: [ arm64-macos, x86_64-macos ]' \
+      'install-name: /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation' \
+      'current-version: 1.0' \
+      'compatibility-version: 1.0' \
+      'exports:' \
+      '  - targets: [ arm64-macos, x86_64-macos ]' \
+      '    symbols: [ _CFRelease, _CFTimeZoneCopySystem, _CFTimeZoneGetName, _CFTimeZoneResetSystem, _CFStringGetCStringPtr, _CFStringGetLength, _CFStringGetBytes ]' \
+      '...' > /opt/opensourceDarwinStubs/CoreFoundation.framework/CoreFoundation.tbd \
+    && printf '%s\n' \
+      'CoreFoundation interface symbols derived from core-foundation-sys 0.8.7.' \
+      'Source: https://github.com/servo/core-foundation-rs/tree/652bab0a62d87df8a974ffad2ad9f7be218a8b56/core-foundation-sys' \
+      'Licensed under MIT (selected from MIT OR Apache-2.0).' \
+      '' \
+      'Copyright (c) 2012-2013 Mozilla Foundation' \
+      '' \
+      'Permission is hereby granted, free of charge, to any person obtaining a copy' \
+      'of this software and associated documentation files (the "Software"), to deal' \
+      'in the Software without restriction, including without limitation the rights' \
+      'to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies' \
+      'of the Software, and to permit persons to whom the Software is furnished to' \
+      'do so, subject to the following conditions:' \
+      '' \
+      'The above copyright notice and this permission notice shall be included in' \
+      'all copies or substantial portions of the Software.' \
+      '' \
+      'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR' \
+      'IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,' \
+      'FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE' \
+      'AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER' \
+      'LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,' \
+      'OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN' \
+      'THE SOFTWARE.' > /opt/opensourceDarwinStubs/NOTICE \
+    && chmod 0444 /opt/opensourceDarwinStubs/CoreFoundation.framework/CoreFoundation.tbd /opt/opensourceDarwinStubs/NOTICE
 COPY entrypoint.py /usr/local/bin/oxidex-build-entrypoint
 RUN chmod 0755 /usr/local/bin/oxidex-build-entrypoint \
     && install -m 0444 /dev/null /run/oxidex-build-container
@@ -36,10 +76,11 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
     && rm /tmp/rustup-init.sh \
     && rustup component add rustfmt clippy --toolchain 1.97.1 \
     && rustup target add --toolchain 1.97.1 x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
-    && cargo install --locked just \
-    && cargo install --locked cargo-nextest \
-    && cargo install --locked --version 0.29.2 cbindgen \
-    && cargo install --locked --path /tmp/cargo-zigbuild-source \
+    && rustup target add --toolchain 1.97.1 aarch64-apple-darwin x86_64-apple-darwin \
+    && cargo install --locked -j4 just \
+    && cargo install --locked -j4 cargo-nextest \
+    && cargo install --locked -j4 --version 0.29.2 cbindgen \
+    && cargo install --locked -j4 --path /tmp/cargo-zigbuild-source \
     && rm -rf /tmp/cargo-zigbuild-source \
     && test "$(cargo zigbuild --version)" = 'cargo-zigbuild 0.23.4' \
     && rustc -vV && cargo -V && cargo nextest --version && cbindgen --version \
