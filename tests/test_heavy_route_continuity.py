@@ -1,4 +1,5 @@
 import json
+from dataclasses import asdict
 import tempfile
 import time
 import unittest
@@ -26,7 +27,7 @@ class HeavyRouteContinuityTests(unittest.TestCase):
         self.assertEqual(controller.protected_heavy_routes([self.vm],[other],state),[])
         self.assertNotIn('protected_heavy_routes',state)
     def test_delete_is_held_before_any_deployment_or_drain_effect(self):
-        state={'host_operation':{'kind':'delete','vm':{'instance_id':'721'}}}
+        state={'host_operation':{'kind':'delete','vm':asdict(self.vm)}}
         with patch.object(controller,'import_deployment_receipt') as effect, patch.object(controller,'write_scale_state'):
             self.assertTrue(controller.reconcile_host_operation([self.vm],[self.runner],None,state,None))
             effect.assert_not_called()
@@ -80,6 +81,60 @@ class HeavyRouteContinuityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root, patch.object(tier_controller,'evidence_for',return_value=({}, {}, time.time())) as observed, patch.object(tier_controller,'begin_migration') as launch:
             tier_controller.check_tiers([],[],SimpleNamespace(),state,Path(root)/'state.json')
             observed.assert_called_once();launch.assert_not_called()
+    def test_protected_pending_launch_holds_abandonment_but_allows_registration(self):
+        args=SimpleNamespace(org='swack-tools',scaling_mode='legacy')
+        for count,complete in ((2,False),(1,True)):
+            state={'host_operation':{'kind':'launch','vm':asdict(self.vm),'started_at':0,
+                                    'expected_runner_count':count,'abandon':'deadline'}}
+            with patch.object(controller,'import_deployment_receipt'), patch.object(controller,'write_scale_state'), patch.object(controller,'abandon_launch') as destroy:
+                self.assertTrue(controller.reconcile_host_operation([self.vm],[self.runner],args,state,None))
+                destroy.assert_not_called()
+                self.assertEqual('host_operation' not in state,complete)
+    def test_missing_operation_identity_cannot_bypass_protection(self):
+        record=asdict(self.vm);record['instance_id']=None
+        state={'host_operation':{'kind':'delete','vm':record}}
+        with patch.object(controller,'import_deployment_receipt') as mutate,patch.object(controller,'write_scale_state'):
+            self.assertTrue(controller.reconcile_host_operation([self.vm],[self.runner],None,state,None))
+            mutate.assert_not_called()
+            self.assertIsNone(state['host_operation']['vm']['instance_id'])
+    def test_fresh_drain_label_is_protected_before_labels_are_removed(self):
+        ordinary=runner_fleet.GitHubRunner(1,self.runner.name,'online',False,('spot',))
+        state={'host_operation':{'kind':'drain','vm':asdict(self.vm),'drain_mode':'label_only'}}
+        from lib import runner_drain
+        with patch.object(controller,'import_deployment_receipt'),patch.object(controller,'write_scale_state'),patch.object(controller,'list_github_runners',return_value=[self.runner]),patch.object(fleet_migration,'guard_staged_retirement',return_value=True),patch.object(runner_drain,'drain_runners') as mutate:
+            self.assertTrue(controller.reconcile_host_operation([self.vm],[ordinary],SimpleNamespace(org='swack-tools',scaling_mode='legacy'),state,None))
+            mutate.assert_not_called()
+            self.assertIn('721',state['protected_heavy_routes'])
+    def test_prices_that_expire_inventory_cannot_delete_or_begin_operation(self):
+        state={'runner_inventory_observed_at':time.time()-119}
+        def prices(*args,**kwargs):
+            state['runner_inventory_observed_at']=time.time()-121
+            return [self.vm]
+        with patch.object(controller,'check_running_prices',side_effect=prices),patch.object(controller,'delete_overpriced_vm') as destroy,patch.object(controller,'begin_host_operation') as begin:
+            with self.assertRaises(RuntimeError):controller.reconcile_prices([self.vm],[],SimpleNamespace(project='p',max_daily_usd=3),state,None)
+            destroy.assert_not_called();begin.assert_not_called()
+        with patch.object(controller,'platform_preferences') as discovery:
+            with self.assertRaises(RuntimeError):controller.launch_offer(None,SimpleNamespace(state_file=Path('/unused')),state,None)
+            discovery.assert_not_called()
+    def test_stale_main_loop_still_observes_metrics_without_mutating(self):
+        from contextlib import ExitStack
+        args=controller.args_parser().parse_args(['--once','--scaling-mode','tiered']);state={}
+        with ExitStack() as stack:
+            for name,value in (('read_scale_state',state),('load_cpu_platform_map',{}),('list_github_runners',[]),('list_gcloud_vms',[self.vm])):
+                stack.enter_context(patch.object(controller,name,return_value=value))
+            for name in ('write_scale_state','observe_vms','reconcile_deletion_identities'):
+                stack.enter_context(patch.object(controller,name))
+            stack.enter_context(patch.object(controller,'JobRecovery'))
+            stack.enter_context(patch.object(controller,'log_hourly_spend',side_effect=lambda *a:state.update(runner_inventory_observed_at=time.time()-121)))
+            observed=stack.enter_context(patch.object(tier_controller,'evidence_for',return_value=({}, {}, time.time())))
+            mutation=stack.enter_context(patch.object(controller,'reconcile_host_operation'))
+            self.assertEqual(controller._run_controller(args),0)
+            observed.assert_called_once();mutation.assert_not_called()
+    def test_drain_api_checks_ttl_at_each_write(self):
+        from lib import runner_drain
+        with patch.object(runner_drain,'api') as write:
+            with self.assertRaises(RuntimeError):runner_drain.guarded_api(lambda:controller.guard_fleet_mutation({'runner_inventory_observed_at':time.time()-121},self.vm),'org','DELETE','/labels')
+            write.assert_not_called()
     def test_inventory_requires_total_pages_labels_and_no_diagnostics(self):
         item={'id':1,'name':'r','status':'online','busy':False,'labels':[{'name':'spot-heavy32'}]}
         valid=[{'total_count':1,'runners':[item]}]

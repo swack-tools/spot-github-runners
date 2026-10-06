@@ -135,6 +135,23 @@ def runner_inventory_stale(state):
                                      or not 0<=time.time()-observed<=120)
 
 
+def guard_inventory_fresh(state):
+    if runner_inventory_stale(state):
+        raise RuntimeError('Fleet mutation held: runner inventory expired')
+
+
+def guard_fleet_mutation(state,vm=None):
+    guard_inventory_fresh(state)
+    protected=state.get('protected_heavy_routes',{})
+    if vm is None:
+        if heavy_route_capacity_hold(state):
+            raise RuntimeError('Automatic launch held: heavy route has no verified replacement')
+    elif vm.status!='TERMINATED' and (not isinstance(protected,dict) or any(
+            not isinstance(row,dict) or row=={'name':vm.name,'zone':vm.zone}
+            for row in protected.values())):
+        raise RuntimeError('Retirement held: heavy route has no verified replacement')
+
+
 def fleet_summary(vms, runners, state: dict) -> str:
     """Describe runner capacity, Spot hosts, and any pending host operation in one line."""
     online = [runner for runner in runners if runner.online]
@@ -244,6 +261,7 @@ def write_scale_state(path: Path, state: dict) -> None:
 
 def begin_host_operation(kind, vm, runners, vms, state, state_path, **metadata):
     """Persist the single host identity before making any cloud change."""
+    guard_fleet_mutation(state)
     if state.get("host_operation"):
         raise RuntimeError("A previous host operation is still pending")
     state["host_operation"] = {"kind": kind, "vm": asdict(vm),
@@ -300,18 +318,19 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
     if runner_inventory_stale(state):
         LOG.warning('Host operation held: runner inventory is stale')
         return True
-    if operation.get('kind') in ('drain','delete','recovery') and any(
-            vm.instance_id==operation.get('vm',{}).get('instance_id') for vm in protected):
+    from .fleet_logging import vm_from_record
+    vm=vm_from_record(operation['vm'])
+    current=next((item for item in vms if item.zone==vm.zone and item.name==vm.name),None)
+    if current and vm.instance_id and current.instance_id!=vm.instance_id:
+        LOG.error('Host operation waits: provider identity changed for %s',vm.name)
+        return True
+    protected_operation=any(item.name==vm.name and item.zone==vm.zone for item in protected)
+    if protected_operation and operation.get('kind')!='launch':
         LOG.warning('Retirement held: live heavy route has no verified replacement')
         write_scale_state(state_path,state)
         return True
-    import_deployment_receipt(state, state_path)
-    from .fleet_logging import vm_from_record
-    vm = vm_from_record(operation["vm"])
-    current = next((item for item in vms if item.zone == vm.zone and item.name == vm.name), None)
-    if current and vm.instance_id and current.instance_id != vm.instance_id:
-        LOG.error("Host operation waits: instance identity changed for %s", vm_details(vm))
-        return True
+    import_deployment_receipt(state,state_path)
+    vm=vm_from_record(operation['vm'])
     if current and not vm.instance_id:
         operation["vm"] = asdict(current)
         awaiting=state.get('migration',{}).get('awaiting_launch',{})
@@ -338,14 +357,20 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
             try:
                 from .runner_drain import drain_runners
                 fresh = list_github_runners(args.org)
+                state['runner_inventory_observed_at']=time.time()
+                protected_heavy_routes(vms,fresh,state)
+                write_scale_state(state_path,state)
+                guard_fleet_mutation(state,vm)
                 assigned = host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]])
                 if drain_runners(operation, vm, args, state,
-                                 lambda: write_scale_state(state_path, state), assigned):
+                                 lambda: write_scale_state(state_path, state), assigned,
+                                 mutation_guard=lambda:guard_fleet_mutation(state,vm)):
                     if not quiesce_remote_builder(vm, args):
                         return True
                     if not guard_staged_retirement(vms,runners,args,state,state_path):
                         return True
                     def before_delete():
+                        guard_fleet_mutation(state,vm)
                         operation.update(kind="delete", drained=True)
                         key = f"{vm.zone}/{vm.name}"
                         if key not in state.setdefault("intentional_deletions", []):
@@ -404,6 +429,10 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
             operation.setdefault("abandon", f"all {count} runners did not register within "
                                             f"{deadline // 60} minutes")
         if operation.get("abandon"):
+            if protected_operation:
+                LOG.warning('Launch abandonment held: running host carries a heavy route')
+                write_scale_state(state_path,state)
+                return True
             try:
                 abandon_launch(args, state, state_path)
             except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -455,6 +484,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                     LOG.info("Paused pending price eviction: fresh price is within cap; previous deletion outcome remains pending for %s",
                              vm_details(current))
                     return True
+                guard_fleet_mutation(state,current)
                 delete_overpriced_vm(current, args.project)
             else:
                 if operation.get("drained"):
@@ -462,12 +492,15 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
                     if not guard_staged_retirement(vms,runners,args,state,state_path):
                         return True
                     fresh = list_github_runners(args.org)
+                    state['runner_inventory_observed_at']=time.time()
+                    protected_heavy_routes(vms,fresh,state)
+                    guard_fleet_mutation(state,vm)
                     if host_runners(vm, fresh, [vm, *[item for item in vms if item.name != vm.name]]):
                         LOG.warning("Deletion waits: runner records reappeared for %s", vm_details(vm))
                         return True
-                    delete_drained_vm(vm, args)
+                    delete_drained_vm(vm, args,lambda:guard_fleet_mutation(state,vm))
                 else:
-                    terminate_spot_vm(current, args.project, args.org, runners, vms)
+                    terminate_spot_vm(current, args.project, args.org, runners, vms,lambda:guard_fleet_mutation(state,current))
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             clear_rejected_deletion(vm, exc, state, state_path)
             LOG.warning("Deletion remains pending for %s: %s", vm_details(vm), error_detail(exc))
@@ -497,7 +530,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
     if operation.get("drain_group_id"):
         from .runner_drain import cleanup_group
         try:
-            cleanup_group(operation, args.org)
+            cleanup_group(operation, args.org,mutation_guard=lambda:guard_inventory_fresh(state))
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             LOG.warning("Drain group cleanup remains pending: %s", error_detail(exc))
             return True
@@ -865,15 +898,19 @@ def reconcile_prices(vms, runners, args, state, state_path) -> bool:
     """Evict or restore one host, preserving the restoration target across polls."""
     if state.get("host_operation"):
         return True
+    protected_heavy_routes(vms,runners,state)
+    if heavy_route_capacity_hold(state) or runner_inventory_stale(state):return True
     fleet = spot_instances(vms)
     overpriced = check_running_prices(fleet, args.project, args.max_daily_usd)
     if overpriced:
         state["price_replacement_target"] = max(state.get("price_replacement_target", 0), len(fleet))
         state["idle_loops"] = 0
         vm = overpriced[0]
+        guard_fleet_mutation(state,vm)
         begin_host_operation("delete", vm, runners, vms, state, state_path, price_eviction=True)
         LOG.warning("Price exceeds cap: deleting %s with its disks, including any active jobs", vm_details(vm))
         try:
+            guard_fleet_mutation(state,vm)
             delete_overpriced_vm(vm, args.project)
             LOG.info("Deleted overpriced Spot VM %s and its attached disks", vm_details(vm))
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -1088,6 +1125,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
     """Try each zone until the manager confirms a complete runner deployment."""
     state_path = state_path or args.state_file.expanduser()
     state = state if state is not None else read_scale_state(state_path)
+    guard_fleet_mutation(state)
     if state.get("host_operation"):
         raise RuntimeError("A previous host operation is still pending")
     preferences = platform_preferences(offer.machine_type)
@@ -1188,6 +1226,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         deadline = 2400 if tier and getattr(args, 'remote_builder', False) else LAUNCH_DEADLINE_SECONDS
         command.extend(["--deployment-receipt", str(receipt),
                         "--registration-timeout-seconds", str(deadline)])
+        guard_fleet_mutation(state)
         begin_host_operation("launch", vm, [], [], state, state_path,
                              requested_cpu_platform=cpu_platform, deployment_receipt=str(receipt),
                              candidate_key=f"{zone}/{offer.machine_type}/{cpu_platform}",
@@ -1197,6 +1236,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         manager_hung = False
         try:
             # The manager enforces the registration deadline; this backstop covers a hung manager.
+            guard_fleet_mutation(state)
             result = subprocess.run(command, check=False, text=True, capture_output=True,
                                     timeout=deadline + 120)
         except subprocess.TimeoutExpired:
@@ -1256,12 +1296,18 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
     operation = state["host_operation"]
     from .fleet_logging import vm_from_record
     vm = vm_from_record(operation["vm"])
+    if runner_inventory_stale(state):raise RuntimeError('Launch cleanup held: stale runner inventory')
     reason = operation["abandon"]
     if operation.get("candidate_key"):
         state.setdefault("failed_launch_candidates", {})[operation["candidate_key"]] = now()
     key = f"{vm.zone}/{vm.name}"
     current = next((item for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
                     if item.zone == vm.zone and item.name == vm.name), None)
+    if current:
+        fresh=list_github_runners(args.org)
+        state['runner_inventory_observed_at']=time.time()
+        protected_heavy_routes([current],fresh,state)
+        guard_fleet_mutation(state,current)
     if getattr(args,'scaling_mode','resource')=='tiered':
         if current:
             if not vm.instance_id or current.instance_id!=vm.instance_id:
@@ -1300,6 +1346,7 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
             state.setdefault("intentional_deletion_ids", {})[key] = current.instance_id
         write_scale_state(state_path, state)
         LOG.warning("Deleting launch %s with its disks: %s", vm_details(current), reason)
+        guard_fleet_mutation(state,current)
         subprocess.run(["gcloud", "compute", "instances", "delete", vm.name, f"--zone={vm.zone}",
                         f"--project={args.project}", "--delete-disks=all", "--quiet"],
                        check=True, text=True, capture_output=True, timeout=300)
@@ -1322,6 +1369,7 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
         write_scale_state(state_path, state)
         return False
     for disk in leftovers:
+        if runner_inventory_stale(state):raise RuntimeError('Disk cleanup held: stale runner inventory')
         subprocess.run(["gcloud", "compute", "disks", "delete", disk["name"], f"--zone={vm.zone}",
                         f"--project={args.project}", "--quiet"],
                        check=True, text=True, capture_output=True, timeout=120)
@@ -1491,7 +1539,8 @@ def _run_controller(args: argparse.Namespace) -> int:
         log_hourly_spend(vms, args, state, state_path)
         if runner_inventory_stale(state):
             LOG.warning('Fleet changes held: strict runner inventory expired during observation')
-            write_scale_state(state_path,state)
+            from .tier_controller import check_tiers
+            check_tiers(vms,runners,args,state,state_path)
             if args.once:return 0
             time.sleep(args.interval_seconds)
             continue
