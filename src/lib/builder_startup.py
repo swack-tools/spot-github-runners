@@ -53,7 +53,7 @@ def render_builder_startup(args,deployment_id):
     replacements['BUILD_CONFIG']=json.dumps(config,separators=(',',':'),sort_keys=True)
     replacements['ADMISSION_CONFIG']=json.dumps(admission,separators=(',',':'),sort_keys=True)
     sources=builder_guest_sources()
-    replacements['ASSET_WRITES']='\n'.join("printf '%s' '"+base64.b64encode(source.encode()).decode()+"' | base64 -d >"+path for path,source in sources.items())
+    replacements['ASSET_WRITES']='\n'.join("install -d -o root -g root -m 0755 "+str(Path(path).parent)+"\nprintf '%s' '"+base64.b64encode(source.encode()).decode()+"' | base64 -d >"+path for path,source in sources.items())
     hashes={path:hashlib.sha256(source.encode()).hexdigest() for path,source in sources.items()}
     replacements['READINESS_SOURCE']=readiness_source(deployment_id,hashes,args.disk_device_name)
     result=STARTUP
@@ -68,6 +68,9 @@ def readiness_source(deployment_id,hashes,disk_device_name='builder-cache'):
 from pathlib import Path
 import runpy
 module=runpy.run_path('/opt/gha-runners/host_admission.py',run_name='builder_readiness')
+for executable in ('/usr/bin/git','/usr/bin/ssh-keygen','/usr/bin/python3'):
+    if not os.access(executable,os.X_OK):raise SystemExit('Host verifier dependency unavailable')
+subprocess.run(['/usr/bin/git','--version'],check=True,timeout=10,stdout=subprocess.DEVNULL)
 expected_hashes='''+repr(hashes)+'''
 for path,expected in expected_hashes.items():
     if hashlib.sha256(Path(path).read_bytes()).hexdigest()!=expected:raise SystemExit('Installed builder source differs')
