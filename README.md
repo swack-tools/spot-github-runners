@@ -46,12 +46,34 @@ your project and grant the operator the corresponding permissions.
 
 Runner deployment requires GitHub organization runner-management access. Job
 recovery also requires Actions read/write and Checks read access to each tracked
-repository. Configure a runner group with access only to the repositories that
-should use the fleet. The examples use `swack-tools/oxidex`; replace organization,
-repository, project, group, region, and zone values for your environment.
+repository. The manager requires a selected-repository runner group with access
+to `ORG/oxidex`, where `ORG` is the configured organization. These scripts are
+built around OxiDex; changing example repository names does not change that
+verification contract. Replace project, region, and zone values for your
+environment. See [Runner-group restrictions](#runner-group-restrictions) before
+changing organization or group settings.
 
 Dedicated builder rendering does not require a GitHub runner token. It requires
 an approved public SSH identity mapping for its uploader account.
+
+### Runner-group restrictions
+
+Controller-created runner hosts currently use group ID 10: the controller does
+not pass a configurable group ID to the deployment manager, and tier evidence
+also queries group 10. Before enabling automatic launches, verify that group 10
+exists in the selected organization and permits access to `ORG/oxidex`.
+
+The manual manager accepts `--runner-group-id` for another qualifying group, but
+that option does not update controller launches or tier evidence. Supporting a
+different automatic group requires a reviewed source change. The controller's
+`--job-repository` option changes job tracking, not runner placement or the
+manager's required repository.
+
+Inspect the required group without changing it:
+
+```bash
+gh api orgs/swack-tools/actions/runner-groups/10
+```
 
 ### Clone and authenticate
 
@@ -154,14 +176,14 @@ python3 src/spot_runner_manager.py \
   --tier large --tier-slots 20 \
   --tier-job-memory-gib 32 \
   --disk-size-gb 100 \
-  --runner-group-id YOUR_GROUP_ID \
+  --runner-group-id 10 \
   --runner-label spot \
   --runner-prefix oxidex \
   --instance-name oxidex-runners-example
 ```
 
-Replace `YOUR_GROUP_ID` with a numeric group ID. The hourly and daily limits in
-this example are acceptance limits, not quoted prices. Price must be strictly
+The example uses controller-compatible group 10. The hourly and daily limits
+are acceptance limits, not quoted prices. Price must be strictly
 below the applicable cap; an equal price does not qualify.
 
 ### Apply the reviewed plan
