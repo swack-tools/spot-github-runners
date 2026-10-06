@@ -71,8 +71,10 @@ with open(root+'/diagnostics','w+b') as output:wait_guardian(command,tuple(locks
                 wait_for(lambda: (root/'child').exists() and (root/'grandchild').exists())
                 pids = [int((root/name).read_text()) for name in ('child', 'grandchild')]
                 self.assertTrue(all(running(pid) for pid in pids))
-                fds = [os.open(root/name, os.O_RDWR) for name in ('build', 'namespace', 'import')]
+                fds = []
                 try:
+                    for name in ('build', 'namespace', 'import'):
+                        fds.append(os.open(root/name, os.O_RDWR))
                     for fd in fds:
                         with self.assertRaises(BlockingIOError):fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     if termination is not None:os.kill(owner.pid, termination)
@@ -91,7 +93,8 @@ with open(root+'/diagnostics','w+b') as output:wait_guardian(command,tuple(locks
                 for pid in pids:
                     if running(pid):
                         try:os.kill(pid, signal.SIGKILL)
-                        except ProcessLookupError:pass
+                        except ProcessLookupError:
+                            pass  # The observed cleanup target already exited.
 
     def test_term_retains_locks_until_child_and_grandchild_stop(self):self.lifecycle(signal.SIGTERM)
     def test_hup_retains_locks_until_child_and_grandchild_stop(self):self.lifecycle(signal.SIGHUP)

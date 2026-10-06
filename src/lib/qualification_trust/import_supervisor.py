@@ -27,7 +27,7 @@ def reap_import(process, *, subreaper):
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
-        pass
+        pass  # The group already exited; wait and adopted-child reaping still follow.
     process.wait()
     if not subreaper:
         # Portable test mode covers same-group children only; production forbids it.
@@ -45,7 +45,7 @@ def reap_import(process, *, subreaper):
             try:
                 os.kill(int(child), signal.SIGKILL)
             except ProcessLookupError:
-                pass
+                pass  # The adopted child exited between observation and signaling.
         time.sleep(.01)
 
 

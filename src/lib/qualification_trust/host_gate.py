@@ -209,7 +209,7 @@ def wait_guardian(command, locks, diagnostics):
             try:
                 process.wait(timeout=.1)
             except subprocess.TimeoutExpired:
-                pass
+                pass  # Keep guardian locks held while it finishes reaping descendants.
         code = process.returncode
         if cancelled:
             raise InterruptedError('Source import cancelled by launcher signal')

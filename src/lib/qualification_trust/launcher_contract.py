@@ -1,11 +1,9 @@
 """Host-owned sealed qualification lifecycle under namespace and cache locks."""
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
-import stat
 import tempfile
 from .host_gate import (copy_sealed, verify_sealed, execution_arguments, regular_bytes,
                         tree_manifest, write_owned, validate_identity, PROTECTIVE_FDS)

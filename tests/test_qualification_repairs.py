@@ -1,5 +1,4 @@
 """Small offline regressions for host admission; no Docker or infrastructure."""
-import importlib.util
 import json
 import os
 from pathlib import Path
