@@ -198,10 +198,10 @@ class MountContractTests(unittest.TestCase):
                 for dst,(src,rw) in expected_mounts(root,project).items()]
         adapter.inspected_mounts(mounts,project)
         row=dict(Name='/'+name,Config={'Labels':{'oxidex.remote-build':'true','oxidex.cache-project':project,'oxidex.run-id':run}},Mounts=mounts)
-        self.assertEqual(host_admission.builder_cache_identity(row),(project,run))
+        self.assertEqual(host_admission.builder_cache_identity(row,host_config={'role':'builder'}),(project,run))
         mounts[2]['RW']=True
         with self.assertRaises(ValueError):adapter.inspected_mounts(mounts,project)
-        self.assertIsNone(host_admission.builder_cache_identity(row))
+        self.assertIsNone(host_admission.builder_cache_identity(row,host_config={'role':'builder'}))
 
     def test_fresh_startup_creates_parents_before_asset_and_sets_anchor_after(self):
         from lib.builder_startup import render_builder_startup
