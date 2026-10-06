@@ -281,6 +281,10 @@ def begin_host_operation(kind, vm, runners, vms, state, state_path, **metadata):
     write_scale_state(state_path, state)
 
 
+class ReceiptProviderMismatch(RuntimeError):
+    """An otherwise valid receipt belongs to a different current instance."""
+
+
 def import_deployment_receipt(state, state_path,current=None):
     """Recover the provider identity even when a launch vanishes before inventory."""
     operation = state.get("host_operation", {})
@@ -298,7 +302,7 @@ def import_deployment_receipt(state, state_path,current=None):
         raise RuntimeError("Deployment receipt does not match the pending host identity")
     if current is not None and (actual.instance_id!=current.instance_id
                                 or actual.name!=current.name or actual.zone!=current.zone):
-        raise RuntimeError('Deployment receipt differs from current provider identity')
+        raise ReceiptProviderMismatch('Deployment receipt differs from current provider identity')
     if record.get('tier'):
         tier = tier_for_shape(actual.vcpu,actual.ram_gib)
         if not tier or tier.name != record['tier'] or not 1 <= record.get('expected_runner_count',0) <= tier.maximum_slots:
@@ -338,7 +342,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         return True
     try:
         import_deployment_receipt(state,state_path,current)
-    except RuntimeError as exc:
+    except ReceiptProviderMismatch as exc:
         LOG.warning('Host receipt held: %s',error_detail(exc))
         return True
     vm=vm_from_record(operation['vm'])
@@ -1317,6 +1321,9 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
     key = f"{vm.zone}/{vm.name}"
     current = next((item for item in list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
                     if item.zone == vm.zone and item.name == vm.name), None)
+    if current and vm.instance_id and current.instance_id!=vm.instance_id:
+        LOG.warning('Launch cleanup held: provider identity changed')
+        return False
     if current:
         fresh=list_github_runners(args.org)
         state['runner_inventory_observed_at']=time.time()
