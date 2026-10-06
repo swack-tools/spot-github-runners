@@ -154,7 +154,7 @@ class HeavyRouteContinuityTests(unittest.TestCase):
                 destroy.assert_not_called();write.assert_not_called()
     def test_retirement_revalidation_uses_the_new_snapshot_timestamp(self):
         record=asdict(self.vm)
-        state={'runner_inventory_observed_at':0,'host_operation':{'vm':record,'migration_retirement':{}},
+        state={'runner_inventory_observed_at':0,'host_operation':{'vm':record,'migration_retirement':{'started_at':1}},
                'migration':{'sources':[record],'started_at':1}}
         clock=[115]
         def observe(*args):clock[0]=125
