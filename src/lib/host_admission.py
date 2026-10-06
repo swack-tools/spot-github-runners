@@ -23,6 +23,10 @@ LEDGER_ROOT = Path('/var/lib/gha-admission')
 BENCHMARK_CONFIG = None
 
 
+class OrphanRunnerHook(ValueError):
+    """The requesting hook has outlived its GitHub-assigned Worker."""
+
+
 def lock_file(path):
     return open(path,'a',opener=lambda name,flags:os.open(name,flags|os.O_NOFOLLOW,0o600))
 
@@ -255,13 +259,16 @@ def worker_owner(pid,container_id,container_started):
         if pid <= 1 or pid in seen:
             break
         seen.add(pid)
-        parent,start,comm,cgroup=process_record(pid)
+        try:
+            parent,start,comm,cgroup=process_record(pid)
+        except FileNotFoundError as error:
+            raise OrphanRunnerHook('Runner hook lost its Worker ancestry') from error
         if runner_cgroup(cgroup)!=container_id:
-            raise ValueError('Runner hook left its container')
+            raise OrphanRunnerHook('Runner hook left its container')
         if comm=='Runner.Worker':
             return f'runner:{container_id}:{container_started}:{pid}:{start}'
         pid=parent
-    raise ValueError('Runner hook has no live Worker ancestor')
+    raise OrphanRunnerHook('Runner hook has no live Worker ancestor')
 
 
 def legacy_runner_idle(record):
@@ -463,6 +470,8 @@ def request(action,kind='runner'):
         client.sendall((json.dumps(dict(action=action,kind=kind))+'\n').encode())
         client.shutdown(socket.SHUT_WR)
         response = json.loads(client.recv(4096))
+    if isinstance(response,dict) and response.get('code')=='orphaned-runner-hook':
+        raise OrphanRunnerHook(response.get('error','Runner hook lost its Worker ancestry'))
     if 'error' in response:
         raise RuntimeError(response['error'])
     return response['accepted']
@@ -556,6 +565,11 @@ def serve():
                     answer = dict(accepted=accepted)
                 except (OSError,ValueError,KeyError,RuntimeError,subprocess.SubprocessError) as exc:
                     answer = dict(error=str(exc)[:200])
+                    if isinstance(exc,OrphanRunnerHook):
+                        answer['code']='orphaned-runner-hook'
+                        # Old container clients decode only the error string.
+                        # The upgraded completed hook recognizes this prefix.
+                        answer['error']='ORPHAN_RUNNER_HOOK: '+str(exc)[:180]
                 try:
                     client.sendall(json.dumps(answer).encode())
                 except OSError:
