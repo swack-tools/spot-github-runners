@@ -633,6 +633,8 @@ def guard_staged_retirement(vms,runners,args,state,state_path):
         controller.observe_vms(current_vms,state)
         record_missing_sources(current_vms,state)
         fresh=controller.list_github_runners(args.org)
+        state['runner_inventory_observed_at']=time.time()
+        controller.protected_heavy_routes(current_vms,fresh,state)
         from .tier_controller import evidence_for
         evidence_for(current_vms,fresh,args,state)
         if safe(current_vms,fresh,args,state,state_path,operation):return True

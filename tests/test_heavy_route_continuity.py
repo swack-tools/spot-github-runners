@@ -152,6 +152,16 @@ class HeavyRouteContinuityTests(unittest.TestCase):
                 self.assertTrue(controller.reconcile_host_operation([current],[],SimpleNamespace(),state,None))
                 self.assertIsNone(state['host_operation']['vm']['instance_id'])
                 destroy.assert_not_called();write.assert_not_called()
+    def test_retirement_revalidation_uses_the_new_snapshot_timestamp(self):
+        record=asdict(self.vm)
+        state={'runner_inventory_observed_at':0,'host_operation':{'vm':record,'migration_retirement':{}},
+               'migration':{'sources':[record],'started_at':1}}
+        clock=[115]
+        def observe(*args):clock[0]=125
+        def safe(*args):return not controller.runner_inventory_stale(state)
+        with patch.object(controller,'list_gcloud_vms',return_value=[self.vm]),patch.object(controller,'observe_vms'),patch.object(controller,'list_github_runners',return_value=[]),patch.object(fleet_migration,'record_missing_sources'),patch.object(fleet_migration,'retirement_safe',side_effect=safe),patch.object(tier_controller,'evidence_for',side_effect=observe),patch.object(fleet_migration.time,'time',side_effect=lambda:clock[0]):
+            self.assertTrue(fleet_migration.guard_staged_retirement([self.vm],[],SimpleNamespace(project='p',org='org'),state,None))
+        self.assertEqual(state['runner_inventory_observed_at'],115)
     def test_inventory_requires_total_pages_labels_and_no_diagnostics(self):
         item={'id':1,'name':'r','status':'online','busy':False,'labels':[{'name':'spot-heavy32'}]}
         valid=[{'total_count':1,'runners':[item]}]
