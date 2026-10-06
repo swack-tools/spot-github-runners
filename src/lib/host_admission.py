@@ -164,6 +164,13 @@ def observed_builder_envelope(config):
         raise ValueError('Malformed aggregate builder evidence') from error
 
 
+def legacy_owner_for_worker(owner):
+    match=re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)',owner)
+    if match is None:
+        raise ValueError('Invalid Worker lease identity')
+    return f'container:{match[1]}:{match[2]}'
+
+
 class LeasePool:
     def __init__(self,path,limit_gib,*,alive,capacity=None,owner_kind=None,retain=None,removal_fence=None):
         self.path = Path(path)
@@ -187,7 +194,11 @@ class LeasePool:
                 raise ValueError('Unknown/legacy builder reservation')
         return len(requested)<=1 and sum(requested.values())<=self.limit
 
-    def _change(self,owner,amount):
+    def _change(self,owner,amount,legacy_owner=None):
+        if legacy_owner is not None:
+            if (self.capacity is not None or self.retain is not None
+                or legacy_owner!=legacy_owner_for_worker(owner)):
+                raise ValueError('Invalid runner lease transition')
         self.path.parent.mkdir(parents=True,exist_ok=True)
         # Lock a separate inode: the data file is atomically replaced.
         fd = os.open(str(self.path)+'.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
@@ -199,8 +210,16 @@ class LeasePool:
             # is distinct from liveness, and only explicit cleanup unprotects it.
             protected={key for key,value in rows.items() if self.retain is not None and self.retain(key,value)}
             rows = {key:value for key,value in rows.items() if key in protected or self.alive(key)}
+            # An upgraded hook names the Worker while an older daemon may
+            # have reserved the same persistent container. Transfer/release
+            # that exact row under this one ledger lock, with no double count.
+            legacy_value=rows.pop(legacy_owner,None) if legacy_owner is not None else None
             accepted = True
-            if amount is None:
+            if amount is not None and legacy_value is not None and legacy_value!=amount:
+                # A container may still have its old, larger memory cap.
+                # Never reduce its aggregate reservation by renaming the row.
+                accepted=False
+            elif amount is None:
                 if owner in protected:raise ValueError('Owned maintenance cleanup proof required before release')
                 rows.pop(owner,None)
             elif owner in rows:
@@ -209,6 +228,8 @@ class LeasePool:
                 rows[owner] = amount
             else:
                 accepted = False
+            if not accepted and legacy_value is not None:
+                rows[legacy_owner]=legacy_value
             temporary = self.path.with_suffix('.tmp')
             fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
             with os.fdopen(fd,'w') as target:
@@ -230,6 +251,14 @@ class LeasePool:
 
     def release(self,owner):
         self._change(owner,None)
+
+    def acquire_runner(self,owner,amount):
+        if not math.isfinite(amount) or not 0 < amount <= self.limit:
+            raise ValueError('Request exceeds host memory budget')
+        return self._change(owner,amount,legacy_owner_for_worker(owner))
+
+    def release_runner(self,owner):
+        self._change(owner,None,legacy_owner_for_worker(owner))
 
     def refresh(self):
         # Reclaim only independently dead owners, never another live lease.
@@ -534,7 +563,8 @@ def serve():
                     builders_present=builders_running()
                     if message['action'] == 'release':
                         if kind!='builder' or not builders_present:
-                            pool.release(owner)
+                            if kind=='runner':pool.release_runner(owner)
+                            else:pool.release(owner)
                         accepted = True
                     elif message['action'] == 'acquire':
                         if limit<config[kind+'_gib'] or (kind == 'builder' and (LOCK_ROOT/'oxidex-build-draining').exists()):
@@ -554,11 +584,12 @@ def serve():
                                     retain.canary_grant.observe(actor)
                                     return role
                                 pool.owner_kind=benchmark_owner
-                            accepted = pool.acquire(owner,config[kind+'_gib'])
+                            accepted = (pool.acquire_runner(owner,config[kind+'_gib']) if kind=='runner'
+                                        else pool.acquire(owner,config[kind+'_gib']))
                             if accepted and kind=='runner' and not owner_alive(owner):
                                 # The Worker may have exited between peer
                                 # authentication and the ledger write.
-                                pool.release(owner)
+                                pool.release_runner(owner)
                                 accepted=False
                     else:
                         raise ValueError('Unknown admission action')
