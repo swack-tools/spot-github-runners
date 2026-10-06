@@ -556,7 +556,8 @@ python3 src/remote_rust_build.py \
   --evidence-dir "$HOME/oxidex-ops/evidence/remote-build-example"
 ```
 
-It snapshots tracked files, transfers and verifies the archive, runs the build,
+Use a new evidence directory for each attempt to preserve earlier receipts.
+The client snapshots tracked files, transfers and verifies the archive, runs the build,
 checks the artifact checksum, and records source and timing evidence.
 `--artifact-dir` downloads the verified `oxidex` binary into that directory;
 without it, the client retains a receipt without downloading the binary. It uses
@@ -726,7 +727,8 @@ Documentation follows the [Google developer documentation style guide](https://d
 Use sentence case headings, active voice, direct instructions, and explicit
 prerequisites. Preserve command names and technical meaning when fixing prose.
 
-Install Vale, then synchronize and run the configured Google rules:
+Install Vale using its [installation guide](https://docs.vale.sh/topics/installation),
+then synchronize and run the configured Google rules:
 
 ```bash
 vale sync
