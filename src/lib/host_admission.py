@@ -604,7 +604,7 @@ def serve():
                     limit=config['work_gib']
                     retain=_benchmark_module().ImageMaintenancePolicy(config) if config.get('role')=='benchmark-builder' else None
                     policy=heavy_runner_policy(config) if config.get('role') in (None,'runner') else None
-                    if config.get('heavy_runner') is not None and config.get('role') not in (None,'runner'):
+                    if 'heavy_runner' in config and config.get('role') not in (None,'runner'):
                         raise ValueError('Heavy runner policy on unsupported host role')
                     pool = LeasePool(ledger/'leases.json',config['work_gib'],alive=owner_alive,retain=retain,removal_fence=retain.finalize if retain is not None else None,heavy_builder_isolation=policy is not None)
                     if config.get('role')=='benchmark-builder':pool.refresh()
