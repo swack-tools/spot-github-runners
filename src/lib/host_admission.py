@@ -501,8 +501,8 @@ def peer_owner(pid,uid,config):
 
 def heavy_runner_policy(config):
     """An absent policy preserves the ordinary 15-GiB deployment."""
-    policy=config.get('heavy_runner')
-    if policy is None:return None
+    if 'heavy_runner' not in config:return None
+    policy=config['heavy_runner']
     if (not isinstance(policy,dict) or set(policy)!={'name','memory_gib','cpus'}
         or type(policy['name']) is not str or not policy['name']
         or type(policy['memory_gib']) is not int or policy['memory_gib']!=32

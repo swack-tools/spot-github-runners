@@ -589,8 +589,8 @@ GIB=1024**3
 def heavy_runner_policy(config):
     # The controller rolls out before the guest daemon. Keep this parser
     # self-contained so the still-old host_admission module remains importable.
-    policy=config.get('heavy_runner')
-    if policy is None:return None
+    if 'heavy_runner' not in config:return None
+    policy=config['heavy_runner']
     if (not isinstance(policy,dict) or set(policy)!={'name','memory_gib','cpus'}
         or type(policy['name']) is not str or not policy['name']
         or type(policy['memory_gib']) is not int or policy['memory_gib']!=32

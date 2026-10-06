@@ -52,6 +52,9 @@ class HeavyRunnerAdmissionTests(unittest.TestCase):
         bad=config();bad['runner_gib']=float('nan')
         with self.assertRaisesRegex(ValueError,'Invalid single'):
             heavy_runner_policy(bad)
+        bad=config();bad['heavy_runner']=None
+        with self.assertRaisesRegex(ValueError,'Invalid single'):
+            heavy_runner_policy(bad)
         row={'Id':CID,'Name':'/'+OTHER,'State':{'StartedAt':START,'Running':True},
              'HostConfig':{'Memory':16*GIB,'MemorySwap':16*GIB,'NanoCpus':0}}
         with patch('lib.host_admission.docker_identity',return_value=(f'container:{CID}:{START}',row)), \
