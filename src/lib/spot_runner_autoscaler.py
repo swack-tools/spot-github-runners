@@ -99,6 +99,35 @@ def host_runners(vm: GceVm, runners: list[GitHubRunner] | tuple[GitHubRunner, ..
     return assigned
 
 
+def protected_heavy_routes(vms,runners,state):
+    """Protect planned/live routes; label absence never clears a root-protected VM."""
+    protected=state.get('protected_heavy_routes',{})
+    if not isinstance(protected,dict) or any(
+            not isinstance(identity,str) or not isinstance(row,dict)
+            or set(row)!={'name','zone'} or not all(isinstance(row[key],str) and row[key]
+                                                   for key in ('name','zone'))
+            for identity,row in protected.items()):
+        LOG.warning('Fleet changes held: heavy-route protection record is malformed')
+        return [vm for vm in vms if vm.spot and vm.status!='TERMINATED'
+                and vm.name.startswith('oxidex-runners-')]
+    for vm in vms:
+        if not (vm.running and vm.spot and vm.name.startswith('oxidex-runners-')
+                and vm.instance_id):continue
+        if any('spot-heavy32' in runner.labels for runner in host_runners(vm,runners,vms)):
+            protected=state.setdefault('protected_heavy_routes',{})
+            protected[vm.instance_id]={'name':vm.name,'zone':vm.zone}
+    return [vm for vm in vms if vm.status!='TERMINATED' and any(
+            row=={'name':vm.name,'zone':vm.zone} for row in protected.values())]
+
+
+def runner_inventory_stale(state):
+    # Pure legacy callers have no receipt; real controller polls always set it
+    # immediately after the strict paginated API call, never from saved history.
+    observed=state.get('runner_inventory_observed_at')
+    return observed is not None and (type(observed) not in (int,float)
+                                     or not 0<=time.time()-observed<=120)
+
+
 def fleet_summary(vms, runners, state: dict) -> str:
     """Describe runner capacity, Spot hosts, and any pending host operation in one line."""
     online = [runner for runner in runners if runner.online]
@@ -257,9 +286,18 @@ def import_deployment_receipt(state, state_path):
 
 def reconcile_host_operation(vms, runners, args, state, state_path):
     """Hold all fleet changes until a fresh inventory confirms completion."""
+    protected=protected_heavy_routes(vms,runners,state)
     operation = state.get("host_operation")
     if not operation:
         return False
+    if runner_inventory_stale(state):
+        LOG.warning('Host operation held: runner inventory is stale')
+        return True
+    if operation.get('kind') in ('drain','delete') and any(
+            vm.instance_id==operation.get('vm',{}).get('instance_id') for vm in protected):
+        LOG.warning('Retirement held: live heavy route has no verified replacement')
+        write_scale_state(state_path,state)
+        return True
     import_deployment_receipt(state, state_path)
     from .fleet_logging import vm_from_record
     vm = vm_from_record(operation["vm"])
@@ -1436,6 +1474,7 @@ def _run_controller(args: argparse.Namespace) -> int:
             except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
                 LOG.error('CPU platform map unavailable; capacity launches paused until fresh inventory succeeds: %s', error_detail(exc))
         runners = list_github_runners(args.org)
+        state['runner_inventory_observed_at']=time.time()
         vms = list_gcloud_vms(args.project, name_prefix="oxidex-runners-")
         reconcile_deletion_identities(vms, state)
         jobs.poll(vms)
@@ -1443,9 +1482,22 @@ def _run_controller(args: argparse.Namespace) -> int:
         write_scale_state(state_path, state)
         LOG.info(fleet_summary(vms, runners, state))
         log_hourly_spend(vms, args, state, state_path)
+        if runner_inventory_stale(state):
+            LOG.warning('Fleet changes held: strict runner inventory expired during observation')
+            write_scale_state(state_path,state)
+            if args.once:return 0
+            time.sleep(args.interval_seconds)
+            continue
         operation_work = reconcile_host_operation(vms, runners, args, state, state_path)
         recovery_work = False if operation_work else reconcile_lost_vms(vms, runners, args, state, state_path)
-        price_work = False if recovery_work or operation_work or args.scaling_mode=='tiered' else reconcile_prices(vms, runners, args, state, state_path)
+        protected=protected_heavy_routes(vms,runners,state)
+        price_work = False if protected or recovery_work or operation_work or args.scaling_mode=='tiered' else reconcile_prices(vms, runners, args, state, state_path)
+        if protected:
+            from .tier_controller import check_tiers
+            check_tiers(vms,runners,args,state,state_path)
+            if args.once:return 0
+            time.sleep(args.interval_seconds)
+            continue
         if operation_work or price_work or recovery_work:
             if args.once:
                 return 0
