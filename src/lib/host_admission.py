@@ -237,6 +237,54 @@ def process_identity(pid):
     return f'host:{pid}:{stat[19]}'
 
 
+def process_record(pid):
+    root = Path(f'/proc/{pid}')
+    stat = (root/'stat').read_text().rsplit(')',1)[1].split()
+    return int(stat[1]),stat[19],(root/'comm').read_text().strip(),(root/'cgroup').read_text()
+
+
+def runner_cgroup(cgroup):
+    ids = re.findall(r'(?:docker[-/])([a-f0-9]{64})(?:\.scope)?',cgroup)
+    return next(iter(set(ids))) if len(set(ids)) == 1 else None
+
+
+def worker_owner(pid,container_id,container_started):
+    """Bind a hook to its live Worker, not its persistent runner container."""
+    seen=set()
+    for _ in range(32):
+        if pid <= 1 or pid in seen:
+            break
+        seen.add(pid)
+        parent,start,comm,cgroup=process_record(pid)
+        if runner_cgroup(cgroup)!=container_id:
+            raise ValueError('Runner hook left its container')
+        if comm=='Runner.Worker':
+            return f'runner:{container_id}:{container_started}:{pid}:{start}'
+        pid=parent
+    raise ValueError('Runner hook has no live Worker ancestor')
+
+
+def legacy_runner_idle(record):
+    """Reclaim old container leases only on a complete baseline-only process list."""
+    container_id=record['Id']
+    output=subprocess.run(['/usr/bin/docker','top',container_id,'-eo','pid,comm'],
+                          check=True,capture_output=True,text=True,timeout=10).stdout.splitlines()
+    if not output or output[0].split()!=['PID','COMMAND']:
+        return False
+    rows=[line.split() for line in output[1:]]
+    if (len(rows)!=3 or any(len(row)!=2 or not row[0].isdigit() for row in rows)
+        or {row[1] for row in rows}!={'run.sh','run-helper.sh','Runner.Listener'}):
+        return False
+    pids={comm:int(pid) for pid,comm in rows}
+    if record['State'].get('Pid')!=pids['run.sh']:
+        return False
+    for comm,parent in (('run-helper.sh','run.sh'),('Runner.Listener','run-helper.sh')):
+        actual_parent,_,actual_comm,cgroup=process_record(pids[comm])
+        if actual_parent!=pids[parent] or actual_comm!=comm or runner_cgroup(cgroup)!=container_id:
+            return False
+    return True
+
+
 def docker_identity(container):
     row = json.loads(subprocess.run(['docker','inspect',container],check=True,capture_output=True,text=True,timeout=10).stdout)[0]
     if not row['State']['Running']:
@@ -246,6 +294,19 @@ def docker_identity(container):
 
 def owner_alive(owner):
     try:
+        if owner.startswith('runner:'):
+            match=re.fullmatch(r'runner:([a-f0-9]{64}):(.+):([0-9]+):([0-9]+)',owner)
+            if match is None:
+                return True
+            container_id,container_started,pid,start=match.groups()
+            try:
+                _,actual_start,comm,cgroup=process_record(int(pid))
+            except FileNotFoundError:
+                return False
+            if comm!='Runner.Worker' or actual_start!=start or runner_cgroup(cgroup)!=container_id:
+                return False
+            actual,row=docker_identity(container_id)
+            return actual==f'container:{container_id}:{container_started}'
         kind,identity,start = owner.split(':',2)
         if kind == 'host':
             if process_identity(int(identity)) == owner:
@@ -253,10 +314,17 @@ def owner_alive(owner):
             return builders_running()  # PID reuse cannot free a surviving build.
         row=json.loads(subprocess.run(['/usr/bin/docker','inspect',identity],
             check=True,capture_output=True,text=True,timeout=10).stdout)[0]
-        return (row['State']['Running'] and row['Id']==identity
-                and row['State']['StartedAt']==start)
+        if not (row['State']['Running'] and row['Id']==identity
+                and row['State']['StartedAt']==start):
+            return False
+        # Old versions used the lifetime of a persistent runner container as
+        # the lease lifetime. Keep any uncertain process; only a complete
+        # baseline-only inventory proves its old job has ended.
+        return not legacy_runner_idle(row)
     except (OSError,ValueError,KeyError,IndexError,subprocess.SubprocessError):
-        if owner.startswith('host:'):
+        if owner.startswith(('host:','runner:')):
+            if owner.startswith('runner:'):
+                return True  # Unknown Docker/process state is not proof of idleness.
             return builders_running()
         try:
             rows=subprocess.run(['/usr/bin/docker','ps','-a','--no-trunc','--format','{{.ID}}'],
@@ -379,13 +447,13 @@ def peer_owner(pid,uid,config):
     if uid != 1001:
         raise ValueError('Unauthorized admission peer')
     cgroup = Path(f'/proc/{pid}/cgroup').read_text()
-    ids = re.findall(r'(?:docker[-/])([a-f0-9]{64})(?:\.scope)?',cgroup)
-    if len(set(ids)) != 1:
+    identity = runner_cgroup(cgroup)
+    if identity is None:
         raise ValueError('Runner must belong to a Docker cgroup')
-    owner,row = docker_identity(ids[0])
+    _,row = docker_identity(identity)
     if row['Name'].lstrip('/') not in config['runner_names']:
         raise ValueError('Container is outside this runner deployment')
-    return owner,'runner'
+    return worker_owner(pid,identity,row['State']['StartedAt']),'runner'
 
 
 def request(action,kind='runner'):
@@ -478,6 +546,11 @@ def serve():
                                     return role
                                 pool.owner_kind=benchmark_owner
                             accepted = pool.acquire(owner,config[kind+'_gib'])
+                            if accepted and kind=='runner' and not owner_alive(owner):
+                                # The Worker may have exited between peer
+                                # authentication and the ledger write.
+                                pool.release(owner)
+                                accepted=False
                     else:
                         raise ValueError('Unknown admission action')
                     answer = dict(accepted=accepted)
