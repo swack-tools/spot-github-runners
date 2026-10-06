@@ -1,5 +1,4 @@
 """Preserve measured history across early polls without changing distinct-window gates."""
-import copy
 import json
 import tempfile
 import unittest

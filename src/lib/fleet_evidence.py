@@ -98,7 +98,10 @@ def record_io_pressure(state,evidence,health,timestamp):
                     and previous.get('boot_id')==record['boot_id'] and previous.get('io_complete') is True):
                 validate_io_pressure(previous['io_pressure'])
                 legacy_tick=previous['observed_at']
-        except (KeyError,TypeError,ValueError):pass
+        except (KeyError,TypeError,ValueError):
+            # Invalid legacy evidence cannot advance the observation clock;
+            # use the recorded history for the conservative gap check.
+            pass
         last=last_observation(windows,legacy_tick)
         if (record['boot_id']!=observed['boot_id'] or
                 (windows and (last is None or not 0<=tick-last<=450))):

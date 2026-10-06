@@ -553,3 +553,7 @@ worktree identifier. This disk persists between builds on that VM. Cache is lost
 when the VM and its auto-deleted disks are retired or interrupted; no cross-VM
 cache survival is claimed. A separate additional cache disk would need to fit
 the same all-disk price cap.
+
+## Dedicated OxiDex builders
+
+For the runner-free Rust 1.99 Spot host, complete startup payload and single-command launch, see [dedicated builder provisioning](docs/dedicated-builders.md). Dedicated builder capacity and cache/draining are separate from GitHub runner hosts.

@@ -360,7 +360,7 @@ class MigrationRetirementBarrierTests(unittest.TestCase):
     def test_persisted_drain_with_all_sources_absent_still_checks_final_readiness_and_workload(self):
         for defect in ('builder','jobs','io','boot','peak'):
             with self.subTest(defect=defect):
-                self.setUp();self.removal();source=copy.deepcopy(self.state['host_operation']['vm'])
+                self.setUp();self.removal()
                 self.state['host_operation'].update(kind='delete',drained=True);self.hosts=[self.large]
                 controller.reconcile_host_operation(self.hosts,self.runners,self.args,self.state,self.path)
                 self.state=json.loads(self.path.read_text());self.fresh_evidence(1600)
