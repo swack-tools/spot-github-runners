@@ -135,6 +135,23 @@ class HeavyRouteContinuityTests(unittest.TestCase):
         with patch.object(runner_drain,'api') as write:
             with self.assertRaises(RuntimeError):runner_drain.guarded_api(lambda:controller.guard_fleet_mutation({'runner_inventory_observed_at':time.time()-121},self.vm),'org','DELETE','/labels')
             write.assert_not_called()
+    def test_confirmed_loss_cleanup_is_not_blocked_as_a_launch(self):
+        state={'protected_heavy_routes':{'721':{'name':self.vm.name,'zone':'z'}}}
+        with patch.object(controller,'write_scale_state'):
+            controller.begin_host_operation('recovery',self.vm,[],[],state,None)
+        self.assertEqual(state['host_operation']['kind'],'recovery')
+        self.assertTrue(controller.heavy_route_capacity_hold(state))
+    def test_receipt_cannot_adopt_reused_provider_identity(self):
+        record=asdict(self.vm);record['instance_id']=None
+        current=runner_fleet.GceVm(self.vm.name,'z','RUNNING','n4-standard-16',True,16,64,instance_id='new')
+        old=asdict(self.vm)
+        with tempfile.TemporaryDirectory() as root:
+            receipt=Path(root)/'receipt.json';receipt.write_text(json.dumps(old))
+            state={'host_operation':{'kind':'launch','vm':record,'deployment_receipt':str(receipt)}}
+            with patch.object(controller,'abandon_launch') as destroy,patch.object(controller,'write_scale_state') as write:
+                self.assertTrue(controller.reconcile_host_operation([current],[],SimpleNamespace(),state,None))
+                self.assertIsNone(state['host_operation']['vm']['instance_id'])
+                destroy.assert_not_called();write.assert_not_called()
     def test_inventory_requires_total_pages_labels_and_no_diagnostics(self):
         item={'id':1,'name':'r','status':'online','busy':False,'labels':[{'name':'spot-heavy32'}]}
         valid=[{'total_count':1,'runners':[item]}]

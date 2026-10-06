@@ -261,7 +261,11 @@ def write_scale_state(path: Path, state: dict) -> None:
 
 def begin_host_operation(kind, vm, runners, vms, state, state_path, **metadata):
     """Persist the single host identity before making any cloud change."""
-    guard_fleet_mutation(state)
+    if kind=='recovery':
+        guard_inventory_fresh(state)
+    else:
+        protected_heavy_routes(vms,runners,state)
+        guard_fleet_mutation(state,None if kind=='launch' else vm)
     if state.get("host_operation"):
         raise RuntimeError("A previous host operation is still pending")
     state["host_operation"] = {"kind": kind, "vm": asdict(vm),
@@ -277,7 +281,7 @@ def begin_host_operation(kind, vm, runners, vms, state, state_path, **metadata):
     write_scale_state(state_path, state)
 
 
-def import_deployment_receipt(state, state_path):
+def import_deployment_receipt(state, state_path,current=None):
     """Recover the provider identity even when a launch vanishes before inventory."""
     operation = state.get("host_operation", {})
     receipt = operation.get("deployment_receipt")
@@ -292,6 +296,9 @@ def import_deployment_receipt(state, state_path):
             or actual.zone != planned.zone or actual.machine_type != planned.machine_type
             or (planned.instance_id and actual.instance_id != planned.instance_id)):
         raise RuntimeError("Deployment receipt does not match the pending host identity")
+    if current is not None and (actual.instance_id!=current.instance_id
+                                or actual.name!=current.name or actual.zone!=current.zone):
+        raise RuntimeError('Deployment receipt differs from current provider identity')
     if record.get('tier'):
         tier = tier_for_shape(actual.vcpu,actual.ram_gib)
         if not tier or tier.name != record['tier'] or not 1 <= record.get('expected_runner_count',0) <= tier.maximum_slots:
@@ -329,8 +336,15 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
         LOG.warning('Retirement held: live heavy route has no verified replacement')
         write_scale_state(state_path,state)
         return True
-    import_deployment_receipt(state,state_path)
+    try:
+        import_deployment_receipt(state,state_path,current)
+    except RuntimeError as exc:
+        LOG.warning('Host receipt held: %s',error_detail(exc))
+        return True
     vm=vm_from_record(operation['vm'])
+    if current and vm.instance_id and current.instance_id!=vm.instance_id:
+        LOG.warning('Host operation held: receipt identity differs from provider')
+        return True
     if current and not vm.instance_id:
         operation["vm"] = asdict(current)
         awaiting=state.get('migration',{}).get('awaiting_launch',{})
