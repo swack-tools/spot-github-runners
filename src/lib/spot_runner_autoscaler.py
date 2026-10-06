@@ -584,8 +584,24 @@ def adjust_admission(vm,args,kind='runner'):
     program='kind='+repr(kind)+'\n'+'''import fcntl, json, math, os, re, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0,'/opt/gha-runners')
-from host_admission import heavy_runner_policy, observed_envelope, request
+from host_admission import observed_envelope, request
 GIB=1024**3
+def heavy_runner_policy(config):
+    # The controller rolls out before the guest daemon. Keep this parser
+    # self-contained so the still-old host_admission module remains importable.
+    policy=config.get('heavy_runner')
+    if policy is None:return None
+    if (not isinstance(policy,dict) or set(policy)!={'name','memory_gib','cpus'}
+        or type(policy['name']) is not str or not policy['name']
+        or type(policy['memory_gib']) is not int or policy['memory_gib']!=32
+        or type(policy['cpus']) is not int or policy['cpus']!=8
+        or policy['name'] not in config['runner_names']
+        or type(config['runner_gib']) not in (int,float)
+        or not math.isfinite(config['runner_gib']) or not 0<config['runner_gib']<32
+        or type(config['work_gib']) not in (int,float)
+        or not math.isfinite(config['work_gib']) or config['work_gib']<32):
+        raise ValueError('Invalid single heavy runner policy')
+    return policy
 changed=[]
 pending_runner_ids=[]
 ledger_deadline=None

@@ -76,9 +76,9 @@ class AdmissionCapRecoveryTests(unittest.TestCase):
                 if fail_limits and path==builder.with_suffix('.tmp'):
                     raise OSError('Builder config disk write failed')
                 return original_replace(path,target)
-            from lib.host_admission import heavy_runner_policy
-            module=SimpleNamespace(observed_envelope=lambda _:envelope,request=root_request,
-                                   heavy_runner_policy=heavy_runner_policy)
+            # Simulate controller-first rollout against the previously
+            # deployed host module, which has no heavy_runner_policy symbol.
+            module=SimpleNamespace(observed_envelope=lambda _:envelope,request=root_request)
             stdout=io.StringIO();status=0
             with patch.dict(sys.modules,{'host_admission':module}),patch('subprocess.run',side_effect=docker),\
                  patch.object(Path,'replace',replace),patch('time.monotonic',side_effect=lambda:elapsed[0]),redirect_stdout(stdout):

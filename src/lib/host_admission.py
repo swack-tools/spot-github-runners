@@ -543,7 +543,7 @@ def runner_reservation(owner,config):
     expected=int(config['runner_gib']*1024**3)
     if (type(caps.get('Memory')) is not int or not 0<caps['Memory']<=expected
         or type(caps.get('MemorySwap')) is not int
-        or caps['MemorySwap']!=caps['Memory']):
+        or not caps['Memory']<=caps['MemorySwap']<=2*expected):
         raise ValueError('Ordinary runner memory cap exceeds reservation')
     return config['runner_gib']
 

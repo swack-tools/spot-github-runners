@@ -59,6 +59,13 @@ class HeavyRunnerAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'Ordinary runner memory cap'):
                 runner_reservation(OWNER,config())
 
+    def test_actual_ordinary_15_gib_memory_30_gib_combined_swap_is_allowed(self):
+        row={'Id':CID,'Name':'/'+OTHER,'State':{'StartedAt':START,'Running':True},
+             'HostConfig':{'Memory':15*GIB,'MemorySwap':30*GIB,'NanoCpus':0}}
+        with patch('lib.host_admission.docker_identity',return_value=(f'container:{CID}:{START}',row)), \
+             patch('lib.host_admission.owner_alive',return_value=True):
+            self.assertEqual(runner_reservation(OWNER,config()),15)
+
     def test_aggregate_budget_and_owned_release(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'leases.json'
