@@ -134,7 +134,8 @@ def list_github_runners(org: str = "swack-tools", *, gh_binary: str = "gh") -> t
         result = subprocess.run(command, check=True, text=True, capture_output=True, timeout=60)
         if result.stderr.strip():raise ValueError("GitHub inventory diagnostic")
         pages=json.loads(result.stdout)
-        if not isinstance(pages,list) or not pages:raise ValueError("Missing runner pages")
+        if not isinstance(pages,list) or not pages or not isinstance(pages[0],dict):
+            raise ValueError("Missing runner pages")
         total=pages[0].get('total_count')
         if type(total) is not int or total<0:raise ValueError("Invalid runner total")
         items=[]

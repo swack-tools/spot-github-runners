@@ -67,7 +67,7 @@ class HeavyRouteContinuityTests(unittest.TestCase):
     def test_inventory_requires_total_pages_labels_and_no_diagnostics(self):
         item={'id':1,'name':'r','status':'online','busy':False,'labels':[{'name':'spot-heavy32'}]}
         valid=[{'total_count':1,'runners':[item]}]
-        cases=[([{'total_count':2,'runners':[item]}],''),([{'total_count':1,'runners':[dict(item,labels=None)]}],''),(valid,'partial warning')]
+        cases=[([1],''),([{'total_count':2,'runners':[item]}],''),([{'total_count':1,'runners':[dict(item,labels=None)]}],''),(valid,'partial warning')]
         for pages,stderr in cases:
             with patch.object(runner_fleet.subprocess,'run',return_value=SimpleNamespace(stdout=json.dumps(pages),stderr=stderr)):
                 with self.assertRaises(RuntimeError):runner_fleet.list_github_runners()
