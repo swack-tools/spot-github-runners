@@ -14,7 +14,9 @@ READINESS='/var/lib/oxidex-builder-readiness.json'
 
 
 def builder_guest_sources():
-    return {**ASSETS,'/opt/gha-runners/host_admission.py':Path(__file__).with_name('host_admission.py').read_text(),
+    trust={f'/opt/oxidex-builder/qualification_trust/{path.name}':path.read_text()
+           for path in Path(__file__).with_name('qualification_trust').glob('*.py')}
+    return {**ASSETS,**trust,'/opt/gha-runners/host_admission.py':Path(__file__).with_name('host_admission.py').read_text(),
             '/opt/gha-runners/builder_access.py':Path(__file__).with_name('builder_access.py').read_text()}
 
 
