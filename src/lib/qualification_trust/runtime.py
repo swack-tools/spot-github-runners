@@ -21,11 +21,13 @@ def main(arguments):
         if key.startswith(('PYTHON', 'GIT_')):
             del os.environ[key]
     # Git may write only metadata. Never honor writable metadata for executables,
-    # hooks, filesystem monitoring, replace refs, network transports or templates.
+    # hooks, filesystem monitoring, replace refs or arbitrary network transports.
     options = {'safe.directory': str(CHECKOUT), 'core.hooksPath': '/dev/null',
                'core.fsmonitor': 'false', 'protocol.allow': 'never',
-               'protocol.file.allow': 'always', 'gpg.program': '/usr/bin/gpg',
+               'protocol.file.allow': 'always', 'protocol.https.allow': 'never', 'gpg.program': '/usr/bin/gpg',
                'gpg.ssh.program': '/usr/bin/ssh-keygen', 'core.sshCommand': '/bin/false'}
+    # Readonly wrapper permits only the authenticated pinned oracle clone.
+    os.environ['PATH'] = '/qualification-bin:' + os.environ.get('PATH', '/usr/bin:/bin')
     os.environ.update(GIT_CONFIG_GLOBAL='/dev/null',
                       GIT_NO_REPLACE_OBJECTS='1', GIT_CONFIG_COUNT=str(len(options)),
                       PYTHONDONTWRITEBYTECODE='1', OXIDEX_OPS_DIR='/target/ops',

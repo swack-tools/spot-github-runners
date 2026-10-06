@@ -8,7 +8,7 @@ import shutil
 import stat
 import tempfile
 from .host_gate import (copy_sealed, verify_sealed, execution_arguments, regular_bytes,
-                        tree_manifest, write_owned, validate_identity)
+                        tree_manifest, write_owned, validate_identity, PROTECTIVE_FDS)
 from .mounts import qualification_project, volume_arguments
 
 
@@ -102,13 +102,14 @@ def cleanup(root, project, inventory):
             shutil.rmtree(candidate)
 
 
-def dispatch(root, project, arguments, container_command, config, execute):
+def dispatch(root, project, arguments, container_command, config, execute, *, protective_fds=()):
     if not qualification_project(project):
         raise ValueError('Qualification run namespace required')
     trust = root / 'qualification-sealed'
     trusted_directory(trust)
     fd = os.open('/run/oxidex-qualification-' + project + '.lock',
                  os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    token = PROTECTIVE_FDS.set((*protective_fds, fd))
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         sealed = trust / project
@@ -144,4 +145,5 @@ def dispatch(root, project, arguments, container_command, config, execute):
         invocation = replaced + volume_arguments(root, project) + invocation[image_index:]
         return execute(invocation)
     finally:
+        PROTECTIVE_FDS.reset(token)
         os.close(fd)

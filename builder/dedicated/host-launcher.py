@@ -85,7 +85,7 @@ def source_not_mounted(source,target):
             raise ValueError('Source/cache still belongs to an actual Docker transaction')
 
 
-def project_action(root,project,arguments,config,uploader,benchmark):
+def project_action(root,project,arguments,config,uploader,benchmark,*,protective_fds=()):
     def request_gate():
         if benchmark:
             import benchmark_admission
@@ -138,7 +138,7 @@ def project_action(root,project,arguments,config,uploader,benchmark):
         sys.path.insert(0,'/opt/oxidex-builder')
         from qualification_trust.launcher_contract import dispatch
         result=dispatch(root,project,arguments,container_command,config,
-                        lambda invocation:subprocess.run(invocation).returncode)
+                        lambda invocation:subprocess.run(invocation).returncode, protective_fds=protective_fds)
         if isinstance(result,dict):print(json.dumps(result,sort_keys=True));return 0
         return result
     command=arguments or ['cargo','build','--release','--locked','--bin','oxidex']
@@ -180,7 +180,7 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_SH)
         if arguments[1:]!=['cleanup'] and (lock_root/'oxidex-build-draining').exists():
             raise SystemExit(75)
-        raise SystemExit(project_action(root,project,arguments[1:],config,uploader,benchmark))
+        raise SystemExit(project_action(root,project,arguments[1:],config,uploader,benchmark,protective_fds=(lock.fileno(),)))
 
 
 if __name__ == '__main__':

@@ -2,6 +2,7 @@
 import hashlib
 import fcntl
 from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ ANCHOR = Path('/etc/oxidex-remote-build/qualification-maintainer.allowed_signers
 MAX_FILE = 256 * 1024 * 1024
 MAX_TOTAL = 2 * 1024 * 1024 * 1024
 MAX_ENTRIES = 100000
+PROTECTIVE_FDS = ContextVar('qualification_protective_fds', default=())
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 
 
@@ -180,9 +182,49 @@ def import_slot():
                  os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+        yield fd
     finally:
         os.close(fd)
+
+
+def wait_guardian(command, locks, diagnostics):
+    """Owner endpoint, also used by real process lifecycle controls."""
+    env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LANG': 'C'}
+    reader, writer = os.pipe()
+    cancelled = []
+    previous = {sig: signal.signal(sig, lambda number, frame: cancelled.append(number))
+                for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    process = None
+    try:
+        argv = command(reader, locks)
+        process = subprocess.Popen(argv, env=env, cwd='/', stdin=subprocess.DEVNULL,
+                                   stdout=diagnostics, stderr=diagnostics, start_new_session=True,
+                                   pass_fds=(reader, *locks))
+        os.close(reader); reader = None
+        while process.poll() is None:
+            if cancelled and writer is not None:
+                os.close(writer); writer = None
+            # Guardian owns the hard deadline. Never kill it or drop its locks
+            # while it is still reaping children, even after owner cancellation.
+            try:
+                process.wait(timeout=.1)
+            except subprocess.TimeoutExpired:
+                pass
+        code = process.returncode
+        if cancelled:
+            raise InterruptedError('Source import cancelled by launcher signal')
+        if code:
+            diagnostics.seek(0)
+            raise ValueError('Bounded source import refused: ' + diagnostics.read(4096).decode(errors='replace'))
+    finally:
+        if writer is not None:
+            os.close(writer)
+        if reader is not None:
+            os.close(reader)
+        if process is not None:
+            process.wait()  # EOF cancellation; guardian closes locks only after reap.
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def sandbox_import(stage, head, bundle_sha, run_id, attestation):
@@ -192,30 +234,12 @@ def sandbox_import(stage, head, bundle_sha, run_id, attestation):
     account = pwd.getpwnam('nobody')
     work = stage / 'importer'; work.mkdir(mode=0o700)
     os.chown(work, account.pw_uid, account.pw_gid); work.chmod(0o700)
-    argv = ['/usr/bin/python3', '-I', '-B', str(Path(__file__).with_name('git_sandbox.py')),
-            str(stage / 'incoming'), str(work), head, bundle_sha, run_id, str(ANCHOR)]
-    # No untrusted environment or Git configuration reaches the helper.
-    env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LANG': 'C'}
-    # File-backed bounded diagnostics avoid an unbounded communicate() buffer.
-    with import_slot(), tempfile.TemporaryFile(dir=stage) as diagnostics:
-        process = subprocess.Popen(argv, env=env, cwd='/', stdin=subprocess.DEVNULL,
-                                   stdout=diagnostics, stderr=diagnostics, start_new_session=True,
-                                   user=account.pw_uid, group=account.pw_gid, extra_groups=[1001])
-        try:
-            code = process.wait(timeout=120)
-        except BaseException:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            raise
-        finally:
-            # Descendants cannot survive a successful or failed helper exit either.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        if code:
-            diagnostics.seek(0)
-            raise ValueError('Bounded source import refused: ' + diagnostics.read(4096).decode(errors='replace'))
+    with import_slot() as slot, tempfile.TemporaryFile(dir=stage) as diagnostics:
+        def command(reader, locks):
+            return ['/usr/bin/python3', '-I', '-B', str(Path(__file__).with_name('import_supervisor.py')),
+                    str(reader), ','.join(map(str, locks)), str(account.pw_uid), str(account.pw_gid),
+                    str(stage), head, bundle_sha, run_id, str(ANCHOR)]
+        wait_guardian(command, (*PROTECTIVE_FDS.get(), slot), diagnostics)
     return json.loads(regular_bytes(work / 'identity.json', 65536), object_pairs_hook=verifier._pairs)
 
 

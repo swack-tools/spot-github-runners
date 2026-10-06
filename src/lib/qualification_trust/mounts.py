@@ -5,6 +5,7 @@ import re
 ANCHOR = '/etc/oxidex-remote-build/qualification-maintainer.allowed_signers'
 GITCONFIG = '/etc/oxidex-remote-build/qualification.gitconfig'
 RUNTIME = '/opt/oxidex-builder/qualification_trust/runtime.py'
+RUNTIME_GIT = '/opt/oxidex-builder/qualification_trust/runtime_git.py'
 
 
 def qualification_project(project):
@@ -21,7 +22,8 @@ def expected_mounts(root, project):
             '/target/checkout': (sealed + '/checkout', False),
             '/target/checkout/.git': (sealed + '/runtime-git', True),
             ANCHOR: (ANCHOR, False), '/etc/gitconfig': (GITCONFIG, False),
-            '/qualification-runtime.py': (RUNTIME, False)}
+            '/qualification-runtime.py': (RUNTIME, False),
+            '/qualification-bin/git': (RUNTIME_GIT, False)}
 
 
 def volume_arguments(root, project):

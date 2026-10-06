@@ -108,6 +108,7 @@ install -d -o root -g root -m 0755 "$MOUNT_POINT/remote-build/qualification-seal
 {{ASSET_WRITES}}
 chmod 0444 /etc/oxidex-remote-build/qualification-maintainer.allowed_signers /etc/oxidex-remote-build/qualification.gitconfig
 chmod 0644 /opt/oxidex-builder/qualification_trust/*.py
+chmod 0555 /opt/oxidex-builder/qualification_trust/runtime_git.py
 printf '%s\n' '{{BUILD_CONFIG}}' >/etc/oxidex-remote-build.json
 printf '%s\n' '{{ADMISSION_CONFIG}}' >/etc/gha-admission.json
 printf '%s\n' '{{UPLOADER_CONFIG}}' >/etc/oxidex-builder-uploader.json

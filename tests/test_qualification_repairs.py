@@ -61,11 +61,10 @@ class GitBoundaryTests(unittest.TestCase):
         self.assertEqual(safe_tree_entries(f'100644 blob {"a"*40}\tfile.py\0'.encode()),
                          [('file.py', 'a'*40, 0o644)])
 
-    def test_import_limit_applies_to_children_and_timeout_kills_group(self):
+    def test_import_limits_and_guardian_handoff(self):
         from lib.qualification_trust import git_sandbox
         from types import SimpleNamespace
         import resource
-        import subprocess
         with patch.object(git_sandbox.resource, 'setrlimit') as limits:
             git_sandbox.limits()
         limits.assert_any_call(resource.RLIMIT_AS, (1024**3, 1024**3))
@@ -73,19 +72,22 @@ class GitBoundaryTests(unittest.TestCase):
         limits.assert_any_call(resource.RLIMIT_NPROC, (32, 32))
         with tempfile.TemporaryDirectory() as directory:
             stage = Path(directory)
-            process = unittest.mock.Mock(pid=123)
-            process.wait.side_effect = [subprocess.TimeoutExpired('import', 120), 137]
-            with patch.object(gate.os, 'geteuid', return_value=0), \
-                 patch.object(gate.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=65534, pw_gid=65534)), \
-                 patch.object(gate.os, 'chown'), patch.object(gate.os, 'killpg') as kill, \
-                 patch.object(gate, 'import_slot', return_value=__import__('contextlib').nullcontext()), \
-                 patch.object(gate.subprocess, 'Popen', return_value=process) as launch:
-                with self.assertRaises(subprocess.TimeoutExpired):
-                    gate.sandbox_import(stage, 'a'*40, 'b'*64, 'run', None)
-            self.assertTrue(launch.call_args.kwargs['start_new_session'])
-            self.assertEqual(launch.call_args.kwargs['user'], 65534)
-            self.assertEqual(launch.call_args.kwargs['env']['PATH'], '/usr/bin:/bin')
-            kill.assert_called()
+            token = gate.PROTECTIVE_FDS.set((41, 42))
+            def inspect(command, locks, diagnostics):
+                self.assertEqual(locks, (41, 42, 43))
+                argv = command(44, locks)
+                self.assertTrue(argv[3].endswith('/import_supervisor.py'))
+                self.assertEqual(argv[4:8], ['44', '41,42,43', '65534', '65534'])
+                (stage/'importer/identity.json').write_text('{}')
+            try:
+                with patch.object(gate.os, 'geteuid', return_value=0), \
+                     patch.object(gate.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=65534, pw_gid=65534)), \
+                     patch.object(gate.os, 'chown'), \
+                     patch.object(gate, 'import_slot', return_value=__import__('contextlib').nullcontext(43)), \
+                     patch.object(gate, 'wait_guardian', side_effect=inspect):
+                    self.assertEqual(gate.sandbox_import(stage, 'a'*40, 'b'*64, 'run', None), {})
+            finally:
+                gate.PROTECTIVE_FDS.reset(token)
 
     def test_real_tiny_signed_bundle_import_ignores_uploader_git_config(self):
         import hashlib

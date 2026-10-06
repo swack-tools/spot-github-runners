@@ -7,7 +7,7 @@ ASSETS = {
     for name in ('Dockerfile', 'standalone-entrypoint.py', 'worktree_commands.py', 'toolchain_probe.py')
 }
 ASSETS.update({
-    '/etc/oxidex-remote-build/qualification.gitconfig': '[safe]\n\tdirectory = /target/checkout\n[core]\n\thooksPath = /dev/null\n\tfsmonitor = false\n[gpg]\n\tprogram = /usr/bin/gpg\n[gpg "ssh"]\n\tprogram = /usr/bin/ssh-keygen\n[protocol]\n\tallow = never\n[protocol "file"]\n\tallow = always\n',
+    '/etc/oxidex-remote-build/qualification.gitconfig': '[safe]\n\tdirectory = /target/checkout\n[core]\n\thooksPath = /dev/null\n\tfsmonitor = false\n[gpg]\n\tprogram = /usr/bin/gpg\n[gpg "ssh"]\n\tprogram = /usr/bin/ssh-keygen\n[protocol]\n\tallow = never\n[protocol "file"]\n\tallow = always\n[protocol "https"]\n\tallow = never\n',
 
     '/usr/local/bin/oxidex-remote-build': (_ROOT / 'builder/dedicated/host-launcher.py').read_text(),
     '/usr/local/bin/docker': (_ROOT / 'builder/dedicated/docker-admission.py').read_text(),
