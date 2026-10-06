@@ -552,11 +552,14 @@ python3 src/remote_rust_build.py \
   --instance YOUR_INSTANCE --zone YOUR_ZONE --project YOUR_PROJECT \
   --worktree-id oxidex-example \
   --profile release \
+  --artifact-dir "$HOME/git/oxidex/target/remote-linux/release" \
   --evidence-dir "$HOME/oxidex-ops/evidence/remote-build-example"
 ```
 
 It snapshots tracked files, transfers and verifies the archive, runs the build,
-checks the artifact checksum, and records source and timing evidence. It uses
+checks the artifact checksum, and records source and timing evidence.
+`--artifact-dir` downloads the verified `oxidex` binary into that directory;
+without it, the client retains a receipt without downloading the binary. It uses
 `gcloud compute ssh/scp`; verify that its selected account and host access match
 the target. Its automatic selector considers legacy `oxidex-runners-*` and
 `oxidex-buildbench-*` hosts, not the new `builder-` registry.
@@ -565,6 +568,7 @@ Install the optional Cargo shims:
 
 ```bash
 python3 src/install_remote_commands.py
+export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 They execute scripts from this checkout; keep the checkout in place. The command
@@ -573,6 +577,10 @@ checkout supplies remote instance, zone, project, and worktree settings through
 its environment or `.cargo/config.toml`. Use `--profile debug` or
 `--profile release` with the explicit client. Automatic selection defaults to
 three attempts; compiler or header errors stop instead of moving to another host.
+The legacy automatic helper also calls `cargo remote-build`; that separate alias
+or command must already exist in the configured OxiDex checkout. The installer
+creates the two `oxidex-*` shims, not that alias. Do not assume installing the
+shims alone configures automatic selection or the dedicated-builder registry.
 
 Linux artifacts from these clients do not run natively on macOS. Cross targets
 and SDK-free framework interfaces do not replace native artifact validation.
