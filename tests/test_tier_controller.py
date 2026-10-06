@@ -133,3 +133,18 @@ class TierControllerTests(unittest.TestCase):
         with patch.object(controller.subprocess,'run',side_effect=AssertionError('external side effect')):
             with self.assertRaisesRegex(RuntimeError,'forbidden'):
                 controller.launch_offer(offer,args,{},Path('/tmp/never-used-tier-state'))
+
+    def test_host_oom_topology_replaces_affected_retained_tier(self):
+        from lib import tier_controller
+        from lib.runner_fleet import GceVm
+        hosts=[GceVm('oxidex-runners-large','z','RUNNING','n4-standard-16',True,16,64,instance_id='1'),
+               GceVm('oxidex-runners-tail','z','RUNNING','n4-standard-8',True,8,32,instance_id='2')]
+        args=controller.args_parser().parse_args(['--scaling-mode','tiered'])
+        state={'pending_oom':{'z/1':'host'}}
+        with tempfile.TemporaryDirectory() as folder, \
+             patch('lib.tier_controller.evidence_for',return_value=({}, {},1000)), \
+             patch('lib.tier_controller.plan_capacity',return_value=dict(action='topology',target=('large','large'),reason='oom')), \
+             patch('lib.tier_controller.begin_migration') as begin, \
+             patch('lib.tier_controller.reconcile_migration'):
+            tier_controller.check_tiers(hosts,[],args,state,Path(folder)/'state.json')
+        self.assertEqual(begin.call_args.kwargs.get('force_ids'),['1'])

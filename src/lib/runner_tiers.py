@@ -60,7 +60,7 @@ def next_topology(tiers, direction, reason):
         elif tail in ('large','bulky'):
             result = tiers + ('small',) if len(tiers) < 5 else tiers
         elif tail == 'small':
-            result = prefix + (('starting' if not prefix else 'expanded'),)
+            result = prefix + (('starting' if not prefix and reason not in ('memory','oom') else 'expanded'),)
         elif tail == 'starting':
             result = prefix + (('expanded' if reason in ('memory', 'oom','queue') else 'large'),)
         else:

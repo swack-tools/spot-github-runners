@@ -36,3 +36,8 @@ class TierTopologyTests(unittest.TestCase):
         self.assertEqual(next_topology(('bulky',),'down','low'),('large',))
         self.assertEqual(next_topology(('bulky',),'up','queue'),('bulky','small'))
         self.assertEqual(next_topology(('bulky','bulky','large'),'up','cpu'),('bulky','bulky','large'))
+
+    def test_small_host_memory_growth_increases_ram(self):
+        for reason in ('memory','oom'):
+            self.assertEqual(next_topology(('small',),'up',reason),('expanded',))
+        self.assertEqual(next_topology(('small',),'up','cpu'),('starting',))

@@ -126,7 +126,11 @@ def check_tiers(vms,runners,args,state,state_path):
     LOG.info('Tier decision: topology=%s target=%s reason=%s absolute demand=%s',
              topology,decision['target'],decision['reason'],evidence)
     if decision['action']=='topology':
-        begin_migration(fleet,decision['target'],state,state_path,decision['reason'],decision.get('slots'))
+        # Host-OOM obligations belong to exact VM identities; retaining an affected
+        # host would prevent replacement readiness from ever clearing that obligation.
+        force_ids=[vm.instance_id for vm in fleet
+                   if 'host' in pending_kinds(state,f'{vm.zone}/{vm.instance_id}')] if decision['reason']=='oom' else []
+        begin_migration(fleet,decision['target'],state,state_path,decision['reason'],decision.get('slots'),force_ids=force_ids)
         reconcile_migration(vms,runners,args,state,state_path)
     elif decision['action']=='density':
         begin_migration(fleet,topology,state,state_path,decision['reason'],decision['slots'],force_ids=[tail.instance_id])
