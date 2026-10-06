@@ -66,8 +66,8 @@ exists in the selected organization and permits access to `ORG/oxidex`.
 The manual manager accepts `--runner-group-id` for another qualifying group, but
 that option does not update controller launches or tier evidence. Supporting a
 different automatic group requires a reviewed source change. The controller's
-`--job-repository` option changes job tracking, not runner placement or the
-manager's required repository.
+`--job-repository` option changes job tracking. Runner placement and the
+manager's required repository stay unchanged.
 
 Inspect the required group without changing it:
 
