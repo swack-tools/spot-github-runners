@@ -584,7 +584,7 @@ def adjust_admission(vm,args,kind='runner'):
     program='kind='+repr(kind)+'\n'+'''import fcntl, json, math, os, re, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0,'/opt/gha-runners')
-from host_admission import observed_envelope, request
+from host_admission import heavy_runner_policy, observed_envelope, request
 GIB=1024**3
 changed=[]
 pending_runner_ids=[]
@@ -619,6 +619,9 @@ try:
     with os.fdopen(fd,'a') as operation:
         fcntl.flock(operation,fcntl.LOCK_EX|fcntl.LOCK_NB)
         p=Path('/etc/gha-admission.json');config=json.loads(p.read_text())
+        heavy=heavy_runner_policy(config)
+        if heavy is not None and kind=='builder':
+            raise ValueError('Builder cap adjustment held while heavy runner policy is active')
         current=config[kind+'_gib']
         if not math.isfinite(current) or current<=0:raise ValueError('Invalid reservation')
         envelope=observed_envelope(config)
@@ -638,10 +641,17 @@ try:
             records={name:inspect(name,name) for name in names}
             if len({row['Id'] for row in records.values()})!=len(names):
                 raise ValueError('Runner identities are not unique')
-            if any(row['HostConfig']['Memory']>current*GIB for row in records.values()):
+            if heavy:
+                cap=records[heavy['name']]['HostConfig']
+                if (cap['Memory']!=32*GIB or cap['MemorySwap']!=32*GIB
+                    or cap['NanoCpus']!=8_000_000_000):
+                    raise ValueError('Heavy runner cap differs from policy')
+            ordinary={name:row for name,row in records.items()
+                      if heavy is None or name!=heavy['name']}
+            if any(row['HostConfig']['Memory']>current*GIB for row in ordinary.values()):
                 raise ValueError('Runner limit exceeds its reservation')
-            lagging=any(row['HostConfig']['Memory']<current*GIB for row in records.values())
-        next_limit=current if lagging else min(current*2,ceiling)
+            lagging=any(row['HostConfig']['Memory']<current*GIB for row in ordinary.values())
+        next_limit=current if lagging or heavy is not None else min(current*2,ceiling)
         if next_limit>ceiling or (not lagging and next_limit<=current):
             print(json.dumps(dict(kind=kind,status='capacity',reservation_gib=current,observed_work_gib=envelope)))
             raise SystemExit(76)
@@ -670,6 +680,8 @@ try:
                 changed.append('future-builder')
             else:
                 for name,before in records.items():
+                    if heavy is not None and name==heavy['name']:
+                        continue  # Never rewrite the dedicated slot to ordinary caps.
                     identity=before['Id']
                     if any(owner.startswith(prefix+identity+':')
                            for owner in rows for prefix in ('container:','runner:')):
