@@ -394,6 +394,14 @@ def builder_cache_identity(record):
     mounts=record.get('Mounts',[])
     if not isinstance(mounts,list) or any(not isinstance(mount,dict) for mount in mounts):
         return None
+    if project.startswith('qualification-'):
+        import sys
+        sys.path.insert(0, '/opt/oxidex-builder')
+        from qualification_trust.mounts import qualification_project, check_inspected_mounts
+        if not qualification_project(project):return None
+        try:check_inspected_mounts(mounts, BUILD_ROOT, project)
+        except (ValueError, TypeError, KeyError):return None
+        return project,run
     for destination,folder in (('/src','sources'),('/target','targets')):
         matching=[mount for mount in mounts if mount.get('Destination')==destination]
         if (len(matching)!=1 or matching[0].get('Type')!='bind'
