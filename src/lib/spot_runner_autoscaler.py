@@ -293,7 +293,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
     if runner_inventory_stale(state):
         LOG.warning('Host operation held: runner inventory is stale')
         return True
-    if operation.get('kind') in ('drain','delete') and any(
+    if operation.get('kind') in ('drain','delete','recovery') and any(
             vm.instance_id==operation.get('vm',{}).get('instance_id') for vm in protected):
         LOG.warning('Retirement held: live heavy route has no verified replacement')
         write_scale_state(state_path,state)

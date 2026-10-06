@@ -64,6 +64,12 @@ class HeavyRouteContinuityTests(unittest.TestCase):
                 observed=stack.enter_context(patch.object(tier_controller,'evidence_for',return_value=({}, {}, time.time())))
                 self.assertEqual(controller._run_controller(args),0)
                 price.assert_not_called();observed.assert_called_once()
+    def test_lost_cleanup_can_finish_without_unqualified_replacement_launch(self):
+        from lib import vm_recovery
+        state={'pending_vm_recovery':{'lost':{'_cleanup_complete':True}}}
+        with patch.object(vm_recovery,'record_loss_restoration_target'), patch.object(controller,'reconcile_prices') as launch:
+            self.assertFalse(vm_recovery.reconcile_lost_vms([self.vm],[self.runner],SimpleNamespace(scaling_mode='resource'),state,None))
+            launch.assert_not_called()
     def test_inventory_requires_total_pages_labels_and_no_diagnostics(self):
         item={'id':1,'name':'r','status':'online','busy':False,'labels':[{'name':'spot-heavy32'}]}
         valid=[{'total_count':1,'runners':[item]}]
