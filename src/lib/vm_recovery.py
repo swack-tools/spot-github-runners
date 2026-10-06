@@ -113,7 +113,7 @@ def record_loss_restoration_target(vms, state, state_path):
 def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
     """Share a persisted restoration target with price recovery; launch each deficit once."""
     from .spot_runner_autoscaler import (begin_host_operation, reconcile_prices,
-                                        write_scale_state,protected_heavy_routes,runner_inventory_stale)
+                                        write_scale_state,protected_heavy_routes,runner_inventory_stale,heavy_route_capacity_hold)
 
     pending = state.get('pending_vm_recovery', {})
     if not pending:
@@ -141,7 +141,8 @@ def reconcile_lost_vms(vms, runners, args, state, state_path) -> bool:
         return True  # Finish this cleanup and deregistration before touching another host.
     if getattr(args,'scaling_mode','resource')=='tiered':
         return False  # Tier orchestration now owns exact-topology restoration.
-    if protected_heavy_routes(vms,runners,state) or runner_inventory_stale(state):
+    protected_heavy_routes(vms,runners,state)
+    if heavy_route_capacity_hold(state) or runner_inventory_stale(state):
         return False
     reconcile_prices(vms, runners, args, state, state_path)
     return True

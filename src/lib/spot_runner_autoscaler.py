@@ -120,6 +120,13 @@ def protected_heavy_routes(vms,runners,state):
             row=={'name':vm.name,'zone':vm.zone} for row in protected.values())]
 
 
+def heavy_route_capacity_hold(state):
+    # Known loss permits identity-scoped cleanup, not a generic replacement
+    # that would omit the protected route's admission policy and label.
+    protected=state.get('protected_heavy_routes',{})
+    return not isinstance(protected,dict) or bool(protected)
+
+
 def runner_inventory_stale(state):
     # Pure legacy callers have no receipt; real controller polls always set it
     # immediately after the strict paginated API call, never from saved history.
@@ -1490,7 +1497,7 @@ def _run_controller(args: argparse.Namespace) -> int:
             continue
         operation_work = reconcile_host_operation(vms, runners, args, state, state_path)
         recovery_work = False if operation_work else reconcile_lost_vms(vms, runners, args, state, state_path)
-        protected=protected_heavy_routes(vms,runners,state)
+        protected=bool(protected_heavy_routes(vms,runners,state)) or heavy_route_capacity_hold(state)
         price_work = False if protected or recovery_work or operation_work or args.scaling_mode=='tiered' else reconcile_prices(vms, runners, args, state, state_path)
         if protected:
             from .tier_controller import check_tiers

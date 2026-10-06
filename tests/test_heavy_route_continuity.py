@@ -70,6 +70,16 @@ class HeavyRouteContinuityTests(unittest.TestCase):
         with patch.object(vm_recovery,'record_loss_restoration_target'), patch.object(controller,'reconcile_prices') as launch:
             self.assertFalse(vm_recovery.reconcile_lost_vms([self.vm],[self.runner],SimpleNamespace(scaling_mode='resource'),state,None))
             launch.assert_not_called()
+    def test_known_heavy_host_loss_does_not_launch_an_unrouted_replacement(self):
+        from lib import vm_recovery
+        state={'pending_vm_recovery':{'lost':{'_cleanup_complete':True}},
+               'protected_heavy_routes':{'721':{'name':self.vm.name,'zone':'z'}}}
+        with patch.object(vm_recovery,'record_loss_restoration_target'), patch.object(controller,'reconcile_prices') as launch:
+            self.assertFalse(vm_recovery.reconcile_lost_vms([],[],SimpleNamespace(scaling_mode='legacy'),state,None))
+            launch.assert_not_called()
+        with tempfile.TemporaryDirectory() as root, patch.object(tier_controller,'evidence_for',return_value=({}, {}, time.time())) as observed, patch.object(tier_controller,'begin_migration') as launch:
+            tier_controller.check_tiers([],[],SimpleNamespace(),state,Path(root)/'state.json')
+            observed.assert_called_once();launch.assert_not_called()
     def test_inventory_requires_total_pages_labels_and_no_diagnostics(self):
         item={'id':1,'name':'r','status':'online','busy':False,'labels':[{'name':'spot-heavy32'}]}
         valid=[{'total_count':1,'runners':[item]}]
