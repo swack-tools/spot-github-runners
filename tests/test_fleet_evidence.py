@@ -50,3 +50,24 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue(result['queue_delayed'])
         jobs[-1]['runner_group_id'] = 123
         self.assertFalse(workload_signals(jobs,labels,1000,group_ids={10})['pending'])
+
+    def test_queue_labels_match_case_insensitively_without_bypassing_group_or_architecture(self):
+        jobs=[dict(id=3,status='queued',labels=['SELF-HOSTED','linux','x64','SPOT'],
+                   created_at='1970-01-01T00:00:00Z',runner_group_id=10)]
+        available=[{'self-hosted','Linux','X64','spot'}]
+        actual=workload_signals(jobs,available,1000,group_ids={10})
+        self.assertTrue(actual['pending']);self.assertTrue(actual['queue_delayed'])
+        self.assertFalse(workload_signals(jobs,available,1000,group_ids={11})['pending'])
+        jobs[0]['labels']=['self-hosted','linux','arm64','spot']
+        self.assertFalse(workload_signals(jobs,available,1000,group_ids={10})['pending'])
+
+    def test_completion_label_case_does_not_split_comparable_duration_history(self):
+        from datetime import datetime,timezone
+        def iso(tick):return datetime.fromtimestamp(tick,timezone.utc).isoformat()
+        jobs=[]
+        for index in range(10):
+            start=1000+index*1000;duration=100 if index<5 else 200
+            jobs.append(dict(id=index,name='compile',repository='o/r',workflow_id=1,
+                             labels=['self-hosted','linux','x64'] if index%2 else ['SELF-HOSTED','Linux','X64'],
+                             conclusion='success',started_at=iso(start),completed_at=iso(start+duration)))
+        self.assertTrue(workload_signals(jobs,[{'self-hosted','Linux','X64'}],12000)['duration_regression'])

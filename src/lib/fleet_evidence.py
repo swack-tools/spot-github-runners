@@ -166,9 +166,12 @@ def record_resources(state, vms, samples, timestamp):
 def workload_signals(jobs, runner_labels, timestamp, *, group_ids=None):
     result = dict(pending=False,queue_delayed=False,duration_regression=False)
     completions = {}
+    # GitHub matches runner labels case-insensitively, including default OS/CPU
+    # labels. Use the same identity for queue fit and duration-history grouping.
+    available_labels = [{label.casefold() for label in available} for available in runner_labels]
     for job in jobs:
-        labels = set(job.get('labels') or [])
-        if (not labels or not any(labels <= set(available) for available in runner_labels)
+        labels = {label.casefold() for label in (job.get('labels') or [])}
+        if (not labels or not any(labels <= available for available in available_labels)
                 or (job.get('runner_group_id') and group_ids is not None
                     and job['runner_group_id'] not in group_ids)):
             continue
