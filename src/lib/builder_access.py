@@ -170,7 +170,9 @@ def enroll(record,expected_sha):
         info=os.fstat(home)
         if info.st_uid!=record['uid'] or info.st_mode&0o022:raise ValueError('Unsafe uploader home')
         try:os.mkdir('.ssh',0o700,dir_fd=home)
-        except FileExistsError:pass
+        except FileExistsError:
+            # An existing directory is accepted only after the nofollow ownership/mode checks below.
+            pass
         directory=os.open('.ssh',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=home)
         try:
             info=os.fstat(directory)

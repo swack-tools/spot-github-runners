@@ -4,7 +4,6 @@ No services or processes are changed. An unavailable observation holds startup.
 This source is embedded in startup before any filesystem/service mutation.
 """
 import os
-import json
 from pathlib import Path
 import re
 import shlex

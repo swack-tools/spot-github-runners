@@ -5,7 +5,7 @@ import json
 import re
 from pathlib import Path
 from .builder_only_assets import ASSETS, STARTUP
-from .builder_access import canonical_sha,approved_mapping,uploader_enrollment_plan
+from .builder_access import canonical_sha,approved_mapping
 
 IMAGE='oxidex-remote-builder:1.99.0'
 COMMIT='b940084d7eb6a299eb4bfeb8e34901bc051e7ac4'
