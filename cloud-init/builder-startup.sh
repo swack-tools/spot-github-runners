@@ -84,6 +84,8 @@ cat >/etc/systemd/system/docker.service.d/builder-data.conf <<EOF
 RequiresMountsFor=$MOUNT_POINT/docker
 EOF
 printf '{"data-root":"%s/docker","features":{"containerd-snapshotter":false},"log-driver":"local","log-opts":{"max-size":"20m","max-file":"3"}}\n' "$MOUNT_POINT" >/etc/docker/daemon.json
+install -d -o root -g root -m 0755 /var/lib/oxidex-builder/qualification-sealed
+chmod 0444 /etc/oxidex-remote-build/qualification-maintainer.allowed_signers
 systemctl daemon-reload
 systemctl enable --now containerd docker
 python3 - <<'CLASSIC_STORE'
@@ -141,6 +143,8 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ADMISSION_SERVICE
+install -d -o root -g root -m 0755 /var/lib/oxidex-builder/qualification-sealed
+chmod 0444 /etc/oxidex-remote-build/qualification-maintainer.allowed_signers
 systemctl daemon-reload
 systemctl enable --now gha-admission
 for attempt in $(seq 1 30); do [[ ! -S /run/gha-admission/socket ]] || break; sleep 1; done
