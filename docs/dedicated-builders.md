@@ -158,3 +158,11 @@ pending marker. A private permit in `/run` allows only the current maintenance
 boot to restart admission while that marker exists. Reboot removes the permit,
 so admission stays off until explicit recovery or the verified handoff. The
 pending marker and volatile drain are separate from build leases.
+
+Preparation only writes private backups and leaves the live runtime unchanged.
+The first live cutover removes launcher execution permission and persists that
+mode before runtime replacement. Both the previous and installed launcher stay
+readable but non-executable (`0644`) through partial updates and reboot. Restoring
+`0755` is part of the separately verified client-pin handoff, not automatic
+installation success. Administrative controlled proofs use the authenticated
+root control path; the uploader cannot bypass this hold.

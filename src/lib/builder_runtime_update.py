@@ -17,6 +17,8 @@ BOOT_GUARD_BYTES = (b'[Unit]\n'
     b'ConditionPathExists=|/run/oxidex-runtime-update-allow\n')
 
 
+LAUNCHER_TARGET = '/usr/local/bin/oxidex-remote-build'
+
 QUALIFICATION = '/opt/oxidex-builder/qualification_trust/'
 TARGETS = {
     '/usr/local/bin/oxidex-remote-build': 0o755,
@@ -465,7 +467,7 @@ def mutation_idle_fence(plan):
 
 
 
-def file_mutation_fence(plan, target=None):
+def file_mutation_fence(plan, target=None, *, expected_file=None):
     import time
     if service_identity() != (plan['service_pid'], plan['service_startticks']):
         raise ValueError('Approved admission process changed before planned restart')
@@ -473,7 +475,7 @@ def file_mutation_fence(plan, target=None):
             or root_file_state('/etc/oxidex-remote-build.json')['sha256'] != plan['config_sha256']
             or root_file_state('/etc/gha-admission.json')['sha256'] != plan['admission_sha256']
             or root_file_state('/etc/systemd/system/gha-admission.service')['sha256'] != plan['service_sha256']
-            or (target is not None and root_file_state(target) != plan['before'][target])):
+            or (target is not None and root_file_state(target) != (plan['before'][target] if expected_file is None else expected_file))):
         raise ValueError('Immediate runtime mutation bindings changed')
     validate_plan(plan, time.time())
 
@@ -551,20 +553,32 @@ def apply_update(plan):
                 if plan['before'][target] is not None:
                     atomic_write(backup / (str(index) + '.before'), Path(target).read_bytes(), 0o600)
             record('BACKUPS_COMPLETE', before=plan['before'])
+            # Preparation has not changed live code. This durable permission
+            # transition is the first live cutover, including the old launcher.
+            mutation_idle_fence(plan)
+            file_mutation_fence(plan, LAUNCHER_TARGET)
+            close_launcher_execution(LAUNCHER_TARGET)
+            held_launcher = root_file_state(LAUNCHER_TARGET)
+            intended = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
+            if held_launcher != intended:
+                raise ValueError('Durable launcher execution hold differs')
+            record('MUTATING_HELD', launcher=held_launcher)
             prepare_boot_hold(plan)
             verify_boot_hold(plan)
             record('PERSISTENT_BOOT_HOLD_INSTALLED')
             for target in sorted(TARGETS):
                 validate_plan(plan, time.time())
                 mutation_idle_fence(plan)
-                file_mutation_fence(plan, target)
+                expected_file = held_launcher if target == LAUNCHER_TARGET else None
+                file_mutation_fence(plan, target, expected_file=expected_file)
                 trusted_directory(Path(target).parent, create=True)
                 mutation_idle_fence(plan)
-                file_mutation_fence(plan, target)
+                file_mutation_fence(plan, target, expected_file=expected_file)
                 def before_replace():
                     mutation_idle_fence(plan)
-                    file_mutation_fence(plan, target)
-                atomic_write(target, assets[target], TARGETS[target], before_replace=before_replace)
+                    file_mutation_fence(plan, target, expected_file=expected_file)
+                installed_mode = 0o644 if target == LAUNCHER_TARGET else TARGETS[target]
+                atomic_write(target, assets[target], installed_mode, before_replace=before_replace)
                 record('FILE_REPLACED', target=target,
                        sha256=hashlib.sha256(assets[target]).hexdigest())
             validate_plan(plan, time.time())
@@ -587,7 +601,7 @@ def apply_update(plan):
                 raise ValueError('Original admission process is still present')
             for target, data in assets.items():
                 state = after['before'][target]
-                if state['sha256'] != hashlib.sha256(data).hexdigest() or state['mode'] != TARGETS[target]:
+                if state['sha256'] != hashlib.sha256(data).hexdigest() or state['mode'] != (0o644 if target == LAUNCHER_TARGET else TARGETS[target]):
                     raise ValueError('Installed runtime proof differs')
             verify_boot_hold(plan)
             record('FILES_AND_SERVICE_VERIFIED', service_pid=after['service_pid'],
@@ -613,7 +627,7 @@ def apply_update(plan):
             check_snapshot(expected, snapshot, owned_drain=True)
             for target, raw in assets.items():
                 state = snapshot['before'][target]
-                if state['sha256'] != hashlib.sha256(raw).hexdigest() or state['mode'] != TARGETS[target]:
+                if state['sha256'] != hashlib.sha256(raw).hexdigest() or state['mode'] != (0o644 if target == LAUNCHER_TARGET else TARGETS[target]):
                     raise ValueError('Installed runtime changed before drain release')
             admission_ready(plan, result['service_pid'], result['service_startticks'], wait=False)
             records = []

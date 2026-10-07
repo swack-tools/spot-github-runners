@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import fcntl
+import subprocess
 import sys
 import tempfile
 import unittest
