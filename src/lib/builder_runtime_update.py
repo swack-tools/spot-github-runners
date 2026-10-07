@@ -190,8 +190,10 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
             if before_release is not None:
                 before_release(result)
             current = drain_path.lstat()
-            if (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino):
-                raise ValueError('Owned drain replaced during final checks')
+            os.lseek(drain, 0, os.SEEK_SET)
+            if ((current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino)
+                    or current.st_nlink != 1 or os.read(drain, 129) != raw):
+                raise ValueError('Owned drain changed during final checks')
             os.unlink(drain_path)
             os.fsync(directory)
             return result
@@ -325,6 +327,20 @@ def admission_ready(plan, pid, ticks, *, wait=True):
             time.sleep(min(.05, max(0, deadline-time.monotonic())))
 
 
+def observed_work_processes():
+    work_records = []
+    for proc_path in Path('/proc').iterdir():
+        if not proc_path.name.isdecimal():
+            continue
+        try:
+            comm = (proc_path / 'comm').read_text().strip()
+            argv = (proc_path / 'cmdline').read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        work_records.append(dict(pid=int(proc_path.name),comm=comm,argv=argv.split(b'\0')))
+    return active_work_processes(work_records)
+
+
 def live_snapshot(plan):
     """Read fixed host facts, never acquire leases or start containers."""
     import json
@@ -346,17 +362,7 @@ def live_snapshot(plan):
     tools_ready = all(stat.S_ISREG(Path(p).stat().st_mode) and Path(p).stat().st_uid == 0
                       and not Path(p).stat().st_mode & 0o022
                       and os.access(p, os.X_OK) for p in executables)
-    work_records = []
-    for proc_path in Path('/proc').iterdir():
-        if not proc_path.name.isdecimal():
-            continue
-        try:
-            comm = (proc_path / 'comm').read_text().strip()
-            argv = (proc_path / 'cmdline').read_bytes()
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        work_records.append(dict(pid=int(proc_path.name),comm=comm,argv=argv.split(b'\0')))
-    uploads = active_work_processes(work_records)
+    uploads = observed_work_processes()
     return dict(
         upload_processes=uploads,
         vm_id=checked_command(['/usr/bin/curl', '-q', '--fail', '--silent', '--show-error',
@@ -386,6 +392,31 @@ def trusted_directory(path, *, create=False):
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
                 or info.st_mode & 0o022):
             raise ValueError('Untrusted update directory: ' + str(current))
+
+
+
+def mutation_idle_fence(plan):
+    import json
+    import time
+    _, ledger = root_file_read('/var/lib/gha-admission/leases.json')
+    _, token = root_file_read('/run/oxidex-build-draining')
+    if (json.loads(ledger) != {} or token != plan['nonce'].encode()
+            or checked_command(['/usr/bin/docker', 'ps', '-aq', '--no-trunc'])
+            or observed_work_processes()):
+        raise ValueError('Transfer, launcher, lease or container appeared before mutation')
+    validate_plan(plan, time.time())
+
+
+
+def file_mutation_fence(plan, target=None):
+    import time
+    if (Path('/proc/sys/kernel/random/boot_id').read_text().strip() != plan['boot']
+            or root_file_state('/etc/oxidex-remote-build.json')['sha256'] != plan['config_sha256']
+            or root_file_state('/etc/gha-admission.json')['sha256'] != plan['admission_sha256']
+            or root_file_state('/etc/systemd/system/gha-admission.service')['sha256'] != plan['service_sha256']
+            or (target is not None and root_file_state(target) != plan['before'][target])):
+        raise ValueError('Immediate runtime mutation bindings changed')
+    validate_plan(plan, time.time())
 
 
 def apply_update(plan):
@@ -427,18 +458,20 @@ def apply_update(plan):
             record('BACKUPS_COMPLETE', before=plan['before'])
             for target in sorted(TARGETS):
                 validate_plan(plan, time.time())
-                if (Path('/proc/sys/kernel/random/boot_id').read_text().strip() != plan['boot']
-                        or root_file_state('/etc/oxidex-remote-build.json')['sha256'] != plan['config_sha256']
-                        or root_file_state('/etc/gha-admission.json')['sha256'] != plan['admission_sha256']
-                        or root_file_state(target) != plan['before'][target]):
-                    raise ValueError('Immediate file mutation fence failed')
+                mutation_idle_fence(plan)
+                file_mutation_fence(plan, target)
                 trusted_directory(Path(target).parent, create=True)
+                mutation_idle_fence(plan)
+                file_mutation_fence(plan, target)
                 atomic_write(target, assets[target], TARGETS[target])
                 record('FILE_REPLACED', target=target,
                        sha256=hashlib.sha256(assets[target]).hexdigest())
             validate_plan(plan, time.time())
+            mutation_idle_fence(plan)
             trusted_directory('/mnt/runner-data/remote-build/qualification-sealed', create=True)
             validate_plan(plan, time.time())
+            mutation_idle_fence(plan)
+            file_mutation_fence(plan)
             checked_command(['/usr/bin/systemctl', 'restart', 'gha-admission.service'])
             new_pid, new_ticks = service_identity(strict=False)
             admission_ready(plan, new_pid, new_ticks)

@@ -170,4 +170,13 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
                 validate_admission_response(response)
 
 
+    def test_final_callback_cannot_change_owned_drain_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();lock=root/'build.lock';lock.touch();drain=root/'drain'
+            def replace_token(result):drain.write_text('foreign-after-check')
+            with self.assertRaises(ValueError):
+                drained_update(lock,drain,'owned',lambda:42,before_release=replace_token)
+            self.assertEqual(drain.read_text(),'foreign-after-check')
+
+
 if __name__=='__main__':unittest.main()
