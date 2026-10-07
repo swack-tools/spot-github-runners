@@ -516,6 +516,15 @@ def verify_owned_drain(fd, path, token, canonical_owned):
             or any(getattr(before, name) != getattr(after, name) for name in attributes)
             or raw != token.encode('ascii')):
         raise ValueError('Owned drain changed during token read')
+    def metadata_guard():
+        canonical_owned()
+        retained = os.fstat(fd);canonical = Path(path).lstat()
+        fields = ('st_dev','st_ino',*attributes)
+        if (any(getattr(after,name) != getattr(retained,name) for name in fields)
+                or any(getattr(retained,name) != getattr(canonical,name) for name in fields)):
+            raise ValueError('Selected owned drain changed after release fence')
+    return metadata_guard
+
 
 
 def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False, lock_bound=None, release_fence=None, publication_fence=None, root_custody=False):
@@ -550,6 +559,7 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
                 if before_drain is not None:before_drain()
                 canonical_owned()
                 if publication_fence is not None:publication_fence()
+                canonical_owned()
             before_publish()
             drain = publish_owned_drain(drain_path, token, before_publish=before_publish)
             directory = os.open(drain_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -563,9 +573,10 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
                     canonical_owned()
                     before_release(result)
                     canonical_owned()
-                verify_owned_drain(drain, drain_path, token, canonical_owned)
+                final_drain_guard = verify_owned_drain(drain, drain_path, token, canonical_owned)
                 if not keep_drain:
                     if release_fence is not None:release_fence()
+                    final_drain_guard()
                     os.unlink(drain_path)
                     try:os.fsync(directory)
                     except BaseException as error:raise CommittedReleaseError(result) from error
@@ -614,7 +625,7 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
                     raise ValueError('Canonical build lock ownership lost')
             if lock_bound is not None:lock_bound(canonical_owned)
             def still_owned():
-                verify_owned_drain(drain, drain_path, token, canonical_owned)
+                return verify_owned_drain(drain, drain_path, token, canonical_owned)
             still_owned()
             check()
             still_owned()
@@ -626,9 +637,10 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
                 still_owned()
                 if commit is not None:
                     commit()
-                still_owned()
+                final_drain_guard = still_owned()
                 if release:
                     if release_fence is not None:release_fence()
+                    final_drain_guard()
                     os.unlink(drain_path)
                     released = True
                     try:os.fsync(directory)

@@ -1079,5 +1079,44 @@ class PendingMarkerIdentityTests(unittest.TestCase):
             with self.subTest(field=field),self.assertRaises(ValueError):runtime.validate_pending_marker(altered,observation['boot'],committed_original=original)
 
 
+class FinalDrainCustodyTests(unittest.TestCase):
+    def test_release_fence_replacement_is_preserved(self):
+        for existing in (True,False):
+            for changed in ('lock','drain'):
+                with tempfile.TemporaryDirectory() as directory:
+                    lock=Path(directory).resolve()/'lock';lock.touch();drain=lock.parent/'drain'
+                    if existing:drain.write_text('owned');drain.chmod(0o600)
+                    target=lock if changed=='lock' else drain
+                    def fence():
+                        other=lock.parent/'foreign';other.write_text('foreign');other.chmod(0o600);other.replace(target)
+                    with self.subTest(existing=existing,changed=changed),self.assertRaises(ValueError):
+                        if existing:runtime.finish_owned_drain(lock,drain,'owned',lambda:None,lambda:1,release_fence=fence)
+                        else:runtime.drained_update(lock,drain,'owned',lambda:1,release_fence=fence)
+                    self.assertEqual(target.read_text(),'foreign');self.assertTrue(drain.exists())
+
+    def test_final_release_verification_does_not_reread_token(self):
+        for existing in (True,False):
+            with tempfile.TemporaryDirectory() as directory:
+                lock=Path(directory).resolve()/'lock';lock.touch();drain=lock.parent/'drain'
+                if existing:drain.write_text('owned');drain.chmod(0o600)
+                read=os.read;fenced=[False]
+                def checked_read(*args):
+                    self.assertFalse(fenced[0], 'Blocking token read after final freshness fence')
+                    return read(*args)
+                def fence():fenced[0]=True
+                with patch.object(runtime.os,'read',side_effect=checked_read):
+                    if existing:result=runtime.finish_owned_drain(lock,drain,'owned',lambda:None,lambda:1,release_fence=fence)
+                    else:result=runtime.drained_update(lock,drain,'owned',lambda:1,release_fence=fence)
+                self.assertEqual(result,1);self.assertFalse(drain.exists())
+
+    def test_publication_fence_replacement_creates_no_drain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock=Path(directory).resolve()/'lock';lock.touch();drain=lock.parent/'drain'
+            def fence():
+                other=lock.parent/'foreign';other.write_text('foreign');other.replace(lock)
+            with self.assertRaises(ValueError):runtime.drained_update(lock,drain,'owned',lambda:self.fail('action ran'),publication_fence=fence)
+            self.assertFalse(drain.exists());self.assertEqual(lock.read_text(),'foreign')
+
+
 if __name__ == '__main__':
     unittest.main()
