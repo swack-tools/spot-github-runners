@@ -179,8 +179,12 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
         final = journal[indices[-1]]
         comparison_files = dict(comparison_files, **{LAUNCHER_TARGET:dict(selected, mode=0o755)})
     if final.get('stage') == 'COMMITTED_REBOOT_RECOVERED':
-        state = observation['service_state']
-        if (final.get('boot') != observation['boot']
+        historical_boot = final.get('boot')
+        try:
+            valid_boot = isinstance(historical_boot, str) and str(uuid.UUID(historical_boot)) == historical_boot
+        except (ValueError, TypeError, AttributeError):
+            valid_boot = False
+        if (not valid_boot
                 or type(final.get('service_pid')) is not int or final['service_pid'] <= 0
                 or type(final.get('service_startticks')) is not int or final['service_startticks'] <= 0
                 or not any(isinstance(row, dict) and row.get('stage') == 'FINISH_RELEASE_COMMITTED'
@@ -312,17 +316,24 @@ def append_journal_record(path, record, *, before_publish=None, freshness=None, 
     return updated
 
 
+def authenticate_ancestor_custody(info):
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('Untrusted selected ancestor')
+
+
 @contextmanager
-def retained_ancestor_selection(path):
+def retained_ancestor_selection(path, *, authenticate=False):
     """Retain directory custody for metadata-only checks at mutation boundaries."""
     path = Path(path)
     ancestors = []
     try:
         for parent in path.parents:
             directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            ancestors.append((parent, directory, os.fstat(directory)))
+            info = os.fstat(directory)
+            ancestors.append((parent, directory, info))
+            if authenticate:authenticate_ancestor_custody(info)
         def verify():
-            custody = ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink')
+            custody = ('st_dev','st_ino','st_uid','st_gid','st_mode')
             for parent, directory, original in ancestors:
                 retained = os.fstat(directory)
                 canonical = parent.lstat()
@@ -503,66 +514,69 @@ def verify_owned_drain(fd, path, token, canonical_owned):
         raise ValueError('Owned drain changed during token read')
 
 
-def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False, lock_bound=None, release_fence=None, publication_fence=None):
+def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False, lock_bound=None, release_fence=None, publication_fence=None, root_custody=False):
     """Run under the existing lock; failures retain the protective owned drain."""
     import fcntl
     if not isinstance(token, str) or not re.fullmatch('[a-zA-Z0-9_-]{1,128}', token):
         raise ValueError('Invalid update token')
     lock_path, drain_path = Path(lock_path), Path(drain_path)
-    lock = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
-    drain = None
-    try:
-        original = os.fstat(lock)
-        if (not stat.S_ISREG(original.st_mode) or original.st_nlink != 1
-                or original.st_uid != os.geteuid()):
-            raise ValueError('Untrusted build lock')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        current = lock_path.lstat()
-        if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
-            raise ValueError('Build lock replaced')
-        def canonical_owned():
-            current = lock_path.lstat()
-            if ((current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
-                    or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
-                    or current.st_uid != os.geteuid() or current.st_mode & 0o022):
-                raise ValueError('Canonical build lock ownership lost')
-        if lock_bound is not None:lock_bound(canonical_owned)
-        def before_publish():
-            canonical_owned()
-            if before_drain is not None:before_drain()
-            canonical_owned()
-            if publication_fence is not None:publication_fence()
-        before_publish()
-        drain = publish_owned_drain(drain_path, token, before_publish=before_publish)
-        raw = token.encode('ascii')
-        directory = os.open(drain_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    with retained_ancestor_selection(lock_path, authenticate=root_custody) as verify_lock_ancestors, retained_ancestor_selection(drain_path, authenticate=root_custody) as verify_drain_ancestors:
+        lock = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        drain = None
         try:
-            os.fsync(directory)
-            canonical_owned()
-            result = action()
-            canonical_owned()
-            verify_owned_drain(drain, drain_path, token, canonical_owned)
-            if before_release is not None:
+            original = os.fstat(lock)
+            if (not stat.S_ISREG(original.st_mode) or original.st_nlink != 1
+                    or original.st_uid != os.geteuid()):
+                raise ValueError('Untrusted build lock')
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            current = lock_path.lstat()
+            if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+                raise ValueError('Build lock replaced')
+            def canonical_owned():
+                verify_lock_ancestors()
+                verify_drain_ancestors()
+                current = lock_path.lstat()
+                if ((current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+                        or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                        or current.st_uid != os.geteuid() or current.st_mode & 0o022):
+                    raise ValueError('Canonical build lock ownership lost')
+            if lock_bound is not None:lock_bound(canonical_owned)
+            def before_publish():
                 canonical_owned()
-                before_release(result)
+                if before_drain is not None:before_drain()
                 canonical_owned()
-            verify_owned_drain(drain, drain_path, token, canonical_owned)
-            if not keep_drain:
-                if release_fence is not None:release_fence()
-                os.unlink(drain_path)
-                try:os.fsync(directory)
-                except BaseException as error:raise CommittedReleaseError(result) from error
-            return result
+                if publication_fence is not None:publication_fence()
+            before_publish()
+            drain = publish_owned_drain(drain_path, token, before_publish=before_publish)
+            raw = token.encode('ascii')
+            directory = os.open(drain_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(directory)
+                canonical_owned()
+                result = action()
+                canonical_owned()
+                verify_owned_drain(drain, drain_path, token, canonical_owned)
+                if before_release is not None:
+                    canonical_owned()
+                    before_release(result)
+                    canonical_owned()
+                verify_owned_drain(drain, drain_path, token, canonical_owned)
+                if not keep_drain:
+                    if release_fence is not None:release_fence()
+                    os.unlink(drain_path)
+                    try:os.fsync(directory)
+                    except BaseException as error:raise CommittedReleaseError(result) from error
+                return result
+            finally:
+                os.close(directory)
         finally:
-            os.close(directory)
-    finally:
-        if drain is not None:
-            os.close(drain)
-        os.close(lock)
+            if drain is not None:
+                os.close(drain)
+            os.close(lock)
 
 
 
-def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failure=None, commit=None, release=True, lock_bound=None, release_fence=None):
+def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failure=None, commit=None, release=True, lock_bound=None, release_fence=None, root_custody=False):
     """Finish under the existing lock; delete only the unchanged owned drain.
 
     The root caller verifies canonical paths and supplies fresh state checks.
@@ -572,57 +586,60 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
     if not isinstance(token, str) or not re.fullmatch('[a-zA-Z0-9_-]{1,128}', token):
         raise ValueError('Invalid finish token')
     lock_path, drain_path = Path(lock_path), Path(drain_path)
-    lock = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
-    drain = directory = None
-    try:
-        original = os.fstat(lock)
-        if (not stat.S_ISREG(original.st_mode) or original.st_nlink != 1
-                or original.st_uid != os.geteuid() or original.st_mode & 0o022):
-            raise ValueError('Untrusted build lock')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        drain = os.open(drain_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        owned = os.fstat(drain)
-        if (not stat.S_ISREG(owned.st_mode) or owned.st_nlink != 1
-                or owned.st_uid != os.geteuid() or owned.st_mode & 0o077):
-            raise ValueError('Untrusted owned drain')
-        directory = os.open(drain_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        def canonical_owned():
-            current = lock_path.lstat()
-            if ((current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
-                    or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
-                    or current.st_uid != os.geteuid() or current.st_mode & 0o022):
-                raise ValueError('Canonical build lock ownership lost')
-        if lock_bound is not None:lock_bound(canonical_owned)
-        def still_owned():
-            verify_owned_drain(drain, drain_path, token, canonical_owned)
-        still_owned()
-        check()
-        still_owned()
-        released = False
+    with retained_ancestor_selection(lock_path, authenticate=root_custody) as verify_lock_ancestors, retained_ancestor_selection(drain_path, authenticate=root_custody) as verify_drain_ancestors:
+        lock = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        drain = directory = None
         try:
-            result = action()
+            original = os.fstat(lock)
+            if (not stat.S_ISREG(original.st_mode) or original.st_nlink != 1
+                    or original.st_uid != os.geteuid() or original.st_mode & 0o022):
+                raise ValueError('Untrusted build lock')
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            drain = os.open(drain_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            owned = os.fstat(drain)
+            if (not stat.S_ISREG(owned.st_mode) or owned.st_nlink != 1
+                    or owned.st_uid != os.geteuid() or owned.st_mode & 0o077):
+                raise ValueError('Untrusted owned drain')
+            directory = os.open(drain_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            def canonical_owned():
+                verify_lock_ancestors()
+                verify_drain_ancestors()
+                current = lock_path.lstat()
+                if ((current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+                        or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                        or current.st_uid != os.geteuid() or current.st_mode & 0o022):
+                    raise ValueError('Canonical build lock ownership lost')
+            if lock_bound is not None:lock_bound(canonical_owned)
+            def still_owned():
+                verify_owned_drain(drain, drain_path, token, canonical_owned)
             still_owned()
             check()
             still_owned()
-            if commit is not None:
-                commit()
-            still_owned()
-            if release:
-                if release_fence is not None:release_fence()
-                os.unlink(drain_path)
-                released = True
-                try:os.fsync(directory)
-                except BaseException as error:raise CommittedReleaseError(result) from error
-            return result
-        except BaseException as error:
-            if on_failure is not None and not released:
-                canonical_owned()
-                on_failure(error, canonical_owned)
-            raise
-    finally:
-        if directory is not None:os.close(directory)
-        if drain is not None:os.close(drain)
-        os.close(lock)
+            released = False
+            try:
+                result = action()
+                still_owned()
+                check()
+                still_owned()
+                if commit is not None:
+                    commit()
+                still_owned()
+                if release:
+                    if release_fence is not None:release_fence()
+                    os.unlink(drain_path)
+                    released = True
+                    try:os.fsync(directory)
+                    except BaseException as error:raise CommittedReleaseError(result) from error
+                return result
+            except BaseException as error:
+                if on_failure is not None and not released:
+                    canonical_owned()
+                    on_failure(error, canonical_owned)
+                raise
+        finally:
+            if directory is not None:os.close(directory)
+            if drain is not None:os.close(drain)
+            os.close(lock)
 
 
 def check_snapshot(plan, snapshot, *, owned_drain=False):
@@ -899,7 +916,7 @@ def set_verified_launcher_mode(path, expected, mode, *, before_change=None, fres
     if mode not in (0o644, 0o755) or expected['mode'] not in (0o644, 0o755):
         raise ValueError('Unexpected launcher execution mode')
     path = Path(path)
-    with retained_ancestor_selection(path) as verify_ancestors:
+    with retained_ancestor_selection(path, authenticate=True) as verify_ancestors:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             info = os.fstat(fd)
@@ -1190,7 +1207,7 @@ def apply_update(plan):
                 observed_at=time.time(), error_type=type(error).__name__), before_publish=lock_guard, selected_history=journal_history[0])
             raise
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                          plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True, lock_bound=bind_lock, publication_fence=lambda:validate_plan(plan,time.time()))
+                          plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True, lock_bound=bind_lock, root_custody=True, publication_fence=lambda:validate_plan(plan,time.time()))
 
 
 def installed_history(plan, client_pin, *, recovery=False, with_history=False):
@@ -1304,7 +1321,7 @@ def finish_update(plan, client_pin):
 
     result = finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
                                 plan['nonce'], check, reopen, on_failure=hold_failure, commit=commit_release,
-                                lock_bound=bind_lock, release_fence=lambda:validate_plan(plan,time.time()))
+                                lock_bound=bind_lock, root_custody=True, release_fence=lambda:validate_plan(plan,time.time()))
     # The durable release decision was recorded under EX. The returned receipt
     # observes actual drain removal; do not append outside the protected lock.
     return result
@@ -1458,9 +1475,9 @@ def complete_committed_recovery(plan, client_pin):
     # Keep the drain on any failure; no lease is invented or cleared.
     if raw:
         return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                                  plan['nonce'], check, complete, commit=publish_success, lock_bound=bind_lock, release_fence=lambda:validate_runtime_observation(plan,time.time()))
+                                  plan['nonce'], check, complete, commit=publish_success, lock_bound=bind_lock, root_custody=True, release_fence=lambda:validate_runtime_observation(plan,time.time()))
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining', plan['nonce'],
-                          complete, before_drain=check, before_release=lambda result:(check(), publish_success()), lock_bound=bind_lock, release_fence=lambda:validate_runtime_observation(plan,time.time()), publication_fence=lambda:validate_runtime_observation(plan,time.time()))
+                          complete, before_drain=check, before_release=lambda result:(check(), publish_success()), lock_bound=bind_lock, root_custody=True, release_fence=lambda:validate_runtime_observation(plan,time.time()), publication_fence=lambda:validate_runtime_observation(plan,time.time()))
 
 
 def recover_finish_update(plan, client_pin):
@@ -1536,9 +1553,9 @@ def recover_finish_update(plan, client_pin):
 
     if existing_drain:
         return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                                  plan['nonce'], check, restore_hold, release=False, lock_bound=bind_lock)
+                                  plan['nonce'], check, restore_hold, release=False, lock_bound=bind_lock, root_custody=True)
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining', plan['nonce'],
-                          restore_hold, before_drain=lambda:check(owned=False), keep_drain=True, lock_bound=bind_lock, publication_fence=lambda:validate_plan(plan,time.time()))
+                          restore_hold, before_drain=lambda:check(owned=False), keep_drain=True, lock_bound=bind_lock, root_custody=True, publication_fence=lambda:validate_plan(plan,time.time()))
 
 
 def plan_from_snapshot(source_main, assets, snapshot, observed_at, nonce, *, owned_drain=False):

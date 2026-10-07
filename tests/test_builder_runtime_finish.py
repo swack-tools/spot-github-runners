@@ -175,6 +175,10 @@ class InactiveServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):runtime.parse_recovery_service_state(raw.replace('running','start'))
 
 class OrdinaryFinishClockTests(unittest.TestCase):
+    def setUp(self):
+        custody = patch.object(runtime,'authenticate_ancestor_custody')
+        custody.start();self.addCleanup(custody.stop)
+
     def exercise(self,expire_at,*,recovery=False):
         _,plan,_,pin=InstalledHistoryTests().fixture();plan['observed_at']=time.time();clock=[plan['observed_at']];opened=[];stages=[]
         with tempfile.TemporaryDirectory() as directory:
@@ -250,6 +254,11 @@ class OrdinaryFinishClockTests(unittest.TestCase):
     def test_pending_directory_fsync_expiry_keeps_drain(self):self.exercise('pending-fsync')
 
 class CommittedFlowTests(unittest.TestCase):
+    def setUp(self):
+        # Synthetic root-service flows use real temporary files under user ancestors.
+        custody = patch.object(runtime,'authenticate_ancestor_custody')
+        custody.start();self.addCleanup(custody.stop)
+
     def exercise(self,*,failure=None,existing=False,already_running=False,missing_lock=False,held=False):
         _,_,plan,pin=InstalledHistoryTests().reboot_fixture();plan['observed_at']=time.time()
         if failure=='missing-schema':plan.pop('service_state')
@@ -526,6 +535,10 @@ class FinishCliTests(unittest.TestCase):
         self.assertIn('not allowed with argument',result.stderr)
 
 class LauncherRestoreTests(unittest.TestCase):
+    def setUp(self):
+        custody = patch.object(runtime,'authenticate_ancestor_custody')
+        custody.start();self.addCleanup(custody.stop)
+
     def state(self,path):
         info=path.stat()
         return dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),mode=info.st_mode&0o777,uid=info.st_uid,gid=info.st_gid,device=info.st_dev,inode=info.st_ino)
@@ -718,6 +731,12 @@ class InstalledHistoryTests(unittest.TestCase):
         try:result=self.reboot_verify(original,journal,observation,pin)
         except ValueError as error:self.fail('Durable checkpoint cannot resume drain release: '+str(error))
         self.assertEqual(result,pin)
+
+    def test_committed_checkpoint_survives_another_reboot(self):
+        original,journal,observation,pin=self.reboot_fixture()
+        journal.append(dict(stage='COMMITTED_REBOOT_RECOVERED',files=observation['before'],client_launcher_sha256=pin,qualification_ready=False,boot=observation['boot'],service_pid=50,service_startticks=60))
+        observation['boot']='11111111-2222-3333-4444-555555555555'
+        self.assertEqual(self.reboot_verify(original,journal,observation,pin),pin)
 
     def test_committed_reboot_accepts_held_postcommit_failure(self):
         original,journal,observation,pin=self.reboot_fixture()
@@ -974,3 +993,33 @@ class OwnedFinishTests(unittest.TestCase):
             self.assertFalse(drain.exists());self.assertEqual(list(lock.parent.iterdir()),[lock])
 
 if __name__=='__main__':unittest.main()
+
+
+class InitialAncestorCustodyTests(unittest.TestCase):
+    def test_only_root_nonwritable_directory_is_trusted(self):
+        from types import SimpleNamespace
+        import stat
+        for uid, mode, allowed in ((0,stat.S_IFDIR|0o755,True),(1,stat.S_IFDIR|0o755,False),(0,stat.S_IFDIR|0o777,False),(0,stat.S_IFREG|0o644,False)):
+            with self.subTest(uid=uid,mode=mode):
+                info=SimpleNamespace(st_uid=uid,st_mode=mode)
+                if allowed:runtime.authenticate_ancestor_custody(info)
+                else:
+                    with self.assertRaises(ValueError):runtime.authenticate_ancestor_custody(info)
+
+    def test_token_read_directory_change_retains_owned_drain(self):
+        for existing in (True,False):
+            with tempfile.TemporaryDirectory() as directory:
+                lock=Path(directory).resolve()/'lock';lock.touch();drain=lock.parent/'drain'
+                if existing:drain.write_text('owned');drain.chmod(0o600)
+                read=os.read;armed=[False]
+                def action():armed[0]=True;return 1
+                def changed(fd,size):
+                    raw=read(fd,size)
+                    if armed[0] and size==129:lock.parent.chmod(0o777)
+                    return raw
+                try:
+                    with patch.object(runtime.os,'read',side_effect=changed),self.assertRaises(ValueError):
+                        if existing:runtime.finish_owned_drain(lock,drain,'owned',lambda:None,action)
+                        else:runtime.drained_update(lock,drain,'owned',action)
+                    self.assertEqual(drain.read_text(),'owned')
+                finally:lock.parent.chmod(0o700)
