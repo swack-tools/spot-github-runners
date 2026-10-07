@@ -1063,5 +1063,21 @@ class InitialAncestorCustodyTests(unittest.TestCase):
                     self.assertEqual(drain.read_text(),'owned')
                 finally:lock.parent.chmod(0o700)
 
+class PendingMarkerIdentityTests(unittest.TestCase):
+    def test_original_marker_remains_valid_across_reboots(self):
+        original,_,observation,_=InstalledHistoryTests().reboot_fixture()
+        marker=dict(nonce=original['nonce'],boot=original['boot'],source_main=original['source_main'])
+        for boot in (observation['boot'],'11111111-2222-3333-4444-555555555555'):
+            self.assertEqual(runtime.validate_pending_marker(marker,boot,committed_original=original),original['nonce'])
+            with self.assertRaises(ValueError):runtime.validate_pending_marker(marker,boot)
+
+    def test_foreign_recovery_marker_is_refused(self):
+        original,_,observation,_=InstalledHistoryTests().reboot_fixture()
+        marker=dict(nonce=original['nonce'],boot=original['boot'],source_main=original['source_main'])
+        for field in marker:
+            altered=dict(marker);altered[field]='foreign'
+            with self.subTest(field=field),self.assertRaises(ValueError):runtime.validate_pending_marker(altered,observation['boot'],committed_original=original)
+
+
 if __name__ == '__main__':
     unittest.main()

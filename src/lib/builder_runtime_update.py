@@ -813,6 +813,17 @@ def parse_inactive_service_state(raw):
     return fields
 
 
+def validate_pending_marker(pending, current_boot, *, committed_original=None):
+    if not isinstance(pending, dict):raise ValueError('Invalid pending marker')
+    if committed_original is not None:
+        expected = dict(nonce=committed_original['nonce'], boot=committed_original['boot'],
+                        source_main=committed_original['source_main'])
+        if pending != expected:raise ValueError('Committed marker differs from original update')
+    elif pending.get('boot') != current_boot:
+        raise ValueError('Pending update survived reboot; explicit recovery required')
+    return pending.get('nonce')
+
+
 def live_snapshot(plan, *, committed_original=None):
     """Read fixed host facts, never acquire leases or start containers."""
     config_path = Path('/etc/oxidex-remote-build.json')
@@ -851,14 +862,8 @@ def live_snapshot(plan, *, committed_original=None):
     pending_nonce = None
     if pending_state is not None:
         pending = json.loads(pending_raw)
-        if committed_original is not None:
-            expected_pending = dict(nonce=committed_original['nonce'], boot=committed_original['boot'],
-                                    source_main=committed_original['source_main'])
-            if pending != expected_pending:
-                raise ValueError('Committed reboot marker differs from original update')
-        elif pending.get('boot') != Path('/proc/sys/kernel/random/boot_id').read_text().strip():
-            raise ValueError('Pending update survived reboot; explicit recovery required')
-        pending_nonce = pending.get('nonce')
+        current_boot = None if committed_original is not None else Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        pending_nonce = validate_pending_marker(pending, current_boot, committed_original=committed_original)
     result = dict(
         pending_nonce=pending_nonce,
         upload_processes=uploads,
