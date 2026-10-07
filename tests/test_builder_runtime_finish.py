@@ -119,9 +119,9 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             def sync(fd):
                 real_fsync(fd)
                 if expire_at=='pending-fsync' and not pending.exists():clock[0]=plan['observed_at']+121
-            def restore(path,expected):
+            def restore(path,expected,**kwargs):
                 if expire_at=='require-commit':self.assertIn('FINISH_RELEASE_COMMITTED',stages)
-                opened.append(1);real_restore(launcher,expected)
+                opened.append(1);real_restore(launcher,expected,**kwargs)
             def close(path,**kwargs):closed.append(1);real_close(launcher,**kwargs)
             with ExitStack() as stack:
                 replacements=dict(PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
@@ -200,8 +200,8 @@ class CommittedFlowTests(unittest.TestCase):
             def sync(fd):
                 real_sync(fd)
                 if failure=='pending-expiry' and not pending.exists():clock[0]=plan['observed_at']+121
-            def restore_selected(path,expected):
-                real_restore(launcher,expected)
+            def restore_selected(path,expected,**kwargs):
+                real_restore(launcher,expected,**kwargs)
                 if failure=='marker-replaced':
                     replacement=root/'foreign';replacement.write_text('foreign');replacement.replace(pending)
             def new_transaction(_lock,_drain,*args,**kwargs):return real_new(lock,drain,*args,**kwargs)
@@ -378,6 +378,18 @@ class LauncherRestoreTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode&0o777,0o644)
             self.assertEqual(path.stat().st_ino,expected['inode'])
 
+    def test_permission_fence_runs_after_descriptor_read(self):
+        self.assertIn('before_change',inspect.signature(runtime.restore_launcher_execution).parameters)
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(0o644);expected=self.state(path);read=os.read;clock=[0]
+            def slow_read(*args):
+                raw=read(*args);clock[0]=121;return raw
+            def fence():
+                if clock[0]>120:raise ValueError('expired after read')
+            with patch.object(runtime.os,'read',side_effect=slow_read):
+                with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected,before_change=fence)
+            self.assertEqual(path.stat().st_mode&0o777,0o644)
+
 class InstalledHistoryTests(unittest.TestCase):
     def fixture(self):
         raw=b'bounded synthetic runtime\n';sha=hashlib.sha256(raw).hexdigest()
@@ -523,6 +535,18 @@ class InstalledHistoryTests(unittest.TestCase):
             observation['before']={k:dict(v) for k,v in observation['before'].items()};observation['before'][runtime.LAUNCHER_TARGET]['mode']=mode
             with self.subTest(mode=mode):self.assertEqual(self.reboot_verify(original,journal,observation,pin),pin)
 
+    def test_reheld_finish_retry_preserves_committed_reboot_authority(self):
+        for stage in ('FINISH_START','FINISH_READY_TO_RELEASE'):
+            original,journal,observation,pin=self.reboot_fixture()
+            held={k:dict(v) for k,v in observation['before'].items()};held[runtime.LAUNCHER_TARGET]['mode']=0o644
+            journal.append(dict(stage='FINISH_RECOVERED_HELD',files=held,service_pid=30,service_startticks=40))
+            journal.append(dict(stage=stage,files=held,client_launcher_sha256=pin))
+            observation['before']=held
+            with self.subTest(stage=stage):
+                try:result=self.reboot_verify(original,journal,observation,pin)
+                except ValueError as error:self.fail('Writer retry stage lost authority: '+str(error))
+                self.assertEqual(result,pin)
+
 class OwnedFinishTests(unittest.TestCase):
     def run_finish(self,lock,drain,action,check=lambda:None):
         self.assertTrue(callable(getattr(runtime,'finish_owned_drain',None)), 'Owned finish transaction is missing')
@@ -627,5 +651,13 @@ class OwnedFinishTests(unittest.TestCase):
             lock,drain=self.fixture(directory)
             self.assertEqual(runtime.finish_owned_drain(lock,drain,'owned',lambda:None,lambda:3,release=False),3)
             self.assertEqual(drain.read_text(),'owned')
+
+    def test_lost_canonical_lock_refuses_failure_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock,drain=self.fixture(directory);called=[]
+            def action():
+                replacement=lock.parent/'replacement';replacement.touch();replacement.replace(lock)
+            with self.assertRaises(ValueError):runtime.finish_owned_drain(lock,drain,'owned',lambda:None,action,on_failure=lambda error:called.append('mutated'))
+            self.assertEqual(called,[]);self.assertEqual(drain.read_text(),'owned')
 
 if __name__=='__main__':unittest.main()

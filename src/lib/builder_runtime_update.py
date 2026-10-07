@@ -144,7 +144,7 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
         raise ValueError('Missing durable release decision')
     final = journal[-1]
     comparison_files = observation['before']
-    transitions = {'HOLD_FINISH_RECOVERY', 'HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT', 'FINISH_RECOVERY_START', 'FINISH_RECOVERED_HELD'}
+    transitions = {'HOLD_FINISH_RECOVERY', 'HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT', 'FINISH_RECOVERY_START', 'FINISH_RECOVERED_HELD', 'FINISH_START', 'FINISH_READY_TO_RELEASE'}
     if final.get('stage') in transitions:
         indices = [index for index, row in enumerate(journal)
                    if isinstance(row, dict) and row.get('stage') == 'FINISH_RELEASE_COMMITTED']
@@ -155,7 +155,10 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
         if not isinstance(selected, dict) or selected.get('mode') not in (0o644, 0o755):
             raise ValueError('Unknown committed launcher permission state')
         for row in journal[indices[-1]+1:]:
-            if row['stage'] == 'FINISH_RECOVERED_HELD':
+            if row['stage'] == 'FINISH_START' and row.get('client_launcher_sha256') != client_pin:
+                raise ValueError('Finish retry selected a different client')
+            if row['stage'] in ('FINISH_RECOVERED_HELD', 'FINISH_READY_TO_RELEASE'):
+
                 recovered = row.get('files')
                 if (not isinstance(recovered, dict) or set(recovered) != set(comparison_files)
                         or not isinstance(recovered.get(LAUNCHER_TARGET), dict)
@@ -468,6 +471,12 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
                 or owned.st_uid != os.geteuid() or owned.st_mode & 0o077):
             raise ValueError('Untrusted owned drain')
         directory = os.open(drain_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        def canonical_owned():
+            current = lock_path.lstat()
+            if ((current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+                    or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                    or current.st_uid != os.geteuid() or current.st_mode & 0o022):
+                raise ValueError('Canonical build lock ownership lost')
         def still_owned():
             current_lock = lock_path.lstat()
             current = drain_path.lstat()
@@ -496,6 +505,7 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
             return result
         except BaseException as error:
             if on_failure is not None:
+                canonical_owned()
                 on_failure(error)
             raise
     finally:
@@ -745,15 +755,16 @@ def live_snapshot(plan, *, committed_original=None):
 
 
 
-def close_launcher_execution(path, *, expected=None):
+def close_launcher_execution(path, *, expected=None, before_change=None):
     if expected is not None:
-        return set_verified_launcher_mode(path, expected, 0o644)
+        return set_verified_launcher_mode(path, expected, 0o644, before_change=before_change)
     path = Path(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise ValueError('Launcher is not a single regular file')
+        if before_change is not None:before_change()
         os.fchmod(fd, 0o644)
         os.fsync(fd)
     finally:
@@ -766,14 +777,14 @@ def close_launcher_execution(path, *, expected=None):
 
 
 
-def restore_launcher_execution(path, expected):
+def restore_launcher_execution(path, expected, *, before_change=None):
     """Restore execution only on the still-held, selected inode and bytes."""
     if expected['mode'] != 0o644:
         raise ValueError('Expected launcher must be held')
-    return set_verified_launcher_mode(path, expected, 0o755)
+    return set_verified_launcher_mode(path, expected, 0o755, before_change=before_change)
 
 
-def set_verified_launcher_mode(path, expected, mode):
+def set_verified_launcher_mode(path, expected, mode, *, before_change=None):
     if mode not in (0o644, 0o755) or expected['mode'] not in (0o644, 0o755):
         raise ValueError('Unexpected launcher execution mode')
     path = Path(path)
@@ -789,6 +800,7 @@ def set_verified_launcher_mode(path, expected, mode):
                 or info.st_uid != expected['uid']
                 or hashlib.sha256(os.read(fd, 262145)).hexdigest() != expected['sha256']):
             raise ValueError('Held launcher changed before restoring execution')
+        if before_change is not None:before_change()
         os.fchmod(fd, mode)
         os.fsync(fd)
     finally:
@@ -924,7 +936,8 @@ def apply_update(plan):
             # transition is the first live cutover, including the old launcher.
             mutation_idle_fence(plan)
             file_mutation_fence(plan, LAUNCHER_TARGET)
-            close_launcher_execution(LAUNCHER_TARGET)
+            close_launcher_execution(LAUNCHER_TARGET, expected=plan['before'][LAUNCHER_TARGET],
+                                     before_change=lambda:validate_plan(plan, time.time()))
             held_launcher = root_file_state(LAUNCHER_TARGET)
             intended = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
             if held_launcher != intended:
@@ -1090,7 +1103,8 @@ def finish_update(plan, client_pin):
         record('FINISH_RELEASE_COMMITTED', files=release_files, observed_files=expected['before'],
                client_launcher_sha256=client_pin, qualification_ready=False)
         validate_plan(plan, time.time())
-        restore_launcher_execution(LAUNCHER_TARGET, plan['before'][LAUNCHER_TARGET])
+        restore_launcher_execution(LAUNCHER_TARGET, plan['before'][LAUNCHER_TARGET],
+                                   before_change=lambda:validate_plan(plan, time.time()))
         phase['opened'] = True
         expected['before'] = release_files
         check()
@@ -1214,7 +1228,8 @@ def complete_committed_recovery(plan, client_pin):
             append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_LAUNCHER_RESTORE_INTENT',
                 observed_at=time.time(), launcher=selected))
             validate_runtime_observation(plan, time.time())
-            restore_launcher_execution(LAUNCHER_TARGET, selected)
+            restore_launcher_execution(LAUNCHER_TARGET, selected,
+                                       before_change=lambda:validate_runtime_observation(plan, time.time()))
             released_files[LAUNCHER_TARGET] = dict(selected, mode=0o755)
         # The earlier fsynced release decision authorizes this exact marker
         # removal. Preserve that historical journal until service proof succeeds.
@@ -1302,7 +1317,8 @@ def recover_finish_update(plan, client_pin):
                launcher=plan['before'][LAUNCHER_TARGET])
         validate_plan(plan, time.time())
         phase['started'] = True
-        close_launcher_execution(LAUNCHER_TARGET, expected=plan['before'][LAUNCHER_TARGET])
+        close_launcher_execution(LAUNCHER_TARGET, expected=plan['before'][LAUNCHER_TARGET],
+                                 before_change=lambda:validate_plan(plan, time.time()))
         expected['before'][LAUNCHER_TARGET] = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
         check()
         if root_file_state(CURRENT_BOOT_PERMIT) is None:
