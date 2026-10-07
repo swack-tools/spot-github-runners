@@ -414,6 +414,11 @@ def mkdir_exact(path, mode):
         os.fsync(fd)
     finally:
         os.close(fd)
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
 
 
 def trusted_directory(path, *, create=False):
