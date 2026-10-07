@@ -595,6 +595,14 @@ class LauncherRestoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected)
             self.assertEqual(path.stat().st_mode&0o777,0o644)
 
+    def test_permission_ancestor_change_never_grants_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(0o644);expected=self.state(path)
+            try:
+                with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected,before_change=lambda:path.parent.chmod(0o777))
+                self.assertEqual(path.stat().st_mode&0o777,0o644)
+            finally:path.parent.chmod(0o700)
+
     def test_permission_callback_custody_change_is_not_adopted(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(0o644);expected=self.state(path)

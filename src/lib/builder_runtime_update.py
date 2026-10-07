@@ -313,20 +313,14 @@ def append_journal_record(path, record, *, before_publish=None, freshness=None, 
 
 
 @contextmanager
-def retained_file_selection(path, expected, read_state):
-    """Read before authority checks; retain identity for metadata-only revalidation."""
+def retained_ancestor_selection(path):
+    """Retain directory custody for metadata-only checks at mutation boundaries."""
     path = Path(path)
-    fd = None
     ancestors = []
     try:
         for parent in path.parents:
             directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             ancestors.append((parent, directory, os.fstat(directory)))
-        if expected is not None:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            selected = os.fstat(fd)
-        if read_state() != expected:
-            raise ValueError('Selected file changed before authority check')
         def verify():
             custody = ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink')
             for parent, directory, original in ancestors:
@@ -335,22 +329,42 @@ def retained_file_selection(path, expected, read_state):
                 if (any(getattr(original,key) != getattr(retained,key) for key in custody)
                         or any(getattr(retained,key) != getattr(canonical,key) for key in custody)):
                     raise ValueError('Selected ancestor custody changed')
-            if fd is None:
-                try:path.lstat()
-                except FileNotFoundError:return
-                raise ValueError('Absent selected file appeared')
-            after = os.fstat(fd)
-            current = path.lstat()
-            fields = ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink',
-                      'st_size','st_mtime_ns','st_ctime_ns')
-            if (any(getattr(selected,key) != getattr(after,key) for key in fields)
-                    or any(getattr(after,key) != getattr(current,key) for key in fields)):
-                raise ValueError('Selected descriptor or canonical file changed')
         verify()
         yield verify
     finally:
-        if fd is not None:os.close(fd)
         for _, directory, _ in reversed(ancestors):os.close(directory)
+
+
+@contextmanager
+def retained_file_selection(path, expected, read_state):
+    """Read before authority checks; retain identity for metadata-only revalidation."""
+    path = Path(path)
+    with retained_ancestor_selection(path) as verify_ancestors:
+        fd = None
+        try:
+            if expected is not None:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                selected = os.fstat(fd)
+            if read_state() != expected:
+                raise ValueError('Selected file changed before authority check')
+            def verify():
+                verify_ancestors()
+                if fd is None:
+                    try:path.lstat()
+                    except FileNotFoundError:return
+                    raise ValueError('Absent selected file appeared')
+                after = os.fstat(fd)
+                current = path.lstat()
+                fields = ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink',
+                          'st_size','st_mtime_ns','st_ctime_ns')
+                if (any(getattr(selected,key) != getattr(after,key) for key in fields)
+                        or any(getattr(after,key) != getattr(current,key) for key in fields)):
+                    raise ValueError('Selected descriptor or canonical file changed')
+            verify()
+            yield verify
+        finally:
+            if fd is not None:os.close(fd)
+
 
 
 def root_file_read(path):
@@ -885,32 +899,34 @@ def set_verified_launcher_mode(path, expected, mode, *, before_change=None, fres
     if mode not in (0o644, 0o755) or expected['mode'] not in (0o644, 0o755):
         raise ValueError('Unexpected launcher execution mode')
     path = Path(path)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        info = os.fstat(fd)
-        current = path.lstat()
-        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                or info.st_uid != os.geteuid() or info.st_size > 262144
-                or stat.S_IMODE(info.st_mode) != expected['mode']
-                or (info.st_dev, info.st_ino) != (expected['device'], expected['inode'])
-                or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
-                or info.st_uid != expected['uid'] or info.st_gid != expected['gid']
-                or hashlib.sha256(os.read(fd, 262145)).hexdigest() != expected['sha256']):
-            raise ValueError('Held launcher changed before restoring execution')
-        if before_change is not None:before_change()
-        canonical = path.lstat();after = os.fstat(fd)
-        if ((after.st_dev, after.st_ino) != (canonical.st_dev, canonical.st_ino)
-                or (info.st_uid, info.st_gid, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-                   != (after.st_uid, after.st_gid, after.st_mode, after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
-            raise ValueError('Launcher custody changed during descriptor verification')
-        if freshness is not None:freshness()
-        os.fchmod(fd, mode)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:os.fsync(parent)
-    finally:os.close(parent)
+    with retained_ancestor_selection(path) as verify_ancestors:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            current = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or info.st_size > 262144
+                    or stat.S_IMODE(info.st_mode) != expected['mode']
+                    or (info.st_dev, info.st_ino) != (expected['device'], expected['inode'])
+                    or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+                    or info.st_uid != expected['uid'] or info.st_gid != expected['gid']
+                    or hashlib.sha256(os.read(fd, 262145)).hexdigest() != expected['sha256']):
+                raise ValueError('Held launcher changed before restoring execution')
+            if before_change is not None:before_change()
+            canonical = path.lstat();after = os.fstat(fd)
+            if ((after.st_dev, after.st_ino) != (canonical.st_dev, canonical.st_ino)
+                    or (info.st_uid, info.st_gid, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                       != (after.st_uid, after.st_gid, after.st_mode, after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                raise ValueError('Launcher custody changed during descriptor verification')
+            verify_ancestors()
+            if freshness is not None:freshness()
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:os.fsync(parent)
+        finally:os.close(parent)
 
 
 def mkdir_exact(path, mode):
