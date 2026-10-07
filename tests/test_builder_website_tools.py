@@ -16,7 +16,7 @@ class WebsiteToolsTests(unittest.TestCase):
         return dict(node='v24.21.0', playwright='1.63.0', chromium_revision='1243',
                     chromium_version='153.0.8010.12', browser_path='/opt/playwright-browsers',
                     uid=1001, executable_readable=True, libraries_available=True,
-                    root_owned_runtime=True)
+                    root_owned_runtime=True, runtime_path=PROBE['WEBSITE_PATH'])
 
     def test_rejects_version_path_identity_and_render_mismatch(self):
         self.assertEqual(PROBE['validate_website_tools'](self.record()), self.record())
@@ -49,6 +49,15 @@ class WebsiteToolsTests(unittest.TestCase):
                 patch('subprocess.check_output', return_value=json.dumps(self.record())) as run:
             self.assertEqual(PROBE['website_tools'](), self.record())
             self.assertEqual(run.call_args.kwargs['timeout'], 15)
+            self.assertEqual(run.call_args.kwargs['env']['PATH'], PROBE['WEBSITE_PATH'])
+
+    def test_website_children_do_not_inherit_shadow_path_or_node_options(self):
+        import os
+        with patch.dict(os.environ, {'PATH': '/home/runner/.cargo/bin:/usr/bin',
+                                     'NODE_OPTIONS': '--require=/target/untrusted.js'}):
+            env = PROBE['website_environment']()
+            self.assertEqual(env['PATH'], PROBE['WEBSITE_PATH'])
+            self.assertNotIn('NODE_OPTIONS', env)
 
     def test_unowned_runtime_refused_before_node_execution(self):
         def refuse():
