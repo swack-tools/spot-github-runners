@@ -418,7 +418,7 @@ def verify_owned_drain(fd, path, token, canonical_owned):
     canonical_owned()
 
 
-def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False):
+def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False, lock_bound=None, release_fence=None):
     """Run under the existing lock; failures retain the protective owned drain."""
     import fcntl
     if not isinstance(token, str) or not re.fullmatch('[a-zA-Z0-9_-]{1,128}', token):
@@ -441,6 +441,7 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
                     or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
                     or current.st_uid != os.geteuid() or current.st_mode & 0o022):
                 raise ValueError('Canonical build lock ownership lost')
+        if lock_bound is not None:lock_bound(canonical_owned)
         def before_publish():
             canonical_owned()
             if before_drain is not None:before_drain()
@@ -462,6 +463,7 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
             verify_owned_drain(drain, drain_path, token, canonical_owned)
             if not keep_drain:
                 canonical_owned()
+                if release_fence is not None:release_fence()
                 os.unlink(drain_path)
                 os.fsync(directory)
             return result
@@ -474,7 +476,7 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
 
 
 
-def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failure=None, commit=None, release=True):
+def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failure=None, commit=None, release=True, lock_bound=None, release_fence=None):
     """Finish under the existing lock; delete only the unchanged owned drain.
 
     The root caller verifies canonical paths and supplies fresh state checks.
@@ -504,6 +506,7 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
                     or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
                     or current.st_uid != os.geteuid() or current.st_mode & 0o022):
                 raise ValueError('Canonical build lock ownership lost')
+        if lock_bound is not None:lock_bound(canonical_owned)
         def still_owned():
             verify_owned_drain(drain, drain_path, token, canonical_owned)
         still_owned()
@@ -518,6 +521,8 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
                 commit()
             still_owned()
             if release:
+                canonical_owned()
+                if release_fence is not None:release_fence()
                 os.unlink(drain_path)
                 os.fsync(directory)
             return result
@@ -931,10 +936,21 @@ def verify_boot_hold(plan):
         raise ValueError('Persistent boot hold or current-boot permit differs')
 
 
+def transaction_lock_guard():
+    """Bind the existing EX authority; unbound mutation checks fail closed."""
+    holder = []
+    def bind(check):holder[:] = [check]
+    def verify():
+        if not holder:raise ValueError('Transaction lock authority is not bound')
+        holder[0]()
+    return verify, bind
+
+
 def apply_update(plan):
     """Replace only approved runtime files after actual idle-state confirmation."""
     import json
     import time
+    lock_guard, bind_lock = transaction_lock_guard()
     assets = validate_plan(plan, time.time())
     backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
     trusted_directory(backup.parent)
@@ -952,7 +968,8 @@ def apply_update(plan):
         journal = backup / 'journal.jsonl'
 
         def record(stage, **facts):
-            append_journal_record(journal, dict(stage=stage, observed_at=time.time(), **facts))
+            lock_guard()
+            append_journal_record(journal, dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard)
 
         record('BACKUP_START')
         try:
@@ -968,7 +985,7 @@ def apply_update(plan):
             mutation_idle_fence(plan)
             file_mutation_fence(plan, LAUNCHER_TARGET)
             close_launcher_execution(LAUNCHER_TARGET, expected=plan['before'][LAUNCHER_TARGET],
-                                     before_change=lambda:validate_plan(plan, time.time()))
+                                     before_change=lambda:(lock_guard(),validate_plan(plan, time.time())))
             held_launcher = root_file_state(LAUNCHER_TARGET)
             intended = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
             if held_launcher != intended:
@@ -986,8 +1003,10 @@ def apply_update(plan):
                 mutation_idle_fence(plan)
                 file_mutation_fence(plan, target, expected_file=expected_file)
                 def before_replace():
+                    lock_guard()
                     mutation_idle_fence(plan)
                     file_mutation_fence(plan, target, expected_file=expected_file)
+                    lock_guard()
                 installed_mode = 0o644 if target == LAUNCHER_TARGET else TARGETS[target]
                 atomic_write(target, assets[target], installed_mode, before_replace=before_replace)
                 record('FILE_REPLACED', target=target,
@@ -1023,6 +1042,7 @@ def apply_update(plan):
             raise
 
     def before_drain():
+        lock_guard()
         snapshot = live_snapshot(plan)
         validate_plan(plan, time.time())
         check_snapshot(plan, snapshot)
@@ -1054,7 +1074,7 @@ def apply_update(plan):
                 observed_at=time.time(), error_type=type(error).__name__))
             raise
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                          plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True)
+                          plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True, lock_bound=bind_lock)
 
 
 def installed_history(plan, client_pin, *, recovery=False):
@@ -1074,6 +1094,7 @@ def finish_update(plan, client_pin):
     """Reopen the verified ordinary route; qualification still needs live proof."""
     import json
     import time
+    lock_guard, bind_lock = transaction_lock_guard()
     validate_plan(plan, time.time())
     backup = installed_history(plan, client_pin)
     expected = dict(plan, before=dict(plan['before']))
@@ -1082,10 +1103,12 @@ def finish_update(plan, client_pin):
     phase = dict(started=False, opened=False, pending=False, permit=False)
 
     def record(stage, *, guard=None, **facts):
-        if guard is not None:guard()
+        guard = guard or lock_guard
+        guard()
         append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=guard)
 
     def check():
+        lock_guard()
         validate_plan(plan, time.time())
         if not phase['started']:
             # Authorization must be reread after acquiring the actual build EX.
@@ -1110,6 +1133,7 @@ def finish_update(plan, client_pin):
         if state is None or root_file_state(path) != state:
             raise ValueError('Finish does not own the selected marker')
         validate_plan(plan, time.time())
+        lock_guard()
         os.unlink(path)
         parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:os.fsync(parent)
@@ -1138,13 +1162,14 @@ def finish_update(plan, client_pin):
                client_launcher_sha256=client_pin, qualification_ready=False)
         validate_plan(plan, time.time())
         restore_launcher_execution(LAUNCHER_TARGET, plan['before'][LAUNCHER_TARGET],
-                                   before_change=lambda:validate_plan(plan, time.time()))
+                                   before_change=lambda:(lock_guard(),validate_plan(plan, time.time())))
         phase['opened'] = True
         expected['before'] = release_files
         check()
         if pending_state is None or root_file_state(PENDING_UPDATE) != pending_state:
             raise ValueError('Persistent marker changed before committed release')
         validate_plan(plan, time.time())
+        lock_guard()
         os.unlink(PENDING_UPDATE)
         parent = os.open(PENDING_UPDATE.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:os.fsync(parent)
@@ -1166,7 +1191,8 @@ def finish_update(plan, client_pin):
         record('HOLD_FINISH_RECOVERY', error_type=type(error).__name__, execution_held=held, guard=canonical_guard)
 
     result = finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                                plan['nonce'], check, reopen, on_failure=hold_failure, commit=commit_release)
+                                plan['nonce'], check, reopen, on_failure=hold_failure, commit=commit_release,
+                                lock_bound=bind_lock, release_fence=lambda:validate_plan(plan,time.time()))
     # The durable release decision was recorded under EX. The returned receipt
     # observes actual drain removal; do not append outside the protected lock.
     return result
@@ -1228,6 +1254,7 @@ def ensure_recovery_lock(path):
 def complete_committed_recovery(plan, client_pin):
     """Complete an explicitly selected durable release after reboot."""
     import time
+    lock_guard, bind_lock = transaction_lock_guard()
     # Fresh capture reads the immutable original records and exact inactive unit.
     current = capture_committed_recovery(plan['nonce'], plan['source_main'], plan['assets'], client_pin)
     validate_runtime_observation(plan, time.time())
@@ -1241,6 +1268,7 @@ def complete_committed_recovery(plan, client_pin):
 
     phase = {'active':None, 'lock_state':None}
     def check():
+        lock_guard()
         if phase['lock_state'] is not None and root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
             raise ValueError('Selected canonical recovery lock changed')
         verify_boot_guard()
@@ -1266,10 +1294,10 @@ def complete_committed_recovery(plan, client_pin):
         selected = plan['before'][LAUNCHER_TARGET]
         if selected['mode'] == 0o644:
             append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_LAUNCHER_RESTORE_INTENT',
-                observed_at=time.time(), launcher=selected))
+                observed_at=time.time(), launcher=selected), before_publish=lock_guard)
             validate_runtime_observation(plan, time.time())
             restore_launcher_execution(LAUNCHER_TARGET, selected,
-                                       before_change=lambda:validate_runtime_observation(plan, time.time()))
+                                       before_change=lambda:(lock_guard(),validate_runtime_observation(plan, time.time())))
             released_files[LAUNCHER_TARGET] = dict(selected, mode=0o755)
         # The earlier fsynced release decision authorizes this exact marker
         # removal. Preserve that historical journal until service proof succeeds.
@@ -1277,6 +1305,7 @@ def complete_committed_recovery(plan, client_pin):
         if root_file_state(PENDING_UPDATE) != pending:
             raise ValueError('Committed pending marker replaced before deletion')
         validate_runtime_observation(plan, time.time())
+        lock_guard()
         if pending is not None:os.unlink(PENDING_UPDATE)
         parent = os.open(PENDING_UPDATE.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:os.fsync(parent)
@@ -1303,7 +1332,7 @@ def complete_committed_recovery(plan, client_pin):
         append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_REBOOT_RECOVERED',
             observed_at=time.time(), boot=plan['boot'], service_pid=active['service_pid'],
             service_startticks=active['service_startticks'], files=active['before'],
-            client_launcher_sha256=client_pin, qualification_ready=False))
+            client_launcher_sha256=client_pin, qualification_ready=False), before_publish=lock_guard)
         validate_runtime_observation(plan, time.time())
 
     # No unrelated launcher needs to recreate the volatile mutex after reboot.
@@ -1314,15 +1343,16 @@ def complete_committed_recovery(plan, client_pin):
     # Keep the drain on any failure; no lease is invented or cleared.
     if raw:
         return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                                  plan['nonce'], check, complete, commit=publish_success)
+                                  plan['nonce'], check, complete, commit=publish_success, lock_bound=bind_lock, release_fence=lambda:validate_runtime_observation(plan,time.time()))
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining', plan['nonce'],
-                          complete, before_drain=check, before_release=lambda result:(check(), publish_success()))
+                          complete, before_drain=check, before_release=lambda result:(check(), publish_success()), lock_bound=bind_lock, release_fence=lambda:validate_runtime_observation(plan,time.time()))
 
 
 def recover_finish_update(plan, client_pin):
     """Return a same-boot interrupted finish to its exact owned held state."""
     import json
     import time
+    lock_guard, bind_lock = transaction_lock_guard()
     validate_plan(plan, time.time())
     backup = installed_history(plan, client_pin, recovery=True)
     expected = dict(plan, before=dict(plan['before']))
@@ -1334,9 +1364,11 @@ def recover_finish_update(plan, client_pin):
     if phase['lock_state'] is None:raise ValueError('Missing same-boot recovery mutex')
 
     def record(stage, **facts):
-        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts))
+        lock_guard()
+        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard)
 
     def check(*, owned=True):
+        lock_guard()
         if root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
             raise ValueError('Canonical same-boot recovery lock changed')
         validate_plan(plan, time.time())
@@ -1368,7 +1400,7 @@ def recover_finish_update(plan, client_pin):
         validate_plan(plan, time.time())
         phase['started'] = True
         close_launcher_execution(LAUNCHER_TARGET, expected=plan['before'][LAUNCHER_TARGET],
-                                 before_change=lambda:validate_plan(plan, time.time()))
+                                 before_change=lambda:(lock_guard(),validate_plan(plan, time.time())))
         expected['before'][LAUNCHER_TARGET] = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
         check()
         if root_file_state(CURRENT_BOOT_PERMIT) is None:
@@ -1385,9 +1417,9 @@ def recover_finish_update(plan, client_pin):
 
     if existing_drain:
         return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                                  plan['nonce'], check, restore_hold, release=False)
+                                  plan['nonce'], check, restore_hold, release=False, lock_bound=bind_lock)
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining', plan['nonce'],
-                          restore_hold, before_drain=lambda:check(owned=False), keep_drain=True)
+                          restore_hold, before_drain=lambda:check(owned=False), keep_drain=True, lock_bound=bind_lock)
 
 
 def plan_from_snapshot(source_main, assets, snapshot, observed_at, nonce, *, owned_drain=False):

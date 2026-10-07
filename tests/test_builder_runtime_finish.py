@@ -113,7 +113,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             def record(path,row,**kwargs):
                 stages.append(row['stage'])
                 if expire_at=='lock-during-hold' and row['stage']=='FINISH_START':raise ValueError('force hold')
-                if expire_at=='lock-during-hold' and row['stage']=='HOLD_FINISH_INTENT':
+                if (expire_at=='lock-during-hold' and row['stage']=='HOLD_FINISH_INTENT') or (expire_at=='lock-during-commit' and row['stage']=='FINISH_RELEASE_COMMITTED'):
                     replacement=root/'replacement';replacement.touch();replacement.replace(lock)
                 if row['stage']==expire_at:clock[0]=plan['observed_at']+121
             def read(path):
@@ -126,7 +126,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                 if expire_at=='pending-fsync' and not pending.exists():clock[0]=plan['observed_at']+121
             def restore(path,expected,**kwargs):
                 if expire_at=='require-commit':self.assertIn('FINISH_RELEASE_COMMITTED',stages)
-                opened.append(1);real_restore(launcher,expected,**kwargs)
+                real_restore(launcher,expected,**kwargs);opened.append(1)
             def close(path,**kwargs):real_close(launcher,**kwargs);closed.append(1)
             with ExitStack() as stack:
                 replacements=dict(PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
@@ -144,7 +144,10 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                 self.assertEqual(drain.read_text(),plan['nonce']);self.assertEqual(launcher.stat().st_mode&0o777,0o644)
                 if expire_at=='permit-read':self.assertTrue(permit.exists())
                 if expire_at=='lock-during-hold':self.assertEqual(closed,[])
+                if expire_at=='lock-during-commit':self.assertEqual(opened,[]);self.assertTrue(pending.exists())
             return closed if recovery else opened
+
+    def test_lost_lock_during_forward_commit_prevents_effects(self):self.exercise('lock-during-commit')
 
     def test_lost_lock_during_hold_publication_prevents_chmod(self):self.exercise('lock-during-hold')
 
@@ -717,5 +720,16 @@ class OwnedFinishTests(unittest.TestCase):
                         else:runtime.drained_update(lock,drain,'owned',action)
                 self.assertTrue(drain.exists(),'Foreign drain was deleted')
                 if drain.exists():self.assertEqual(drain.read_text(),'foreign')
+
+    def test_final_token_read_expiry_keeps_owned_drain(self):
+        self.assertIn('release_fence',inspect.signature(runtime.finish_owned_drain).parameters)
+        with tempfile.TemporaryDirectory() as directory:
+            lock,drain=self.fixture(directory);read=os.read;late=[False]
+            def delayed(fd,size):raw=read(fd,size);late[0]=True;return raw
+            def fresh():
+                if late[0]:raise ValueError('expired during final read')
+            with patch.object(runtime.os,'read',side_effect=delayed):
+                with self.assertRaises(ValueError):runtime.finish_owned_drain(lock,drain,'owned',lambda:None,lambda:None,release_fence=fresh)
+            self.assertEqual(drain.read_text(),'owned')
 
 if __name__=='__main__':unittest.main()
