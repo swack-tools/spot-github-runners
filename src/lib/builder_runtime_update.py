@@ -143,6 +143,19 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
     if not isinstance(journal, list) or not journal or not isinstance(journal[-1], dict):
         raise ValueError('Missing durable release decision')
     final = journal[-1]
+    comparison_files = observation['before']
+    if final.get('stage') == 'HOLD_FINISH_RECOVERY':
+        indices = [index for index, row in enumerate(journal)
+                   if isinstance(row, dict) and row.get('stage') == 'FINISH_RELEASE_COMMITTED']
+        if (not indices or final.get('execution_held') is not True
+                or any(not isinstance(row, dict) or row.get('stage') != 'HOLD_FINISH_RECOVERY'
+                       for row in journal[indices[-1]+1:])):
+            raise ValueError('Unknown held post-commit history')
+        final = journal[indices[-1]]
+        selected = comparison_files.get(LAUNCHER_TARGET)
+        if not isinstance(selected, dict) or selected.get('mode') != 0o644:
+            raise ValueError('Held recovery launcher does not match failure record')
+        comparison_files = dict(comparison_files, **{LAUNCHER_TARGET:dict(selected, mode=0o755)})
     if final.get('stage') == 'COMMITTED_REBOOT_RECOVERED':
         state = observation['service_state']
         if (state.get('ActiveState') != 'active' or final.get('boot') != observation['boot']
@@ -153,14 +166,14 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
             raise ValueError('Recovered checkpoint process or boot changed')
     elif final.get('stage') != 'FINISH_RELEASE_COMMITTED':
         raise ValueError('No durable committed release to recover')
-    if (final.get('files') != observation['before']
+    if (final.get('files') != comparison_files
             or final.get('client_launcher_sha256') != client_pin
             or final.get('qualification_ready') is not False):
         raise ValueError('No matching durable unqualified release commit')
-    launcher = observation['before'].get(LAUNCHER_TARGET)
+    launcher = comparison_files.get(LAUNCHER_TARGET)
     if not isinstance(launcher, dict) or launcher.get('mode') != 0o755:
         raise ValueError('Committed launcher must match its executable release state')
-    held = dict(observation['before'], **{LAUNCHER_TARGET:dict(launcher, mode=0o644)})
+    held = dict(comparison_files, **{LAUNCHER_TARGET:dict(launcher, mode=0o644)})
     return verify_installed_runtime(observation['assets'], held, client_launcher_sha256=client_pin)
 
 
@@ -1114,6 +1127,29 @@ def capture_committed_recovery(nonce, source_main, assets, client_pin):
     return observation
 
 
+def ensure_recovery_lock(path):
+    """Initialize only an absent volatile lock; preserve every existing inode."""
+    path = Path(path)
+    parent = path.parent.lstat()
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o022:
+        raise ValueError('Untrusted recovery lock parent')
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd);current = path.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid() or info.st_mode & 0o022
+                or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)):
+            raise ValueError('Untrusted existing recovery lock')
+        os.fsync(fd)
+    finally:os.close(fd)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:os.fsync(directory)
+    finally:os.close(directory)
+
+
 def complete_committed_recovery(plan, client_pin):
     """Complete an explicitly selected durable release after reboot."""
     import time
@@ -1145,6 +1181,11 @@ def complete_committed_recovery(plan, client_pin):
 
     def complete():
         check()
+        released_files = dict(plan['before'])
+        selected = plan['before'][LAUNCHER_TARGET]
+        if selected['mode'] == 0o644:
+            restore_launcher_execution(LAUNCHER_TARGET, selected)
+            released_files[LAUNCHER_TARGET] = dict(selected, mode=0o755)
         # The earlier fsynced release decision authorizes this exact marker
         # removal. Preserve that historical journal until service proof succeeds.
         validate_runtime_observation(plan, time.time())
@@ -1160,7 +1201,7 @@ def complete_committed_recovery(plan, client_pin):
                 int(plan['service_state']['MainPID']), plan['service_state']['StartTicks']):
             raise ValueError('Selected running recovery process changed')
         active = {key:value for key,value in plan.items() if key != 'service_state'}
-        active.update(schema=1, service_pid=pid, service_startticks=ticks)
+        active.update(schema=1, service_pid=pid, service_startticks=ticks, before=released_files)
         phase['active'] = active
         admission_ready(active, pid, ticks)
         snapshot = live_snapshot(active)
@@ -1172,9 +1213,13 @@ def complete_committed_recovery(plan, client_pin):
         active = phase['active']
         append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_REBOOT_RECOVERED',
             observed_at=time.time(), boot=plan['boot'], service_pid=active['service_pid'],
-            service_startticks=active['service_startticks'], files=plan['before'],
+            service_startticks=active['service_startticks'], files=active['before'],
             client_launcher_sha256=client_pin, qualification_ready=False))
+        validate_runtime_observation(plan, time.time())
 
+    # No unrelated launcher needs to recreate the volatile mutex after reboot.
+    validate_runtime_observation(plan, time.time())
+    ensure_recovery_lock('/run/oxidex-build.lock')
     # Keep the drain on any failure; no lease is invented or cleared.
     if raw:
         return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',

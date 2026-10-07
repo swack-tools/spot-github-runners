@@ -55,6 +55,25 @@ class InstalledRuntimeTests(unittest.TestCase):
         assets,files,pin=self.fixture();files['/usr/local/bin/docker']=None
         with self.assertRaises(ValueError):self.verify(assets,files,pin)
 
+class RecoveryLockTests(unittest.TestCase):
+    def ensure(self,path):
+        self.assertTrue(callable(getattr(runtime,'ensure_recovery_lock',None)), 'Checked reboot lock initialization is missing')
+        runtime.ensure_recovery_lock(path)
+
+    def test_missing_lock_created_and_existing_inode_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'lock';self.ensure(path);inode=path.stat().st_ino
+            self.assertEqual(path.stat().st_mode&0o777,0o600)
+            self.ensure(path);self.assertEqual(path.stat().st_ino,inode)
+
+    def test_foreign_symlink_or_writable_lock_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();target=root/'target';target.touch();path=root/'lock';path.symlink_to(target)
+            with self.assertRaises((ValueError,OSError)):self.ensure(path)
+            path.unlink();path.touch();path.chmod(0o666)
+            with self.assertRaises(ValueError):self.ensure(path)
+            self.assertEqual(path.stat().st_mode&0o777,0o666)
+
 class InactiveServiceTests(unittest.TestCase):
     def parse(self,raw):
         self.assertTrue(callable(getattr(runtime,'parse_inactive_service_state',None)), 'Native inactive state parser is missing')
@@ -76,13 +95,19 @@ class InactiveServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):runtime.parse_recovery_service_state(raw.replace('running','start'))
 
 class CommittedFlowTests(unittest.TestCase):
-    def exercise(self,*,failure=None,existing=False,already_running=False):
+    def exercise(self,*,failure=None,existing=False,already_running=False,missing_lock=False,held=False):
         _,_,plan,pin=InstalledHistoryTests().reboot_fixture();plan['observed_at']=time.time()
         if already_running:plan['service_state']=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='50',ControlPID='0',StartTicks=60)
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory).resolve();lock=root/'lock';lock.touch();drain=root/'drain';pending=root/'pending';pending.write_text('retained')
+            root=Path(directory).resolve();lock=root/'lock'
+            if not missing_lock:lock.touch()
+            drain=root/'drain';pending=root/'pending';pending.write_text('retained')
+            launcher=root/'launcher';launcher.write_bytes(b'bounded synthetic runtime\n');launcher.chmod(0o644 if held else 0o755)
+            if held:
+                info=launcher.stat();plan['before']={k:dict(v) for k,v in plan['before'].items()}
+                plan['before'][runtime.LAUNCHER_TARGET].update(mode=0o644,uid=info.st_uid,device=info.st_dev,inode=info.st_ino)
             if existing:drain.write_text(plan['nonce']);drain.chmod(0o600)
-            running=already_running;events=[];snapshots=0
+            running=already_running;events=[];snapshots=0;clock=[plan['observed_at']]
             def file_state(path):
                 path=Path(path)
                 if path==pending:
@@ -110,11 +135,15 @@ class CommittedFlowTests(unittest.TestCase):
                 snapshots+=1
                 if failure=='final' and snapshots>1:raise ValueError('final host observation failed')
                 return dict(active,image_pin=active['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=None,drain_token=drain.read_text())
-            real_new,real_owned=runtime.drained_update,runtime.finish_owned_drain
+            real_new,real_owned,real_init,real_restore=runtime.drained_update,runtime.finish_owned_drain,runtime.ensure_recovery_lock,runtime.restore_launcher_execution
             def new_transaction(_lock,_drain,*args,**kwargs):return real_new(lock,drain,*args,**kwargs)
             def owned_transaction(_lock,_drain,*args,**kwargs):return real_owned(lock,drain,*args,**kwargs)
+            def journal(path,row):
+                events.append(row['stage'])
+                if failure=='checkpoint-expiry':clock[0]=plan['observed_at']+121
             with ExitStack() as stack:
-                replacements=dict(PENDING_UPDATE=pending,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=lambda:(50,60),admission_ready=ready,live_snapshot=snapshot,append_journal_record=lambda path,row:events.append(row['stage']),drained_update=new_transaction,finish_owned_drain=owned_transaction)
+                stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]))
+                replacements=dict(restore_launcher_execution=lambda path,expected:real_restore(launcher,expected),ensure_recovery_lock=lambda path:real_init(lock),PENDING_UPDATE=pending,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=lambda:(50,60),admission_ready=ready,live_snapshot=snapshot,append_journal_record=journal,drained_update=new_transaction,finish_owned_drain=owned_transaction)
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
                 if failure:
                     with self.assertRaises((OSError,ValueError)):runtime.complete_committed_recovery(plan,pin)
@@ -123,7 +152,13 @@ class CommittedFlowTests(unittest.TestCase):
                     result=runtime.complete_committed_recovery(plan,pin)
                     self.assertEqual(result['status'],'REBOOT_RECOVERED_UNQUALIFIED');self.assertIs(result['qualification_ready'],False)
                     self.assertFalse(drain.exists());self.assertTrue(running);self.assertGreaterEqual(snapshots,2)
+                    if held:self.assertEqual(launcher.stat().st_mode&0o777,0o755)
             return events
+
+    def test_held_postcommit_launcher_restored_under_owned_transaction(self):self.exercise(held=True,missing_lock=True)
+
+    def test_recovery_initializes_missing_reboot_lock(self):self.exercise(missing_lock=True)
+    def test_checkpoint_expiry_keeps_owned_drain(self):self.exercise(failure='checkpoint-expiry')
 
     def test_running_retry_uses_exact_service_without_restart(self):
         events=self.exercise(existing=True,already_running=True)
@@ -374,6 +409,14 @@ class InstalledHistoryTests(unittest.TestCase):
         journal.append(dict(stage='COMMITTED_REBOOT_RECOVERED',files=observation['before'],client_launcher_sha256=pin,qualification_ready=False,boot=observation['boot'],service_pid=50,service_startticks=60))
         try:result=self.reboot_verify(original,journal,observation,pin)
         except ValueError as error:self.fail('Durable checkpoint cannot resume drain release: '+str(error))
+        self.assertEqual(result,pin)
+
+    def test_committed_reboot_accepts_held_postcommit_failure(self):
+        original,journal,observation,pin=self.reboot_fixture()
+        observation['before']={k:dict(v) for k,v in observation['before'].items()};observation['before'][runtime.LAUNCHER_TARGET]['mode']=0o644
+        journal.append(dict(stage='HOLD_FINISH_RECOVERY',execution_held=True))
+        try:result=self.reboot_verify(original,journal,observation,pin)
+        except ValueError as error:self.fail('Held committed release lost recovery authority: '+str(error))
         self.assertEqual(result,pin)
 
 class OwnedFinishTests(unittest.TestCase):

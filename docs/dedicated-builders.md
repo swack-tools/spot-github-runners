@@ -276,3 +276,10 @@ If the exact process is already running after a partial attempt, recovery checks
 it without another start command. A failed start or postflight retains the owned
 drain. Successful recovery remains unqualified until actual OxiDex build and
 gate checks pass.
+
+After reboot, recovery initializes an absent volatile build lock without
+replacing an existing inode. A held post-commit launcher remains recoverable:
+the saved release decision must match every file, with only its execution mode
+held. Recovery restores execution through the verified descriptor while the
+owned drain remains. It rechecks freshness after publishing its checkpoint and
+before drain release.
