@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 
 PENDING_UPDATE = Path('/var/lib/oxidex-builder/runtime-update-pending.json')
 CURRENT_BOOT_PERMIT = Path('/run/oxidex-runtime-update-allow')
@@ -255,37 +255,60 @@ def verify_installed_history(plan, original, journal, client_pin, now, *, recove
                                     client_launcher_sha256=client_pin)
 
 
+def verify_descriptor_selection(fd, path, selected):
+    """One metadata-only final guard for selected file descriptors and paths."""
+    retained = os.fstat(fd);canonical = Path(path).lstat()
+    fields = ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink',
+              'st_size','st_mtime_ns','st_ctime_ns')
+    if (any(getattr(selected,key) != getattr(retained,key) for key in fields)
+            or any(getattr(retained,key) != getattr(canonical,key) for key in fields)):
+        raise ValueError('Selected descriptor or canonical file changed')
+
+
+def cleanup_selected_staging(fd, path, selected, verify_parent):
+    """Remove only the selected private staging inode; preserve foreign evidence."""
+    try:
+        Path(path).lstat()
+        verify_parent()
+        verify_descriptor_selection(fd,path,selected)
+    except (FileNotFoundError,ValueError):
+        return None
+    os.unlink(path)
+    return None
+
+
 def atomic_write(path, data, mode, *, before_replace=None, exclusive=False):
     path = Path(path)
     if any(p.is_symlink() for p in (path, *path.parents)):
         raise ValueError('Symlinked runtime path')
     if path.exists() and not path.is_file():
         raise ValueError('Runtime target is not a regular file')
-    descriptor, temporary = tempfile.mkstemp(prefix='.runtime-', dir=path.parent)
-    try:
+    with retained_ancestor_selection(path) as verify_parent:
+        descriptor, temporary = tempfile.mkstemp(prefix='.runtime-', dir=path.parent)
         with os.fdopen(descriptor, 'wb') as stream:
-            os.fchmod(stream.fileno(), mode)
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
             staged = os.fstat(stream.fileno())
-        if before_replace is not None:
-            before_replace()
-        if exclusive:
-            rename_exclusive(temporary, path)
-        else:
-            os.replace(temporary, path)
-        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(parent)
-        finally:
-            os.close(parent)
-        return {'sha256': hashlib.sha256(data).hexdigest(),
-                'mode': stat.S_IMODE(staged.st_mode), 'uid': staged.st_uid,
-                'gid': staged.st_gid, 'device': staged.st_dev, 'inode': staged.st_ino}
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+            try:
+                verify_parent()
+                verify_descriptor_selection(stream.fileno(),temporary,staged)
+                os.fchmod(stream.fileno(), mode)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+                staged = os.fstat(stream.fileno())
+                if before_replace is not None:before_replace()
+                verify_parent()
+                verify_descriptor_selection(stream.fileno(),temporary,staged)
+                if exclusive:rename_exclusive(temporary,path)
+                else:os.replace(temporary,path)
+                parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:os.fsync(parent)
+                finally:os.close(parent)
+                return {'sha256': hashlib.sha256(data).hexdigest(),
+                        'mode': stat.S_IMODE(staged.st_mode), 'uid': staged.st_uid,
+                        'gid': staged.st_gid, 'device': staged.st_dev, 'inode': staged.st_ino}
+            finally:
+                cleanup_selected_staging(stream.fileno(),temporary,staged,verify_parent)
+
 
 
 def append_journal_record(path, record, *, before_publish=None, freshness=None, selected_history=None):
@@ -369,13 +392,7 @@ def retained_file_selection(path, expected, read_state):
                     try:path.lstat()
                     except FileNotFoundError:return
                     raise ValueError('Absent selected file appeared')
-                after = os.fstat(fd)
-                current = path.lstat()
-                fields = ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink',
-                          'st_size','st_mtime_ns','st_ctime_ns')
-                if (any(getattr(selected,key) != getattr(after,key) for key in fields)
-                        or any(getattr(after,key) != getattr(current,key) for key in fields)):
-                    raise ValueError('Selected descriptor or canonical file changed')
+                verify_descriptor_selection(fd,path,selected)
             verify()
             yield verify
         finally:
@@ -462,29 +479,35 @@ def rename_exclusive(source, target):
 
 def publish_owned_drain(path, token, *, before_publish=None):
     """Publish a complete durable token exclusively; never expose an empty drain."""
-    if not isinstance(token, str) or not re.fullmatch('[a-zA-Z0-9_-]{1,128}', token):
+    if not isinstance(token,str) or not re.fullmatch('[a-zA-Z0-9_-]{1,128}',token):
         raise ValueError('Invalid drain token')
     path = Path(path)
-    fd, temporary = tempfile.mkstemp(prefix='.drain-', dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        raw = token.encode('ascii')
-        if os.write(fd, raw) != len(raw):
-            raise OSError('Incomplete private drain write')
-        os.fsync(fd)
-        if before_publish is not None:before_publish()
-        # A no-replace rename publishes one complete, singly linked token.
-        rename_exclusive(temporary, path)
-        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:os.fsync(parent)
-        finally:os.close(parent)
-        os.lseek(fd, 0, os.SEEK_SET)
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-    finally:
-        if os.path.exists(temporary):os.unlink(temporary)
+    with retained_ancestor_selection(path) as verify_parent:
+        fd, temporary = tempfile.mkstemp(prefix='.drain-',dir=path.parent)
+        staged = None
+        try:
+            staged = os.fstat(fd)
+            verify_parent()
+            verify_descriptor_selection(fd,temporary,staged)
+            os.fchmod(fd,0o600)
+            raw = token.encode('ascii')
+            if os.write(fd,raw) != len(raw):raise OSError('Incomplete private drain write')
+            os.fsync(fd);staged = os.fstat(fd)
+            if before_publish is not None:before_publish()
+            verify_parent()
+            verify_descriptor_selection(fd,temporary,staged)
+            rename_exclusive(temporary,path)
+            parent = os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            try:os.fsync(parent)
+            finally:os.close(parent)
+            os.lseek(fd,0,os.SEEK_SET)
+            return fd
+        except BaseException:
+            try:
+                if staged is not None:cleanup_selected_staging(fd,temporary,staged,verify_parent)
+            finally:os.close(fd)
+            raise
+
 
 
 class CommittedReleaseError(RuntimeError):
@@ -518,11 +541,7 @@ def verify_owned_drain(fd, path, token, canonical_owned):
         raise ValueError('Owned drain changed during token read')
     def metadata_guard():
         canonical_owned()
-        retained = os.fstat(fd);canonical = Path(path).lstat()
-        fields = ('st_dev','st_ino',*attributes)
-        if (any(getattr(after,name) != getattr(retained,name) for name in fields)
-                or any(getattr(retained,name) != getattr(canonical,name) for name in fields)):
-            raise ValueError('Selected owned drain changed after release fence')
+        verify_descriptor_selection(fd,path,after)
     return metadata_guard
 
 
@@ -902,26 +921,9 @@ def live_snapshot(plan, *, committed_original=None):
 
 
 def close_launcher_execution(path, *, expected=None, before_change=None, freshness=None):
-    if expected is not None:
-        set_verified_launcher_mode(path, expected, 0o644, before_change=before_change, freshness=freshness)
-        return None
-    path = Path(path)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise ValueError('Launcher is not a single regular file')
-        if before_change is not None:before_change()
-        os.fchmod(fd, 0o644)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        os.fsync(parent)
-    finally:
-        os.close(parent)
-    return None
+    """Close only an explicitly selected launcher; never adopt an unbound path."""
+    if not isinstance(expected, dict):raise ValueError('Selected launcher state required')
+    set_verified_launcher_mode(path, expected, 0o644, before_change=before_change, freshness=freshness)
 
 
 
@@ -950,13 +952,12 @@ def set_verified_launcher_mode(path, expected, mode, *, before_change=None, fres
                     or hashlib.sha256(os.read(fd, 262145)).hexdigest() != expected['sha256']):
                 raise ValueError('Held launcher changed before restoring execution')
             if before_change is not None:before_change()
-            canonical = path.lstat();after = os.fstat(fd)
-            if ((after.st_dev, after.st_ino) != (canonical.st_dev, canonical.st_ino)
-                    or (info.st_uid, info.st_gid, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-                       != (after.st_uid, after.st_gid, after.st_mode, after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
-                raise ValueError('Launcher custody changed during descriptor verification')
-            verify_ancestors()
+            def verify_selected():
+                verify_ancestors()
+                verify_descriptor_selection(fd,path,info)
+            verify_selected()
             if freshness is not None:freshness()
+            verify_selected()
             os.fchmod(fd, mode)
             os.fsync(fd)
         finally:
@@ -1020,25 +1021,56 @@ def file_mutation_fence(plan, target=None, *, expected_file=None):
 
 
 
-def prepare_boot_hold(plan):
+@contextmanager
+def selected_service_bindings(plan):
+    """Keep the unchanged service/config identities selected through an effect."""
+    bindings = (('/etc/oxidex-remote-build.json','config_sha256'),
+                ('/etc/gha-admission.json','admission_sha256'),
+                ('/etc/systemd/system/gha-admission.service','service_sha256'))
+    with ExitStack() as stack:
+        guards = []
+        for path, field in bindings:
+            selected = root_file_state(path)
+            if selected is None or selected['sha256'] != plan[field]:
+                raise ValueError('Selected service binding changed: '+path)
+            guards.append(stack.enter_context(retained_file_selection(path, selected,
+                          lambda path=path:root_file_state(path))))
+        def verify():
+            for guard in guards:guard()
+        yield verify
+
+
+def prepare_boot_hold(plan, canonical_guard):
     state = root_file_state(BOOT_GUARD)
-    if state is not None and state['sha256'] != hashlib.sha256(BOOT_GUARD_BYTES).hexdigest():
+    if state is not None and (state['sha256'] != hashlib.sha256(BOOT_GUARD_BYTES).hexdigest() or state['mode'] != 0o644):
         raise ValueError('Unknown admission boot guard')
     if root_file_state(PENDING_UPDATE) is not None or root_file_state(CURRENT_BOOT_PERMIT) is not None:
         raise ValueError('Existing update hold requires explicit recovery')
     trusted_directory(BOOT_GUARD.parent, create=True)
-    file_mutation_fence(plan)
+    def publication(target, selected):
+        with retained_file_selection(target, selected, lambda:root_file_state(target)) as verify:
+            with selected_service_bindings(plan) as verify_bindings:
+                file_mutation_fence(plan)
+                canonical_guard()
+                verify_bindings();verify()
     if state is None:
-        atomic_write(BOOT_GUARD, BOOT_GUARD_BYTES, 0o644,
-                     before_replace=lambda:file_mutation_fence(plan), exclusive=True)
-    checked_command(['/usr/bin/systemctl', 'daemon-reload'])
-    file_mutation_fence(plan)
+        published = atomic_write(BOOT_GUARD, BOOT_GUARD_BYTES, 0o644,
+                     before_replace=lambda:publication(BOOT_GUARD,None), exclusive=True)
+        state, raw = root_file_read(BOOT_GUARD)
+        if state != published or raw != BOOT_GUARD_BYTES:
+            raise ValueError('Own boot guard publication changed')
+    with retained_file_selection(BOOT_GUARD,state,lambda:root_file_state(BOOT_GUARD)) as verify:
+        with selected_service_bindings(plan) as verify_bindings:
+            file_mutation_fence(plan)
+            canonical_guard()
+            verify_bindings();verify()
+            checked_command(['/usr/bin/systemctl', 'daemon-reload'])
     atomic_write(CURRENT_BOOT_PERMIT, plan['nonce'].encode(), 0o600,
-                 before_replace=lambda:file_mutation_fence(plan), exclusive=True)
-    # Must become durable before the first of the fifteen runtime replacements.
+                 before_replace=lambda:publication(CURRENT_BOOT_PERMIT,None), exclusive=True)
+    # Durable before the first of the fifteen runtime replacements.
     atomic_write(PENDING_UPDATE, (json.dumps(dict(nonce=plan['nonce'], boot=plan['boot'],
                  source_main=plan['source_main']))+'\n').encode(), 0o600,
-                 before_replace=lambda:file_mutation_fence(plan), exclusive=True)
+                 before_replace=lambda:publication(PENDING_UPDATE,None), exclusive=True)
 
 
 
@@ -1090,11 +1122,11 @@ def apply_replacement_fence(plan, target, expected_file, canonical_guard):
     import time
     mutation_idle_fence(plan)
     file_mutation_fence(plan, target, expected_file=expected_file)
-    canonical_guard()
     selected = plan['before'][target] if expected_file is None else expected_file
-    if root_file_state(target) != selected:
-        raise ValueError('Selected runtime target changed during canonical lookup')
-    validate_plan(plan, time.time())
+    with retained_file_selection(target, selected, lambda:root_file_state(target)) as verify:
+        validate_plan(plan, time.time())
+        canonical_guard()
+        verify()
 
 
 def apply_update(plan):
@@ -1115,7 +1147,7 @@ def apply_update(plan):
         validate_plan(plan, time.time())
         mkdir_exact(backup, 0o700)
         validate_plan(plan, time.time())
-        atomic_write(backup / 'plan.json', (json.dumps(plan, sort_keys=True) + '\n').encode(), 0o600)
+        atomic_write(backup / 'plan.json', (json.dumps(plan, sort_keys=True) + '\n').encode(), 0o600, before_replace=lock_guard, exclusive=True)
         journal = backup / 'journal.jsonl'
         journal_history[0] = root_file_read(journal)
 
@@ -1131,7 +1163,7 @@ def apply_update(plan):
                 if root_file_state(target) != plan['before'][target]:
                     raise ValueError('Runtime changed before backup')
                 if plan['before'][target] is not None:
-                    atomic_write(backup / (str(index) + '.before'), Path(target).read_bytes(), 0o600)
+                    atomic_write(backup / (str(index) + '.before'), Path(target).read_bytes(), 0o600, before_replace=lock_guard, exclusive=True)
             record('BACKUPS_COMPLETE', before=plan['before'])
             # Preparation has not changed live code. This durable permission
             # transition is the first live cutover, including the old launcher.
@@ -1144,7 +1176,7 @@ def apply_update(plan):
             if held_launcher != intended:
                 raise ValueError('Durable launcher execution hold differs')
             record('MUTATING_HELD', launcher=held_launcher)
-            prepare_boot_hold(plan)
+            prepare_boot_hold(plan, lock_guard)
             verify_boot_hold(plan)
             record('PERSISTENT_BOOT_HOLD_INSTALLED')
             for target in sorted(TARGETS):
@@ -1166,8 +1198,12 @@ def apply_update(plan):
             trusted_directory('/mnt/runner-data/remote-build/qualification-sealed', create=True)
             validate_plan(plan, time.time())
             mutation_idle_fence(plan)
-            file_mutation_fence(plan)
-            checked_command(['/usr/bin/systemctl', 'restart', 'gha-admission.service'])
+            with selected_service_bindings(plan) as verify_bindings:
+                mutation_idle_fence(plan)
+                file_mutation_fence(plan)
+                lock_guard()
+                verify_bindings()
+                checked_command(['/usr/bin/systemctl', 'restart', 'gha-admission.service'])
             new_pid, new_ticks = service_identity(strict=False)
             admission_ready(plan, new_pid, new_ticks)
             after = live_snapshot(plan)
@@ -1441,24 +1477,33 @@ def complete_committed_recovery(plan, client_pin):
         # The persistent hold survives service/postflight failures and another
         # reboot. Only this boot's exact nonce permit allows the guarded start.
         def hold_publication():
-            lock_guard()
-            if root_file_state(PENDING_UPDATE) != pending:
-                raise ValueError('Persistent recovery hold changed')
-            validate_runtime_observation(plan, time.time())
+            with ExitStack() as stack:
+                guards = [stack.enter_context(retained_file_selection(PENDING_UPDATE, pending,
+                          lambda:root_file_state(PENDING_UPDATE)))]
+                if phase['permit'] is not None:
+                    guards.append(stack.enter_context(retained_file_selection(CURRENT_BOOT_PERMIT,
+                        phase['permit'], lambda:root_file_state(CURRENT_BOOT_PERMIT))))
+                validate_runtime_observation(plan, time.time())
+                lock_guard()
+                for verify in guards:verify()
         if pending is None:
-            atomic_write(PENDING_UPDATE, (json.dumps(dict(nonce=plan['nonce'],
-                boot=original['boot'], source_main=original['source_main']))+'\n').encode(),
-                0o600, before_replace=hold_publication, exclusive=True)
-            pending = root_file_state(PENDING_UPDATE)
-            if pending is None:raise ValueError('Persistent recovery hold disappeared')
+            pending_raw = (json.dumps(dict(nonce=original['nonce'], boot=original['boot'],
+                           source_main=original['source_main']))+'\n').encode()
+            published = atomic_write(PENDING_UPDATE, pending_raw, 0o600,
+                                     before_replace=hold_publication, exclusive=True)
+            pending, observed_raw = root_file_read(PENDING_UPDATE)
+            if pending != published or observed_raw != pending_raw:
+                raise ValueError('Own persistent recovery hold publication changed')
         permit, permit_raw = root_file_read(CURRENT_BOOT_PERMIT)
         if permit is not None and (permit['mode'] != 0o600 or permit_raw != plan['nonce'].encode()):
             raise ValueError('Foreign current-boot recovery permit')
         if permit is None:
-            atomic_write(CURRENT_BOOT_PERMIT, plan['nonce'].encode(), 0o600,
-                         before_replace=hold_publication, exclusive=True)
-        phase['permit'] = root_file_state(CURRENT_BOOT_PERMIT)
-        if phase['permit'] is None:raise ValueError('Recovery permit disappeared')
+            published = atomic_write(CURRENT_BOOT_PERMIT, plan['nonce'].encode(), 0o600,
+                                     before_replace=hold_publication, exclusive=True)
+            permit, observed_raw = root_file_read(CURRENT_BOOT_PERMIT)
+            if permit != published or observed_raw != plan['nonce'].encode():
+                raise ValueError('Own current-boot permit publication changed')
+        phase['permit'] = permit
         released_files = dict(plan['before'])
         selected = plan['before'][LAUNCHER_TARGET]
         if selected['mode'] == 0o644:
@@ -1468,12 +1513,12 @@ def complete_committed_recovery(plan, client_pin):
             restore_launcher_execution(LAUNCHER_TARGET, selected,
                                        before_change=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()))
             released_files[LAUNCHER_TARGET] = dict(selected, mode=0o755)
-        hold_publication()
-        if plan['service_state']['ActiveState'] == 'inactive':
-            lock_guard()
-            validate_runtime_observation(plan, time.time())
-            checked_command(['/usr/bin/systemctl', 'start', 'gha-admission.service'],
-                            timeout=min(20, max(1, plan['observed_at']+120-time.time())))
+        with selected_service_bindings(plan) as verify_bindings:
+            hold_publication()
+            verify_bindings()
+            if plan['service_state']['ActiveState'] == 'inactive':
+                checked_command(['/usr/bin/systemctl', 'start', 'gha-admission.service'],
+                                timeout=min(20, max(1, plan['observed_at']+120-time.time())))
         pid, ticks = service_identity(strict=False)
         if plan['service_state']['ActiveState'] == 'active' and (pid, ticks) != (
                 int(plan['service_state']['MainPID']), plan['service_state']['StartTicks']):

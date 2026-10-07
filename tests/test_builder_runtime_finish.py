@@ -159,8 +159,22 @@ class ApplyPublicationBoundaryTests(unittest.TestCase):
             plan['before'][target]=state(target)
             def guard():
                 other=path.parent/'foreign';other.write_bytes(b'foreign');other.replace(path)
-            with patch.object(runtime,'mutation_idle_fence',return_value=None),patch.object(runtime,'file_mutation_fence',return_value=None),patch.object(runtime,'root_file_state',side_effect=state):
+            with patch.object(runtime,'Path',side_effect=lambda value:path if str(value)==target else Path(value)),patch.object(runtime,'mutation_idle_fence',return_value=None),patch.object(runtime,'file_mutation_fence',return_value=None),patch.object(runtime,'root_file_state',side_effect=state):
                 with self.assertRaises(ValueError):runtime.apply_replacement_fence(plan,target,None,guard)
+            self.assertEqual(path.read_bytes(),b'foreign')
+
+    def test_target_replaced_during_final_validation_is_preserved(self):
+        _,plan,_,_=InstalledHistoryTests().fixture();plan['observed_at']=time.time();target='/usr/local/bin/docker'
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'target';path.write_bytes(b'old')
+            def state(selected):return dict(inode=path.stat().st_ino,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            plan['before'][target]=state(target);validate=runtime.validate_plan
+            def freshness(*args):
+                result=validate(*args)
+                other=path.parent/'foreign';other.write_bytes(b'foreign');other.replace(path)
+                return result
+            with patch.object(runtime,'Path',side_effect=lambda value:path if str(value)==target else Path(value)),patch.object(runtime,'mutation_idle_fence',return_value=None),patch.object(runtime,'file_mutation_fence',return_value=None),patch.object(runtime,'root_file_state',side_effect=state),patch.object(runtime,'validate_plan',side_effect=freshness):
+                with self.assertRaises(ValueError):runtime.apply_replacement_fence(plan,target,None,lambda:None)
             self.assertEqual(path.read_bytes(),b'foreign')
 
 class InactiveServiceTests(unittest.TestCase):
@@ -274,10 +288,15 @@ class CommittedFlowTests(unittest.TestCase):
         if already_running:plan['service_state']=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='50',ControlPID='0',StartTicks=60)
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory).resolve();lock=root/'lock'
+            binding_paths={}
+            for name,field in (('/etc/oxidex-remote-build.json','config_sha256'),('/etc/gha-admission.json','admission_sha256'),('/etc/systemd/system/gha-admission.service','service_sha256')):
+                path=root/field;path.write_bytes(field.encode());binding_paths[name]=path
+                plan[field]=hashlib.sha256(path.read_bytes()).hexdigest()
             if not missing_lock:lock.touch()
             drain=root/'drain';pending=root/'pending';permit=root/'permit'
             if not missing_pending:pending.write_text('retained')
             if failure=='foreign-permit':permit.write_text('foreign');permit.chmod(0o600)
+            if failure=='permit-swapped':permit.write_text(plan['nonce']);permit.chmod(0o600)
             launcher=root/'launcher';launcher.write_bytes(b'bounded synthetic runtime\n');launcher.chmod(0o644 if held else 0o755)
             if held:
                 info=launcher.stat();plan['before']={k:dict(v) for k,v in plan['before'].items()}
@@ -286,18 +305,23 @@ class CommittedFlowTests(unittest.TestCase):
             running=already_running;executed=already_running;events=[];snapshots=0;captures=0;marker_reads=0;clock=[plan['observed_at']]
             def file_state(path):
                 nonlocal marker_reads
-                path=lock if str(path)=='/run/oxidex-build.lock' else Path(path)
-                if path in (pending,lock,permit):
+                path=lock if str(path)=='/run/oxidex-build.lock' else binding_paths.get(str(path),Path(path))
+                if path in (pending,lock,permit,*binding_paths.values()):
                     if path==pending:
                         marker_reads+=1
                         if failure=='final-marker-expiry' and marker_reads>1:clock[0]=plan['observed_at']+121
                     if not path.exists():return None
-                    info=path.stat();return dict(inode=info.st_ino,mode=info.st_mode&0o777,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                    info=path.stat();return dict(inode=info.st_ino,device=info.st_dev,uid=info.st_uid,gid=info.st_gid,mode=info.st_mode&0o777,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
                 return None
             def read(path):
                 if str(path)=='/run/oxidex-build-draining':return None,drain.read_bytes() if drain.exists() else b''
                 if Path(path).name=='journal.jsonl':return None,b''
-                if Path(path)==permit:return file_state(permit),permit.read_bytes() if permit.exists() else b''
+                if Path(path)==pending:return file_state(pending),pending.read_bytes() if pending.exists() else b''
+                if Path(path)==permit:
+                    selected=file_state(permit);raw=permit.read_bytes() if permit.exists() else b''
+                    if failure=='permit-swapped' and raw==plan['nonce'].encode():
+                        other=root/'foreign-permit';other.write_text('foreign');other.chmod(0o600);other.replace(permit)
+                    return selected,raw
                 raise AssertionError('Unexpected fixture read '+str(path))
             def capture(*args,**kwargs):
                 nonlocal captures
@@ -345,6 +369,7 @@ class CommittedFlowTests(unittest.TestCase):
                 if failure=='checkpoint-expiry':clock[0]=plan['observed_at']+121
                 return None,b''
             with ExitStack() as stack:
+                stack.enter_context(patch.object(runtime,'Path',side_effect=lambda value:binding_paths.get(str(value),Path(value))))
                 stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]))
                 stack.enter_context(patch.object(runtime.os,'fsync',side_effect=sync))
                 replacements=dict(verify_boot_guard=lambda:None,restore_launcher_execution=restore_selected,ensure_recovery_lock=lambda path:real_init(lock),PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=identity,admission_ready=ready,live_snapshot=snapshot,append_journal_record=journal,drained_update=new_transaction,finish_owned_drain=owned_transaction)
@@ -354,8 +379,8 @@ class CommittedFlowTests(unittest.TestCase):
                     self.assertEqual(drain.read_text(),plan['nonce'])
                     if failure=='capture-expiry':self.assertEqual(launcher.stat().st_mode&0o777,0o644)
                     if failure=='marker-replaced':self.assertEqual(pending.read_text(),'foreign')
-                    if failure in ('final-marker-expiry','missing-schema','foreign-permit'):self.assertNotIn('start',events)
-                    if failure=='foreign-permit':self.assertEqual(permit.read_text(),'foreign')
+                    if failure in ('final-marker-expiry','missing-schema','foreign-permit','permit-swapped'):self.assertNotIn('start',events)
+                    if failure in ('foreign-permit','permit-swapped'):self.assertEqual(permit.read_text(),'foreign')
                     if failure in ('pending-expiry','lock-pending-fsync'):
                         self.assertIn('COMMITTED_REBOOT_RECOVERED',events);self.assertIn('ready',events)
                     if failure in ('missing-schema','start','readiness','final'):self.assertTrue(pending.exists(), 'Persistent hold lost before successful postflight')
@@ -373,6 +398,7 @@ class CommittedFlowTests(unittest.TestCase):
     def test_lost_lock_during_pending_fsync_prevents_start(self):self.exercise(failure='lock-pending-fsync',existing=True)
 
     def test_missing_pending_hold_is_recreated_before_start(self):self.exercise(missing_pending=True)
+    def test_validated_permit_replacement_is_preserved(self):self.exercise(failure='permit-swapped',existing=True)
     def test_foreign_boot_permit_is_preserved(self):self.exercise(failure='foreign-permit',existing=True)
     def test_missing_pending_hold_survives_start_failure(self):self.exercise(failure='start',existing=True,missing_pending=True)
 
@@ -645,6 +671,16 @@ class LauncherRestoreTests(unittest.TestCase):
                 with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected,before_change=lambda:path.parent.chmod(0o777))
                 self.assertEqual(path.stat().st_mode&0o777,0o644)
             finally:path.parent.chmod(0o700)
+
+    def test_permission_freshness_custody_change_is_preserved(self):
+        for mode in (0o644,0o755):
+            with tempfile.TemporaryDirectory() as directory:
+                path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(mode);expected=self.state(path)
+                def fence():path.chmod(0o400)
+                with self.subTest(mode=mode),self.assertRaises(ValueError):
+                    if mode==0o644:runtime.restore_launcher_execution(path,expected,freshness=fence)
+                    else:runtime.close_launcher_execution(path,expected=expected,freshness=fence)
+                self.assertEqual(path.stat().st_mode&0o777,0o400)
 
     def test_permission_callback_custody_change_is_not_adopted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1116,6 +1152,36 @@ class FinalDrainCustodyTests(unittest.TestCase):
                 other=lock.parent/'foreign';other.write_text('foreign');other.replace(lock)
             with self.assertRaises(ValueError):runtime.drained_update(lock,drain,'owned',lambda:self.fail('action ran'),publication_fence=fence)
             self.assertFalse(drain.exists());self.assertEqual(lock.read_text(),'foreign')
+
+
+class SharedFinalMetadataGuardTests(unittest.TestCase):
+    def test_atomic_stage_changed_during_callback_is_not_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'target';path.write_bytes(b'old')
+            def changed():next(path.parent.glob('.runtime-*')).write_bytes(b'foreign')
+            with self.assertRaises(ValueError):runtime.atomic_write(path,b'new',0o600,before_replace=changed)
+            self.assertEqual(path.read_bytes(),b'old')
+            self.assertEqual(next(path.parent.glob('.runtime-*')).read_bytes(),b'foreign')
+
+    def test_drain_stage_changed_during_callback_is_not_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'drain'
+            def changed():next(path.parent.glob('.drain-*')).write_bytes(b'foreign')
+            with self.assertRaises(ValueError):runtime.publish_owned_drain(path,'owned',before_publish=changed)
+            self.assertFalse(path.exists());self.assertEqual(next(path.parent.glob('.drain-*')).read_bytes(),b'foreign')
+
+    def test_service_binding_replacement_is_refused_by_production_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();mapping={};plan={}
+            for name,field in (('/etc/oxidex-remote-build.json','config_sha256'),('/etc/gha-admission.json','admission_sha256'),('/etc/systemd/system/gha-admission.service','service_sha256')):
+                path=root/field;path.write_bytes(field.encode());mapping[name]=path;plan[field]=hashlib.sha256(path.read_bytes()).hexdigest()
+            def state(name):
+                path=mapping.get(str(name),Path(name));info=path.stat()
+                return dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),mode=info.st_mode&0o777,uid=info.st_uid,gid=info.st_gid,device=info.st_dev,inode=info.st_ino)
+            with patch.object(runtime,'Path',side_effect=lambda value:mapping.get(str(value),Path(value))),patch.object(runtime,'root_file_state',side_effect=state):
+                with runtime.selected_service_bindings(plan) as guard:
+                    replacement=root/'foreign';replacement.write_bytes(b'foreign');replacement.replace(mapping['/etc/systemd/system/gha-admission.service'])
+                    with self.assertRaises(ValueError):guard()
 
 
 if __name__ == '__main__':
