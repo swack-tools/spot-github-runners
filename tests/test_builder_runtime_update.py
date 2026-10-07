@@ -212,6 +212,8 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(),raw)
             self.assertEqual(path.stat().st_ino,before.st_ino)
             self.assertEqual(path.stat().st_mode & 0o777,0o644)
+            with self.assertRaises(PermissionError):
+                subprocess.run([str(path)],check=True)
 
 
 if __name__=='__main__':unittest.main()
