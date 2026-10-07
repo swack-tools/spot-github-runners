@@ -107,7 +107,7 @@ class CommittedFlowTests(unittest.TestCase):
                 info=launcher.stat();plan['before']={k:dict(v) for k,v in plan['before'].items()}
                 plan['before'][runtime.LAUNCHER_TARGET].update(mode=0o644,uid=info.st_uid,device=info.st_dev,inode=info.st_ino)
             if existing:drain.write_text(plan['nonce']);drain.chmod(0o600)
-            running=already_running;events=[];snapshots=0;clock=[plan['observed_at']]
+            running=already_running;events=[];snapshots=0;captures=0;clock=[plan['observed_at']]
             def file_state(path):
                 path=Path(path)
                 if path==pending:
@@ -118,6 +118,9 @@ class CommittedFlowTests(unittest.TestCase):
                 if str(path)=='/run/oxidex-build-draining':return None,drain.read_bytes() if drain.exists() else b''
                 raise AssertionError('Unexpected fixture read '+str(path))
             def capture(*args):
+                nonlocal captures
+                captures+=1
+                if failure=='capture-expiry' and captures>1:clock[0]=plan['observed_at']+121
                 if running and not already_running:raise ValueError('Inactive capture used after service start')
                 return dict(plan)
             def command(argv,**kwargs):
@@ -148,12 +151,15 @@ class CommittedFlowTests(unittest.TestCase):
                 if failure:
                     with self.assertRaises((OSError,ValueError)):runtime.complete_committed_recovery(plan,pin)
                     self.assertEqual(drain.read_text(),plan['nonce'])
+                    if failure=='capture-expiry':self.assertEqual(launcher.stat().st_mode&0o777,0o644)
                 else:
                     result=runtime.complete_committed_recovery(plan,pin)
                     self.assertEqual(result['status'],'REBOOT_RECOVERED_UNQUALIFIED');self.assertIs(result['qualification_ready'],False)
                     self.assertFalse(drain.exists());self.assertTrue(running);self.assertGreaterEqual(snapshots,2)
                     if held:self.assertEqual(launcher.stat().st_mode&0o777,0o755)
             return events
+
+    def test_slow_capture_expiry_does_not_restore_launcher(self):self.exercise(failure='capture-expiry',existing=True,held=True)
 
     def test_held_postcommit_launcher_restored_under_owned_transaction(self):self.exercise(held=True,missing_lock=True)
 
@@ -418,6 +424,17 @@ class InstalledHistoryTests(unittest.TestCase):
         try:result=self.reboot_verify(original,journal,observation,pin)
         except ValueError as error:self.fail('Held committed release lost recovery authority: '+str(error))
         self.assertEqual(result,pin)
+
+    def test_committed_permission_intents_allow_either_crash_side(self):
+        for stage in ('HOLD_FINISH_INTENT','COMMITTED_LAUNCHER_RESTORE_INTENT'):
+            for mode in (0o644,0o755):
+                original,journal,observation,pin=self.reboot_fixture()
+                observation['before']={k:dict(v) for k,v in observation['before'].items()};observation['before'][runtime.LAUNCHER_TARGET]['mode']=mode
+                journal.append(dict(stage=stage,launcher=observation['before'][runtime.LAUNCHER_TARGET]))
+                with self.subTest(stage=stage,mode=mode):
+                    try:result=self.reboot_verify(original,journal,observation,pin)
+                    except ValueError as error:self.fail('Intent lost retry authority: '+str(error))
+                    self.assertEqual(result,pin)
 
 class OwnedFinishTests(unittest.TestCase):
     def run_finish(self,lock,drain,action,check=lambda:None):

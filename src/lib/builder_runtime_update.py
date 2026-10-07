@@ -144,17 +144,23 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
         raise ValueError('Missing durable release decision')
     final = journal[-1]
     comparison_files = observation['before']
-    if final.get('stage') == 'HOLD_FINISH_RECOVERY':
+    transitions = {'HOLD_FINISH_RECOVERY', 'HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT'}
+    if final.get('stage') in transitions:
         indices = [index for index, row in enumerate(journal)
                    if isinstance(row, dict) and row.get('stage') == 'FINISH_RELEASE_COMMITTED']
-        if (not indices or final.get('execution_held') is not True
-                or any(not isinstance(row, dict) or row.get('stage') != 'HOLD_FINISH_RECOVERY'
-                       for row in journal[indices[-1]+1:])):
-            raise ValueError('Unknown held post-commit history')
-        final = journal[indices[-1]]
+        if (not indices or any(not isinstance(row, dict) or row.get('stage') not in transitions
+                               for row in journal[indices[-1]+1:])):
+            raise ValueError('Unknown post-commit transition history')
         selected = comparison_files.get(LAUNCHER_TARGET)
-        if not isinstance(selected, dict) or selected.get('mode') != 0o644:
-            raise ValueError('Held recovery launcher does not match failure record')
+        if not isinstance(selected, dict) or selected.get('mode') not in (0o644, 0o755):
+            raise ValueError('Unknown committed launcher permission state')
+        for row in journal[indices[-1]+1:]:
+            if row['stage'] in ('HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT'):
+                recorded = row.get('launcher')
+                if (not isinstance(recorded, dict) or recorded.get('mode') not in (0o644, 0o755)
+                        or dict(recorded, mode=0o755) != dict(selected, mode=0o755)):
+                    raise ValueError('Permission intent belongs to a different launcher')
+        final = journal[indices[-1]]
         comparison_files = dict(comparison_files, **{LAUNCHER_TARGET:dict(selected, mode=0o755)})
     if final.get('stage') == 'COMMITTED_REBOOT_RECOVERED':
         state = observation['service_state']
@@ -203,7 +209,7 @@ def verify_installed_history(plan, original, journal, client_pin, now, *, recove
             raise ValueError('Recovery requires a verified installation')
         index = indices[-1]
         allowed = {'FINISH_START', 'FINISH_READY_TO_RELEASE', 'FINISH_RELEASE_COMMITTED',
-                   'HOLD_FINISH_RECOVERY', 'FINISH_REOPENED_UNQUALIFIED', 'FINISH_RECOVERY_START'}
+                   'HOLD_FINISH_RECOVERY', 'HOLD_FINISH_INTENT', 'FINISH_REOPENED_UNQUALIFIED', 'FINISH_RECOVERY_START'}
         if any(not isinstance(row, dict) or row.get('stage') not in allowed
                for row in journal[index+1:]):
             raise ValueError('Recovery cannot bypass failed apply or unknown history')
@@ -1087,6 +1093,7 @@ def finish_update(plan, client_pin):
         selected = plan['before'][LAUNCHER_TARGET]
         if (current is not None and current['sha256'] == selected['sha256']
                 and (current['device'], current['inode']) == (selected['device'], selected['inode'])):
+            record('HOLD_FINISH_INTENT', launcher=current)
             close_launcher_execution(LAUNCHER_TARGET, expected=current)
             held = root_file_state(LAUNCHER_TARGET)['mode'] == 0o644
         record('HOLD_FINISH_RECOVERY', error_type=type(error).__name__, execution_held=held)
@@ -1176,6 +1183,7 @@ def complete_committed_recovery(plan, client_pin):
         fresh = capture_committed_recovery(plan['nonce'], plan['source_main'], plan['assets'], client_pin)
         if any(fresh[key] != value for key, value in plan.items() if key != 'observed_at'):
             raise ValueError('Committed recovery bindings changed under lock')
+        validate_runtime_observation(plan, time.time())
         if root_file_state(PENDING_UPDATE) != pending:
             raise ValueError('Persistent committed marker changed')
 
@@ -1184,6 +1192,9 @@ def complete_committed_recovery(plan, client_pin):
         released_files = dict(plan['before'])
         selected = plan['before'][LAUNCHER_TARGET]
         if selected['mode'] == 0o644:
+            append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_LAUNCHER_RESTORE_INTENT',
+                observed_at=time.time(), launcher=selected))
+            validate_runtime_observation(plan, time.time())
             restore_launcher_execution(LAUNCHER_TARGET, selected)
             released_files[LAUNCHER_TARGET] = dict(selected, mode=0o755)
         # The earlier fsynced release decision authorizes this exact marker

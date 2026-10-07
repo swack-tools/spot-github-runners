@@ -283,3 +283,8 @@ the saved release decision must match every file, with only its execution mode
 held. Recovery restores execution through the verified descriptor while the
 owned drain remains. It rechecks freshness after publishing its checkpoint and
 before drain release.
+
+Permission transitions publish durable intent before changing the selected
+launcher. Recovery checks both sides of that transition against the same inode
+and bytes. Slow recovery observations must pass the selected plan's freshness
+check again before any permission change.
