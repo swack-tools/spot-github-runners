@@ -176,9 +176,10 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                 if (expire_at=='lock-during-hold' and row['stage']=='HOLD_FINISH_INTENT') or (expire_at=='lock-during-commit' and row['stage']=='FINISH_RELEASE_COMMITTED'):
                     replacement=root/'replacement';replacement.touch();replacement.replace(lock)
                 if row['stage']==expire_at:clock[0]=plan['observed_at']+121
+                return None,b''
             def read(path):
                 selected=drain if str(path)=='/run/oxidex-build-draining' else Path(path)
-                return state(selected),selected.read_bytes() if selected.exists() else b''
+                return (None,b'') if selected.name=='journal.jsonl' else (state(selected),selected.read_bytes() if selected.exists() else b'')
             closed=[]
             real_fsync,real_owned,real_restore,real_close=os.fsync,runtime.finish_owned_drain,runtime.restore_launcher_execution,runtime.close_launcher_execution
             def sync(fd):
@@ -189,7 +190,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                 real_restore(launcher,expected,**kwargs);opened.append(1)
             def close(path,**kwargs):real_close(launcher,**kwargs);closed.append(1)
             with ExitStack() as stack:
-                replacements=dict(PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
+                replacements=dict(PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:(root,(None,b'')) if kwargs.get('with_history') else root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
                 stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]));stack.enter_context(patch.object(runtime.os,'fsync',side_effect=sync))
                 if expire_at=='require-commit':
@@ -228,6 +229,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
 class CommittedFlowTests(unittest.TestCase):
     def exercise(self,*,failure=None,existing=False,already_running=False,missing_lock=False,held=False):
         _,_,plan,pin=InstalledHistoryTests().reboot_fixture();plan['observed_at']=time.time()
+        if failure=='missing-schema':plan.pop('service_state')
         if already_running:plan['service_state']=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='50',ControlPID='0',StartTicks=60)
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory).resolve();lock=root/'lock'
@@ -251,13 +253,14 @@ class CommittedFlowTests(unittest.TestCase):
                 return None
             def read(path):
                 if str(path)=='/run/oxidex-build-draining':return None,drain.read_bytes() if drain.exists() else b''
+                if Path(path).name=='journal.jsonl':return None,b''
                 raise AssertionError('Unexpected fixture read '+str(path))
-            def capture(*args):
+            def capture(*args,**kwargs):
                 nonlocal captures
                 captures+=1
                 if failure=='capture-expiry' and captures>1:clock[0]=plan['observed_at']+121
                 if running and not already_running:raise ValueError('Inactive capture used after service start')
-                return dict(plan)
+                return (dict(plan),(None,b'')) if kwargs.get('with_history') else dict(plan)
             def command(argv,**kwargs):
                 nonlocal running
                 self.assertEqual(argv,['/usr/bin/systemctl','start','gha-admission.service'])
@@ -294,23 +297,27 @@ class CommittedFlowTests(unittest.TestCase):
             def journal(path,row,**kwargs):
                 events.append(row['stage'])
                 if failure=='checkpoint-expiry':clock[0]=plan['observed_at']+121
+                return None,b''
             with ExitStack() as stack:
                 stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]))
                 stack.enter_context(patch.object(runtime.os,'fsync',side_effect=sync))
                 replacements=dict(verify_boot_guard=lambda:None,restore_launcher_execution=restore_selected,ensure_recovery_lock=lambda path:real_init(lock),PENDING_UPDATE=pending,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=identity,admission_ready=ready,live_snapshot=snapshot,append_journal_record=journal,drained_update=new_transaction,finish_owned_drain=owned_transaction)
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
                 if failure:
-                    with self.assertRaises((OSError,ValueError)):runtime.complete_committed_recovery(plan,pin)
+                    with self.assertRaises((OSError,ValueError,KeyError)):runtime.complete_committed_recovery(plan,pin)
                     self.assertEqual(drain.read_text(),plan['nonce'])
                     if failure=='capture-expiry':self.assertEqual(launcher.stat().st_mode&0o777,0o644)
                     if failure=='marker-replaced':self.assertEqual(pending.read_text(),'foreign')
-                    if failure in ('pending-expiry','lock-pending-fsync','final-marker-expiry'):self.assertNotIn('start',events)
+                    if failure in ('pending-expiry','lock-pending-fsync','final-marker-expiry','missing-schema'):self.assertNotIn('start',events)
+                    if failure=='missing-schema':self.assertTrue(pending.exists())
                 else:
                     result=runtime.complete_committed_recovery(plan,pin)
                     self.assertEqual(result['status'],'REBOOT_RECOVERED_UNQUALIFIED');self.assertIs(result['qualification_ready'],False)
                     self.assertFalse(drain.exists());self.assertTrue(running);self.assertGreaterEqual(snapshots,2)
                     if held:self.assertEqual(launcher.stat().st_mode&0o777,0o755)
             return events
+
+    def test_incomplete_selected_plan_refused_before_effects(self):self.exercise(failure='missing-schema',existing=True)
 
     def test_expired_final_marker_read_retains_drain(self):self.exercise(failure='final-marker-expiry',existing=True)
 
@@ -387,6 +394,26 @@ class JournalPublicationTests(unittest.TestCase):
                 other=path.parent/'foreign';other.write_bytes(b'{"stage":"FOREIGN"}\n');other.replace(path)
             with patch.object(runtime,'root_file_read',side_effect=self.reader):
                 with self.assertRaises(ValueError):runtime.append_journal_record(path,dict(stage='NEW'),before_publish=replaced)
+            self.assertEqual(path.read_bytes(),b'{"stage":"FOREIGN"}\n')
+
+    def test_selected_history_is_not_readopted_after_foreign_change(self):
+        self.assertIn('selected_history',inspect.signature(runtime.append_journal_record).parameters)
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';path.write_bytes(b'{"stage":"AUTHORIZED"}\n');selected=self.reader(path)
+            path.write_bytes(b'{"stage":"HOLD_EXPLICIT_RECOVERY"}\n')
+            with patch.object(runtime,'root_file_read',side_effect=self.reader):
+                with self.assertRaises(ValueError):runtime.append_journal_record(path,dict(stage='COMMIT'),selected_history=selected)
+            self.assertEqual(path.read_bytes(),b'{"stage":"HOLD_EXPLICIT_RECOVERY"}\n')
+
+    def test_selected_history_advances_only_through_verified_own_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';path.write_bytes(b'{"stage":"AUTHORIZED"}\n');selected=self.reader(path)
+            with patch.object(runtime,'root_file_read',side_effect=self.reader):
+                selected=runtime.append_journal_record(path,dict(stage='OWN_ONE'),selected_history=selected)
+                selected=runtime.append_journal_record(path,dict(stage='OWN_TWO'),selected_history=selected)
+                self.assertEqual(len(selected[1].splitlines()),3)
+                other=path.parent/'foreign';other.write_bytes(b'{"stage":"FOREIGN"}\n');other.replace(path)
+                with self.assertRaises(ValueError):runtime.append_journal_record(path,dict(stage='OWN_THREE'),selected_history=selected)
             self.assertEqual(path.read_bytes(),b'{"stage":"FOREIGN"}\n')
 
 class DrainPublicationTests(unittest.TestCase):

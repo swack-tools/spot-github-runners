@@ -299,3 +299,8 @@ If unlink succeeded but directory sync failed, the helper reports
 removed and does not claim a protective hold or close launcher execution.
 Inspect actual jobs, leases and files before any further recovery; do not replay
 apply or treat this result as a held installation.
+
+The transaction pins the authorized journal identity and complete prefix. Only
+verified writes by that transaction advance the pin. Unexpected replacement or
+appended history is preserved and refused, including during failure holding.
+Selected reboot plans must match the complete schema before recovery effects.

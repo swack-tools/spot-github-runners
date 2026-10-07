@@ -112,8 +112,7 @@ def validate_runtime_observation(plan, now):
 
 
 
-def verify_committed_reboot(original, journal, observation, client_pin, now):
-    """Validate explicit reboot completion; no fabricated running-process facts."""
+def validate_committed_observation(observation, now):
     fields = {'schema', 'nonce', 'source_main', 'vm_id', 'boot', 'image_id',
               'config_sha256', 'admission_sha256', 'service_sha256', 'service_state',
               'observed_at', 'assets', 'before'}
@@ -121,6 +120,11 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
             or type(observation['schema']) is not int or observation['schema'] != 2):
         raise ValueError('Unknown committed reboot observation')
     validate_runtime_observation(observation, now)
+
+
+def verify_committed_reboot(original, journal, observation, client_pin, now):
+    """Validate explicit reboot completion; no fabricated running-process facts."""
+    validate_committed_observation(observation, now)
     if not isinstance(original, dict):raise ValueError('Missing original update plan')
     validate_plan(original, original.get('observed_at', now))
     for field in ('nonce', 'source_main', 'vm_id', 'image_id', 'config_sha256',
@@ -274,10 +278,12 @@ def atomic_write(path, data, mode, *, before_replace=None, exclusive=False):
             os.unlink(temporary)
 
 
-def append_journal_record(path, record, *, before_publish=None, freshness=None):
+def append_journal_record(path, record, *, before_publish=None, freshness=None, selected_history=None):
     """Atomically publish a complete bounded history, retaining the old prefix."""
     import json
     state, old = root_file_read(path)
+    if selected_history is not None and (state, old) != selected_history:
+        raise ValueError('Journal differs from previously authorized history')
     if old and not old.endswith(b'\n'):
         raise ValueError('Incomplete historical journal needs explicit inspection')
     for line in old.splitlines():
@@ -296,6 +302,9 @@ def append_journal_record(path, record, *, before_publish=None, freshness=None):
             raise ValueError('Historical journal changed during publication guard')
         if freshness is not None:freshness()
     atomic_write(path, raw, 0o600, before_replace=unchanged)
+    updated = root_file_read(path)
+    if updated[1] != raw:raise ValueError('Own journal publication changed before receipt')
+    return updated
 
 
 def root_file_read(path):
@@ -999,6 +1008,7 @@ def apply_update(plan):
     import time
     lock_guard, bind_lock = transaction_lock_guard()
     assets = validate_plan(plan, time.time())
+    journal_history = [None]
     backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
     trusted_directory(backup.parent)
     if backup.exists() or backup.is_symlink():
@@ -1013,11 +1023,12 @@ def apply_update(plan):
         validate_plan(plan, time.time())
         atomic_write(backup / 'plan.json', (json.dumps(plan, sort_keys=True) + '\n').encode(), 0o600)
         journal = backup / 'journal.jsonl'
+        journal_history[0] = root_file_read(journal)
 
         def record(stage, **facts):
             lock_guard()
             fresh = None if stage.startswith('HOLD_') else lambda:validate_plan(plan,time.time())
-            append_journal_record(journal, dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard, freshness=fresh)
+            journal_history[0] = append_journal_record(journal, dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard, freshness=fresh, selected_history=journal_history[0])
 
         record('BACKUP_START')
         try:
@@ -1115,24 +1126,24 @@ def apply_update(plan):
             validate_plan(plan, time.time())
         except BaseException as error:
             import json
-            append_journal_record(backup/'journal.jsonl', dict(stage='HOLD_BEFORE_DRAIN_RELEASE',
-                observed_at=time.time(), error_type=type(error).__name__), before_publish=lock_guard)
+            journal_history[0] = append_journal_record(backup/'journal.jsonl', dict(stage='HOLD_BEFORE_DRAIN_RELEASE',
+                observed_at=time.time(), error_type=type(error).__name__), before_publish=lock_guard, selected_history=journal_history[0])
             raise
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining',
                           plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True, lock_bound=bind_lock, publication_fence=lambda:validate_plan(plan,time.time()))
 
 
-def installed_history(plan, client_pin, *, recovery=False):
+def installed_history(plan, client_pin, *, recovery=False, with_history=False):
     """Read the original private records; do not re-date the installation."""
     import json
     backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
     _, raw = root_file_read(backup / 'plan.json')
-    _, journal = root_file_read(backup / 'journal.jsonl')
+    journal_state, journal = root_file_read(backup / 'journal.jsonl')
     original = json.loads(raw)
     rows = [json.loads(line) for line in journal.splitlines()]
     import time
     verify_installed_history(plan, original, rows, client_pin, time.time(), recovery=recovery)
-    return backup
+    return (backup, (journal_state, journal)) if with_history else backup
 
 
 def finish_update(plan, client_pin):
@@ -1142,6 +1153,7 @@ def finish_update(plan, client_pin):
     lock_guard, bind_lock = transaction_lock_guard()
     validate_plan(plan, time.time())
     backup = installed_history(plan, client_pin)
+    journal_history = [None]
     expected = dict(plan, before=dict(plan['before']))
     pending_state = root_file_state(PENDING_UPDATE)
     permit_state = root_file_state(CURRENT_BOOT_PERMIT)
@@ -1151,15 +1163,17 @@ def finish_update(plan, client_pin):
         forward = guard is None
         guard = guard or lock_guard
         guard()
-        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts),
-            before_publish=guard, freshness=(lambda:validate_plan(plan,time.time())) if forward else None)
+        if journal_history[0] is None:raise ValueError('No authorized installation history bound')
+        journal_history[0] = append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts),
+            before_publish=guard, freshness=(lambda:validate_plan(plan,time.time())) if forward else None, selected_history=journal_history[0])
 
     def check():
         lock_guard()
         validate_plan(plan, time.time())
-        if not phase['started']:
-            # Authorization must be reread after acquiring the actual build EX.
-            installed_history(plan, client_pin)
+        if journal_history[0] is None:
+            _, journal_history[0] = installed_history(plan, client_pin, with_history=True)
+        if root_file_read(backup/'journal.jsonl') != journal_history[0]:
+            raise ValueError('Previously authorized installation history changed')
         snapshot = live_snapshot(expected)
         check_snapshot(expected, snapshot, owned_drain=True)
         mutation_idle_fence(plan)
@@ -1236,7 +1250,7 @@ def finish_update(plan, client_pin):
     return result
 
 
-def capture_committed_recovery(nonce, source_main, assets, client_pin):
+def capture_committed_recovery(nonce, source_main, assets, client_pin, *, with_history=False):
     """Capture a new boot and inactive unit without changing the saved update."""
     import json
     import time
@@ -1246,7 +1260,7 @@ def capture_committed_recovery(nonce, source_main, assets, client_pin):
     _, raw = root_file_read(backup/'plan.json')
     original = json.loads(raw)
     validate_plan(original, original.get('observed_at', time.time()))
-    _, raw = root_file_read(backup/'journal.jsonl')
+    journal_state, raw = root_file_read(backup/'journal.jsonl')
     journal = [json.loads(line) for line in raw.splitlines()]
     observed_at = time.time()
     verify_boot_guard()
@@ -1263,7 +1277,7 @@ def capture_committed_recovery(nonce, source_main, assets, client_pin):
         **{field:snapshot[field] for field in ('vm_id', 'boot', 'image_id', 'config_sha256',
             'admission_sha256', 'service_sha256', 'service_state', 'before')})
     verify_committed_reboot(original, journal, observation, client_pin, time.time())
-    return observation
+    return (observation, (journal_state, raw)) if with_history else observation
 
 
 def ensure_recovery_lock(path):
@@ -1293,8 +1307,10 @@ def complete_committed_recovery(plan, client_pin):
     """Complete an explicitly selected durable release after reboot."""
     import time
     lock_guard, bind_lock = transaction_lock_guard()
+    validate_committed_observation(plan, time.time())
     # Fresh capture reads the immutable original records and exact inactive unit.
-    current = capture_committed_recovery(plan['nonce'], plan['source_main'], plan['assets'], client_pin)
+    current, authorized = capture_committed_recovery(plan['nonce'], plan['source_main'], plan['assets'], client_pin, with_history=True)
+    journal_history = [authorized]
     validate_runtime_observation(plan, time.time())
     if any(current[key] != value for key, value in plan.items() if key != 'observed_at'):
         raise ValueError('Committed recovery observation changed')
@@ -1307,6 +1323,8 @@ def complete_committed_recovery(plan, client_pin):
     phase = {'active':None, 'lock_state':None}
     def check():
         lock_guard()
+        if root_file_read(backup/'journal.jsonl') != journal_history[0]:
+            raise ValueError('Previously authorized committed history changed')
         if phase['lock_state'] is not None and root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
             raise ValueError('Selected canonical recovery lock changed')
         verify_boot_guard()
@@ -1332,8 +1350,8 @@ def complete_committed_recovery(plan, client_pin):
         released_files = dict(plan['before'])
         selected = plan['before'][LAUNCHER_TARGET]
         if selected['mode'] == 0o644:
-            append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_LAUNCHER_RESTORE_INTENT',
-                observed_at=time.time(), launcher=selected), before_publish=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()))
+            journal_history[0] = append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_LAUNCHER_RESTORE_INTENT',
+                observed_at=time.time(), launcher=selected), before_publish=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()), selected_history=journal_history[0])
             validate_runtime_observation(plan, time.time())
             restore_launcher_execution(LAUNCHER_TARGET, selected,
                                        before_change=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()))
@@ -1366,10 +1384,10 @@ def complete_committed_recovery(plan, client_pin):
 
     def publish_success():
         active = phase['active']
-        append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_REBOOT_RECOVERED',
+        journal_history[0] = append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_REBOOT_RECOVERED',
             observed_at=time.time(), boot=plan['boot'], service_pid=active['service_pid'],
             service_startticks=active['service_startticks'], files=active['before'],
-            client_launcher_sha256=client_pin, qualification_ready=False), before_publish=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()))
+            client_launcher_sha256=client_pin, qualification_ready=False), before_publish=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()), selected_history=journal_history[0])
         validate_runtime_observation(plan, time.time())
 
     # No unrelated launcher needs to recreate the volatile mutex after reboot.
@@ -1392,6 +1410,7 @@ def recover_finish_update(plan, client_pin):
     lock_guard, bind_lock = transaction_lock_guard()
     validate_plan(plan, time.time())
     backup = installed_history(plan, client_pin, recovery=True)
+    journal_history = [None]
     expected = dict(plan, before=dict(plan['before']))
     _, drain_raw = root_file_read('/run/oxidex-build-draining')
     if drain_raw not in (b'', plan['nonce'].encode()):
@@ -1402,15 +1421,18 @@ def recover_finish_update(plan, client_pin):
 
     def record(stage, **facts):
         lock_guard()
-        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard, freshness=lambda:validate_plan(plan,time.time()))
+        if journal_history[0] is None:raise ValueError('Unbound recovery history')
+        journal_history[0] = append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard, freshness=lambda:validate_plan(plan,time.time()), selected_history=journal_history[0])
 
     def check(*, owned=True):
         lock_guard()
         if root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
             raise ValueError('Canonical same-boot recovery lock changed')
         validate_plan(plan, time.time())
-        if not phase['started']:
-            installed_history(plan, client_pin, recovery=True)
+        if journal_history[0] is None:
+            _, journal_history[0] = installed_history(plan, client_pin, recovery=True, with_history=True)
+        if root_file_read(backup/'journal.jsonl') != journal_history[0]:
+            raise ValueError('Authorized recovery history changed')
         snapshot = live_snapshot(expected)
         check_snapshot(expected, snapshot, owned_drain=owned)
         if owned:mutation_idle_fence(plan)
