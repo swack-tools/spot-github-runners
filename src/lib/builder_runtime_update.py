@@ -1614,6 +1614,7 @@ def recover_finish_update(plan, client_pin):
         if root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
             raise ValueError('Canonical recovery lock changed at mutation boundary')
         validate_plan(plan, time.time())
+        lock_guard()
 
     def restore_hold():
         check()

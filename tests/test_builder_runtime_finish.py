@@ -213,6 +213,8 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                 info=path.stat()
                 if expire_at=='permit-read' and path==permit and 'FINISH_START' in stages:clock[0]=plan['observed_at']+121
                 return dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),mode=info.st_mode&0o777,uid=info.st_uid,gid=info.st_gid,device=info.st_dev,inode=info.st_ino)
+            publishing=[False];permit_seen=[False]
+            if expire_at=='recovery-publication-lock':permit.unlink()
             plan['before']={k:dict(v) for k,v in plan['before'].items()};plan['before'][runtime.LAUNCHER_TARGET]=state(launcher)
             if expire_at=='selected-gid-changed':plan['before'][runtime.LAUNCHER_TARGET]['gid']+=1
             guard=root/'guard';guard.write_bytes(runtime.BOOT_GUARD_BYTES);guard.chmod(0o644)
@@ -228,6 +230,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                 if row['stage']==expire_at:clock[0]=plan['observed_at']+121
                 return None,b''
             def read(path):
+                if publishing[0] and Path(path)==permit:permit_seen[0]=True
                 selected=drain if str(path)=='/run/oxidex-build-draining' else Path(path)
                 return (None,b'') if selected.name=='journal.jsonl' else (state(selected),selected.read_bytes() if selected.exists() else b'')
             closed=[]
@@ -239,8 +242,18 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                 if expire_at=='require-commit':self.assertIn('FINISH_RELEASE_COMMITTED',stages)
                 real_restore(launcher,expected,**kwargs);opened.append(1)
             def close(path,**kwargs):real_close(launcher,**kwargs);closed.append(1)
+            validate=runtime.validate_plan;write=runtime.atomic_write
+            def checked_validation(*args):
+                result=validate(*args)
+                if expire_at=='recovery-publication-lock' and publishing[0] and permit_seen[0]:
+                    other=root/'changed-lock';other.touch();other.replace(lock)
+                return result
+            def selected_write(path,*args,**kwargs):
+                if expire_at=='recovery-publication-lock' and Path(path)==permit:
+                    publishing[0]=True;permit_seen[0]=False
+                return write(path,*args,**kwargs)
             with ExitStack() as stack:
-                replacements=dict(PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:(root,(None,b'')) if kwargs.get('with_history') else root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
+                replacements=dict(validate_plan=checked_validation,atomic_write=selected_write,PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:(root,(None,b'')) if kwargs.get('with_history') else root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
                 stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]));stack.enter_context(patch.object(runtime.os,'fsync',side_effect=sync))
                 if expire_at=='require-commit':
@@ -254,10 +267,13 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             else:
                 self.assertEqual(drain.read_text(),plan['nonce']);self.assertEqual(launcher.stat().st_mode&0o777,0o644)
                 if expire_at=='permit-read':self.assertTrue(permit.exists())
+                if expire_at=='recovery-publication-lock':self.assertFalse(permit.exists())
                 if expire_at in ('lock-during-hold','selected-gid-changed'):self.assertEqual(closed,[])
                 if expire_at=='lock-during-commit':self.assertEqual(opened,[]);self.assertTrue(pending.exists())
                 if expire_at=='authority-stage-expiry':self.assertNotIn('FINISH_RELEASE_COMMITTED',stages)
             return closed if recovery else opened
+
+    def test_same_boot_marker_publication_refuses_lost_final_mutex(self):self.exercise('recovery-publication-lock',recovery=True)
 
     def test_failure_hold_refuses_unselected_group(self):self.exercise('selected-gid-changed')
 
