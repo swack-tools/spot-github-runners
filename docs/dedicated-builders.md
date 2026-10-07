@@ -18,8 +18,8 @@ Chromium revision 1243. The package lock verifies npm archives; the official
 Node archive has a fixed SHA-256. Browser downloads and Linux libraries are
 installed during image construction. Browser files live at the read-only
 `/opt/playwright-browsers` path, selected by `PLAYWRIGHT_BROWSERS_PATH`.
-The tool probe launches a headless browser as UID 1001 and verifies a small
-in-memory page. These source additions need a reviewed image build and actual
+The tool probe checks the browser executable and shared libraries as UID 1001.
+The website audit must separately prove an actual browser launch and rendering. These source additions need a reviewed image build and actual
 tool proof before an existing host is upgraded; they do not establish that
 website tools are installed on previously launched builders.
 

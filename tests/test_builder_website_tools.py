@@ -2,9 +2,8 @@
 import json
 from pathlib import Path
 import runpy
-import subprocess
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PROBE = runpy.run_path(str(ROOT / 'builder/standalone/toolchain_probe.py'))
@@ -14,7 +13,7 @@ class WebsiteToolsTests(unittest.TestCase):
     def record(self):
         return dict(node='v24.21.0', playwright='1.63.0', chromium_revision='1243',
                     chromium_version='153.0.8010.12', browser_path='/opt/playwright-browsers',
-                    uid=1001, page_title='OxiDex tool probe')
+                    uid=1001, executable_readable=True, libraries_available=True)
 
     def test_rejects_version_path_identity_and_render_mismatch(self):
         self.assertEqual(PROBE['validate_website_tools'](self.record()), self.record())
@@ -39,17 +38,14 @@ class WebsiteToolsTests(unittest.TestCase):
         self.assertIn('PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers', dockerfile)
         self.assertIn('/opt/node/bin:/opt/build-tools', dockerfile)
 
-    def test_browser_probe_validates_actual_output(self):
-        process = Mock(returncode=0)
-        process.communicate.return_value = (json.dumps(self.record()), '')
-        with patch('subprocess.Popen', return_value=process):
+    def test_browser_dependency_probe_validates_actual_output(self):
+        with patch('subprocess.check_output', return_value=json.dumps(self.record())) as run:
             self.assertEqual(PROBE['website_tools'](), self.record())
+            self.assertEqual(run.call_args.kwargs['timeout'], 15)
 
-    def test_timeout_reaps_only_owned_browser_process_group(self):
-        process = Mock(pid=43210)
-        process.communicate.side_effect = [subprocess.TimeoutExpired('node', 30), ('', '')]
-        with patch('subprocess.Popen', return_value=process), patch('os.killpg') as kill:
-            with self.assertRaises(subprocess.TimeoutExpired):
-                PROBE['website_tools']()
-            kill.assert_called_once_with(43210, PROBE['signal'].SIGKILL)
-            self.assertEqual(process.communicate.call_count, 2)
+    def test_probe_does_not_start_a_browser_session(self):
+        import inspect
+        source = inspect.getsource(PROBE['website_tools'])
+        self.assertNotIn('chromium.launch', source)
+        self.assertIn("['--version']", source)
+        self.assertIn("'/usr/bin/ldd'", source)

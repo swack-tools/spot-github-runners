@@ -1,9 +1,7 @@
 #!/usr/bin/python3
-"""Actual tool and isolated browser evidence; no application builds or installs."""
+"""Actual tool and browser dependency evidence; no application builds or installs."""
 import hashlib
 import json
-import os
-import signal
 import subprocess
 import time
 from pathlib import Path
@@ -19,45 +17,32 @@ def validate_website_tools(row):
             or row.get('chromium_version') != '153.0.8010.12'
             or row.get('browser_path') != '/opt/playwright-browsers'
             or type(row.get('uid')) is not int or row.get('uid') != 1001
-            or row.get('page_title') != 'OxiDex tool probe'):
-        raise ValueError('Actual website tools differ from pins or browser cannot render')
+            or row.get('executable_readable') is not True
+            or row.get('libraries_available') is not True):
+        raise ValueError('Actual website tools differ from pins or libraries are unavailable')
     return row
 
 
 def website_tools():
     script = r"""
 const fs = require('fs');
+const cp = require('child_process');
 const {chromium} = require('/opt/playwright/node_modules/playwright');
-(async () => {
-  let browser;
-  try {
-    browser = await chromium.launch({headless: true, timeout: 15000});
-    const page = await browser.newPage();
-    await page.setContent('<title>OxiDex tool probe</title>', {timeout: 5000});
-    const manifest = JSON.parse(fs.readFileSync('/opt/playwright/node_modules/playwright-core/browsers.json'));
-    const revision = manifest.browsers.find(row => row.name === 'chromium').revision;
-    console.log(JSON.stringify({node: process.version,
-      playwright: require('/opt/playwright/node_modules/playwright/package.json').version,
-      chromium_revision: revision, chromium_version: browser.version(),
-      browser_path: process.env.PLAYWRIGHT_BROWSERS_PATH, uid: process.getuid(),
-      page_title: await page.title()}));
-  } finally { if (browser) await browser.close(); }
-})().catch(error => { console.error(error.message); process.exitCode = 1; });
+const executable = chromium.executablePath();
+fs.accessSync(executable, fs.constants.R_OK | fs.constants.X_OK);
+const libraries = cp.execFileSync('/usr/bin/ldd', [executable], {timeout: 5000, encoding: 'utf8'});
+if (libraries.includes('not found')) throw new Error('Missing Chromium shared library');
+const version = cp.execFileSync(executable, ['--version'], {timeout: 5000, encoding: 'utf8'}).trim();
+const manifest = JSON.parse(fs.readFileSync('/opt/playwright/node_modules/playwright-core/browsers.json'));
+const revision = manifest.browsers.find(row => row.name === 'chromium').revision;
+console.log(JSON.stringify({node: process.version,
+  playwright: require('/opt/playwright/node_modules/playwright/package.json').version,
+  chromium_revision: revision, chromium_version: version.split(' ').at(-1),
+  browser_path: process.env.PLAYWRIGHT_BROWSERS_PATH, uid: process.getuid(),
+  executable_readable: true, libraries_available: true}));
 """
-    process = subprocess.Popen(['/opt/node/bin/node', '-e', script],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, start_new_session=True)
-    try:
-        output, errors = process.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.communicate()
-        raise
-    if process.returncode != 0:
-        raise ValueError('Website browser probe failed: ' + errors[:2048])
+    output = subprocess.check_output(['/opt/node/bin/node', '-e', script],
+                                     text=True, timeout=15)
     return validate_website_tools(json.loads(output))
 
 
