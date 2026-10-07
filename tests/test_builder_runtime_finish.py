@@ -996,6 +996,18 @@ if __name__=='__main__':unittest.main()
 
 
 class InitialAncestorCustodyTests(unittest.TestCase):
+    def test_directory_descriptor_closes_if_initial_stat_fails(self):
+        opened=[];real_open=os.open;real_stat=os.fstat
+        def capture(*args):
+            fd=real_open(*args);opened.append(fd);return fd
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'marker'
+            with patch.object(runtime.os,'open',side_effect=capture),patch.object(runtime.os,'fstat',side_effect=OSError('failed metadata')):
+                with self.assertRaises(OSError):
+                    with runtime.retained_ancestor_selection(path):self.fail('failed metadata accepted')
+            self.assertEqual(len(opened),1)
+            with self.assertRaises(OSError):real_stat(opened[0])
+
     def test_only_root_nonwritable_directory_is_trusted(self):
         from types import SimpleNamespace
         import stat

@@ -329,8 +329,12 @@ def retained_ancestor_selection(path, *, authenticate=False):
     try:
         for parent in path.parents:
             directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            info = os.fstat(directory)
-            ancestors.append((parent, directory, info))
+            try:
+                info = os.fstat(directory)
+                ancestors.append((parent, directory, info))
+            except BaseException:
+                os.close(directory)
+                raise
             if authenticate:authenticate_ancestor_custody(info)
         def verify():
             custody = ('st_dev','st_ino','st_uid','st_gid','st_mode')
@@ -547,7 +551,6 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
                 if publication_fence is not None:publication_fence()
             before_publish()
             drain = publish_owned_drain(drain_path, token, before_publish=before_publish)
-            raw = token.encode('ascii')
             directory = os.open(drain_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
                 os.fsync(directory)
@@ -899,6 +902,7 @@ def close_launcher_execution(path, *, expected=None, before_change=None, freshne
         os.fsync(parent)
     finally:
         os.close(parent)
+    return None
 
 
 
