@@ -400,6 +400,16 @@ def publish_owned_drain(path, token, *, before_publish=None):
         if os.path.exists(temporary):os.unlink(temporary)
 
 
+class CommittedReleaseError(RuntimeError):
+    """Unlink succeeded; persistence is unconfirmed and no hold is claimed."""
+    def __init__(self, result):
+        super().__init__('Owned drain was unlinked; directory sync unconfirmed; inspect actual state before any recovery')
+        self.result = dict(result if isinstance(result, dict) else {'action_result':result},
+                           drain_unlinked=True, directory_sync_confirmed=False,
+                           qualification_ready=False, protected_hold=False,
+                           status='RELEASE_UNLINKED_SYNC_UNCONFIRMED')
+
+
 def verify_owned_drain(fd, path, token, canonical_owned):
     """Read the token, then recheck both canonical custody and descriptor changes."""
     canonical_owned()
@@ -468,7 +478,8 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
                 canonical_owned()
                 if release_fence is not None:release_fence()
                 os.unlink(drain_path)
-                os.fsync(directory)
+                try:os.fsync(directory)
+                except BaseException as error:raise CommittedReleaseError(result) from error
             return result
         finally:
             os.close(directory)
@@ -515,6 +526,7 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
         still_owned()
         check()
         still_owned()
+        released = False
         try:
             result = action()
             still_owned()
@@ -527,10 +539,12 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
                 canonical_owned()
                 if release_fence is not None:release_fence()
                 os.unlink(drain_path)
-                os.fsync(directory)
+                released = True
+                try:os.fsync(directory)
+                except BaseException as error:raise CommittedReleaseError(result) from error
             return result
         except BaseException as error:
-            if on_failure is not None:
+            if on_failure is not None and not released:
                 canonical_owned()
                 on_failure(error, canonical_owned)
             raise
@@ -1292,6 +1306,7 @@ def complete_committed_recovery(plan, client_pin):
             raise ValueError('Canonical recovery lock changed during observation')
         if root_file_state(PENDING_UPDATE) != pending:
             raise ValueError('Persistent committed marker changed')
+        validate_runtime_observation(plan, time.time())
 
     def complete():
         check()
@@ -1524,4 +1539,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:main()
+    except CommittedReleaseError as error:
+        import json
+        print(json.dumps(error.result, sort_keys=True))
+        raise SystemExit(75)

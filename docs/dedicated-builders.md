@@ -293,3 +293,9 @@ The release journal distinguishes the observed held files from the authorized
 executable state. A committed decision is permission to complete that transition,
 not evidence that it already happened. A completed re-hold keeps that authority
 for checked recovery after another reboot.
+
+If unlink succeeded but directory sync failed, the helper reports
+`RELEASE_UNLINKED_SYNC_UNCONFIRMED` and exits75. It states that the drain was
+removed and does not claim a protective hold or close launcher execution.
+Inspect actual jobs, leases and files before any further recovery; do not replay
+apply or treat this result as a held installation.

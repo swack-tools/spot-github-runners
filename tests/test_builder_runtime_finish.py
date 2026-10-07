@@ -191,10 +191,14 @@ class CommittedFlowTests(unittest.TestCase):
                 info=launcher.stat();plan['before']={k:dict(v) for k,v in plan['before'].items()}
                 plan['before'][runtime.LAUNCHER_TARGET].update(mode=0o644,uid=info.st_uid,gid=info.st_gid,device=info.st_dev,inode=info.st_ino)
             if existing:drain.write_text(plan['nonce']);drain.chmod(0o600)
-            running=already_running;executed=already_running;events=[];snapshots=0;captures=0;clock=[plan['observed_at']]
+            running=already_running;executed=already_running;events=[];snapshots=0;captures=0;marker_reads=0;clock=[plan['observed_at']]
             def file_state(path):
+                nonlocal marker_reads
                 path=lock if str(path)=='/run/oxidex-build.lock' else Path(path)
                 if path in (pending,lock):
+                    if path==pending:
+                        marker_reads+=1
+                        if failure=='final-marker-expiry' and marker_reads>1:clock[0]=plan['observed_at']+121
                     if not path.exists():return None
                     info=path.stat();return dict(inode=info.st_ino,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
                 return None
@@ -253,13 +257,15 @@ class CommittedFlowTests(unittest.TestCase):
                     self.assertEqual(drain.read_text(),plan['nonce'])
                     if failure=='capture-expiry':self.assertEqual(launcher.stat().st_mode&0o777,0o644)
                     if failure=='marker-replaced':self.assertEqual(pending.read_text(),'foreign')
-                    if failure in ('pending-expiry','lock-pending-fsync'):self.assertNotIn('start',events)
+                    if failure in ('pending-expiry','lock-pending-fsync','final-marker-expiry'):self.assertNotIn('start',events)
                 else:
                     result=runtime.complete_committed_recovery(plan,pin)
                     self.assertEqual(result['status'],'REBOOT_RECOVERED_UNQUALIFIED');self.assertIs(result['qualification_ready'],False)
                     self.assertFalse(drain.exists());self.assertTrue(running);self.assertGreaterEqual(snapshots,2)
                     if held:self.assertEqual(launcher.stat().st_mode&0o777,0o755)
             return events
+
+    def test_expired_final_marker_read_retains_drain(self):self.exercise(failure='final-marker-expiry',existing=True)
 
     def test_lost_lock_during_pending_fsync_prevents_start(self):self.exercise(failure='lock-pending-fsync',existing=True)
 
@@ -759,5 +765,30 @@ class OwnedFinishTests(unittest.TestCase):
             with patch.object(runtime.os,'read',side_effect=delayed):
                 with self.assertRaises(ValueError):runtime.finish_owned_drain(lock,drain,'owned',lambda:None,lambda:None,release_fence=fresh)
             self.assertEqual(drain.read_text(),'owned')
+
+    def test_postunlink_fsync_failure_never_claims_protective_hold(self):
+        self.assertTrue(isinstance(getattr(runtime,'CommittedReleaseError',None),type), 'Explicit already-unlinked outcome is missing')
+        with tempfile.TemporaryDirectory() as directory:
+            lock,drain=self.fixture(directory);sync=os.fsync;calls=[]
+            def failed(fd):
+                if not drain.exists():raise OSError('directory persistence unconfirmed')
+                sync(fd)
+            with patch.object(runtime.os,'fsync',side_effect=failed):
+                with self.assertRaises(runtime.CommittedReleaseError) as caught:
+                    runtime.finish_owned_drain(lock,drain,'owned',lambda:None,lambda:dict(qualification_ready=False),on_failure=lambda error,guard:calls.append('held'))
+            self.assertFalse(drain.exists());self.assertEqual(calls,[])
+            self.assertIs(caught.exception.result['drain_unlinked'],True)
+            self.assertIs(caught.exception.result['directory_sync_confirmed'],False)
+
+    def test_new_drain_postunlink_failure_is_explicit_committed_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock=Path(directory).resolve()/'lock';lock.touch();drain=lock.parent/'drain';sync=os.fsync;armed=[False]
+            def action():armed[0]=True;return dict(qualification_ready=False)
+            def failed(fd):
+                if armed[0] and not drain.exists():raise OSError('sync failed after unlink')
+                sync(fd)
+            with patch.object(runtime.os,'fsync',side_effect=failed):
+                with self.assertRaises(runtime.CommittedReleaseError) as caught:runtime.drained_update(lock,drain,'owned',action)
+            self.assertFalse(drain.exists());self.assertIs(caught.exception.result['protected_hold'],False)
 
 if __name__=='__main__':unittest.main()
