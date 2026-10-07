@@ -1,4 +1,4 @@
-# Simplify OxiDex remote builds
+# Simplify remote builds
 
 ## User workflow
 
