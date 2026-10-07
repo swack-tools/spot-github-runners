@@ -308,6 +308,7 @@ def append_journal_record(path, record, *, before_publish=None, freshness=None, 
             if before_publish is not None:before_publish()
             verify()
             if freshness is not None:freshness()
+            verify()
     published = atomic_write(path, raw, 0o600, before_replace=unchanged)
     updated = root_file_read(path)
     if (updated[1] != raw or updated[0] is None
@@ -1030,6 +1031,7 @@ def unlink_selected_marker(path, expected, canonical_guard, freshness):
         canonical_guard()
         verify()
         freshness()
+        verify()
         if expected is not None:os.unlink(path)
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:os.fsync(parent)
@@ -1390,7 +1392,7 @@ def complete_committed_recovery(plan, client_pin):
     if raw not in (b'', plan['nonce'].encode()):
         raise ValueError('Foreign committed-recovery drain')
 
-    phase = {'active':None, 'lock_state':None}
+    phase = {'active':None, 'lock_state':None, 'permit':None}
     def check():
         lock_guard()
         if root_file_read(backup/'journal.jsonl') != journal_history[0]:
@@ -1416,7 +1418,29 @@ def complete_committed_recovery(plan, client_pin):
         validate_runtime_observation(plan, time.time())
 
     def complete():
+        nonlocal pending
         check()
+        # The persistent hold survives service/postflight failures and another
+        # reboot. Only this boot's exact nonce permit allows the guarded start.
+        def hold_publication():
+            lock_guard()
+            if root_file_state(PENDING_UPDATE) != pending:
+                raise ValueError('Persistent recovery hold changed')
+            validate_runtime_observation(plan, time.time())
+        if pending is None:
+            atomic_write(PENDING_UPDATE, (json.dumps(dict(nonce=plan['nonce'],
+                boot=plan['boot'], source_main=plan['source_main']))+'\n').encode(),
+                0o600, before_replace=hold_publication, exclusive=True)
+            pending = root_file_state(PENDING_UPDATE)
+            if pending is None:raise ValueError('Persistent recovery hold disappeared')
+        permit, permit_raw = root_file_read(CURRENT_BOOT_PERMIT)
+        if permit is not None and (permit['mode'] != 0o600 or permit_raw != plan['nonce'].encode()):
+            raise ValueError('Foreign current-boot recovery permit')
+        if permit is None:
+            atomic_write(CURRENT_BOOT_PERMIT, plan['nonce'].encode(), 0o600,
+                         before_replace=hold_publication, exclusive=True)
+        phase['permit'] = root_file_state(CURRENT_BOOT_PERMIT)
+        if phase['permit'] is None:raise ValueError('Recovery permit disappeared')
         released_files = dict(plan['before'])
         selected = plan['before'][LAUNCHER_TARGET]
         if selected['mode'] == 0o644:
@@ -1426,14 +1450,7 @@ def complete_committed_recovery(plan, client_pin):
             restore_launcher_execution(LAUNCHER_TARGET, selected,
                                        before_change=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()))
             released_files[LAUNCHER_TARGET] = dict(selected, mode=0o755)
-        # The earlier fsynced release decision authorizes this exact marker
-        # removal. Preserve that historical journal until service proof succeeds.
-        validate_runtime_observation(plan, time.time())
-        if root_file_state(PENDING_UPDATE) != pending:
-            raise ValueError('Committed pending marker replaced before deletion')
-        unlink_selected_marker(PENDING_UPDATE, pending, lock_guard,
-                               lambda:validate_runtime_observation(plan,time.time()))
-        validate_runtime_observation(plan, time.time())
+        hold_publication()
         if plan['service_state']['ActiveState'] == 'inactive':
             lock_guard()
             validate_runtime_observation(plan, time.time())
@@ -1459,6 +1476,10 @@ def complete_committed_recovery(plan, client_pin):
             service_startticks=active['service_startticks'], files=active['before'],
             client_launcher_sha256=client_pin, qualification_ready=False), before_publish=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()), selected_history=journal_history[0])
         validate_runtime_observation(plan, time.time())
+        unlink_selected_marker(PENDING_UPDATE, pending, lock_guard,
+                               lambda:validate_runtime_observation(plan,time.time()))
+        unlink_selected_marker(CURRENT_BOOT_PERMIT, phase['permit'], lock_guard,
+                               lambda:validate_runtime_observation(plan,time.time()))
 
     # No unrelated launcher needs to recreate the volatile mutex after reboot.
     validate_runtime_observation(plan, time.time())

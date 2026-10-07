@@ -121,6 +121,15 @@ class MarkerRemovalBoundaryTests(unittest.TestCase):
                 self.assertEqual(path.read_bytes(),b'owned')
             finally:path.parent.chmod(0o700)
 
+    def test_marker_changed_during_freshness_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'marker';path.write_text('owned');expected=dict(inode=path.stat().st_ino)
+            def freshness():
+                other=path.parent/'foreign';other.write_text('foreign');other.replace(path)
+            with patch.object(runtime,'root_file_state',return_value=expected):
+                with self.assertRaises(ValueError):runtime.unlink_selected_marker(path,expected,lambda:None,freshness)
+            self.assertEqual(path.read_text(),'foreign')
+
     def test_absent_marker_retry_still_syncs_parent(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory).resolve()/'marker';synced=[]
@@ -259,14 +268,16 @@ class CommittedFlowTests(unittest.TestCase):
         custody = patch.object(runtime,'authenticate_ancestor_custody')
         custody.start();self.addCleanup(custody.stop)
 
-    def exercise(self,*,failure=None,existing=False,already_running=False,missing_lock=False,held=False):
+    def exercise(self,*,failure=None,existing=False,already_running=False,missing_lock=False,held=False,missing_pending=False):
         _,_,plan,pin=InstalledHistoryTests().reboot_fixture();plan['observed_at']=time.time()
         if failure=='missing-schema':plan.pop('service_state')
         if already_running:plan['service_state']=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='50',ControlPID='0',StartTicks=60)
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory).resolve();lock=root/'lock'
             if not missing_lock:lock.touch()
-            drain=root/'drain';pending=root/'pending';pending.write_text('retained')
+            drain=root/'drain';pending=root/'pending';permit=root/'permit'
+            if not missing_pending:pending.write_text('retained')
+            if failure=='foreign-permit':permit.write_text('foreign');permit.chmod(0o600)
             launcher=root/'launcher';launcher.write_bytes(b'bounded synthetic runtime\n');launcher.chmod(0o644 if held else 0o755)
             if held:
                 info=launcher.stat();plan['before']={k:dict(v) for k,v in plan['before'].items()}
@@ -276,16 +287,17 @@ class CommittedFlowTests(unittest.TestCase):
             def file_state(path):
                 nonlocal marker_reads
                 path=lock if str(path)=='/run/oxidex-build.lock' else Path(path)
-                if path in (pending,lock):
+                if path in (pending,lock,permit):
                     if path==pending:
                         marker_reads+=1
                         if failure=='final-marker-expiry' and marker_reads>1:clock[0]=plan['observed_at']+121
                     if not path.exists():return None
-                    info=path.stat();return dict(inode=info.st_ino,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                    info=path.stat();return dict(inode=info.st_ino,mode=info.st_mode&0o777,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
                 return None
             def read(path):
                 if str(path)=='/run/oxidex-build-draining':return None,drain.read_bytes() if drain.exists() else b''
                 if Path(path).name=='journal.jsonl':return None,b''
+                if Path(path)==permit:return file_state(permit),permit.read_bytes() if permit.exists() else b''
                 raise AssertionError('Unexpected fixture read '+str(path))
             def capture(*args,**kwargs):
                 nonlocal captures
@@ -296,7 +308,7 @@ class CommittedFlowTests(unittest.TestCase):
             def command(argv,**kwargs):
                 nonlocal running
                 self.assertEqual(argv,['/usr/bin/systemctl','start','gha-admission.service'])
-                self.assertEqual(drain.read_text(),plan['nonce']);self.assertFalse(pending.exists())
+                self.assertEqual(drain.read_text(),plan['nonce']);self.assertTrue(pending.exists());self.assertEqual(permit.read_text(),plan['nonce'])
                 events.append('start')
                 if failure=='start':raise OSError('service start failed')
                 running=True;return ''
@@ -312,7 +324,7 @@ class CommittedFlowTests(unittest.TestCase):
                 nonlocal snapshots
                 snapshots+=1
                 if failure=='final' and snapshots>1:raise ValueError('final host observation failed')
-                return dict(active,image_pin=active['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=None,drain_token=drain.read_text())
+                return dict(active,image_pin=active['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=plan['nonce'] if pending.exists() else None,drain_token=drain.read_text())
             real_new,real_owned,real_init,real_restore=runtime.drained_update,runtime.finish_owned_drain,runtime.ensure_recovery_lock,runtime.restore_launcher_execution
             real_sync=os.fsync
             def sync(fd):
@@ -333,15 +345,18 @@ class CommittedFlowTests(unittest.TestCase):
             with ExitStack() as stack:
                 stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]))
                 stack.enter_context(patch.object(runtime.os,'fsync',side_effect=sync))
-                replacements=dict(verify_boot_guard=lambda:None,restore_launcher_execution=restore_selected,ensure_recovery_lock=lambda path:real_init(lock),PENDING_UPDATE=pending,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=identity,admission_ready=ready,live_snapshot=snapshot,append_journal_record=journal,drained_update=new_transaction,finish_owned_drain=owned_transaction)
+                replacements=dict(verify_boot_guard=lambda:None,restore_launcher_execution=restore_selected,ensure_recovery_lock=lambda path:real_init(lock),PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=identity,admission_ready=ready,live_snapshot=snapshot,append_journal_record=journal,drained_update=new_transaction,finish_owned_drain=owned_transaction)
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
                 if failure:
                     with self.assertRaises((OSError,ValueError,KeyError)):runtime.complete_committed_recovery(plan,pin)
                     self.assertEqual(drain.read_text(),plan['nonce'])
                     if failure=='capture-expiry':self.assertEqual(launcher.stat().st_mode&0o777,0o644)
                     if failure=='marker-replaced':self.assertEqual(pending.read_text(),'foreign')
-                    if failure in ('pending-expiry','lock-pending-fsync','final-marker-expiry','missing-schema'):self.assertNotIn('start',events)
-                    if failure=='missing-schema':self.assertTrue(pending.exists())
+                    if failure in ('final-marker-expiry','missing-schema','foreign-permit'):self.assertNotIn('start',events)
+                    if failure=='foreign-permit':self.assertEqual(permit.read_text(),'foreign')
+                    if failure in ('pending-expiry','lock-pending-fsync'):
+                        self.assertIn('COMMITTED_REBOOT_RECOVERED',events);self.assertIn('ready',events)
+                    if failure in ('missing-schema','start','readiness','final'):self.assertTrue(pending.exists(), 'Persistent hold lost before successful postflight')
                 else:
                     result=runtime.complete_committed_recovery(plan,pin)
                     self.assertEqual(result['status'],'REBOOT_RECOVERED_UNQUALIFIED');self.assertIs(result['qualification_ready'],False)
@@ -355,8 +370,12 @@ class CommittedFlowTests(unittest.TestCase):
 
     def test_lost_lock_during_pending_fsync_prevents_start(self):self.exercise(failure='lock-pending-fsync',existing=True)
 
+    def test_missing_pending_hold_is_recreated_before_start(self):self.exercise(missing_pending=True)
+    def test_foreign_boot_permit_is_preserved(self):self.exercise(failure='foreign-permit',existing=True)
+    def test_missing_pending_hold_survives_start_failure(self):self.exercise(failure='start',existing=True,missing_pending=True)
+
     def test_foreign_marker_replacement_is_preserved(self):self.exercise(failure='marker-replaced',existing=True,held=True)
-    def test_pending_fsync_expiry_does_not_start_service(self):self.exercise(failure='pending-expiry',existing=True)
+    def test_pending_fsync_expiry_retains_drain_after_postflight(self):self.exercise(failure='pending-expiry',existing=True)
 
     def test_slow_capture_expiry_does_not_restore_launcher(self):self.exercise(failure='capture-expiry',existing=True,held=True)
 
@@ -470,6 +489,15 @@ class JournalPublicationTests(unittest.TestCase):
                     with self.assertRaises(ValueError):runtime.append_journal_record(path,dict(stage='NEW'),before_publish=guard)
                 self.assertEqual(path.read_bytes(),old)
             finally:path.parent.chmod(0o700)
+
+    def test_journal_changed_during_freshness_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';path.write_bytes(b'{"stage":"OLD"}\n')
+            def freshness():
+                other=path.parent/'foreign';other.write_bytes(b'{"stage":"FOREIGN"}\n');other.replace(path)
+            with patch.object(runtime,'root_file_read',side_effect=self.reader):
+                with self.assertRaises(ValueError):runtime.append_journal_record(path,dict(stage='NEW'),freshness=freshness)
+            self.assertEqual(path.read_bytes(),b'{"stage":"FOREIGN"}\n')
 
     def test_identical_foreign_inode_is_not_accepted_as_own_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -992,9 +1020,6 @@ class OwnedFinishTests(unittest.TestCase):
             with self.assertRaises(ValueError):runtime.drained_update(lock,drain,'owned',lambda:self.fail('action ran'),publication_fence=expired)
             self.assertFalse(drain.exists());self.assertEqual(list(lock.parent.iterdir()),[lock])
 
-if __name__=='__main__':unittest.main()
-
-
 class InitialAncestorCustodyTests(unittest.TestCase):
     def test_directory_descriptor_closes_if_initial_stat_fails(self):
         opened=[];real_open=os.open;real_stat=os.fstat
@@ -1035,3 +1060,6 @@ class InitialAncestorCustodyTests(unittest.TestCase):
                         else:runtime.drained_update(lock,drain,'owned',action)
                     self.assertEqual(drain.read_text(),'owned')
                 finally:lock.parent.chmod(0o700)
+
+if __name__ == '__main__':
+    unittest.main()
