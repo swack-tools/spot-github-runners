@@ -85,6 +85,19 @@ class ExclusiveMarkerTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(),b'foreign')
             self.assertEqual(list(path.parent.iterdir()),[path])
 
+class MarkerRemovalBoundaryTests(unittest.TestCase):
+    def test_slow_canonical_guard_expiry_preserves_marker(self):
+        self.assertTrue(callable(getattr(runtime,'unlink_selected_marker',None)), 'Shared marker release boundary is missing')
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'marker';path.write_bytes(b'owned');late=[False]
+            expected=dict(inode=path.stat().st_ino)
+            def guard():late[0]=True
+            def fresh():
+                if late[0]:raise ValueError('expired during canonical lookup')
+            with patch.object(runtime,'root_file_state',side_effect=lambda selected:dict(inode=Path(selected).stat().st_ino)):
+                with self.assertRaises(ValueError):runtime.unlink_selected_marker(path,expected,guard,fresh)
+            self.assertEqual(path.read_bytes(),b'owned')
+
 class InactiveServiceTests(unittest.TestCase):
     def parse(self,raw):
         self.assertTrue(callable(getattr(runtime,'parse_inactive_service_state',None)), 'Native inactive state parser is missing')
@@ -611,6 +624,14 @@ class InstalledHistoryTests(unittest.TestCase):
                 try:result=self.reboot_verify(original,journal,observation,pin)
                 except ValueError as error:self.fail('Writer retry stage lost authority: '+str(error))
                 self.assertEqual(result,pin)
+
+    def test_checkpoint_retry_rebinds_actual_restarted_service(self):
+        original,journal,observation,pin=self.reboot_fixture()
+        journal.append(dict(stage='COMMITTED_REBOOT_RECOVERED',files=observation['before'],client_launcher_sha256=pin,qualification_ready=False,boot=observation['boot'],service_pid=50,service_startticks=60))
+        observation['service_state']=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='51',ControlPID='0',StartTicks=61)
+        try:result=self.reboot_verify(original,journal,observation,pin)
+        except ValueError as error:self.fail('Fresh verified restart lost committed retry: '+str(error))
+        self.assertEqual(result,pin)
 
 class OwnedFinishTests(unittest.TestCase):
     def run_finish(self,lock,drain,action,check=lambda:None):

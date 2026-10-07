@@ -175,12 +175,12 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
         comparison_files = dict(comparison_files, **{LAUNCHER_TARGET:dict(selected, mode=0o755)})
     if final.get('stage') == 'COMMITTED_REBOOT_RECOVERED':
         state = observation['service_state']
-        if (state.get('ActiveState') != 'active' or final.get('boot') != observation['boot']
-                or str(final.get('service_pid')) != state.get('MainPID')
-                or final.get('service_startticks') != state.get('StartTicks')
+        if (final.get('boot') != observation['boot']
+                or type(final.get('service_pid')) is not int or final['service_pid'] <= 0
+                or type(final.get('service_startticks')) is not int or final['service_startticks'] <= 0
                 or not any(isinstance(row, dict) and row.get('stage') == 'FINISH_RELEASE_COMMITTED'
                            for row in journal[:-1])):
-            raise ValueError('Recovered checkpoint process or boot changed')
+            raise ValueError('Recovered checkpoint boot or historical identity is invalid')
     elif final.get('stage') != 'FINISH_RELEASE_COMMITTED':
         raise ValueError('No durable committed release to recover')
     # A release decision records observed held files separately from the
@@ -933,6 +933,20 @@ def prepare_boot_hold(plan):
 
 
 
+def unlink_selected_marker(path, expected, canonical_guard, freshness):
+    """Verify custody, then canonical authority, then time immediately before unlink."""
+    path = Path(path)
+    if root_file_state(path) != expected:
+        raise ValueError('Selected maintenance marker ownership changed')
+    canonical_guard()
+    freshness()
+    if expected is None:return
+    os.unlink(path)
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:os.fsync(parent)
+    finally:os.close(parent)
+
+
 def verify_boot_guard():
     state, raw = root_file_read(BOOT_GUARD)
     if state is None or state['mode'] != 0o644 or raw != BOOT_GUARD_BYTES:
@@ -1148,14 +1162,8 @@ def finish_update(plan, client_pin):
 
     def remove_marker(path, state):
         check()
-        if state is None or root_file_state(path) != state:
-            raise ValueError('Finish does not own the selected marker')
-        validate_plan(plan, time.time())
-        lock_guard()
-        os.unlink(path)
-        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:os.fsync(parent)
-        finally:os.close(parent)
+        if state is None:raise ValueError('Finish does not own the selected marker')
+        unlink_selected_marker(path, state, lock_guard, lambda:validate_plan(plan,time.time()))
 
     def reopen():
         check()
@@ -1186,12 +1194,8 @@ def finish_update(plan, client_pin):
         check()
         if pending_state is None or root_file_state(PENDING_UPDATE) != pending_state:
             raise ValueError('Persistent marker changed before committed release')
-        validate_plan(plan, time.time())
-        lock_guard()
-        os.unlink(PENDING_UPDATE)
-        parent = os.open(PENDING_UPDATE.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:os.fsync(parent)
-        finally:os.close(parent)
+        unlink_selected_marker(PENDING_UPDATE, pending_state, lock_guard,
+                               lambda:validate_plan(plan,time.time()))
         phase['pending'] = True
         validate_plan(plan, time.time())
 
@@ -1324,12 +1328,8 @@ def complete_committed_recovery(plan, client_pin):
         validate_runtime_observation(plan, time.time())
         if root_file_state(PENDING_UPDATE) != pending:
             raise ValueError('Committed pending marker replaced before deletion')
-        validate_runtime_observation(plan, time.time())
-        lock_guard()
-        if pending is not None:os.unlink(PENDING_UPDATE)
-        parent = os.open(PENDING_UPDATE.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:os.fsync(parent)
-        finally:os.close(parent)
+        unlink_selected_marker(PENDING_UPDATE, pending, lock_guard,
+                               lambda:validate_runtime_observation(plan,time.time()))
         validate_runtime_observation(plan, time.time())
         if plan['service_state']['ActiveState'] == 'inactive':
             lock_guard()
