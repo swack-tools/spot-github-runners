@@ -94,6 +94,38 @@ class InactiveServiceTests(unittest.TestCase):
         self.assertEqual(runtime.parse_recovery_service_state(raw)['MainPID'],'50')
         with self.assertRaises(ValueError):runtime.parse_recovery_service_state(raw.replace('running','start'))
 
+class OrdinaryFinishClockTests(unittest.TestCase):
+    def exercise(self,expire_at):
+        _,plan,_,pin=InstalledHistoryTests().fixture();plan['observed_at']=time.time();clock=[plan['observed_at']];opened=[]
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();lock=root/'lock';lock.touch();drain=root/'drain';drain.write_text(plan['nonce']);drain.chmod(0o600)
+            pending=root/'pending';pending.write_text('owned');permit=root/'permit';permit.write_text('owned');launcher=root/'launcher';launcher.write_bytes(b'bounded synthetic runtime\n');launcher.chmod(0o644)
+            def state(path):
+                path=launcher if str(path)==runtime.LAUNCHER_TARGET else Path(path)
+                if not path.exists():return None
+                info=path.stat();return dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),mode=info.st_mode&0o777,uid=info.st_uid,gid=info.st_gid,device=info.st_dev,inode=info.st_ino)
+            plan['before']={k:dict(v) for k,v in plan['before'].items()};plan['before'][runtime.LAUNCHER_TARGET]=state(launcher)
+            guard=root/'guard';guard.write_bytes(runtime.BOOT_GUARD_BYTES);guard.chmod(0o644)
+            def snapshot(expected):return dict(expected,image_pin=expected['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=plan['nonce'] if pending.exists() else None,drain_token=drain.read_text())
+            def record(path,row):
+                if row['stage']==expire_at:clock[0]=plan['observed_at']+121
+            real_fsync,real_owned,real_restore,real_close=os.fsync,runtime.finish_owned_drain,runtime.restore_launcher_execution,runtime.close_launcher_execution
+            def sync(fd):
+                real_fsync(fd)
+                if expire_at=='pending-fsync' and not pending.exists():clock[0]=plan['observed_at']+121
+            def restore(path,expected):opened.append(1);real_restore(launcher,expected)
+            with ExitStack() as stack:
+                replacements=dict(PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=lambda path,**kwargs:real_close(launcher,**kwargs),finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
+                for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
+                stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]));stack.enter_context(patch.object(runtime.os,'fsync',side_effect=sync))
+                with self.assertRaises(ValueError):runtime.finish_update(plan,pin)
+            self.assertEqual(drain.read_text(),plan['nonce'])
+            self.assertEqual(launcher.stat().st_mode&0o777,0o644)
+            return opened
+
+    def test_start_journal_expiry_does_not_restore_execution(self):self.assertEqual(self.exercise('FINISH_START'),[])
+    def test_pending_directory_fsync_expiry_keeps_drain(self):self.exercise('pending-fsync')
+
 class CommittedFlowTests(unittest.TestCase):
     def exercise(self,*,failure=None,existing=False,already_running=False,missing_lock=False,held=False):
         _,_,plan,pin=InstalledHistoryTests().reboot_fixture();plan['observed_at']=time.time()
@@ -107,7 +139,7 @@ class CommittedFlowTests(unittest.TestCase):
                 info=launcher.stat();plan['before']={k:dict(v) for k,v in plan['before'].items()}
                 plan['before'][runtime.LAUNCHER_TARGET].update(mode=0o644,uid=info.st_uid,device=info.st_dev,inode=info.st_ino)
             if existing:drain.write_text(plan['nonce']);drain.chmod(0o600)
-            running=already_running;events=[];snapshots=0;captures=0;clock=[plan['observed_at']]
+            running=already_running;executed=already_running;events=[];snapshots=0;captures=0;clock=[plan['observed_at']]
             def file_state(path):
                 path=Path(path)
                 if path==pending:
@@ -130,7 +162,12 @@ class CommittedFlowTests(unittest.TestCase):
                 events.append('start')
                 if failure=='start':raise OSError('service start failed')
                 running=True;return ''
+            def identity(*,strict=True):
+                if strict and not executed:raise ValueError('Unexpected admission process')
+                return 50,60
             def ready(active,pid,ticks,**kwargs):
+                nonlocal executed
+                executed=True
                 self.assertTrue(running);self.assertEqual((pid,ticks),(50,60));events.append('ready')
                 if failure=='readiness':raise ConnectionRefusedError('not ready')
             def snapshot(active):
@@ -146,7 +183,7 @@ class CommittedFlowTests(unittest.TestCase):
                 if failure=='checkpoint-expiry':clock[0]=plan['observed_at']+121
             with ExitStack() as stack:
                 stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]))
-                replacements=dict(restore_launcher_execution=lambda path,expected:real_restore(launcher,expected),ensure_recovery_lock=lambda path:real_init(lock),PENDING_UPDATE=pending,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=lambda:(50,60),admission_ready=ready,live_snapshot=snapshot,append_journal_record=journal,drained_update=new_transaction,finish_owned_drain=owned_transaction)
+                replacements=dict(restore_launcher_execution=lambda path,expected:real_restore(launcher,expected),ensure_recovery_lock=lambda path:real_init(lock),PENDING_UPDATE=pending,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=identity,admission_ready=ready,live_snapshot=snapshot,append_journal_record=journal,drained_update=new_transaction,finish_owned_drain=owned_transaction)
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
                 if failure:
                     with self.assertRaises((OSError,ValueError)):runtime.complete_committed_recovery(plan,pin)

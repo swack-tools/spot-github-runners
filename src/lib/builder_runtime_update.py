@@ -1057,6 +1057,7 @@ def finish_update(plan, client_pin):
     def reopen():
         check()
         record('FINISH_START', client_launcher_sha256=client_pin)
+        validate_plan(plan, time.time())
         phase['started'] = True
         restore_launcher_execution(LAUNCHER_TARGET, plan['before'][LAUNCHER_TARGET])
         phase['opened'] = True
@@ -1084,6 +1085,7 @@ def finish_update(plan, client_pin):
         try:os.fsync(parent)
         finally:os.close(parent)
         phase['pending'] = True
+        validate_plan(plan, time.time())
 
     def hold_failure(error):
         # Keep executable permission closed on the exact owned launcher after a
@@ -1207,7 +1209,7 @@ def complete_committed_recovery(plan, client_pin):
         if plan['service_state']['ActiveState'] == 'inactive':
             checked_command(['/usr/bin/systemctl', 'start', 'gha-admission.service'],
                             timeout=min(20, max(1, plan['observed_at']+120-time.time())))
-        pid, ticks = service_identity()
+        pid, ticks = service_identity(strict=False)
         if plan['service_state']['ActiveState'] == 'active' and (pid, ticks) != (
                 int(plan['service_state']['MainPID']), plan['service_state']['StartTicks']):
             raise ValueError('Selected running recovery process changed')
