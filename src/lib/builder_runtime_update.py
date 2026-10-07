@@ -891,7 +891,8 @@ def live_snapshot(plan, *, committed_original=None):
 
 def close_launcher_execution(path, *, expected=None, before_change=None, freshness=None):
     if expected is not None:
-        return set_verified_launcher_mode(path, expected, 0o644, before_change=before_change, freshness=freshness)
+        set_verified_launcher_mode(path, expected, 0o644, before_change=before_change, freshness=freshness)
+        return None
     path = Path(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -916,7 +917,7 @@ def restore_launcher_execution(path, expected, *, before_change=None, freshness=
     """Restore execution only on the still-held, selected inode and bytes."""
     if expected['mode'] != 0o644:
         raise ValueError('Expected launcher must be held')
-    return set_verified_launcher_mode(path, expected, 0o755, before_change=before_change, freshness=freshness)
+    set_verified_launcher_mode(path, expected, 0o755, before_change=before_change, freshness=freshness)
 
 
 def set_verified_launcher_mode(path, expected, mode, *, before_change=None, freshness=None):
