@@ -179,4 +179,19 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
             self.assertEqual(drain.read_text(),'foreign-after-check')
 
 
+    def test_expiry_after_staging_preserves_live_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();path=root/'target';path.write_bytes(b'old')
+            def expired():raise ValueError('expired after staging')
+            with self.assertRaises(ValueError):
+                atomic_write(path,b'new',0o644,before_replace=expired)
+            self.assertEqual(path.read_bytes(),b'old')
+
+    def test_successful_install_can_remain_drained_for_pin_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();lock=root/'build.lock';lock.touch();drain=root/'drain'
+            self.assertEqual(drained_update(lock,drain,'owned',lambda:42,keep_drain=True),42)
+            self.assertEqual(drain.read_text(),'owned')
+
+
 if __name__=='__main__':unittest.main()

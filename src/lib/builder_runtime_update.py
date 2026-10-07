@@ -73,7 +73,7 @@ def validate_plan(plan, now):
     return validate_assets(plan['assets'])
 
 
-def atomic_write(path, data, mode):
+def atomic_write(path, data, mode, *, before_replace=None):
     path = Path(path)
     if any(p.is_symlink() for p in (path, *path.parents)):
         raise ValueError('Symlinked runtime path')
@@ -86,6 +86,8 @@ def atomic_write(path, data, mode):
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary, path)
         parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
@@ -152,7 +154,7 @@ def active_work_processes(records):
             or b'/usr/local/bin/oxidex-remote-build' in row['argv']]
 
 
-def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None):
+def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False):
     """Run under the existing lock; failures retain the protective owned drain."""
     import fcntl
     if not isinstance(token, str) or not re.fullmatch('[a-zA-Z0-9_-]{1,128}', token):
@@ -194,8 +196,9 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
             if ((current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino)
                     or current.st_nlink != 1 or os.read(drain, 129) != raw):
                 raise ValueError('Owned drain changed during final checks')
-            os.unlink(drain_path)
-            os.fsync(directory)
+            if not keep_drain:
+                os.unlink(drain_path)
+                os.fsync(directory)
             return result
         finally:
             os.close(directory)
@@ -410,6 +413,8 @@ def mutation_idle_fence(plan):
 
 def file_mutation_fence(plan, target=None):
     import time
+    if service_identity() != (plan['service_pid'], plan['service_startticks']):
+        raise ValueError('Approved admission process changed before planned restart')
     if (Path('/proc/sys/kernel/random/boot_id').read_text().strip() != plan['boot']
             or root_file_state('/etc/oxidex-remote-build.json')['sha256'] != plan['config_sha256']
             or root_file_state('/etc/gha-admission.json')['sha256'] != plan['admission_sha256']
@@ -463,7 +468,10 @@ def apply_update(plan):
                 trusted_directory(Path(target).parent, create=True)
                 mutation_idle_fence(plan)
                 file_mutation_fence(plan, target)
-                atomic_write(target, assets[target], TARGETS[target])
+                def before_replace():
+                    mutation_idle_fence(plan)
+                    file_mutation_fence(plan, target)
+                atomic_write(target, assets[target], TARGETS[target], before_replace=before_replace)
                 record('FILE_REPLACED', target=target,
                        sha256=hashlib.sha256(assets[target]).hexdigest())
             validate_plan(plan, time.time())
@@ -490,7 +498,7 @@ def apply_update(plan):
                     raise ValueError('Installed runtime proof differs')
             record('FILES_AND_SERVICE_VERIFIED', service_pid=after['service_pid'],
                    service_startticks=after['service_startticks'], files=after['before'])
-            return dict(status='UPDATED', source_main=plan['source_main'], backup=str(backup),
+            return dict(status='INSTALLED_DRAINED', source_main=plan['source_main'], backup=str(backup),
                         service_pid=after['service_pid'], service_startticks=after['service_startticks'],
                         qualification_ready=False)
         except BaseException as error:
@@ -532,7 +540,7 @@ def apply_update(plan):
                 output.flush();os.fsync(output.fileno())
             raise
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                          plan['nonce'], install, before_drain=before_drain, before_release=before_release)
+                          plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True)
 
 
 def plan_from_snapshot(source_main, assets, snapshot, observed_at, nonce):

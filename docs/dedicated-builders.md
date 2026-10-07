@@ -144,8 +144,11 @@ creates an owned drain, backs up old files, and replaces only the fixed runtime
 file set. It restarts admission alone. It preserves the image, build limits,
 source worktrees, and caches. A partial failure retains the drain and backups
 for explicit recovery. Success verifies installed bytes and the new admission
-process before removing the owned drain.
+process while retaining the owned drain.
 
 Coordinate the exact OxiDex launcher pin before this update. The helper does not
 change clients or declare qualification ready. Run the reviewed Linux gate and
-ordinary build checks before routing qualification work to the updated host.
+ordinary build checks before routing qualification work to the updated host. A successful installation
+returns `INSTALLED_DRAINED`; it keeps the route off until an independently
+verified client-pin handoff authorizes removal of the exact owned drain. The
+updater never reopens the route automatically.
