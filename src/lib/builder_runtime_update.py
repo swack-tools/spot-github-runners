@@ -271,7 +271,7 @@ def atomic_write(path, data, mode, *, before_replace=None):
             os.unlink(temporary)
 
 
-def append_journal_record(path, record):
+def append_journal_record(path, record, *, before_publish=None):
     """Atomically publish a complete bounded history, retaining the old prefix."""
     import json
     state, old = root_file_read(path)
@@ -288,6 +288,7 @@ def append_journal_record(path, record):
     def unchanged():
         if root_file_read(path)[0] != state:
             raise ValueError('Historical journal changed before publication')
+        if before_publish is not None:before_publish()
     atomic_write(path, raw, 0o600, before_replace=unchanged)
 
 
@@ -396,6 +397,27 @@ def publish_owned_drain(path, token, *, before_publish=None):
         if os.path.exists(temporary):os.unlink(temporary)
 
 
+def verify_owned_drain(fd, path, token, canonical_owned):
+    """Read the token, then recheck both canonical custody and descriptor changes."""
+    canonical_owned()
+    before = os.fstat(fd);current = Path(path).lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_uid != os.geteuid() or before.st_mode & 0o077
+            or (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino)):
+        raise ValueError('Owned drain custody differs')
+    os.lseek(fd, 0, os.SEEK_SET)
+    raw = os.read(fd, 129)
+    after = os.fstat(fd);current = Path(path).lstat()
+    attributes = ('st_uid', 'st_gid', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+    if ((after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+            or after.st_nlink != 1 or current.st_nlink != 1
+            or current.st_uid != os.geteuid() or current.st_mode & 0o077
+            or any(getattr(before, name) != getattr(after, name) for name in attributes)
+            or raw != token.encode('ascii')):
+        raise ValueError('Owned drain changed during token read')
+    canonical_owned()
+
+
 def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False):
     """Run under the existing lock; failures retain the protective owned drain."""
     import fcntl
@@ -432,21 +454,12 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
             canonical_owned()
             result = action()
             canonical_owned()
-            owned, current = os.fstat(drain), drain_path.lstat()
-            if (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino) or current.st_nlink != 1:
-                raise ValueError('Owned drain replaced; explicit recovery required')
-            os.lseek(drain, 0, os.SEEK_SET)
-            if os.read(drain, 129) != raw:
-                raise ValueError('Owned drain changed; explicit recovery required')
+            verify_owned_drain(drain, drain_path, token, canonical_owned)
             if before_release is not None:
                 canonical_owned()
                 before_release(result)
                 canonical_owned()
-            current = drain_path.lstat()
-            os.lseek(drain, 0, os.SEEK_SET)
-            if ((current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino)
-                    or current.st_nlink != 1 or os.read(drain, 129) != raw):
-                raise ValueError('Owned drain changed during final checks')
+            verify_owned_drain(drain, drain_path, token, canonical_owned)
             if not keep_drain:
                 canonical_owned()
                 os.unlink(drain_path)
@@ -492,16 +505,7 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
                     or current.st_uid != os.geteuid() or current.st_mode & 0o022):
                 raise ValueError('Canonical build lock ownership lost')
         def still_owned():
-            current_lock = lock_path.lstat()
-            current = drain_path.lstat()
-            os.lseek(drain, 0, os.SEEK_SET)
-            if ((current_lock.st_dev, current_lock.st_ino) != (original.st_dev, original.st_ino)
-                    or not stat.S_ISREG(current_lock.st_mode) or current_lock.st_nlink != 1
-                    or current_lock.st_uid != os.geteuid() or current_lock.st_mode & 0o022
-                    or (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino)
-                    or current.st_nlink != 1 or current.st_uid != os.geteuid()
-                    or current.st_mode & 0o077 or os.read(drain, 129) != token.encode('ascii')):
-                raise ValueError('Owned finish lock or drain changed')
+            verify_owned_drain(drain, drain_path, token, canonical_owned)
         still_owned()
         check()
         still_owned()
@@ -520,7 +524,7 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
         except BaseException as error:
             if on_failure is not None:
                 canonical_owned()
-                on_failure(error)
+                on_failure(error, canonical_owned)
             raise
     finally:
         if directory is not None:os.close(directory)
@@ -1077,8 +1081,9 @@ def finish_update(plan, client_pin):
     permit_state = root_file_state(CURRENT_BOOT_PERMIT)
     phase = dict(started=False, opened=False, pending=False, permit=False)
 
-    def record(stage, **facts):
-        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts))
+    def record(stage, *, guard=None, **facts):
+        if guard is not None:guard()
+        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=guard)
 
     def check():
         validate_plan(plan, time.time())
@@ -1147,7 +1152,7 @@ def finish_update(plan, client_pin):
         phase['pending'] = True
         validate_plan(plan, time.time())
 
-    def hold_failure(error):
+    def hold_failure(error, canonical_guard):
         # Keep executable permission closed on the exact owned launcher after a
         # partial finish. Never restore bytes or manipulate unrelated services.
         held = False
@@ -1155,10 +1160,10 @@ def finish_update(plan, client_pin):
         selected = plan['before'][LAUNCHER_TARGET]
         if (current is not None and current['sha256'] == selected['sha256']
                 and (current['device'], current['inode']) == (selected['device'], selected['inode'])):
-            record('HOLD_FINISH_INTENT', launcher=current)
-            close_launcher_execution(LAUNCHER_TARGET, expected=current)
+            record('HOLD_FINISH_INTENT', launcher=current, guard=canonical_guard)
+            close_launcher_execution(LAUNCHER_TARGET, expected=current, before_change=canonical_guard)
             held = root_file_state(LAUNCHER_TARGET)['mode'] == 0o644
-        record('HOLD_FINISH_RECOVERY', error_type=type(error).__name__, execution_held=held)
+        record('HOLD_FINISH_RECOVERY', error_type=type(error).__name__, execution_held=held, guard=canonical_guard)
 
     result = finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
                                 plan['nonce'], check, reopen, on_failure=hold_failure, commit=commit_release)

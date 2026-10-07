@@ -110,8 +110,11 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             plan['before']={k:dict(v) for k,v in plan['before'].items()};plan['before'][runtime.LAUNCHER_TARGET]=state(launcher)
             guard=root/'guard';guard.write_bytes(runtime.BOOT_GUARD_BYTES);guard.chmod(0o644)
             def snapshot(expected):return dict(expected,image_pin=expected['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=plan['nonce'] if pending.exists() else None,drain_token=drain.read_text())
-            def record(path,row):
+            def record(path,row,**kwargs):
                 stages.append(row['stage'])
+                if expire_at=='lock-during-hold' and row['stage']=='FINISH_START':raise ValueError('force hold')
+                if expire_at=='lock-during-hold' and row['stage']=='HOLD_FINISH_INTENT':
+                    replacement=root/'replacement';replacement.touch();replacement.replace(lock)
                 if row['stage']==expire_at:clock[0]=plan['observed_at']+121
             def read(path):
                 selected=drain if str(path)=='/run/oxidex-build-draining' else Path(path)
@@ -124,7 +127,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             def restore(path,expected,**kwargs):
                 if expire_at=='require-commit':self.assertIn('FINISH_RELEASE_COMMITTED',stages)
                 opened.append(1);real_restore(launcher,expected,**kwargs)
-            def close(path,**kwargs):closed.append(1);real_close(launcher,**kwargs)
+            def close(path,**kwargs):real_close(launcher,**kwargs);closed.append(1)
             with ExitStack() as stack:
                 replacements=dict(PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
@@ -140,7 +143,10 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             else:
                 self.assertEqual(drain.read_text(),plan['nonce']);self.assertEqual(launcher.stat().st_mode&0o777,0o644)
                 if expire_at=='permit-read':self.assertTrue(permit.exists())
+                if expire_at=='lock-during-hold':self.assertEqual(closed,[])
             return closed if recovery else opened
+
+    def test_lost_lock_during_hold_publication_prevents_chmod(self):self.exercise('lock-during-hold')
 
     def test_expired_permit_read_preserves_permit(self):self.exercise('permit-read')
 
@@ -211,7 +217,7 @@ class CommittedFlowTests(unittest.TestCase):
                     replacement=root/'foreign';replacement.write_text('foreign');replacement.replace(pending)
             def new_transaction(_lock,_drain,*args,**kwargs):return real_new(lock,drain,*args,**kwargs)
             def owned_transaction(_lock,_drain,*args,**kwargs):return real_owned(lock,drain,*args,**kwargs)
-            def journal(path,row):
+            def journal(path,row,**kwargs):
                 events.append(row['stage'])
                 if failure=='checkpoint-expiry':clock[0]=plan['observed_at']+121
             with ExitStack() as stack:
@@ -637,7 +643,9 @@ class OwnedFinishTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             lock,drain=self.fixture(directory);seen=[]
             def action():raise ValueError('partial finish')
-            def hold(error):
+            def hold(error,guard=None):
+                self.assertTrue(callable(guard), 'Failure callback needs canonical guard through slow steps')
+                guard()
                 with lock.open('r+') as other:
                     with self.assertRaises(BlockingIOError):fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
                 self.assertEqual(drain.read_text(),'owned');seen.append(type(error).__name__)
@@ -679,7 +687,7 @@ class OwnedFinishTests(unittest.TestCase):
             lock,drain=self.fixture(directory);called=[]
             def action():
                 replacement=lock.parent/'replacement';replacement.touch();replacement.replace(lock)
-            with self.assertRaises(ValueError):runtime.finish_owned_drain(lock,drain,'owned',lambda:None,action,on_failure=lambda error:called.append('mutated'))
+            with self.assertRaises(ValueError):runtime.finish_owned_drain(lock,drain,'owned',lambda:None,action,on_failure=lambda error,guard:called.append('mutated'))
             self.assertEqual(called,[]);self.assertEqual(drain.read_text(),'owned')
 
     def test_new_drain_transaction_refuses_replaced_lock_release(self):
@@ -689,5 +697,25 @@ class OwnedFinishTests(unittest.TestCase):
                 other=lock.parent/'other';other.touch();other.replace(lock);return 1
             with self.assertRaises(ValueError):runtime.drained_update(lock,drain,'owned',action)
             self.assertEqual(drain.read_text(),'owned')
+
+    def test_token_read_replacement_never_deletes_foreign_drain(self):
+        for transaction in ('existing','new'):
+            with tempfile.TemporaryDirectory() as directory:
+                lock=Path(directory).resolve()/'lock';lock.touch();drain=lock.parent/'drain';read=os.read;armed=[0]
+                if transaction=='existing':drain.write_text('owned');drain.chmod(0o600)
+                def action():armed[0]=3 if transaction=='existing' else 2;return 1
+                def swapped(fd,size):
+                    raw=read(fd,size)
+                    if armed[0] and size==129:
+                        armed[0]-=1
+                        if armed[0]==0:
+                            replacement=lock.parent/'foreign';replacement.write_text('foreign');replacement.chmod(0o600);replacement.replace(drain)
+                    return raw
+                with self.subTest(transaction=transaction),patch.object(runtime.os,'read',side_effect=swapped):
+                    with self.assertRaises(ValueError):
+                        if transaction=='existing':runtime.finish_owned_drain(lock,drain,'owned',lambda:None,action)
+                        else:runtime.drained_update(lock,drain,'owned',action)
+                self.assertTrue(drain.exists(),'Foreign drain was deleted')
+                if drain.exists():self.assertEqual(drain.read_text(),'foreign')
 
 if __name__=='__main__':unittest.main()
