@@ -166,3 +166,49 @@ readable but non-executable (`0644`) through partial updates and reboot. Restori
 `0755` is part of the separately verified client-pin handoff, not automatic
 installation success. Administrative controlled proofs use the authenticated
 root control path; the uploader cannot bypass this hold.
+
+
+### Finish an installed update
+
+After controlled source checks and coordination of the exact client launcher
+pin, capture a new observation with the original installation nonce:
+
+```sh
+python3 -I -B builder_runtime_update.py --capture-assets assets.json \
+  --assets-sha256 "$ASSETS_SHA256" --source-main "$SOURCE_MAIN" \
+  --finish-nonce "$INSTALLED_NONCE" \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256" > finish-plan.json
+```
+
+Keep the original installation plan and journal. This capture has its own
+observation time and does not extend or rewrite the original plan. Inspect the
+new plan and select its exact digest through the authenticated root control path.
+First check the selected plan without changing the route:
+
+```sh
+python3 -I -B builder_runtime_update.py --plan finish-plan.json \
+  --plan-sha256 "$FINISH_PLAN_SHA256" \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+```
+
+Then explicitly finish:
+
+```sh
+python3 -I -B builder_runtime_update.py --plan finish-plan.json \
+  --plan-sha256 "$FINISH_PLAN_SHA256" --finish \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+```
+
+Finish verifies the successful installation journal and current host under the
+existing build lock. It restores execution on the selected launcher, removes
+only its update markers, and removes the owned drain last. It returns
+`REOPENED_UNQUALIFIED`, with qualification readiness false. Run one actual
+ordinary OxiDex Just build and the qualification checks afterward. The client
+selector requires an executable launcher and no drain, so this ordinary build
+cannot be a pre-finish check. Do not treat reopening as proof of an app build.
+
+If finish fails, inspect its journal and actual files before recovery. Its
+failure handler attempts to close execution only on the exact installed
+launcher while the build lock remains held. It never rolls back runtime bytes,
+clears leases, stops builds, or modifies unrelated services. A changed or foreign
+file needs explicit recovery.
