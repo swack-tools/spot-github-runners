@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from lib.builder_runtime_update import TARGETS, validate_assets, validate_plan, atomic_write, drained_update, check_snapshot, plan_from_snapshot, active_work_processes, checked_json, valid_admission, validate_service_peer, validate_admission_response, mkdir_exact
+from lib.builder_runtime_update import TARGETS, validate_assets, validate_plan, atomic_write, drained_update, check_snapshot, plan_from_snapshot, active_work_processes, checked_json, valid_admission, validate_service_peer, validate_admission_response, mkdir_exact, close_launcher_execution
 
 class BuilderRuntimeUpdateTests(unittest.TestCase):
     def assets(self):
@@ -201,6 +201,16 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
             try:mkdir_exact(path,0o755)
             finally:__import__('os').umask(old)
             self.assertEqual(path.stat().st_mode & 0o777,0o755)
+
+
+    def test_launcher_execution_hold_preserves_bytes_and_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'launcher';path.write_bytes(b'#!/bin/sh\nexit 0\n');path.chmod(0o755)
+            before=path.stat();raw=path.read_bytes()
+            close_launcher_execution(path)
+            self.assertEqual(path.read_bytes(),raw)
+            self.assertEqual(path.stat().st_ino,before.st_ino)
+            self.assertEqual(path.stat().st_mode & 0o777,0o644)
 
 
 if __name__=='__main__':unittest.main()
