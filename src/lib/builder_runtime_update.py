@@ -1,6 +1,7 @@
 """Checked runtime-file updates for an idle dedicated builder; no provisioning."""
 import base64
 import hashlib
+import json
 import math
 import re
 import uuid
@@ -289,7 +290,6 @@ def atomic_write(path, data, mode, *, before_replace=None, exclusive=False):
 
 def append_journal_record(path, record, *, before_publish=None, freshness=None, selected_history=None):
     """Atomically publish a complete bounded history, retaining the old prefix."""
-    import json
     state, old = root_file_read(path)
     if selected_history is not None and (state, old) != selected_history:
         raise ValueError('Journal differs from previously authorized history')
@@ -420,7 +420,6 @@ def root_file_state(path):
 
 
 def checked_json(raw, digest):
-    import json
     if not isinstance(raw, bytes) or len(raw) > 1048576 or hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError('JSON bytes differ from selected digest')
     return json.loads(raw)
@@ -709,7 +708,6 @@ def validate_service_peer(expected_pid, credentials):
 
 
 def validate_admission_response(raw):
-    import json
     if len(raw) > 4096 or json.loads(raw) != {'error': 'Admission kind does not match peer identity'}:
         raise ValueError('Admission service did not return the expected no-action response')
 
@@ -813,7 +811,6 @@ def parse_inactive_service_state(raw):
 
 def live_snapshot(plan, *, committed_original=None):
     """Read fixed host facts, never acquire leases or start containers."""
-    import json
     config_path = Path('/etc/oxidex-remote-build.json')
     config_state, config_raw = root_file_read(config_path)
     config = json.loads(config_raw)
@@ -975,7 +972,6 @@ def trusted_directory(path, *, create=False):
 
 
 def mutation_idle_fence(plan):
-    import json
     import time
     _, ledger = root_file_read('/var/lib/gha-admission/leases.json')
     _, token = root_file_read('/run/oxidex-build-draining')
@@ -1002,7 +998,6 @@ def file_mutation_fence(plan, target=None, *, expected_file=None):
 
 
 def prepare_boot_hold(plan):
-    import json
     state = root_file_state(BOOT_GUARD)
     if state is not None and state['sha256'] != hashlib.sha256(BOOT_GUARD_BYTES).hexdigest():
         raise ValueError('Unknown admission boot guard')
@@ -1045,7 +1040,6 @@ def verify_boot_guard():
 
 
 def verify_boot_hold(plan):
-    import json
     verify_boot_guard()
     guard, _ = root_file_read(BOOT_GUARD)
     _, pending = root_file_read(PENDING_UPDATE)
@@ -1081,7 +1075,6 @@ def apply_replacement_fence(plan, target, expected_file, canonical_guard):
 
 def apply_update(plan):
     """Replace only approved runtime files after actual idle-state confirmation."""
-    import json
     import time
     lock_guard, bind_lock = transaction_lock_guard()
     assets = validate_plan(plan, time.time())
@@ -1202,7 +1195,6 @@ def apply_update(plan):
                 raise ValueError('Launcher or upload appeared before drain release')
             validate_plan(plan, time.time())
         except BaseException as error:
-            import json
             journal_history[0] = append_journal_record(backup/'journal.jsonl', dict(stage='HOLD_BEFORE_DRAIN_RELEASE',
                 observed_at=time.time(), error_type=type(error).__name__), before_publish=lock_guard, selected_history=journal_history[0])
             raise
@@ -1212,7 +1204,6 @@ def apply_update(plan):
 
 def installed_history(plan, client_pin, *, recovery=False, with_history=False):
     """Read the original private records; do not re-date the installation."""
-    import json
     backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
     _, raw = root_file_read(backup / 'plan.json')
     journal_state, journal = root_file_read(backup / 'journal.jsonl')
@@ -1225,7 +1216,6 @@ def installed_history(plan, client_pin, *, recovery=False, with_history=False):
 
 def finish_update(plan, client_pin):
     """Reopen the verified ordinary route; qualification still needs live proof."""
-    import json
     import time
     lock_guard, bind_lock = transaction_lock_guard()
     validate_plan(plan, time.time())
@@ -1329,7 +1319,6 @@ def finish_update(plan, client_pin):
 
 def capture_committed_recovery(nonce, source_main, assets, client_pin, *, with_history=False):
     """Capture a new boot and inactive unit without changing the saved update."""
-    import json
     import time
     if not isinstance(nonce, str) or not re.fullmatch('[a-f0-9]{32}', nonce):
         raise ValueError('Exact installed nonce required for committed recovery')
@@ -1482,7 +1471,6 @@ def complete_committed_recovery(plan, client_pin):
 
 def recover_finish_update(plan, client_pin):
     """Return a same-boot interrupted finish to its exact owned held state."""
-    import json
     import time
     lock_guard, bind_lock = transaction_lock_guard()
     validate_plan(plan, time.time())
@@ -1571,7 +1559,6 @@ def plan_from_snapshot(source_main, assets, snapshot, observed_at, nonce, *, own
 
 def main():
     import argparse
-    import json
     import sys
     import time
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1655,6 +1642,5 @@ def main():
 if __name__ == '__main__':
     try:main()
     except CommittedReleaseError as error:
-        import json
         print(json.dumps(error.result, sort_keys=True))
         raise SystemExit(75)
