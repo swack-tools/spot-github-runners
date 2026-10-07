@@ -117,6 +117,20 @@ class MarkerRemovalBoundaryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):runtime.unlink_selected_marker(path,expected,replaced,lambda:None)
             self.assertEqual(path.read_text(),'foreign')
 
+class ApplyPublicationBoundaryTests(unittest.TestCase):
+    def test_target_replaced_during_lock_lookup_is_preserved(self):
+        self.assertTrue(callable(getattr(runtime,'apply_replacement_fence',None)), 'Shared apply publication boundary is missing')
+        _,plan,_,_=InstalledHistoryTests().fixture();plan['observed_at']=time.time();target='/usr/local/bin/docker'
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'target';path.write_bytes(b'old')
+            def state(selected):return dict(inode=path.stat().st_ino,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            plan['before'][target]=state(target)
+            def guard():
+                other=path.parent/'foreign';other.write_bytes(b'foreign');other.replace(path)
+            with patch.object(runtime,'mutation_idle_fence',return_value=None),patch.object(runtime,'file_mutation_fence',return_value=None),patch.object(runtime,'root_file_state',side_effect=state):
+                with self.assertRaises(ValueError):runtime.apply_replacement_fence(plan,target,None,guard)
+            self.assertEqual(path.read_bytes(),b'foreign')
+
 class InactiveServiceTests(unittest.TestCase):
     def parse(self,raw):
         self.assertTrue(callable(getattr(runtime,'parse_inactive_service_state',None)), 'Native inactive state parser is missing')
@@ -858,5 +872,13 @@ class OwnedFinishTests(unittest.TestCase):
                 with self.assertRaises(ValueError):runtime.verify_owned_drain(fd,drain,'owned',guard)
             finally:os.close(fd)
             self.assertEqual(drain.read_text(),'foreign')
+
+    def test_expired_publication_fence_never_creates_drain(self):
+        self.assertIn('publication_fence',inspect.signature(runtime.drained_update).parameters)
+        with tempfile.TemporaryDirectory() as directory:
+            lock=Path(directory).resolve()/'lock';lock.touch();drain=lock.parent/'drain'
+            def expired():raise ValueError('expired after canonical lookup')
+            with self.assertRaises(ValueError):runtime.drained_update(lock,drain,'owned',lambda:self.fail('action ran'),publication_fence=expired)
+            self.assertFalse(drain.exists());self.assertEqual(list(lock.parent.iterdir()),[lock])
 
 if __name__=='__main__':unittest.main()

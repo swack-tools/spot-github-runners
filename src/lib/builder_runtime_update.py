@@ -434,7 +434,7 @@ def verify_owned_drain(fd, path, token, canonical_owned):
         raise ValueError('Owned drain changed during token read')
 
 
-def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False, lock_bound=None, release_fence=None):
+def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False, lock_bound=None, release_fence=None, publication_fence=None):
     """Run under the existing lock; failures retain the protective owned drain."""
     import fcntl
     if not isinstance(token, str) or not re.fullmatch('[a-zA-Z0-9_-]{1,128}', token):
@@ -462,6 +462,7 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
             canonical_owned()
             if before_drain is not None:before_drain()
             canonical_owned()
+            if publication_fence is not None:publication_fence()
         before_publish()
         drain = publish_owned_drain(drain_path, token, before_publish=before_publish)
         raw = token.encode('ascii')
@@ -980,6 +981,18 @@ def transaction_lock_guard():
     return verify, bind
 
 
+def apply_replacement_fence(plan, target, expected_file, canonical_guard):
+    """Finish all blocking checks, recheck selected target, then selected time."""
+    import time
+    mutation_idle_fence(plan)
+    file_mutation_fence(plan, target, expected_file=expected_file)
+    canonical_guard()
+    selected = plan['before'][target] if expected_file is None else expected_file
+    if root_file_state(target) != selected:
+        raise ValueError('Selected runtime target changed during canonical lookup')
+    validate_plan(plan, time.time())
+
+
 def apply_update(plan):
     """Replace only approved runtime files after actual idle-state confirmation."""
     import json
@@ -1038,11 +1051,7 @@ def apply_update(plan):
                 mutation_idle_fence(plan)
                 file_mutation_fence(plan, target, expected_file=expected_file)
                 def before_replace():
-                    lock_guard()
-                    mutation_idle_fence(plan)
-                    file_mutation_fence(plan, target, expected_file=expected_file)
-                    lock_guard()
-                    validate_plan(plan, time.time())
+                    apply_replacement_fence(plan, target, expected_file, lock_guard)
                 installed_mode = 0o644 if target == LAUNCHER_TARGET else TARGETS[target]
                 atomic_write(target, assets[target], installed_mode, before_replace=before_replace)
                 record('FILE_REPLACED', target=target,
@@ -1110,7 +1119,7 @@ def apply_update(plan):
                 observed_at=time.time(), error_type=type(error).__name__), before_publish=lock_guard)
             raise
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                          plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True, lock_bound=bind_lock)
+                          plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True, lock_bound=bind_lock, publication_fence=lambda:validate_plan(plan,time.time()))
 
 
 def installed_history(plan, client_pin, *, recovery=False):
@@ -1373,7 +1382,7 @@ def complete_committed_recovery(plan, client_pin):
         return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
                                   plan['nonce'], check, complete, commit=publish_success, lock_bound=bind_lock, release_fence=lambda:validate_runtime_observation(plan,time.time()))
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining', plan['nonce'],
-                          complete, before_drain=check, before_release=lambda result:(check(), publish_success()), lock_bound=bind_lock, release_fence=lambda:validate_runtime_observation(plan,time.time()))
+                          complete, before_drain=check, before_release=lambda result:(check(), publish_success()), lock_bound=bind_lock, release_fence=lambda:validate_runtime_observation(plan,time.time()), publication_fence=lambda:validate_runtime_observation(plan,time.time()))
 
 
 def recover_finish_update(plan, client_pin):
@@ -1447,7 +1456,7 @@ def recover_finish_update(plan, client_pin):
         return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
                                   plan['nonce'], check, restore_hold, release=False, lock_bound=bind_lock)
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining', plan['nonce'],
-                          restore_hold, before_drain=lambda:check(owned=False), keep_drain=True, lock_bound=bind_lock)
+                          restore_hold, before_drain=lambda:check(owned=False), keep_drain=True, lock_bound=bind_lock, publication_fence=lambda:validate_plan(plan,time.time()))
 
 
 def plan_from_snapshot(source_main, assets, snapshot, observed_at, nonce, *, owned_drain=False):
