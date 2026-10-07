@@ -144,7 +144,7 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
         raise ValueError('Missing durable release decision')
     final = journal[-1]
     comparison_files = observation['before']
-    transitions = {'HOLD_FINISH_RECOVERY', 'HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT'}
+    transitions = {'HOLD_FINISH_RECOVERY', 'HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT', 'FINISH_RECOVERY_START'}
     if final.get('stage') in transitions:
         indices = [index for index, row in enumerate(journal)
                    if isinstance(row, dict) and row.get('stage') == 'FINISH_RELEASE_COMMITTED']
@@ -155,7 +155,7 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
         if not isinstance(selected, dict) or selected.get('mode') not in (0o644, 0o755):
             raise ValueError('Unknown committed launcher permission state')
         for row in journal[indices[-1]+1:]:
-            if row['stage'] in ('HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT'):
+            if row['stage'] in ('HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT', 'FINISH_RECOVERY_START'):
                 recorded = row.get('launcher')
                 if (not isinstance(recorded, dict) or recorded.get('mode') not in (0o644, 0o755)
                         or dict(recorded, mode=0o755) != dict(selected, mode=0o755)):
@@ -1202,10 +1202,14 @@ def complete_committed_recovery(plan, client_pin):
         # The earlier fsynced release decision authorizes this exact marker
         # removal. Preserve that historical journal until service proof succeeds.
         validate_runtime_observation(plan, time.time())
+        if root_file_state(PENDING_UPDATE) != pending:
+            raise ValueError('Committed pending marker replaced before deletion')
+        validate_runtime_observation(plan, time.time())
         if pending is not None:os.unlink(PENDING_UPDATE)
         parent = os.open(PENDING_UPDATE.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:os.fsync(parent)
         finally:os.close(parent)
+        validate_runtime_observation(plan, time.time())
         if plan['service_state']['ActiveState'] == 'inactive':
             checked_command(['/usr/bin/systemctl', 'start', 'gha-admission.service'],
                             timeout=min(20, max(1, plan['observed_at']+120-time.time())))
@@ -1277,7 +1281,9 @@ def recover_finish_update(plan, client_pin):
 
     def restore_hold():
         check()
-        record('FINISH_RECOVERY_START', client_launcher_sha256=client_pin)
+        record('FINISH_RECOVERY_START', client_launcher_sha256=client_pin,
+               launcher=plan['before'][LAUNCHER_TARGET])
+        validate_plan(plan, time.time())
         phase['started'] = True
         close_launcher_execution(LAUNCHER_TARGET, expected=plan['before'][LAUNCHER_TARGET])
         expected['before'][LAUNCHER_TARGET] = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
