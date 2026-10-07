@@ -269,7 +269,7 @@ class CommittedFlowTests(unittest.TestCase):
         custody.start();self.addCleanup(custody.stop)
 
     def exercise(self,*,failure=None,existing=False,already_running=False,missing_lock=False,held=False,missing_pending=False):
-        _,_,plan,pin=InstalledHistoryTests().reboot_fixture();plan['observed_at']=time.time()
+        original,_,plan,pin=InstalledHistoryTests().reboot_fixture();plan['observed_at']=time.time()
         if failure=='missing-schema':plan.pop('service_state')
         if already_running:plan['service_state']=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='50',ControlPID='0',StartTicks=60)
         with tempfile.TemporaryDirectory() as directory:
@@ -304,11 +304,12 @@ class CommittedFlowTests(unittest.TestCase):
                 captures+=1
                 if failure=='capture-expiry' and captures>1:clock[0]=plan['observed_at']+121
                 if running and not already_running:raise ValueError('Inactive capture used after service start')
-                return (dict(plan),(None,b'')) if kwargs.get('with_history') else dict(plan)
+                return (dict(plan),(None,b''),original) if kwargs.get('with_history') else dict(plan)
             def command(argv,**kwargs):
                 nonlocal running
                 self.assertEqual(argv,['/usr/bin/systemctl','start','gha-admission.service'])
                 self.assertEqual(drain.read_text(),plan['nonce']);self.assertTrue(pending.exists());self.assertEqual(permit.read_text(),plan['nonce'])
+                if missing_pending:self.assertEqual(json.loads(pending.read_text()),dict(nonce=original['nonce'],boot=original['boot'],source_main=original['source_main']))
                 events.append('start')
                 if failure=='start':raise OSError('service start failed')
                 running=True;return ''
@@ -320,8 +321,9 @@ class CommittedFlowTests(unittest.TestCase):
                 executed=True
                 self.assertTrue(running);self.assertEqual((pid,ticks),(50,60));events.append('ready')
                 if failure=='readiness':raise ConnectionRefusedError('not ready')
-            def snapshot(active):
+            def snapshot(active, *, committed_original=None):
                 nonlocal snapshots
+                self.assertEqual(committed_original,original, 'Recovery snapshot lost original marker authority')
                 snapshots+=1
                 if failure=='final' and snapshots>1:raise ValueError('final host observation failed')
                 return dict(active,image_pin=active['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=plan['nonce'] if pending.exists() else None,drain_token=drain.read_text())

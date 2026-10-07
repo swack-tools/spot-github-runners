@@ -1349,7 +1349,7 @@ def capture_committed_recovery(nonce, source_main, assets, client_pin, *, with_h
         **{field:snapshot[field] for field in ('vm_id', 'boot', 'image_id', 'config_sha256',
             'admission_sha256', 'service_sha256', 'service_state', 'before')})
     verify_committed_reboot(original, journal, observation, client_pin, time.time())
-    return (observation, (journal_state, raw)) if with_history else observation
+    return (observation, (journal_state, raw), original) if with_history else observation
 
 
 def ensure_recovery_lock(path):
@@ -1381,7 +1381,7 @@ def complete_committed_recovery(plan, client_pin):
     lock_guard, bind_lock = transaction_lock_guard()
     validate_committed_observation(plan, time.time())
     # Fresh capture reads the immutable original records and exact inactive unit.
-    current, authorized = capture_committed_recovery(plan['nonce'], plan['source_main'], plan['assets'], client_pin, with_history=True)
+    current, authorized, original = capture_committed_recovery(plan['nonce'], plan['source_main'], plan['assets'], client_pin, with_history=True)
     journal_history = [authorized]
     validate_runtime_observation(plan, time.time())
     if any(current[key] != value for key, value in plan.items() if key != 'observed_at'):
@@ -1403,7 +1403,7 @@ def complete_committed_recovery(plan, client_pin):
         if phase['active'] is not None:
             active = phase['active']
             validate_plan(active, time.time())
-            check_snapshot(active, live_snapshot(active), owned_drain=True)
+            check_snapshot(active, live_snapshot(active, committed_original=original), owned_drain=True)
             admission_ready(active, active['service_pid'], active['service_startticks'], wait=False)
             return
         validate_runtime_observation(plan, time.time())
@@ -1429,7 +1429,7 @@ def complete_committed_recovery(plan, client_pin):
             validate_runtime_observation(plan, time.time())
         if pending is None:
             atomic_write(PENDING_UPDATE, (json.dumps(dict(nonce=plan['nonce'],
-                boot=plan['boot'], source_main=plan['source_main']))+'\n').encode(),
+                boot=original['boot'], source_main=original['source_main']))+'\n').encode(),
                 0o600, before_replace=hold_publication, exclusive=True)
             pending = root_file_state(PENDING_UPDATE)
             if pending is None:raise ValueError('Persistent recovery hold disappeared')
@@ -1464,7 +1464,7 @@ def complete_committed_recovery(plan, client_pin):
         active.update(schema=1, service_pid=pid, service_startticks=ticks, before=released_files)
         phase['active'] = active
         admission_ready(active, pid, ticks)
-        snapshot = live_snapshot(active)
+        snapshot = live_snapshot(active, committed_original=original)
         check_snapshot(active, snapshot, owned_drain=True)
         return dict(status='REBOOT_RECOVERED_UNQUALIFIED', qualification_ready=False,
                     service_pid=pid, service_startticks=ticks, boot=plan['boot'])
