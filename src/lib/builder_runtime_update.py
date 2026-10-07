@@ -274,7 +274,7 @@ def atomic_write(path, data, mode, *, before_replace=None, exclusive=False):
             os.unlink(temporary)
 
 
-def append_journal_record(path, record, *, before_publish=None):
+def append_journal_record(path, record, *, before_publish=None, freshness=None):
     """Atomically publish a complete bounded history, retaining the old prefix."""
     import json
     state, old = root_file_read(path)
@@ -292,6 +292,9 @@ def append_journal_record(path, record, *, before_publish=None):
         if root_file_read(path)[0] != state:
             raise ValueError('Historical journal changed before publication')
         if before_publish is not None:before_publish()
+        if root_file_read(path)[0] != state:
+            raise ValueError('Historical journal changed during publication guard')
+        if freshness is not None:freshness()
     atomic_write(path, raw, 0o600, before_replace=unchanged)
 
 
@@ -420,7 +423,8 @@ def verify_owned_drain(fd, path, token, canonical_owned):
         raise ValueError('Owned drain custody differs')
     os.lseek(fd, 0, os.SEEK_SET)
     raw = os.read(fd, 129)
-    after = os.fstat(fd);current = Path(path).lstat()
+    canonical_owned()
+    current = Path(path).lstat();after = os.fstat(fd)
     attributes = ('st_uid', 'st_gid', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
     if ((after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
             or after.st_nlink != 1 or current.st_nlink != 1
@@ -428,7 +432,6 @@ def verify_owned_drain(fd, path, token, canonical_owned):
             or any(getattr(before, name) != getattr(after, name) for name in attributes)
             or raw != token.encode('ascii')):
         raise ValueError('Owned drain changed during token read')
-    canonical_owned()
 
 
 def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False, lock_bound=None, release_fence=None):
@@ -475,7 +478,6 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
                 canonical_owned()
             verify_owned_drain(drain, drain_path, token, canonical_owned)
             if not keep_drain:
-                canonical_owned()
                 if release_fence is not None:release_fence()
                 os.unlink(drain_path)
                 try:os.fsync(directory)
@@ -536,7 +538,6 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
                 commit()
             still_owned()
             if release:
-                canonical_owned()
                 if release_fence is not None:release_fence()
                 os.unlink(drain_path)
                 released = True
@@ -795,9 +796,9 @@ def live_snapshot(plan, *, committed_original=None):
 
 
 
-def close_launcher_execution(path, *, expected=None, before_change=None):
+def close_launcher_execution(path, *, expected=None, before_change=None, freshness=None):
     if expected is not None:
-        return set_verified_launcher_mode(path, expected, 0o644, before_change=before_change)
+        return set_verified_launcher_mode(path, expected, 0o644, before_change=before_change, freshness=freshness)
     path = Path(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -817,14 +818,14 @@ def close_launcher_execution(path, *, expected=None, before_change=None):
 
 
 
-def restore_launcher_execution(path, expected, *, before_change=None):
+def restore_launcher_execution(path, expected, *, before_change=None, freshness=None):
     """Restore execution only on the still-held, selected inode and bytes."""
     if expected['mode'] != 0o644:
         raise ValueError('Expected launcher must be held')
-    return set_verified_launcher_mode(path, expected, 0o755, before_change=before_change)
+    return set_verified_launcher_mode(path, expected, 0o755, before_change=before_change, freshness=freshness)
 
 
-def set_verified_launcher_mode(path, expected, mode, *, before_change=None):
+def set_verified_launcher_mode(path, expected, mode, *, before_change=None, freshness=None):
     if mode not in (0o644, 0o755) or expected['mode'] not in (0o644, 0o755):
         raise ValueError('Unexpected launcher execution mode')
     path = Path(path)
@@ -840,12 +841,13 @@ def set_verified_launcher_mode(path, expected, mode, *, before_change=None):
                 or info.st_uid != expected['uid'] or info.st_gid != expected['gid']
                 or hashlib.sha256(os.read(fd, 262145)).hexdigest() != expected['sha256']):
             raise ValueError('Held launcher changed before restoring execution')
-        after = os.fstat(fd);canonical = path.lstat()
+        if before_change is not None:before_change()
+        canonical = path.lstat();after = os.fstat(fd)
         if ((after.st_dev, after.st_ino) != (canonical.st_dev, canonical.st_ino)
                 or (info.st_uid, info.st_gid, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
                    != (after.st_uid, after.st_gid, after.st_mode, after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
             raise ValueError('Launcher custody changed during descriptor verification')
-        if before_change is not None:before_change()
+        if freshness is not None:freshness()
         os.fchmod(fd, mode)
         os.fsync(fd)
     finally:
@@ -1001,8 +1003,8 @@ def apply_update(plan):
 
         def record(stage, **facts):
             lock_guard()
-            fence = lock_guard if stage.startswith('HOLD_') else lambda:(lock_guard(),validate_plan(plan,time.time()))
-            append_journal_record(journal, dict(stage=stage, observed_at=time.time(), **facts), before_publish=fence)
+            fresh = None if stage.startswith('HOLD_') else lambda:validate_plan(plan,time.time())
+            append_journal_record(journal, dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard, freshness=fresh)
 
         record('BACKUP_START')
         try:
@@ -1018,7 +1020,7 @@ def apply_update(plan):
             mutation_idle_fence(plan)
             file_mutation_fence(plan, LAUNCHER_TARGET)
             close_launcher_execution(LAUNCHER_TARGET, expected=plan['before'][LAUNCHER_TARGET],
-                                     before_change=lambda:(lock_guard(),validate_plan(plan, time.time())))
+                                     before_change=lock_guard, freshness=lambda:validate_plan(plan,time.time()))
             held_launcher = root_file_state(LAUNCHER_TARGET)
             intended = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
             if held_launcher != intended:
@@ -1137,9 +1139,11 @@ def finish_update(plan, client_pin):
     phase = dict(started=False, opened=False, pending=False, permit=False)
 
     def record(stage, *, guard=None, **facts):
-        guard = guard or (lambda:(lock_guard(),validate_plan(plan,time.time())))
+        forward = guard is None
+        guard = guard or lock_guard
         guard()
-        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=guard)
+        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts),
+            before_publish=guard, freshness=(lambda:validate_plan(plan,time.time())) if forward else None)
 
     def check():
         lock_guard()
@@ -1190,7 +1194,7 @@ def finish_update(plan, client_pin):
                client_launcher_sha256=client_pin, qualification_ready=False)
         validate_plan(plan, time.time())
         restore_launcher_execution(LAUNCHER_TARGET, plan['before'][LAUNCHER_TARGET],
-                                   before_change=lambda:(lock_guard(),validate_plan(plan, time.time())))
+                                   before_change=lock_guard, freshness=lambda:validate_plan(plan,time.time()))
         phase['opened'] = True
         expected['before'] = release_files
         check()
@@ -1320,10 +1324,10 @@ def complete_committed_recovery(plan, client_pin):
         selected = plan['before'][LAUNCHER_TARGET]
         if selected['mode'] == 0o644:
             append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_LAUNCHER_RESTORE_INTENT',
-                observed_at=time.time(), launcher=selected), before_publish=lambda:(lock_guard(),validate_runtime_observation(plan,time.time())))
+                observed_at=time.time(), launcher=selected), before_publish=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()))
             validate_runtime_observation(plan, time.time())
             restore_launcher_execution(LAUNCHER_TARGET, selected,
-                                       before_change=lambda:(lock_guard(),validate_runtime_observation(plan, time.time())))
+                                       before_change=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()))
             released_files[LAUNCHER_TARGET] = dict(selected, mode=0o755)
         # The earlier fsynced release decision authorizes this exact marker
         # removal. Preserve that historical journal until service proof succeeds.
@@ -1356,7 +1360,7 @@ def complete_committed_recovery(plan, client_pin):
         append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_REBOOT_RECOVERED',
             observed_at=time.time(), boot=plan['boot'], service_pid=active['service_pid'],
             service_startticks=active['service_startticks'], files=active['before'],
-            client_launcher_sha256=client_pin, qualification_ready=False), before_publish=lambda:(lock_guard(),validate_runtime_observation(plan,time.time())))
+            client_launcher_sha256=client_pin, qualification_ready=False), before_publish=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()))
         validate_runtime_observation(plan, time.time())
 
     # No unrelated launcher needs to recreate the volatile mutex after reboot.
@@ -1389,7 +1393,7 @@ def recover_finish_update(plan, client_pin):
 
     def record(stage, **facts):
         lock_guard()
-        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=lambda:(lock_guard(),validate_plan(plan,time.time())))
+        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard, freshness=lambda:validate_plan(plan,time.time()))
 
     def check(*, owned=True):
         lock_guard()
@@ -1424,7 +1428,7 @@ def recover_finish_update(plan, client_pin):
         validate_plan(plan, time.time())
         phase['started'] = True
         close_launcher_execution(LAUNCHER_TARGET, expected=plan['before'][LAUNCHER_TARGET],
-                                 before_change=lambda:(lock_guard(),validate_plan(plan, time.time())))
+                                 before_change=lock_guard, freshness=lambda:validate_plan(plan,time.time()))
         expected['before'][LAUNCHER_TARGET] = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
         check()
         if root_file_state(CURRENT_BOOT_PERMIT) is None:

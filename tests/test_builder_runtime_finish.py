@@ -156,6 +156,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             def record(path,row,**kwargs):
                 if expire_at=='authority-stage-expiry' and row['stage']=='FINISH_RELEASE_COMMITTED':clock[0]=plan['observed_at']+121
                 if kwargs.get('before_publish') is not None:kwargs['before_publish']()
+                if kwargs.get('freshness') is not None:kwargs['freshness']()
                 stages.append(row['stage'])
                 if expire_at in ('lock-during-hold','selected-gid-changed') and row['stage']=='FINISH_START':raise ValueError('force hold')
                 if (expire_at=='lock-during-hold' and row['stage']=='HOLD_FINISH_INTENT') or (expire_at=='lock-during-commit' and row['stage']=='FINISH_RELEASE_COMMITTED'):
@@ -365,6 +366,15 @@ class JournalPublicationTests(unittest.TestCase):
             with self.assertRaises(ValueError):self.append(path,dict(stage='FINISH_START'))
             self.assertEqual(path.read_bytes(),before)
 
+    def test_journal_changed_during_guard_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';path.write_bytes(b'{"stage":"OLD"}\n')
+            def replaced():
+                other=path.parent/'foreign';other.write_bytes(b'{"stage":"FOREIGN"}\n');other.replace(path)
+            with patch.object(runtime,'root_file_read',side_effect=self.reader):
+                with self.assertRaises(ValueError):runtime.append_journal_record(path,dict(stage='NEW'),before_publish=replaced)
+            self.assertEqual(path.read_bytes(),b'{"stage":"FOREIGN"}\n')
+
 class DrainPublicationTests(unittest.TestCase):
     def publish(self,path,callback=None):
         self.assertTrue(callable(getattr(runtime,'publish_owned_drain',None)), 'Atomic complete-token publication is missing')
@@ -469,7 +479,7 @@ class LauncherRestoreTests(unittest.TestCase):
             def fence():
                 if clock[0]>120:raise ValueError('expired after read')
             with patch.object(runtime.os,'read',side_effect=slow_read):
-                with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected,before_change=fence)
+                with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected,freshness=fence)
             self.assertEqual(path.stat().st_mode&0o777,0o644)
 
     def test_permission_read_detects_changed_custody(self):
@@ -486,6 +496,12 @@ class LauncherRestoreTests(unittest.TestCase):
             path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(0o644);expected=self.state(path);expected['gid']+=1
             with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected)
             self.assertEqual(path.stat().st_mode&0o777,0o644)
+
+    def test_permission_callback_custody_change_is_not_adopted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(0o644);expected=self.state(path)
+            with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected,before_change=lambda:path.chmod(0o666))
+            self.assertEqual(path.stat().st_mode&0o777,0o666)
 
 class InstalledHistoryTests(unittest.TestCase):
     def fixture(self):
@@ -830,5 +846,17 @@ class OwnedFinishTests(unittest.TestCase):
             with patch.object(runtime.os,'fsync',side_effect=failed):
                 with self.assertRaises(runtime.CommittedReleaseError) as caught:runtime.drained_update(lock,drain,'owned',action)
             self.assertFalse(drain.exists());self.assertIs(caught.exception.result['protected_hold'],False)
+
+    def test_drain_changed_during_trailing_authority_check_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _,drain=self.fixture(directory);fd=os.open(drain,os.O_RDONLY);calls=[]
+            def guard():
+                calls.append(1)
+                if len(calls)==2:
+                    other=drain.parent/'foreign';other.write_text('foreign');other.chmod(0o600);other.replace(drain)
+            try:
+                with self.assertRaises(ValueError):runtime.verify_owned_drain(fd,drain,'owned',guard)
+            finally:os.close(fd)
+            self.assertEqual(drain.read_text(),'foreign')
 
 if __name__=='__main__':unittest.main()
