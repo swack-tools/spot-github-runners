@@ -244,3 +244,35 @@ remove journal entries to retry.
 A changed boot, admission process, runtime file, or foreign marker is refused.
 Those cases need a separately reviewed recovery scope. This command does not
 restart services, reopen builds, or declare qualification readiness.
+
+### Complete a committed release after reboot
+
+If reboot interrupted an already committed release, use `--recover-committed`
+in the capture command instead of `--recover-finish`. The new schema-2
+observation preserves the original journal and boot history. It records either
+an exactly inactive unit or the verified PID and start ticks of its running
+admission process. It refuses changed runtime files, image, configuration,
+client pin, or unknown service state.
+
+```sh
+python3 -I -B builder_runtime_update.py --capture-assets assets.json \
+  --assets-sha256 "$ASSETS_SHA256" --source-main "$SOURCE_MAIN" \
+  --finish-nonce "$INSTALLED_NONCE" --recover-committed \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256" > reboot-plan.json
+```
+
+After inspecting that fresh observation and selecting its exact digest:
+
+```sh
+python3 -I -B builder_runtime_update.py --plan reboot-plan.json \
+  --plan-sha256 "$REBOOT_PLAN_SHA256" --recover-committed \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+```
+
+Recovery rechecks the durable release decision under the build lock. It removes
+only the matching pending marker, starts only an inactive admission unit, and
+verifies its process, socket and current host state before releasing the drain.
+If the exact process is already running after a partial attempt, recovery checks
+it without another start command. A failed start or postflight retains the owned
+drain. Successful recovery remains unqualified until actual OxiDex build and
+gate checks pass.

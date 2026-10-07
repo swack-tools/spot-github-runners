@@ -2,6 +2,10 @@
 import base64
 import hashlib
 import inspect
+import os
+import time
+from contextlib import ExitStack
+from unittest.mock import patch
 import fcntl
 import tempfile
 import subprocess
@@ -51,6 +55,156 @@ class InstalledRuntimeTests(unittest.TestCase):
         assets,files,pin=self.fixture();files['/usr/local/bin/docker']=None
         with self.assertRaises(ValueError):self.verify(assets,files,pin)
 
+class InactiveServiceTests(unittest.TestCase):
+    def parse(self,raw):
+        self.assertTrue(callable(getattr(runtime,'parse_inactive_service_state',None)), 'Native inactive state parser is missing')
+        return runtime.parse_inactive_service_state(raw)
+
+    def test_exact_inactive_service_record(self):
+        raw='ControlPID=0\nMainPID=0\nSubState=dead\nActiveState=inactive\nLoadState=loaded\n'
+        self.assertEqual(self.parse(raw),dict(LoadState='loaded',ActiveState='inactive',SubState='dead',MainPID='0',ControlPID='0'))
+
+    def test_unknown_duplicate_missing_or_running_state_refused(self):
+        good='LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlPID=0\n'
+        for raw in (good+'MainPID=0\n',good+'Unknown=0\n',good.replace('ControlPID=0\n',''),good.replace('MainPID=0','MainPID=123'),good.replace('loaded','not-found')):
+            with self.subTest(raw=raw),self.assertRaises(ValueError):self.parse(raw)
+
+    def test_recovery_parser_accepts_exact_running_record(self):
+        self.assertTrue(callable(getattr(runtime,'parse_recovery_service_state',None)), 'Recoverable service parser is missing')
+        raw='LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=50\nControlPID=0\n'
+        self.assertEqual(runtime.parse_recovery_service_state(raw)['MainPID'],'50')
+        with self.assertRaises(ValueError):runtime.parse_recovery_service_state(raw.replace('running','start'))
+
+class CommittedFlowTests(unittest.TestCase):
+    def exercise(self,*,failure=None,existing=False,already_running=False):
+        _,_,plan,pin=InstalledHistoryTests().reboot_fixture();plan['observed_at']=time.time()
+        if already_running:plan['service_state']=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='50',ControlPID='0',StartTicks=60)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();lock=root/'lock';lock.touch();drain=root/'drain';pending=root/'pending';pending.write_text('retained')
+            if existing:drain.write_text(plan['nonce']);drain.chmod(0o600)
+            running=already_running;events=[];snapshots=0
+            def file_state(path):
+                path=Path(path)
+                if path==pending:
+                    if not path.exists():return None
+                    info=path.stat();return dict(inode=info.st_ino,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+                return None
+            def read(path):
+                if str(path)=='/run/oxidex-build-draining':return None,drain.read_bytes() if drain.exists() else b''
+                raise AssertionError('Unexpected fixture read '+str(path))
+            def capture(*args):
+                if running and not already_running:raise ValueError('Inactive capture used after service start')
+                return dict(plan)
+            def command(argv,**kwargs):
+                nonlocal running
+                self.assertEqual(argv,['/usr/bin/systemctl','start','gha-admission.service'])
+                self.assertEqual(drain.read_text(),plan['nonce']);self.assertFalse(pending.exists())
+                events.append('start')
+                if failure=='start':raise OSError('service start failed')
+                running=True;return ''
+            def ready(active,pid,ticks,**kwargs):
+                self.assertTrue(running);self.assertEqual((pid,ticks),(50,60));events.append('ready')
+                if failure=='readiness':raise ConnectionRefusedError('not ready')
+            def snapshot(active):
+                nonlocal snapshots
+                snapshots+=1
+                if failure=='final' and snapshots>1:raise ValueError('final host observation failed')
+                return dict(active,image_pin=active['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=None,drain_token=drain.read_text())
+            real_new,real_owned=runtime.drained_update,runtime.finish_owned_drain
+            def new_transaction(_lock,_drain,*args,**kwargs):return real_new(lock,drain,*args,**kwargs)
+            def owned_transaction(_lock,_drain,*args,**kwargs):return real_owned(lock,drain,*args,**kwargs)
+            with ExitStack() as stack:
+                replacements=dict(PENDING_UPDATE=pending,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=lambda:(50,60),admission_ready=ready,live_snapshot=snapshot,append_journal_record=lambda path,row:events.append(row['stage']),drained_update=new_transaction,finish_owned_drain=owned_transaction)
+                for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
+                if failure:
+                    with self.assertRaises((OSError,ValueError)):runtime.complete_committed_recovery(plan,pin)
+                    self.assertEqual(drain.read_text(),plan['nonce'])
+                else:
+                    result=runtime.complete_committed_recovery(plan,pin)
+                    self.assertEqual(result['status'],'REBOOT_RECOVERED_UNQUALIFIED');self.assertIs(result['qualification_ready'],False)
+                    self.assertFalse(drain.exists());self.assertTrue(running);self.assertGreaterEqual(snapshots,2)
+            return events
+
+    def test_running_retry_uses_exact_service_without_restart(self):
+        events=self.exercise(existing=True,already_running=True)
+        self.assertNotIn('start',events)
+
+    def test_success_releases_new_drain_after_actual_active_checks(self):self.exercise()
+    def test_success_releases_existing_owned_drain(self):self.exercise(existing=True)
+    def test_start_failure_keeps_owned_drain(self):self.exercise(failure='start')
+    def test_readiness_failure_keeps_owned_drain(self):self.exercise(failure='readiness')
+    def test_late_postflight_failure_keeps_owned_drain(self):
+        events=self.exercise(failure='final')
+        self.assertNotIn('COMMITTED_REBOOT_RECOVERED',events)
+
+class JournalPublicationTests(unittest.TestCase):
+    def reader(self,path):
+        path=Path(path)
+        if not path.exists():return None,b''
+        raw=path.read_bytes();info=path.stat()
+        return dict(sha256=hashlib.sha256(raw).hexdigest(),inode=info.st_ino,mode=info.st_mode&0o777),raw
+
+    def append(self,path,row):
+        self.assertTrue(callable(getattr(runtime,'append_journal_record',None)), 'Crash-safe journal publication is missing')
+        # Root custody is covered separately; this adapter retains real file IO.
+        with patch.object(runtime,'root_file_read',side_effect=self.reader):
+            runtime.append_journal_record(path,row)
+
+    def test_complete_records_preserve_historical_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';before=b'{"stage":"VERIFIED"}\n';path.write_bytes(before)
+            self.append(path,dict(stage='FINISH_START',observed_at=1))
+            self.assertTrue(path.read_bytes().startswith(before))
+            self.assertEqual(len(path.read_bytes().splitlines()),2)
+            self.assertEqual(path.stat().st_mode&0o777,0o600)
+
+    def test_failed_publication_preserves_complete_old_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';before=b'{"stage":"VERIFIED"}\n';path.write_bytes(before)
+            with patch.object(runtime.os,'replace',side_effect=OSError('interrupted publication')):
+                with self.assertRaises(OSError):self.append(path,dict(stage='FINISH_START'))
+            self.assertEqual(path.read_bytes(),before);self.assertEqual(list(path.parent.iterdir()),[path])
+
+    def test_malformed_prior_history_is_never_extended(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';before=b'{"stage":"VERIFIED"}\n{"stage":';path.write_bytes(before)
+            with self.assertRaises(ValueError):self.append(path,dict(stage='FINISH_START'))
+            self.assertEqual(path.read_bytes(),before)
+
+class DrainPublicationTests(unittest.TestCase):
+    def publish(self,path,callback=None):
+        self.assertTrue(callable(getattr(runtime,'publish_owned_drain',None)), 'Atomic complete-token publication is missing')
+        return runtime.publish_owned_drain(path,'owned',before_publish=callback)
+
+    def test_publication_exposes_only_complete_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'drain';seen=[]
+            self.assertTrue(callable(getattr(runtime,'rename_exclusive',None)), 'Exclusive atomic rename is missing')
+            rename=runtime.rename_exclusive
+            def observe(source,target,**kwargs):
+                self.assertFalse(path.exists());self.assertEqual(Path(source).read_bytes(),b'owned');seen.append(1)
+                self.assertEqual(Path(source).stat().st_nlink,1)
+                return rename(source,target)
+            with patch.object(runtime,'rename_exclusive',side_effect=observe):fd=self.publish(path)
+            try:
+                self.assertEqual(path.read_bytes(),b'owned');self.assertEqual(os.fstat(fd).st_ino,path.stat().st_ino)
+                self.assertEqual(path.stat().st_nlink,1);self.assertEqual(path.stat().st_mode&0o777,0o600)
+            finally:os.close(fd)
+            self.assertEqual(seen,[1])
+
+    def test_foreign_token_created_before_publication_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'drain'
+            with self.assertRaises(FileExistsError):self.publish(path,lambda:path.write_text('foreign'))
+            self.assertEqual(path.read_text(),'foreign');self.assertEqual(list(path.parent.iterdir()),[path])
+
+    def test_expired_publication_leaves_no_public_or_staging_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'drain'
+            def expired():raise ValueError('expired')
+            with self.assertRaises(ValueError):self.publish(path,expired)
+            self.assertEqual(list(path.parent.iterdir()),[])
+
 class FinishCliTests(unittest.TestCase):
     def invoke(self,*args):
         return subprocess.run([sys.executable,'-I','-B',str(Path(runtime.__file__).resolve()),*args],capture_output=True,text=True,timeout=2)
@@ -62,6 +216,7 @@ class FinishCliTests(unittest.TestCase):
         self.assertIn('--client-launcher-sha256',result.stdout)
         self.assertIn('--finish-nonce',result.stdout)
         self.assertIn('--recover-finish',result.stdout)
+        self.assertIn('--recover-committed',result.stdout)
 
     def test_apply_and_finish_are_mutually_exclusive(self):
         result=self.invoke('--plan','synthetic.json','--apply','--finish')
@@ -175,6 +330,51 @@ class InstalledHistoryTests(unittest.TestCase):
         self.assertIn('recovery',inspect.signature(runtime.verify_installed_history).parameters)
         original,current,journal,pin=self.fixture();journal[-1]['stage']='FINISH_RECOVERED_HELD'
         self.assertEqual(self.verify(original,current,journal,pin),pin)
+
+    def reboot_fixture(self):
+        original,current,journal,pin=self.fixture()
+        opened={k:dict(v) for k,v in current['before'].items()};opened[runtime.LAUNCHER_TARGET]['mode']=0o755
+        journal.append(dict(stage='FINISH_RELEASE_COMMITTED',files=opened,client_launcher_sha256=pin,qualification_ready=False))
+        observation={k:v for k,v in current.items() if k not in ('service_pid','service_startticks')}
+        observation.update(schema=2,boot='5333c11d-fbbd-42e5-9638-cff800bd7e19',before=opened,
+            service_state=dict(LoadState='loaded',ActiveState='inactive',SubState='dead',MainPID='0',ControlPID='0'))
+        return original,journal,observation,pin
+
+    def reboot_verify(self,original,journal,observation,pin):
+        self.assertTrue(callable(getattr(runtime,'verify_committed_reboot',None)), 'Committed reboot verifier is missing')
+        return runtime.verify_committed_reboot(original,journal,observation,pin,2001.0)
+
+    def test_reboot_recovery_requires_durable_committed_release(self):
+        original,journal,observation,pin=self.reboot_fixture()
+        self.assertEqual(self.reboot_verify(original,journal,observation,pin),pin)
+        journal[-1]['stage']='FINISH_READY_TO_RELEASE'
+        with self.assertRaises(ValueError):self.reboot_verify(original,journal,observation,pin)
+
+    def test_reboot_recovery_refuses_changed_assets_host_or_client(self):
+        for field,value in (('vm_id','999'),('config_sha256','0'*64),('source_main','0'*40)):
+            original,journal,observation,pin=self.reboot_fixture();observation[field]=value
+            with self.subTest(field=field),self.assertRaises(ValueError):self.reboot_verify(original,journal,observation,pin)
+        original,journal,observation,pin=self.reboot_fixture()
+        with self.assertRaises(ValueError):self.reboot_verify(original,journal,observation,'0'*64)
+
+    def test_reboot_recovery_refuses_running_or_foreign_service(self):
+        original,journal,observation,pin=self.reboot_fixture();observation['service_state']['MainPID']='99'
+        with self.assertRaises(ValueError):self.reboot_verify(original,journal,observation,pin)
+
+    def test_failed_poststart_can_be_observed_for_committed_recovery(self):
+        original,journal,observation,pin=self.reboot_fixture()
+        observation['service_state']=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='50',ControlPID='0',StartTicks=60)
+        try:result=self.reboot_verify(original,journal,observation,pin)
+        except ValueError as error:self.fail('Committed recovery cannot resume after service started: '+str(error))
+        self.assertEqual(result,pin)
+
+    def test_committed_checkpoint_can_resume_final_drain_release(self):
+        original,journal,observation,pin=self.reboot_fixture()
+        observation['service_state']=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID='50',ControlPID='0',StartTicks=60)
+        journal.append(dict(stage='COMMITTED_REBOOT_RECOVERED',files=observation['before'],client_launcher_sha256=pin,qualification_ready=False,boot=observation['boot'],service_pid=50,service_startticks=60))
+        try:result=self.reboot_verify(original,journal,observation,pin)
+        except ValueError as error:self.fail('Durable checkpoint cannot resume drain release: '+str(error))
+        self.assertEqual(result,pin)
 
 class OwnedFinishTests(unittest.TestCase):
     def run_finish(self,lock,drain,action,check=lambda:None):

@@ -88,6 +88,10 @@ def validate_plan(plan, now):
     for field in ('service_pid', 'service_startticks'):
         if type(plan[field]) is not int or plan[field] <= 0:
             raise ValueError('Invalid admission process identity')
+    return validate_runtime_observation(plan, now)
+
+
+def validate_runtime_observation(plan, now):
     observed = plan['observed_at']
     if (type(observed) not in (int, float) or not math.isfinite(observed)
             or not 0 <= now - observed <= 120):
@@ -106,6 +110,58 @@ def validate_plan(plan, now):
         raise ValueError('Complete current file observations required')
     return validate_assets(plan['assets'])
 
+
+
+def verify_committed_reboot(original, journal, observation, client_pin, now):
+    """Validate explicit reboot completion; no fabricated running-process facts."""
+    fields = {'schema', 'nonce', 'source_main', 'vm_id', 'boot', 'image_id',
+              'config_sha256', 'admission_sha256', 'service_sha256', 'service_state',
+              'observed_at', 'assets', 'before'}
+    if (not isinstance(observation, dict) or set(observation) != fields
+            or type(observation['schema']) is not int or observation['schema'] != 2):
+        raise ValueError('Unknown committed reboot observation')
+    validate_runtime_observation(observation, now)
+    if not isinstance(original, dict):raise ValueError('Missing original update plan')
+    validate_plan(original, original.get('observed_at', now))
+    for field in ('nonce', 'source_main', 'vm_id', 'image_id', 'config_sha256',
+                  'admission_sha256', 'service_sha256', 'assets'):
+        if observation[field] != original[field]:
+            raise ValueError('Committed recovery identity changed: ' + field)
+    if observation['boot'] == original['boot']:
+        raise ValueError('Use same-boot finish recovery without rewriting boot history')
+    inactive = dict(LoadState='loaded', ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0')
+    if observation['service_state'] != inactive:
+        state = observation['service_state']
+        active_keys = set(inactive) | {'StartTicks'}
+        if (not isinstance(state, dict) or set(state) != active_keys
+                or state['LoadState'] != 'loaded' or state['ActiveState'] != 'active'
+                or state['SubState'] != 'running' or state['ControlPID'] != '0'
+                or not isinstance(state['MainPID'], str)
+                or not re.fullmatch('[1-9][0-9]{0,9}', state['MainPID'])
+                or type(state['StartTicks']) is not int or state['StartTicks'] <= 0):
+            raise ValueError('Committed recovery service state is unknown')
+    if not isinstance(journal, list) or not journal or not isinstance(journal[-1], dict):
+        raise ValueError('Missing durable release decision')
+    final = journal[-1]
+    if final.get('stage') == 'COMMITTED_REBOOT_RECOVERED':
+        state = observation['service_state']
+        if (state.get('ActiveState') != 'active' or final.get('boot') != observation['boot']
+                or str(final.get('service_pid')) != state.get('MainPID')
+                or final.get('service_startticks') != state.get('StartTicks')
+                or not any(isinstance(row, dict) and row.get('stage') == 'FINISH_RELEASE_COMMITTED'
+                           for row in journal[:-1])):
+            raise ValueError('Recovered checkpoint process or boot changed')
+    elif final.get('stage') != 'FINISH_RELEASE_COMMITTED':
+        raise ValueError('No durable committed release to recover')
+    if (final.get('files') != observation['before']
+            or final.get('client_launcher_sha256') != client_pin
+            or final.get('qualification_ready') is not False):
+        raise ValueError('No matching durable unqualified release commit')
+    launcher = observation['before'].get(LAUNCHER_TARGET)
+    if not isinstance(launcher, dict) or launcher.get('mode') != 0o755:
+        raise ValueError('Committed launcher must match its executable release state')
+    held = dict(observation['before'], **{LAUNCHER_TARGET:dict(launcher, mode=0o644)})
+    return verify_installed_runtime(observation['assets'], held, client_launcher_sha256=client_pin)
 
 
 def verify_installed_history(plan, original, journal, client_pin, now, *, recovery=False):
@@ -179,6 +235,26 @@ def atomic_write(path, data, mode, *, before_replace=None):
             os.unlink(temporary)
 
 
+def append_journal_record(path, record):
+    """Atomically publish a complete bounded history, retaining the old prefix."""
+    import json
+    state, old = root_file_read(path)
+    if old and not old.endswith(b'\n'):
+        raise ValueError('Incomplete historical journal needs explicit inspection')
+    for line in old.splitlines():
+        if not isinstance(json.loads(line), dict):
+            raise ValueError('Invalid historical journal record')
+    if not isinstance(record, dict):
+        raise ValueError('Journal record must be an object')
+    raw = old + (json.dumps(record, sort_keys=True)+'\n').encode()
+    if len(raw) > 1048576:
+        raise ValueError('Journal size bound exceeded')
+    def unchanged():
+        if root_file_read(path)[0] != state:
+            raise ValueError('Historical journal changed before publication')
+    atomic_write(path, raw, 0o600, before_replace=unchanged)
+
+
 def root_file_read(path):
     """Inspect root custody before trusting a live file or its absence."""
     path = Path(path)
@@ -234,6 +310,56 @@ def active_work_processes(records):
             or b'/usr/local/bin/oxidex-remote-build' in row['argv']]
 
 
+def rename_exclusive(source, target):
+    """Atomic no-replace rename; unsupported kernels fail without publication."""
+    import ctypes
+    import sys
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'linux':
+        operation = libc.renameat2
+        operation.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        operation.restype = ctypes.c_int
+        result = operation(-100, os.fsencode(source), -100, os.fsencode(target), 1)
+    elif sys.platform == 'darwin':
+        # The bounded synthetic controls also run on macOS. SDK RENAME_EXCL=4.
+        operation = libc.renamex_np
+        operation.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        operation.restype = ctypes.c_int
+        result = operation(os.fsencode(source), os.fsencode(target), 4)
+    else:
+        raise ValueError('Exclusive atomic rename is unsupported on this platform')
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(target))
+
+
+def publish_owned_drain(path, token, *, before_publish=None):
+    """Publish a complete durable token exclusively; never expose an empty drain."""
+    if not isinstance(token, str) or not re.fullmatch('[a-zA-Z0-9_-]{1,128}', token):
+        raise ValueError('Invalid drain token')
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix='.drain-', dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        raw = token.encode('ascii')
+        if os.write(fd, raw) != len(raw):
+            raise OSError('Incomplete private drain write')
+        os.fsync(fd)
+        if before_publish is not None:before_publish()
+        # A no-replace rename publishes one complete, singly linked token.
+        rename_exclusive(temporary, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:os.fsync(parent)
+        finally:os.close(parent)
+        os.lseek(fd, 0, os.SEEK_SET)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+    finally:
+        if os.path.exists(temporary):os.unlink(temporary)
+
+
 def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None, keep_drain=False):
     """Run under the existing lock; failures retain the protective owned drain."""
     import fcntl
@@ -253,12 +379,8 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
             raise ValueError('Build lock replaced')
         if before_drain is not None:
             before_drain()
-        drain = os.open(drain_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        drain = publish_owned_drain(drain_path, token, before_publish=before_drain)
         raw = token.encode('ascii')
-        with os.fdopen(os.dup(drain), 'wb') as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
         directory = os.open(drain_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.fsync(directory)
@@ -487,7 +609,38 @@ def observed_work_processes():
     return active_work_processes(work_records)
 
 
-def live_snapshot(plan):
+def parse_recovery_service_state(raw):
+    """Accept only an exact inactive unit or a running unit to verify in /proc."""
+    expected_keys = {'LoadState', 'ActiveState', 'SubState', 'MainPID', 'ControlPID'}
+    if not isinstance(raw, str) or len(raw) > 4096:
+        raise ValueError('Unavailable recovery service record')
+    rows = raw.strip().splitlines()
+    if len(rows) != 5 or any('=' not in row for row in rows):
+        raise ValueError('Incomplete or duplicate recovery service record')
+    fields = dict(row.split('=', 1) for row in rows)
+    if set(fields) != expected_keys or fields['LoadState'] != 'loaded' or fields['ControlPID'] != '0':
+        raise ValueError('Unknown recovery service record')
+    inactive = fields['ActiveState'] == 'inactive' and fields['SubState'] == 'dead' and fields['MainPID'] == '0'
+    active = fields['ActiveState'] == 'active' and fields['SubState'] == 'running' and re.fullmatch('[1-9][0-9]{0,9}', fields['MainPID'])
+    if not (inactive or active):raise ValueError('Unknown recovery service state')
+    return fields
+
+
+def parse_inactive_service_state(raw):
+    """Parse an exact native inactive unit record; unknown state is not absence."""
+    expected = dict(LoadState='loaded', ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0')
+    if not isinstance(raw, str) or len(raw) > 4096:
+        raise ValueError('Unavailable inactive service record')
+    rows = raw.strip().splitlines()
+    if len(rows) != len(expected) or any('=' not in row for row in rows):
+        raise ValueError('Incomplete or duplicate inactive service record')
+    fields = dict(row.split('=', 1) for row in rows)
+    if fields != expected:
+        raise ValueError('Admission service is not exactly loaded and inactive')
+    return fields
+
+
+def live_snapshot(plan, *, committed_original=None):
     """Read fixed host facts, never acquire leases or start containers."""
     import json
     config_path = Path('/etc/oxidex-remote-build.json')
@@ -502,7 +655,20 @@ def live_snapshot(plan):
     service = root_file_state('/etc/systemd/system/gha-admission.service')
     drain = Path('/run/oxidex-build-draining')
     root_file_state(drain)
-    service_pid, service_ticks = service_identity()
+    if committed_original is not None:
+        service_state = parse_recovery_service_state(checked_command(['/usr/bin/systemctl',
+            'show', 'gha-admission.service', '--property=LoadState', '--property=ActiveState',
+            '--property=SubState', '--property=MainPID', '--property=ControlPID'], timeout=2))
+        if service_state['ActiveState'] == 'inactive':
+            service_pid = service_ticks = None  # No running process is observed.
+        else:
+            service_pid, service_ticks = service_identity()
+            if str(service_pid) != service_state['MainPID']:
+                raise ValueError('Running recovery process changed during observation')
+            service_state['StartTicks'] = service_ticks
+    else:
+        service_state = None
+        service_pid, service_ticks = service_identity()
     executables = ('/usr/bin/git', '/usr/bin/ssh-keygen', '/usr/bin/python3',
                    '/usr/bin/docker', '/usr/bin/systemctl')
     tools_ready = all(stat.S_ISREG(Path(p).stat().st_mode) and Path(p).stat().st_uid == 0
@@ -513,10 +679,15 @@ def live_snapshot(plan):
     pending_nonce = None
     if pending_state is not None:
         pending = json.loads(pending_raw)
-        if pending.get('boot') != Path('/proc/sys/kernel/random/boot_id').read_text().strip():
+        if committed_original is not None:
+            expected_pending = dict(nonce=committed_original['nonce'], boot=committed_original['boot'],
+                                    source_main=committed_original['source_main'])
+            if pending != expected_pending:
+                raise ValueError('Committed reboot marker differs from original update')
+        elif pending.get('boot') != Path('/proc/sys/kernel/random/boot_id').read_text().strip():
             raise ValueError('Pending update survived reboot; explicit recovery required')
         pending_nonce = pending.get('nonce')
-    return dict(
+    result = dict(
         pending_nonce=pending_nonce,
         upload_processes=uploads,
         vm_id=checked_command(['/usr/bin/curl', '-q', '--fail', '--silent', '--show-error',
@@ -535,6 +706,8 @@ def live_snapshot(plan):
         containers=checked_command(['/usr/bin/docker', 'ps', '-aq', '--no-trunc']).split(),
         before={target: root_file_state(target) for target in TARGETS},
         drain_token=drain.read_text() if drain.exists() else None)
+    if service_state is not None:result['service_state'] = service_state
+    return result
 
 
 
@@ -703,12 +876,7 @@ def apply_update(plan):
         journal = backup / 'journal.jsonl'
 
         def record(stage, **facts):
-            with journal.open('ab') as output:
-                os.chmod(journal, 0o600)
-                output.write((json.dumps(dict(stage=stage, observed_at=time.time(), **facts),
-                                         sort_keys=True) + '\n').encode())
-                output.flush()
-                os.fsync(output.fileno())
+            append_journal_record(journal, dict(stage=stage, observed_at=time.time(), **facts))
 
         record('BACKUP_START')
         try:
@@ -805,10 +973,8 @@ def apply_update(plan):
             validate_plan(plan, time.time())
         except BaseException as error:
             import json
-            with (backup/'journal.jsonl').open('ab') as output:
-                output.write((json.dumps(dict(stage='HOLD_BEFORE_DRAIN_RELEASE',
-                    observed_at=time.time(),error_type=type(error).__name__),sort_keys=True)+'\n').encode())
-                output.flush();os.fsync(output.fileno())
+            append_journal_record(backup/'journal.jsonl', dict(stage='HOLD_BEFORE_DRAIN_RELEASE',
+                observed_at=time.time(), error_type=type(error).__name__))
             raise
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining',
                           plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True)
@@ -839,12 +1005,7 @@ def finish_update(plan, client_pin):
     phase = dict(started=False, opened=False, pending=False, permit=False)
 
     def record(stage, **facts):
-        # Existing journal is authenticated before opening it for append.
-        root_file_state(backup / 'journal.jsonl')
-        with (backup / 'journal.jsonl').open('ab') as output:
-            output.write((json.dumps(dict(stage=stage, observed_at=time.time(), **facts),
-                                     sort_keys=True)+'\n').encode())
-            output.flush();os.fsync(output.fileno())
+        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts))
 
     def check():
         validate_plan(plan, time.time())
@@ -919,8 +1080,107 @@ def finish_update(plan, client_pin):
 
     result = finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
                                 plan['nonce'], check, reopen, on_failure=hold_failure, commit=commit_release)
-    record('FINISH_REOPENED_UNQUALIFIED', client_launcher_sha256=client_pin)
+    # The durable release decision was recorded under EX. The returned receipt
+    # observes actual drain removal; do not append outside the protected lock.
     return result
+
+
+def capture_committed_recovery(nonce, source_main, assets, client_pin):
+    """Capture a new boot and inactive unit without changing the saved update."""
+    import json
+    import time
+    if not isinstance(nonce, str) or not re.fullmatch('[a-f0-9]{32}', nonce):
+        raise ValueError('Exact installed nonce required for committed recovery')
+    backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + nonce)
+    _, raw = root_file_read(backup/'plan.json')
+    original = json.loads(raw)
+    validate_plan(original, original.get('observed_at', time.time()))
+    _, raw = root_file_read(backup/'journal.jsonl')
+    journal = [json.loads(line) for line in raw.splitlines()]
+    observed_at = time.time()
+    snapshot = live_snapshot({}, committed_original=original)
+    if (snapshot['pending_nonce'] not in (None, nonce) or snapshot['drain_token'] not in (None, nonce)
+            or snapshot['image_pin'] != snapshot['image_id'] or snapshot['admission_valid'] is not True
+            or snapshot['cpu'] != 16 or snapshot['role'] != 'builder'
+            or snapshot['cpus'] != 16 or snapshot['memory_gib'] != 28
+            or snapshot['tools_ready'] is not True or snapshot['leases'] != {}
+            or snapshot['containers'] != [] or snapshot['upload_processes'] != []):
+        raise ValueError('Committed reboot host is not exactly idle and protected')
+    observation = dict(schema=2, nonce=nonce, source_main=source_main,
+        observed_at=observed_at, assets=assets,
+        **{field:snapshot[field] for field in ('vm_id', 'boot', 'image_id', 'config_sha256',
+            'admission_sha256', 'service_sha256', 'service_state', 'before')})
+    verify_committed_reboot(original, journal, observation, client_pin, time.time())
+    return observation
+
+
+def complete_committed_recovery(plan, client_pin):
+    """Complete an explicitly selected durable release after reboot."""
+    import time
+    # Fresh capture reads the immutable original records and exact inactive unit.
+    current = capture_committed_recovery(plan['nonce'], plan['source_main'], plan['assets'], client_pin)
+    validate_runtime_observation(plan, time.time())
+    if any(current[key] != value for key, value in plan.items() if key != 'observed_at'):
+        raise ValueError('Committed recovery observation changed')
+    backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
+    pending = root_file_state(PENDING_UPDATE)
+    _, raw = root_file_read('/run/oxidex-build-draining')
+    if raw not in (b'', plan['nonce'].encode()):
+        raise ValueError('Foreign committed-recovery drain')
+
+    phase = {'active':None}
+    def check():
+        if phase['active'] is not None:
+            active = phase['active']
+            validate_plan(active, time.time())
+            check_snapshot(active, live_snapshot(active), owned_drain=True)
+            admission_ready(active, active['service_pid'], active['service_startticks'], wait=False)
+            return
+        validate_runtime_observation(plan, time.time())
+        fresh = capture_committed_recovery(plan['nonce'], plan['source_main'], plan['assets'], client_pin)
+        if any(fresh[key] != value for key, value in plan.items() if key != 'observed_at'):
+            raise ValueError('Committed recovery bindings changed under lock')
+        if root_file_state(PENDING_UPDATE) != pending:
+            raise ValueError('Persistent committed marker changed')
+
+    def complete():
+        check()
+        # The earlier fsynced release decision authorizes this exact marker
+        # removal. Preserve that historical journal until service proof succeeds.
+        validate_runtime_observation(plan, time.time())
+        if pending is not None:os.unlink(PENDING_UPDATE)
+        parent = os.open(PENDING_UPDATE.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:os.fsync(parent)
+        finally:os.close(parent)
+        if plan['service_state']['ActiveState'] == 'inactive':
+            checked_command(['/usr/bin/systemctl', 'start', 'gha-admission.service'],
+                            timeout=min(20, max(1, plan['observed_at']+120-time.time())))
+        pid, ticks = service_identity()
+        if plan['service_state']['ActiveState'] == 'active' and (pid, ticks) != (
+                int(plan['service_state']['MainPID']), plan['service_state']['StartTicks']):
+            raise ValueError('Selected running recovery process changed')
+        active = {key:value for key,value in plan.items() if key != 'service_state'}
+        active.update(schema=1, service_pid=pid, service_startticks=ticks)
+        phase['active'] = active
+        admission_ready(active, pid, ticks)
+        snapshot = live_snapshot(active)
+        check_snapshot(active, snapshot, owned_drain=True)
+        return dict(status='REBOOT_RECOVERED_UNQUALIFIED', qualification_ready=False,
+                    service_pid=pid, service_startticks=ticks, boot=plan['boot'])
+
+    def publish_success():
+        active = phase['active']
+        append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_REBOOT_RECOVERED',
+            observed_at=time.time(), boot=plan['boot'], service_pid=active['service_pid'],
+            service_startticks=active['service_startticks'], files=plan['before'],
+            client_launcher_sha256=client_pin, qualification_ready=False))
+
+    # Keep the drain on any failure; no lease is invented or cleared.
+    if raw:
+        return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
+                                  plan['nonce'], check, complete, commit=publish_success)
+    return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining', plan['nonce'],
+                          complete, before_drain=check, before_release=lambda result:(check(), publish_success()))
 
 
 def recover_finish_update(plan, client_pin):
@@ -937,11 +1197,7 @@ def recover_finish_update(plan, client_pin):
     phase = dict(started=False)
 
     def record(stage, **facts):
-        root_file_state(backup / 'journal.jsonl')
-        with (backup / 'journal.jsonl').open('ab') as output:
-            output.write((json.dumps(dict(stage=stage, observed_at=time.time(), **facts),
-                                     sort_keys=True)+'\n').encode())
-            output.flush();os.fsync(output.fileno())
+        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts))
 
     def check(*, owned=True):
         validate_plan(plan, time.time())
@@ -1013,6 +1269,7 @@ def main():
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument('--apply', action='store_true', help='Apply the reviewed plan; default checks only')
     actions.add_argument('--finish', action='store_true', help='Reopen an installed route; not qualification readiness')
+    actions.add_argument('--recover-committed', action='store_true', help='Explicitly recover a committed release after reboot')
     actions.add_argument('--recover-finish', action='store_true', help='Restore a checked interrupted finish to held state')
     parser.add_argument('--finish-nonce', help='Capture fresh observations for this installed update nonce')
     parser.add_argument('--client-launcher-sha256', help='Explicit paired client launcher pin')
@@ -1028,6 +1285,12 @@ def main():
             raise ValueError('Candidate assets differ from selected digest')
         assets = checked_json(raw, args.assets_sha256)
         validate_assets(assets)
+        if args.recover_committed:
+            if not args.finish_nonce or not args.client_launcher_sha256:
+                parser.error('Committed recovery capture requires nonce and paired client pin')
+            observation = capture_committed_recovery(args.finish_nonce, args.source_main, assets, args.client_launcher_sha256)
+            print(json.dumps(observation, sort_keys=True))
+            return
         observed_at = time.time()
         snapshot = live_snapshot({})
         if args.recover_finish and not args.finish_nonce:
@@ -1046,6 +1309,12 @@ def main():
     if state is None or state['sha256'] != args.plan_sha256:
         raise ValueError('Plan differs from the explicitly selected reviewed digest')
     plan = checked_json(raw, args.plan_sha256)
+    if args.recover_committed:
+        if not args.client_launcher_sha256:
+            parser.error('Committed recovery requires paired client pin')
+        result = complete_committed_recovery(plan, args.client_launcher_sha256)
+        print(json.dumps(result, sort_keys=True))
+        return
     validate_plan(plan, time.time())
     snapshot = live_snapshot(plan)
     validate_plan(plan, time.time())
