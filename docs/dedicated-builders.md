@@ -23,26 +23,14 @@ explicitly approved uploader identity/public key. Do not use a private SSH key.
 `public_key_sha256` (SHA-256 of that complete key string). Set
 `authorized_uploader_sha256` to SHA-256 of its sorted, compact JSON representation.
 Identity receipts and key mappings are deployment inputs, not repository defaults.
+The renderer supplies the fixed host, container, and baseline disk settings.
+Explicit settings still pass through the same strict policy checks.
 
 ```json
 {
   "instance_name": "builder-your-unique-name",
   "project": "your-project",
-  "zone": "asia-east2-a",
-  "disk_device_name": "builder-cache",
-  "role": "builder",
-  "runner_count": 0,
-  "cpu": 16,
-  "ram": 32,
-  "builder_cpus": 16,
-  "builder_memory_gib": 28,
-  "disk_type": "hyperdisk-balanced",
-  "disk_size_gb": 100,
-  "data_disk_iops": 3000,
-  "data_disk_throughput": 140,
-  "boot_disk_size_gb": 40,
-  "boot_disk_iops": 3000,
-  "boot_disk_throughput": 140
+  "zone": "asia-east2-a"
 }
 ```
 
