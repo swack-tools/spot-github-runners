@@ -200,9 +200,9 @@ python3 -I -B builder_runtime_update.py --plan finish-plan.json \
 ```
 
 Finish verifies the successful installation journal and current host under the
-existing build lock. It restores execution on the selected launcher, removes
-the volatile permit, records a durable release decision after final checks,
-removes its persistent pending marker, and removes the owned drain last. It returns
+existing build lock. It keeps the launcher held through final checks and records a durable release
+decision before restoring execution. It then removes its persistent pending
+marker and removes the owned drain last. It returns
 `REOPENED_UNQUALIFIED`, with qualification readiness false. Run one actual
 ordinary OxiDex Just build and the qualification checks afterward. The client
 selector requires an executable launcher and no drain, so this ordinary build
@@ -288,3 +288,8 @@ Permission transitions publish durable intent before changing the selected
 launcher. Recovery checks both sides of that transition against the same inode
 and bytes. Slow recovery observations must pass the selected plan's freshness
 check again before any permission change.
+
+The release journal distinguishes the observed held files from the authorized
+executable state. A committed decision is permission to complete that transition,
+not evidence that it already happened. A completed re-hold keeps that authority
+for checked recovery after another reboot.

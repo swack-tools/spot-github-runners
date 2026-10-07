@@ -144,7 +144,7 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
         raise ValueError('Missing durable release decision')
     final = journal[-1]
     comparison_files = observation['before']
-    transitions = {'HOLD_FINISH_RECOVERY', 'HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT', 'FINISH_RECOVERY_START'}
+    transitions = {'HOLD_FINISH_RECOVERY', 'HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT', 'FINISH_RECOVERY_START', 'FINISH_RECOVERED_HELD'}
     if final.get('stage') in transitions:
         indices = [index for index, row in enumerate(journal)
                    if isinstance(row, dict) and row.get('stage') == 'FINISH_RELEASE_COMMITTED']
@@ -155,6 +155,14 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
         if not isinstance(selected, dict) or selected.get('mode') not in (0o644, 0o755):
             raise ValueError('Unknown committed launcher permission state')
         for row in journal[indices[-1]+1:]:
+            if row['stage'] == 'FINISH_RECOVERED_HELD':
+                recovered = row.get('files')
+                if (not isinstance(recovered, dict) or set(recovered) != set(comparison_files)
+                        or not isinstance(recovered.get(LAUNCHER_TARGET), dict)
+                        or recovered[LAUNCHER_TARGET].get('mode') != 0o644
+                        or dict(recovered, **{LAUNCHER_TARGET:dict(recovered[LAUNCHER_TARGET], mode=0o755)})
+                           != dict(comparison_files, **{LAUNCHER_TARGET:dict(selected, mode=0o755)})):
+                    raise ValueError('Completed rehold belongs to changed files')
             if row['stage'] in ('HOLD_FINISH_INTENT', 'COMMITTED_LAUNCHER_RESTORE_INTENT', 'FINISH_RECOVERY_START'):
                 recorded = row.get('launcher')
                 if (not isinstance(recorded, dict) or recorded.get('mode') not in (0o644, 0o755)
@@ -172,6 +180,12 @@ def verify_committed_reboot(original, journal, observation, client_pin, now):
             raise ValueError('Recovered checkpoint process or boot changed')
     elif final.get('stage') != 'FINISH_RELEASE_COMMITTED':
         raise ValueError('No durable committed release to recover')
+    # A release decision records observed held files separately from the
+    # authorized executable state. Crash before chmod is still protected.
+    selected = comparison_files.get(LAUNCHER_TARGET)
+    if (final.get('stage') == 'FINISH_RELEASE_COMMITTED' and isinstance(selected, dict)
+            and selected.get('mode') == 0o644 and final.get('observed_files') == comparison_files):
+        comparison_files = dict(comparison_files, **{LAUNCHER_TARGET:dict(selected, mode=0o755)})
     if (final.get('files') != comparison_files
             or final.get('client_launcher_sha256') != client_pin
             or final.get('qualification_ready') is not False):
@@ -1059,11 +1073,7 @@ def finish_update(plan, client_pin):
         record('FINISH_START', client_launcher_sha256=client_pin)
         validate_plan(plan, time.time())
         phase['started'] = True
-        restore_launcher_execution(LAUNCHER_TARGET, plan['before'][LAUNCHER_TARGET])
-        phase['opened'] = True
-        expected['before'][LAUNCHER_TARGET] = dict(plan['before'][LAUNCHER_TARGET], mode=0o755)
-        check()
-        # The persistent marker remains through every fallible final check.
+        # Execution remains held until the durable release decision below.
         remove_marker(CURRENT_BOOT_PERMIT, permit_state);phase['permit'] = True
         check()
         record('FINISH_READY_TO_RELEASE', files=expected['before'])
@@ -1075,8 +1085,15 @@ def finish_update(plan, client_pin):
         # All release checks have passed under EX. This fsynced decision permits
         # ordinary routing after reboot even if power is lost before /run cleanup.
         validate_plan(plan, time.time())
-        record('FINISH_RELEASE_COMMITTED', files=expected['before'],
+        release_files = dict(expected['before'])
+        release_files[LAUNCHER_TARGET] = dict(expected['before'][LAUNCHER_TARGET], mode=0o755)
+        record('FINISH_RELEASE_COMMITTED', files=release_files, observed_files=expected['before'],
                client_launcher_sha256=client_pin, qualification_ready=False)
+        validate_plan(plan, time.time())
+        restore_launcher_execution(LAUNCHER_TARGET, plan['before'][LAUNCHER_TARGET])
+        phase['opened'] = True
+        expected['before'] = release_files
+        check()
         if pending_state is None or root_file_state(PENDING_UPDATE) != pending_state:
             raise ValueError('Persistent marker changed before committed release')
         validate_plan(plan, time.time())

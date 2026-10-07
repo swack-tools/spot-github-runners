@@ -97,7 +97,7 @@ class InactiveServiceTests(unittest.TestCase):
 
 class OrdinaryFinishClockTests(unittest.TestCase):
     def exercise(self,expire_at,*,recovery=False):
-        _,plan,_,pin=InstalledHistoryTests().fixture();plan['observed_at']=time.time();clock=[plan['observed_at']];opened=[]
+        _,plan,_,pin=InstalledHistoryTests().fixture();plan['observed_at']=time.time();clock=[plan['observed_at']];opened=[];stages=[]
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory).resolve();lock=root/'lock';lock.touch();drain=root/'drain';drain.write_text(plan['nonce']);drain.chmod(0o600)
             pending=root/'pending';pending.write_text(json.dumps(dict(nonce=plan['nonce'],boot=plan['boot'],source_main=plan['source_main'])));permit=root/'permit';permit.write_text(plan['nonce']);launcher=root/'launcher';launcher.write_bytes(b'bounded synthetic runtime\n');launcher.chmod(0o644)
@@ -109,6 +109,7 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             guard=root/'guard';guard.write_bytes(runtime.BOOT_GUARD_BYTES);guard.chmod(0o644)
             def snapshot(expected):return dict(expected,image_pin=expected['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=plan['nonce'] if pending.exists() else None,drain_token=drain.read_text())
             def record(path,row):
+                stages.append(row['stage'])
                 if row['stage']==expire_at:clock[0]=plan['observed_at']+121
             def read(path):
                 selected=drain if str(path)=='/run/oxidex-build-draining' else Path(path)
@@ -118,17 +119,27 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             def sync(fd):
                 real_fsync(fd)
                 if expire_at=='pending-fsync' and not pending.exists():clock[0]=plan['observed_at']+121
-            def restore(path,expected):opened.append(1);real_restore(launcher,expected)
+            def restore(path,expected):
+                if expire_at=='require-commit':self.assertIn('FINISH_RELEASE_COMMITTED',stages)
+                opened.append(1);real_restore(launcher,expected)
             def close(path,**kwargs):closed.append(1);real_close(launcher,**kwargs)
             with ExitStack() as stack:
                 replacements=dict(PENDING_UPDATE=pending,CURRENT_BOOT_PERMIT=permit,BOOT_GUARD=guard,installed_history=lambda *args,**kwargs:root,live_snapshot=snapshot,mutation_idle_fence=lambda plan:None,admission_ready=lambda *args,**kwargs:None,verify_boot_hold=lambda plan:None,root_file_state=state,root_file_read=read,append_journal_record=record,restore_launcher_execution=restore,close_launcher_execution=close,finish_owned_drain=lambda _lock,_drain,*args,**kwargs:real_owned(lock,drain,*args,**kwargs))
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
                 stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]));stack.enter_context(patch.object(runtime.os,'fsync',side_effect=sync))
-                with self.assertRaises(ValueError):
-                    (runtime.recover_finish_update if recovery else runtime.finish_update)(plan,pin)
-            self.assertEqual(drain.read_text(),plan['nonce'])
-            self.assertEqual(launcher.stat().st_mode&0o777,0o644)
+                if expire_at=='require-commit':
+                    result=runtime.finish_update(plan,pin)
+                    self.assertEqual(result['status'],'REOPENED_UNQUALIFIED')
+                else:
+                    with self.assertRaises(ValueError):
+                        (runtime.recover_finish_update if recovery else runtime.finish_update)(plan,pin)
+            if expire_at=='require-commit':
+                self.assertFalse(drain.exists());self.assertEqual(launcher.stat().st_mode&0o777,0o755)
+            else:
+                self.assertEqual(drain.read_text(),plan['nonce']);self.assertEqual(launcher.stat().st_mode&0o777,0o644)
             return closed if recovery else opened
+
+    def test_release_authority_precedes_execution_permission(self):self.exercise('require-commit')
 
     def test_recovery_journal_expiry_prevents_chmod(self):self.assertEqual(self.exercise('FINISH_RECOVERY_START',recovery=True),[])
 
@@ -495,6 +506,22 @@ class InstalledHistoryTests(unittest.TestCase):
                     try:result=self.reboot_verify(original,journal,observation,pin)
                     except ValueError as error:self.fail('Intent lost retry authority: '+str(error))
                     self.assertEqual(result,pin)
+
+    def test_completed_rehold_preserves_committed_reboot_authority(self):
+        original,journal,observation,pin=self.reboot_fixture()
+        observation['before']={k:dict(v) for k,v in observation['before'].items()};observation['before'][runtime.LAUNCHER_TARGET]['mode']=0o644
+        journal.append(dict(stage='FINISH_RECOVERED_HELD',files=observation['before'],service_pid=30,service_startticks=40))
+        try:result=self.reboot_verify(original,journal,observation,pin)
+        except ValueError as error:self.fail('Verified rehold lost durable authority: '+str(error))
+        self.assertEqual(result,pin)
+
+    def test_release_decision_supports_before_and_after_permission_change(self):
+        for mode in (0o644,0o755):
+            original,journal,observation,pin=self.reboot_fixture()
+            held={k:dict(v) for k,v in observation['before'].items()};held[runtime.LAUNCHER_TARGET]['mode']=0o644
+            journal[-1]['observed_files']=held
+            observation['before']={k:dict(v) for k,v in observation['before'].items()};observation['before'][runtime.LAUNCHER_TARGET]['mode']=mode
+            with self.subTest(mode=mode):self.assertEqual(self.reboot_verify(original,journal,observation,pin),pin)
 
 class OwnedFinishTests(unittest.TestCase):
     def run_finish(self,lock,drain,action,check=lambda:None):
