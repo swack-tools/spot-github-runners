@@ -102,9 +102,11 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             root=Path(directory).resolve();lock=root/'lock';lock.touch();drain=root/'drain';drain.write_text(plan['nonce']);drain.chmod(0o600)
             pending=root/'pending';pending.write_text(json.dumps(dict(nonce=plan['nonce'],boot=plan['boot'],source_main=plan['source_main'])));permit=root/'permit';permit.write_text(plan['nonce']);launcher=root/'launcher';launcher.write_bytes(b'bounded synthetic runtime\n');launcher.chmod(0o644)
             def state(path):
-                path=launcher if str(path)==runtime.LAUNCHER_TARGET else Path(path)
+                path=launcher if str(path)==runtime.LAUNCHER_TARGET else lock if str(path)=='/run/oxidex-build.lock' else Path(path)
                 if not path.exists():return None
-                info=path.stat();return dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),mode=info.st_mode&0o777,uid=info.st_uid,gid=info.st_gid,device=info.st_dev,inode=info.st_ino)
+                info=path.stat()
+                if expire_at=='permit-read' and path==permit and 'FINISH_START' in stages:clock[0]=plan['observed_at']+121
+                return dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),mode=info.st_mode&0o777,uid=info.st_uid,gid=info.st_gid,device=info.st_dev,inode=info.st_ino)
             plan['before']={k:dict(v) for k,v in plan['before'].items()};plan['before'][runtime.LAUNCHER_TARGET]=state(launcher)
             guard=root/'guard';guard.write_bytes(runtime.BOOT_GUARD_BYTES);guard.chmod(0o644)
             def snapshot(expected):return dict(expected,image_pin=expected['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=plan['nonce'] if pending.exists() else None,drain_token=drain.read_text())
@@ -137,7 +139,10 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                 self.assertFalse(drain.exists());self.assertEqual(launcher.stat().st_mode&0o777,0o755)
             else:
                 self.assertEqual(drain.read_text(),plan['nonce']);self.assertEqual(launcher.stat().st_mode&0o777,0o644)
+                if expire_at=='permit-read':self.assertTrue(permit.exists())
             return closed if recovery else opened
+
+    def test_expired_permit_read_preserves_permit(self):self.exercise('permit-read')
 
     def test_release_authority_precedes_execution_permission(self):self.exercise('require-commit')
 
@@ -161,8 +166,8 @@ class CommittedFlowTests(unittest.TestCase):
             if existing:drain.write_text(plan['nonce']);drain.chmod(0o600)
             running=already_running;executed=already_running;events=[];snapshots=0;captures=0;clock=[plan['observed_at']]
             def file_state(path):
-                path=Path(path)
-                if path==pending:
+                path=lock if str(path)=='/run/oxidex-build.lock' else Path(path)
+                if path in (pending,lock):
                     if not path.exists():return None
                     info=path.stat();return dict(inode=info.st_ino,sha256=hashlib.sha256(path.read_bytes()).hexdigest())
                 return None
@@ -212,7 +217,7 @@ class CommittedFlowTests(unittest.TestCase):
             with ExitStack() as stack:
                 stack.enter_context(patch.object(time,'time',side_effect=lambda:clock[0]))
                 stack.enter_context(patch.object(runtime.os,'fsync',side_effect=sync))
-                replacements=dict(restore_launcher_execution=restore_selected,ensure_recovery_lock=lambda path:real_init(lock),PENDING_UPDATE=pending,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=identity,admission_ready=ready,live_snapshot=snapshot,append_journal_record=journal,drained_update=new_transaction,finish_owned_drain=owned_transaction)
+                replacements=dict(verify_boot_guard=lambda:None,restore_launcher_execution=restore_selected,ensure_recovery_lock=lambda path:real_init(lock),PENDING_UPDATE=pending,capture_committed_recovery=capture,root_file_state=file_state,root_file_read=read,checked_command=command,service_identity=identity,admission_ready=ready,live_snapshot=snapshot,append_journal_record=journal,drained_update=new_transaction,finish_owned_drain=owned_transaction)
                 for name,value in replacements.items():stack.enter_context(patch.object(runtime,name,value))
                 if failure:
                     with self.assertRaises((OSError,ValueError)):runtime.complete_committed_recovery(plan,pin)
@@ -248,6 +253,14 @@ class CommittedFlowTests(unittest.TestCase):
     def test_late_postflight_failure_keeps_owned_drain(self):
         events=self.exercise(failure='final')
         self.assertNotIn('COMMITTED_REBOOT_RECOVERED',events)
+
+class ManagedDropinTests(unittest.TestCase):
+    def test_changed_dropin_bytes_or_mode_refused(self):
+        for mode,raw in ((0o644,b'[Service]\nExecStartPre=/bin/false\n'),(0o666,runtime.BOOT_GUARD_BYTES)):
+            with self.subTest(mode=mode),patch.object(runtime,'root_file_read',return_value=(dict(mode=mode),raw)):
+                with self.assertRaises(ValueError):runtime.verify_boot_guard()
+        with patch.object(runtime,'root_file_read',return_value=(dict(mode=0o644),runtime.BOOT_GUARD_BYTES)):
+            self.assertEqual(runtime.verify_boot_guard()['mode'],0o644)
 
 class JournalPublicationTests(unittest.TestCase):
     def reader(self,path):
@@ -389,6 +402,15 @@ class LauncherRestoreTests(unittest.TestCase):
             with patch.object(runtime.os,'read',side_effect=slow_read):
                 with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected,before_change=fence)
             self.assertEqual(path.stat().st_mode&0o777,0o644)
+
+    def test_permission_read_detects_changed_custody(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(0o644);expected=self.state(path);read=os.read
+            def mutate(*args):
+                raw=read(*args);path.chmod(0o666);return raw
+            with patch.object(runtime.os,'read',side_effect=mutate):
+                with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected)
+            self.assertEqual(path.stat().st_mode&0o777,0o666)
 
 class InstalledHistoryTests(unittest.TestCase):
     def fixture(self):
@@ -659,5 +681,13 @@ class OwnedFinishTests(unittest.TestCase):
                 replacement=lock.parent/'replacement';replacement.touch();replacement.replace(lock)
             with self.assertRaises(ValueError):runtime.finish_owned_drain(lock,drain,'owned',lambda:None,action,on_failure=lambda error:called.append('mutated'))
             self.assertEqual(called,[]);self.assertEqual(drain.read_text(),'owned')
+
+    def test_new_drain_transaction_refuses_replaced_lock_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock=Path(directory).resolve()/'lock';lock.touch();drain=lock.parent/'drain'
+            def action():
+                other=lock.parent/'other';other.touch();other.replace(lock);return 1
+            with self.assertRaises(ValueError):runtime.drained_update(lock,drain,'owned',action)
+            self.assertEqual(drain.read_text(),'owned')
 
 if __name__=='__main__':unittest.main()

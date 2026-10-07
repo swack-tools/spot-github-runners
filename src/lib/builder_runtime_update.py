@@ -413,14 +413,25 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
         current = lock_path.lstat()
         if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
             raise ValueError('Build lock replaced')
-        if before_drain is not None:
-            before_drain()
-        drain = publish_owned_drain(drain_path, token, before_publish=before_drain)
+        def canonical_owned():
+            current = lock_path.lstat()
+            if ((current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+                    or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                    or current.st_uid != os.geteuid() or current.st_mode & 0o022):
+                raise ValueError('Canonical build lock ownership lost')
+        def before_publish():
+            canonical_owned()
+            if before_drain is not None:before_drain()
+            canonical_owned()
+        before_publish()
+        drain = publish_owned_drain(drain_path, token, before_publish=before_publish)
         raw = token.encode('ascii')
         directory = os.open(drain_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.fsync(directory)
+            canonical_owned()
             result = action()
+            canonical_owned()
             owned, current = os.fstat(drain), drain_path.lstat()
             if (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino) or current.st_nlink != 1:
                 raise ValueError('Owned drain replaced; explicit recovery required')
@@ -428,13 +439,16 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
             if os.read(drain, 129) != raw:
                 raise ValueError('Owned drain changed; explicit recovery required')
             if before_release is not None:
+                canonical_owned()
                 before_release(result)
+                canonical_owned()
             current = drain_path.lstat()
             os.lseek(drain, 0, os.SEEK_SET)
             if ((current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino)
                     or current.st_nlink != 1 or os.read(drain, 129) != raw):
                 raise ValueError('Owned drain changed during final checks')
             if not keep_drain:
+                canonical_owned()
                 os.unlink(drain_path)
                 os.fsync(directory)
             return result
@@ -800,6 +814,11 @@ def set_verified_launcher_mode(path, expected, mode, *, before_change=None):
                 or info.st_uid != expected['uid']
                 or hashlib.sha256(os.read(fd, 262145)).hexdigest() != expected['sha256']):
             raise ValueError('Held launcher changed before restoring execution')
+        after = os.fstat(fd);canonical = path.lstat()
+        if ((after.st_dev, after.st_ino) != (canonical.st_dev, canonical.st_ino)
+                or (info.st_uid, info.st_gid, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                   != (after.st_uid, after.st_gid, after.st_mode, after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError('Launcher custody changed during descriptor verification')
         if before_change is not None:before_change()
         os.fchmod(fd, mode)
         os.fsync(fd)
@@ -888,8 +907,16 @@ def prepare_boot_hold(plan):
 
 
 
+def verify_boot_guard():
+    state, raw = root_file_read(BOOT_GUARD)
+    if state is None or state['mode'] != 0o644 or raw != BOOT_GUARD_BYTES:
+        raise ValueError('Managed admission drop-in custody, mode or bytes differ')
+    return state
+
+
 def verify_boot_hold(plan):
     import json
+    verify_boot_guard()
     guard, _ = root_file_read(BOOT_GUARD)
     _, pending = root_file_read(PENDING_UPDATE)
     _, permit = root_file_read(CURRENT_BOOT_PERMIT)
@@ -1071,11 +1098,13 @@ def finish_update(plan, client_pin):
             raise ValueError('Current-boot finish permit changed')
         if not phase['pending'] and not phase['permit']:
             verify_boot_hold(plan)
+        validate_plan(plan, time.time())
 
     def remove_marker(path, state):
         check()
         if state is None or root_file_state(path) != state:
             raise ValueError('Finish does not own the selected marker')
+        validate_plan(plan, time.time())
         os.unlink(path)
         parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:os.fsync(parent)
@@ -1151,6 +1180,7 @@ def capture_committed_recovery(nonce, source_main, assets, client_pin):
     _, raw = root_file_read(backup/'journal.jsonl')
     journal = [json.loads(line) for line in raw.splitlines()]
     observed_at = time.time()
+    verify_boot_guard()
     snapshot = live_snapshot({}, committed_original=original)
     if (snapshot['pending_nonce'] not in (None, nonce) or snapshot['drain_token'] not in (None, nonce)
             or snapshot['image_pin'] != snapshot['image_id'] or snapshot['admission_valid'] is not True
@@ -1204,8 +1234,11 @@ def complete_committed_recovery(plan, client_pin):
     if raw not in (b'', plan['nonce'].encode()):
         raise ValueError('Foreign committed-recovery drain')
 
-    phase = {'active':None}
+    phase = {'active':None, 'lock_state':None}
     def check():
+        if phase['lock_state'] is not None and root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
+            raise ValueError('Selected canonical recovery lock changed')
+        verify_boot_guard()
         if phase['active'] is not None:
             active = phase['active']
             validate_plan(active, time.time())
@@ -1217,6 +1250,8 @@ def complete_committed_recovery(plan, client_pin):
         if any(fresh[key] != value for key, value in plan.items() if key != 'observed_at'):
             raise ValueError('Committed recovery bindings changed under lock')
         validate_runtime_observation(plan, time.time())
+        if phase['lock_state'] is not None and root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
+            raise ValueError('Canonical recovery lock changed during observation')
         if root_file_state(PENDING_UPDATE) != pending:
             raise ValueError('Persistent committed marker changed')
 
@@ -1269,6 +1304,8 @@ def complete_committed_recovery(plan, client_pin):
     # No unrelated launcher needs to recreate the volatile mutex after reboot.
     validate_runtime_observation(plan, time.time())
     ensure_recovery_lock('/run/oxidex-build.lock')
+    phase['lock_state'] = root_file_state('/run/oxidex-build.lock')
+    if phase['lock_state'] is None:raise ValueError('Recovery mutex disappeared')
     # Keep the drain on any failure; no lease is invented or cleared.
     if raw:
         return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
@@ -1288,12 +1325,15 @@ def recover_finish_update(plan, client_pin):
     if drain_raw not in (b'', plan['nonce'].encode()):
         raise ValueError('Recovery cannot replace a foreign drain')
     existing_drain = bool(drain_raw)
-    phase = dict(started=False)
+    phase = dict(started=False, lock_state=root_file_state('/run/oxidex-build.lock'))
+    if phase['lock_state'] is None:raise ValueError('Missing same-boot recovery mutex')
 
     def record(stage, **facts):
         append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts))
 
     def check(*, owned=True):
+        if root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
+            raise ValueError('Canonical same-boot recovery lock changed')
         validate_plan(plan, time.time())
         if not phase['started']:
             installed_history(plan, client_pin, recovery=True)
@@ -1301,6 +1341,8 @@ def recover_finish_update(plan, client_pin):
         check_snapshot(expected, snapshot, owned_drain=owned)
         if owned:mutation_idle_fence(plan)
         admission_ready(plan, plan['service_pid'], plan['service_startticks'], wait=False)
+        if root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
+            raise ValueError('Canonical recovery lock changed during checks')
         guard = root_file_state(BOOT_GUARD)
         if guard is None or guard['mode'] != 0o644 or guard['sha256'] != hashlib.sha256(BOOT_GUARD_BYTES).hexdigest():
             raise ValueError('Unknown recovery boot guard')
@@ -1310,6 +1352,9 @@ def recover_finish_update(plan, client_pin):
         permit, raw = root_file_read(CURRENT_BOOT_PERMIT)
         if permit is not None and raw != plan['nonce'].encode():
             raise ValueError('Foreign current-boot recovery permit')
+        if root_file_state('/run/oxidex-build.lock') != phase['lock_state']:
+            raise ValueError('Canonical recovery lock changed at mutation boundary')
+        validate_plan(plan, time.time())
 
     def restore_hold():
         check()
