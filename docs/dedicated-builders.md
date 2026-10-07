@@ -269,12 +269,14 @@ python3 -I -B builder_runtime_update.py --plan reboot-plan.json \
   --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
 ```
 
-Recovery rechecks the durable release decision under the build lock. It removes
-only the matching pending marker, starts only an inactive admission unit, and
-verifies its process, socket and current host state before releasing the drain.
+Recovery rechecks the durable release decision under the build lock. It retains
+the persistent pending marker and uses an owned current-boot permit to start
+only an inactive admission unit. After verifying its process, socket, and current
+host state, it records a durable checkpoint, removes its markers, and releases
+the drain. A missing pending marker is recreated before startup.
 If the exact process is already running after a partial attempt, recovery checks
-it without another start command. A failed start or postflight retains the owned
-drain. Successful recovery remains unqualified until actual OxiDex build and
+it without another start command. A failed start or postflight retains the persistent marker and owned
+drain; another reboot removes the permit and leaves admission held. Successful recovery remains unqualified until actual OxiDex build and
 gate checks pass.
 
 After reboot, recovery initializes an absent volatile build lock without
