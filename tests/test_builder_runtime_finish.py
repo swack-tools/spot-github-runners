@@ -111,6 +111,8 @@ class OrdinaryFinishClockTests(unittest.TestCase):
             guard=root/'guard';guard.write_bytes(runtime.BOOT_GUARD_BYTES);guard.chmod(0o644)
             def snapshot(expected):return dict(expected,image_pin=expected['image_id'],admission_valid=True,cpu=16,role='builder',cpus=16,memory_gib=28,tools_ready=True,leases={},containers=[],upload_processes=[],pending_nonce=plan['nonce'] if pending.exists() else None,drain_token=drain.read_text())
             def record(path,row,**kwargs):
+                if expire_at=='authority-stage-expiry' and row['stage']=='FINISH_RELEASE_COMMITTED':clock[0]=plan['observed_at']+121
+                if kwargs.get('before_publish') is not None:kwargs['before_publish']()
                 stages.append(row['stage'])
                 if expire_at=='lock-during-hold' and row['stage']=='FINISH_START':raise ValueError('force hold')
                 if (expire_at=='lock-during-hold' and row['stage']=='HOLD_FINISH_INTENT') or (expire_at=='lock-during-commit' and row['stage']=='FINISH_RELEASE_COMMITTED'):
@@ -145,7 +147,10 @@ class OrdinaryFinishClockTests(unittest.TestCase):
                 if expire_at=='permit-read':self.assertTrue(permit.exists())
                 if expire_at=='lock-during-hold':self.assertEqual(closed,[])
                 if expire_at=='lock-during-commit':self.assertEqual(opened,[]);self.assertTrue(pending.exists())
+                if expire_at=='authority-stage-expiry':self.assertNotIn('FINISH_RELEASE_COMMITTED',stages)
             return closed if recovery else opened
+
+    def test_expired_authority_staging_never_publishes_commit(self):self.exercise('authority-stage-expiry')
 
     def test_lost_lock_during_forward_commit_prevents_effects(self):self.exercise('lock-during-commit')
 
@@ -171,7 +176,7 @@ class CommittedFlowTests(unittest.TestCase):
             launcher=root/'launcher';launcher.write_bytes(b'bounded synthetic runtime\n');launcher.chmod(0o644 if held else 0o755)
             if held:
                 info=launcher.stat();plan['before']={k:dict(v) for k,v in plan['before'].items()}
-                plan['before'][runtime.LAUNCHER_TARGET].update(mode=0o644,uid=info.st_uid,device=info.st_dev,inode=info.st_ino)
+                plan['before'][runtime.LAUNCHER_TARGET].update(mode=0o644,uid=info.st_uid,gid=info.st_gid,device=info.st_dev,inode=info.st_ino)
             if existing:drain.write_text(plan['nonce']);drain.chmod(0o600)
             running=already_running;executed=already_running;events=[];snapshots=0;captures=0;clock=[plan['observed_at']]
             def file_state(path):
@@ -214,6 +219,8 @@ class CommittedFlowTests(unittest.TestCase):
             def sync(fd):
                 real_sync(fd)
                 if failure=='pending-expiry' and not pending.exists():clock[0]=plan['observed_at']+121
+                if failure=='lock-pending-fsync' and not pending.exists():
+                    replacement=root/'new-lock';replacement.touch();replacement.replace(lock)
             def restore_selected(path,expected,**kwargs):
                 real_restore(launcher,expected,**kwargs)
                 if failure=='marker-replaced':
@@ -233,13 +240,15 @@ class CommittedFlowTests(unittest.TestCase):
                     self.assertEqual(drain.read_text(),plan['nonce'])
                     if failure=='capture-expiry':self.assertEqual(launcher.stat().st_mode&0o777,0o644)
                     if failure=='marker-replaced':self.assertEqual(pending.read_text(),'foreign')
-                    if failure=='pending-expiry':self.assertNotIn('start',events)
+                    if failure in ('pending-expiry','lock-pending-fsync'):self.assertNotIn('start',events)
                 else:
                     result=runtime.complete_committed_recovery(plan,pin)
                     self.assertEqual(result['status'],'REBOOT_RECOVERED_UNQUALIFIED');self.assertIs(result['qualification_ready'],False)
                     self.assertFalse(drain.exists());self.assertTrue(running);self.assertGreaterEqual(snapshots,2)
                     if held:self.assertEqual(launcher.stat().st_mode&0o777,0o755)
             return events
+
+    def test_lost_lock_during_pending_fsync_prevents_start(self):self.exercise(failure='lock-pending-fsync',existing=True)
 
     def test_foreign_marker_replacement_is_preserved(self):self.exercise(failure='marker-replaced',existing=True,held=True)
     def test_pending_fsync_expiry_does_not_start_service(self):self.exercise(failure='pending-expiry',existing=True)
@@ -360,7 +369,7 @@ class FinishCliTests(unittest.TestCase):
 class LauncherRestoreTests(unittest.TestCase):
     def state(self,path):
         info=path.stat()
-        return dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),mode=info.st_mode&0o777,uid=info.st_uid,device=info.st_dev,inode=info.st_ino)
+        return dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),mode=info.st_mode&0o777,uid=info.st_uid,gid=info.st_gid,device=info.st_dev,inode=info.st_ino)
 
     def restore(self,path,expected):
         self.assertTrue(callable(getattr(runtime,'restore_launcher_execution',None)), 'Verified launcher restore is missing')
@@ -420,6 +429,12 @@ class LauncherRestoreTests(unittest.TestCase):
             with patch.object(runtime.os,'read',side_effect=mutate):
                 with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected)
             self.assertEqual(path.stat().st_mode&0o777,0o666)
+
+    def test_selected_group_mismatch_never_grants_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(0o644);expected=self.state(path);expected['gid']+=1
+            with self.assertRaises(ValueError):runtime.restore_launcher_execution(path,expected)
+            self.assertEqual(path.stat().st_mode&0o777,0o644)
 
 class InstalledHistoryTests(unittest.TestCase):
     def fixture(self):

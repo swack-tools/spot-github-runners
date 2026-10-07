@@ -820,7 +820,7 @@ def set_verified_launcher_mode(path, expected, mode, *, before_change=None):
                 or stat.S_IMODE(info.st_mode) != expected['mode']
                 or (info.st_dev, info.st_ino) != (expected['device'], expected['inode'])
                 or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
-                or info.st_uid != expected['uid']
+                or info.st_uid != expected['uid'] or info.st_gid != expected['gid']
                 or hashlib.sha256(os.read(fd, 262145)).hexdigest() != expected['sha256']):
             raise ValueError('Held launcher changed before restoring execution')
         after = os.fstat(fd);canonical = path.lstat()
@@ -969,7 +969,8 @@ def apply_update(plan):
 
         def record(stage, **facts):
             lock_guard()
-            append_journal_record(journal, dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard)
+            fence = lock_guard if stage.startswith('HOLD_') else lambda:(lock_guard(),validate_plan(plan,time.time()))
+            append_journal_record(journal, dict(stage=stage, observed_at=time.time(), **facts), before_publish=fence)
 
         record('BACKUP_START')
         try:
@@ -1071,7 +1072,7 @@ def apply_update(plan):
         except BaseException as error:
             import json
             append_journal_record(backup/'journal.jsonl', dict(stage='HOLD_BEFORE_DRAIN_RELEASE',
-                observed_at=time.time(), error_type=type(error).__name__))
+                observed_at=time.time(), error_type=type(error).__name__), before_publish=lock_guard)
             raise
     return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining',
                           plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True, lock_bound=bind_lock)
@@ -1103,7 +1104,7 @@ def finish_update(plan, client_pin):
     phase = dict(started=False, opened=False, pending=False, permit=False)
 
     def record(stage, *, guard=None, **facts):
-        guard = guard or lock_guard
+        guard = guard or (lambda:(lock_guard(),validate_plan(plan,time.time())))
         guard()
         append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=guard)
 
@@ -1294,7 +1295,7 @@ def complete_committed_recovery(plan, client_pin):
         selected = plan['before'][LAUNCHER_TARGET]
         if selected['mode'] == 0o644:
             append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_LAUNCHER_RESTORE_INTENT',
-                observed_at=time.time(), launcher=selected), before_publish=lock_guard)
+                observed_at=time.time(), launcher=selected), before_publish=lambda:(lock_guard(),validate_runtime_observation(plan,time.time())))
             validate_runtime_observation(plan, time.time())
             restore_launcher_execution(LAUNCHER_TARGET, selected,
                                        before_change=lambda:(lock_guard(),validate_runtime_observation(plan, time.time())))
@@ -1312,6 +1313,8 @@ def complete_committed_recovery(plan, client_pin):
         finally:os.close(parent)
         validate_runtime_observation(plan, time.time())
         if plan['service_state']['ActiveState'] == 'inactive':
+            lock_guard()
+            validate_runtime_observation(plan, time.time())
             checked_command(['/usr/bin/systemctl', 'start', 'gha-admission.service'],
                             timeout=min(20, max(1, plan['observed_at']+120-time.time())))
         pid, ticks = service_identity(strict=False)
@@ -1332,7 +1335,7 @@ def complete_committed_recovery(plan, client_pin):
         append_journal_record(backup/'journal.jsonl', dict(stage='COMMITTED_REBOOT_RECOVERED',
             observed_at=time.time(), boot=plan['boot'], service_pid=active['service_pid'],
             service_startticks=active['service_startticks'], files=active['before'],
-            client_launcher_sha256=client_pin, qualification_ready=False), before_publish=lock_guard)
+            client_launcher_sha256=client_pin, qualification_ready=False), before_publish=lambda:(lock_guard(),validate_runtime_observation(plan,time.time())))
         validate_runtime_observation(plan, time.time())
 
     # No unrelated launcher needs to recreate the volatile mutex after reboot.
@@ -1365,7 +1368,7 @@ def recover_finish_update(plan, client_pin):
 
     def record(stage, **facts):
         lock_guard()
-        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=lock_guard)
+        append_journal_record(backup/'journal.jsonl', dict(stage=stage, observed_at=time.time(), **facts), before_publish=lambda:(lock_guard(),validate_plan(plan,time.time())))
 
     def check(*, owned=True):
         lock_guard()
