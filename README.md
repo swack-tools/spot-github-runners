@@ -13,7 +13,7 @@ This guide describes the source on `main`. Merging source does not update a
 running controller, container, or VM. Inspect the deployed configuration and
 actual tool versions before routing work to a host.
 
-## Start an OxiDex builder
+## Start a dedicated builder
 
 Use the [dedicated builder setup](docs/dedicated-builders.md): fill the deployment
 identity and public SSH mapping, render the startup payload, and run the generated
