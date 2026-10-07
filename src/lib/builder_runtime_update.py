@@ -972,6 +972,10 @@ def mkdir_exact(path, mode):
     path.mkdir(mode=mode)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        selected = os.fstat(fd)
+        if not stat.S_ISDIR(selected.st_mode) or selected.st_uid != os.geteuid():
+            raise ValueError('New directory custody differs')
+        verify_descriptor_selection(fd,path,selected)
         os.fchmod(fd, mode)
         os.fsync(fd)
     finally:
