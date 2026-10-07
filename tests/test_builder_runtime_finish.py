@@ -1184,5 +1184,29 @@ class SharedFinalMetadataGuardTests(unittest.TestCase):
                     with self.assertRaises(ValueError):guard()
 
 
+class FinalAuthorityAfterFreshnessTests(unittest.TestCase):
+    def test_replaced_mutex_after_freshness_prevents_all_selected_effects(self):
+        for kind in ('journal','marker','launcher'):
+            with tempfile.TemporaryDirectory() as directory:
+                root=Path(directory).resolve();lock=root/'lock';lock.touch();path=root/'selected'
+                raw=b'{"stage":"OLD"}\n' if kind=='journal' else b'owned'
+                path.write_bytes(raw);path.chmod(0o644)
+                with lock.open('r+b') as held:
+                    fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    def guard():
+                        if lock.stat().st_ino != os.fstat(held.fileno()).st_ino:raise ValueError('canonical mutex replaced')
+                    def fresh():
+                        other=root/'foreign';other.write_bytes(b'foreign');other.replace(lock)
+                    with self.subTest(kind=kind),self.assertRaises(ValueError):
+                        if kind=='journal':
+                            with patch.object(runtime,'root_file_read',side_effect=JournalPublicationTests().reader):runtime.append_journal_record(path,dict(stage='NEW'),before_publish=guard,freshness=fresh)
+                        elif kind=='marker':
+                            expected=LauncherRestoreTests().state(path)
+                            with patch.object(runtime,'root_file_state',side_effect=lambda value:LauncherRestoreTests().state(Path(value))):runtime.unlink_selected_marker(path,expected,guard,fresh)
+                        else:
+                            with patch.object(runtime,'authenticate_ancestor_custody'):runtime.restore_launcher_execution(path,LauncherRestoreTests().state(path),before_change=guard,freshness=fresh)
+                    self.assertEqual(path.read_bytes(),raw);self.assertEqual(path.stat().st_mode&0o777,0o644)
+
+
 if __name__ == '__main__':
     unittest.main()

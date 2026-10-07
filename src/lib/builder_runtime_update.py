@@ -331,6 +331,7 @@ def append_journal_record(path, record, *, before_publish=None, freshness=None, 
             if before_publish is not None:before_publish()
             verify()
             if freshness is not None:freshness()
+            if before_publish is not None:before_publish()
             verify()
     published = atomic_write(path, raw, 0o600, before_replace=unchanged)
     updated = root_file_read(path)
@@ -957,6 +958,7 @@ def set_verified_launcher_mode(path, expected, mode, *, before_change=None, fres
                 verify_descriptor_selection(fd,path,info)
             verify_selected()
             if freshness is not None:freshness()
+            if before_change is not None:before_change()
             verify_selected()
             os.fchmod(fd, mode)
             os.fsync(fd)
@@ -1085,6 +1087,7 @@ def unlink_selected_marker(path, expected, canonical_guard, freshness):
         canonical_guard()
         verify()
         freshness()
+        canonical_guard()
         verify()
         if expected is not None:os.unlink(path)
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -1517,12 +1520,15 @@ def complete_committed_recovery(plan, client_pin):
             restore_launcher_execution(LAUNCHER_TARGET, selected,
                                        before_change=lock_guard, freshness=lambda:validate_runtime_observation(plan,time.time()))
             released_files[LAUNCHER_TARGET] = dict(selected, mode=0o755)
+        remaining = plan['observed_at']+120-time.time()
+        if remaining <= 0:raise ValueError('Recovery startup observation expired')
+        startup_timeout = min(20,remaining)
         with selected_service_bindings(plan) as verify_bindings:
             hold_publication()
             verify_bindings()
             if plan['service_state']['ActiveState'] == 'inactive':
                 checked_command(['/usr/bin/systemctl', 'start', 'gha-admission.service'],
-                                timeout=min(20, max(1, plan['observed_at']+120-time.time())))
+                                timeout=startup_timeout)
         pid, ticks = service_identity(strict=False)
         if plan['service_state']['ActiveState'] == 'active' and (pid, ticks) != (
                 int(plan['service_state']['MainPID']), plan['service_state']['StartTicks']):
