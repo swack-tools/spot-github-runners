@@ -201,7 +201,8 @@ python3 -I -B builder_runtime_update.py --plan finish-plan.json \
 
 Finish verifies the successful installation journal and current host under the
 existing build lock. It restores execution on the selected launcher, removes
-only its update markers, and removes the owned drain last. It returns
+the volatile permit, records a durable release decision after final checks,
+removes its persistent pending marker, and removes the owned drain last. It returns
 `REOPENED_UNQUALIFIED`, with qualification readiness false. Run one actual
 ordinary OxiDex Just build and the qualification checks afterward. The client
 selector requires an executable launcher and no drain, so this ordinary build
@@ -212,3 +213,34 @@ failure handler attempts to close execution only on the exact installed
 launcher while the build lock remains held. It never rolls back runtime bytes,
 clears leases, stops builds, or modifies unrelated services. A changed or foreign
 file needs explicit recovery.
+
+### Recover an interrupted finish
+
+For an interrupted finish on the same boot and unchanged admission process,
+capture with the recovery action as well as the original nonce and client pin:
+
+```sh
+python3 -I -B builder_runtime_update.py --capture-assets assets.json \
+  --assets-sha256 "$ASSETS_SHA256" --source-main "$SOURCE_MAIN" \
+  --finish-nonce "$INSTALLED_NONCE" --recover-finish \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256" > recovery-plan.json
+```
+
+Inspect the new observation and select its digest. Recovery is explicit:
+
+```sh
+python3 -I -B builder_runtime_update.py --plan recovery-plan.json \
+  --plan-sha256 "$RECOVERY_PLAN_SHA256" --recover-finish \
+  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+```
+
+Recovery checks the successful installation and known finish stages under the
+existing exclusive lock. It closes execution only on the selected launcher,
+restores missing owned update markers, and retains the drain. It appends a
+`FINISH_RECOVERED_HELD` record; it does not rewrite the original journal or
+observation time. Capture a fresh finish plan afterward. Never replay apply or
+remove journal entries to retry.
+
+A changed boot, admission process, runtime file, or foreign marker is refused.
+Those cases need a separately reviewed recovery scope. This command does not
+restart services, reopen builds, or declare qualification readiness.

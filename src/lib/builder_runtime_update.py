@@ -108,7 +108,7 @@ def validate_plan(plan, now):
 
 
 
-def verify_installed_history(plan, original, journal, client_pin, now):
+def verify_installed_history(plan, original, journal, client_pin, now, *, recovery=False):
     """Join fresh finish observations to the original successful installation.
 
     Original timestamps stay historical. Root custody of the saved plan and
@@ -124,14 +124,32 @@ def verify_installed_history(plan, original, journal, client_pin, now):
             raise ValueError('Finish differs from installed update: ' + field)
     if not isinstance(journal, list) or not journal or not isinstance(journal[-1], dict):
         raise ValueError('Missing successful installation journal')
+    success = ('FILES_AND_SERVICE_VERIFIED', 'FINISH_RECOVERED_HELD')
     final = journal[-1]
-    if (final.get('stage') != 'FILES_AND_SERVICE_VERIFIED'
+    observed = plan['before']
+    if recovery:
+        indices = [index for index, row in enumerate(journal)
+                   if isinstance(row, dict) and row.get('stage') in success]
+        if not indices:
+            raise ValueError('Recovery requires a verified installation')
+        index = indices[-1]
+        allowed = {'FINISH_START', 'FINISH_READY_TO_RELEASE', 'FINISH_RELEASE_COMMITTED',
+                   'HOLD_FINISH_RECOVERY', 'FINISH_REOPENED_UNQUALIFIED', 'FINISH_RECOVERY_START'}
+        if any(not isinstance(row, dict) or row.get('stage') not in allowed
+               for row in journal[index+1:]):
+            raise ValueError('Recovery cannot bypass failed apply or unknown history')
+        final = journal[index]
+        state = observed.get(LAUNCHER_TARGET)
+        if not isinstance(state, dict) or state.get('mode') not in (0o644, 0o755):
+            raise ValueError('Unknown launcher state for recovery')
+        observed = dict(observed, **{LAUNCHER_TARGET:dict(state, mode=0o644)})
+    if (final.get('stage') not in success
             or final.get('service_pid') != plan['service_pid']
             or final.get('service_startticks') != plan['service_startticks']
-            or final.get('files') != plan['before']
+            or final.get('files') != observed
             or plan['service_pid'] == original['service_pid']):
         raise ValueError('Installation incomplete, failed or changed')
-    return verify_installed_runtime(plan['assets'], plan['before'],
+    return verify_installed_runtime(plan['assets'], observed,
                                     client_launcher_sha256=client_pin)
 
 
@@ -271,7 +289,7 @@ def drained_update(lock_path, drain_path, token, action, *, before_drain=None, b
 
 
 
-def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failure=None):
+def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failure=None, commit=None, release=True):
     """Finish under the existing lock; delete only the unchanged owned drain.
 
     The root caller verifies canonical paths and supplies fresh state checks.
@@ -314,8 +332,12 @@ def finish_owned_drain(lock_path, drain_path, token, check, action, *, on_failur
             still_owned()
             check()
             still_owned()
-            os.unlink(drain_path)
-            os.fsync(directory)
+            if commit is not None:
+                commit()
+            still_owned()
+            if release:
+                os.unlink(drain_path)
+                os.fsync(directory)
             return result
         except BaseException as error:
             if on_failure is not None:
@@ -517,7 +539,9 @@ def live_snapshot(plan):
 
 
 
-def close_launcher_execution(path):
+def close_launcher_execution(path, *, expected=None):
+    if expected is not None:
+        return set_verified_launcher_mode(path, expected, 0o644)
     path = Path(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -538,6 +562,14 @@ def close_launcher_execution(path):
 
 def restore_launcher_execution(path, expected):
     """Restore execution only on the still-held, selected inode and bytes."""
+    if expected['mode'] != 0o644:
+        raise ValueError('Expected launcher must be held')
+    return set_verified_launcher_mode(path, expected, 0o755)
+
+
+def set_verified_launcher_mode(path, expected, mode):
+    if mode not in (0o644, 0o755) or expected['mode'] not in (0o644, 0o755):
+        raise ValueError('Unexpected launcher execution mode')
     path = Path(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -545,13 +577,13 @@ def restore_launcher_execution(path, expected):
         current = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                 or info.st_uid != os.geteuid() or info.st_size > 262144
-                or stat.S_IMODE(info.st_mode) != 0o644
+                or stat.S_IMODE(info.st_mode) != expected['mode']
                 or (info.st_dev, info.st_ino) != (expected['device'], expected['inode'])
                 or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
                 or info.st_uid != expected['uid']
                 or hashlib.sha256(os.read(fd, 262145)).hexdigest() != expected['sha256']):
             raise ValueError('Held launcher changed before restoring execution')
-        os.fchmod(fd, 0o755)
+        os.fchmod(fd, mode)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -782,7 +814,7 @@ def apply_update(plan):
                           plan['nonce'], install, before_drain=before_drain, before_release=before_release, keep_drain=True)
 
 
-def installed_history(plan, client_pin):
+def installed_history(plan, client_pin, *, recovery=False):
     """Read the original private records; do not re-date the installation."""
     import json
     backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
@@ -791,7 +823,7 @@ def installed_history(plan, client_pin):
     original = json.loads(raw)
     rows = [json.loads(line) for line in journal.splitlines()]
     import time
-    verify_installed_history(plan, original, rows, client_pin, time.time())
+    verify_installed_history(plan, original, rows, client_pin, time.time(), recovery=recovery)
     return backup
 
 
@@ -804,7 +836,7 @@ def finish_update(plan, client_pin):
     expected = dict(plan, before=dict(plan['before']))
     pending_state = root_file_state(PENDING_UPDATE)
     permit_state = root_file_state(CURRENT_BOOT_PERMIT)
-    phase = dict(opened=False, pending=False, permit=False)
+    phase = dict(started=False, opened=False, pending=False, permit=False)
 
     def record(stage, **facts):
         # Existing journal is authenticated before opening it for append.
@@ -816,6 +848,9 @@ def finish_update(plan, client_pin):
 
     def check():
         validate_plan(plan, time.time())
+        if not phase['started']:
+            # Authorization must be reread after acquiring the actual build EX.
+            installed_history(plan, client_pin)
         snapshot = live_snapshot(expected)
         check_snapshot(expected, snapshot, owned_drain=True)
         mutation_idle_fence(plan)
@@ -842,17 +877,33 @@ def finish_update(plan, client_pin):
     def reopen():
         check()
         record('FINISH_START', client_launcher_sha256=client_pin)
+        phase['started'] = True
         restore_launcher_execution(LAUNCHER_TARGET, plan['before'][LAUNCHER_TARGET])
         phase['opened'] = True
         expected['before'][LAUNCHER_TARGET] = dict(plan['before'][LAUNCHER_TARGET], mode=0o755)
         check()
-        remove_marker(PENDING_UPDATE, pending_state);phase['pending'] = True
+        # The persistent marker remains through every fallible final check.
         remove_marker(CURRENT_BOOT_PERMIT, permit_state);phase['permit'] = True
         check()
         record('FINISH_READY_TO_RELEASE', files=expected['before'])
         return dict(status='REOPENED_UNQUALIFIED', qualification_ready=False,
                     source_main=plan['source_main'], nonce=plan['nonce'],
                     client_launcher_sha256=client_pin, ordinary_build_proof_required=True)
+
+    def commit_release():
+        # All release checks have passed under EX. This fsynced decision permits
+        # ordinary routing after reboot even if power is lost before /run cleanup.
+        validate_plan(plan, time.time())
+        record('FINISH_RELEASE_COMMITTED', files=expected['before'],
+               client_launcher_sha256=client_pin, qualification_ready=False)
+        if pending_state is None or root_file_state(PENDING_UPDATE) != pending_state:
+            raise ValueError('Persistent marker changed before committed release')
+        validate_plan(plan, time.time())
+        os.unlink(PENDING_UPDATE)
+        parent = os.open(PENDING_UPDATE.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:os.fsync(parent)
+        finally:os.close(parent)
+        phase['pending'] = True
 
     def hold_failure(error):
         # Keep executable permission closed on the exact owned launcher after a
@@ -862,14 +913,78 @@ def finish_update(plan, client_pin):
         selected = plan['before'][LAUNCHER_TARGET]
         if (current is not None and current['sha256'] == selected['sha256']
                 and (current['device'], current['inode']) == (selected['device'], selected['inode'])):
-            close_launcher_execution(LAUNCHER_TARGET)
+            close_launcher_execution(LAUNCHER_TARGET, expected=current)
             held = root_file_state(LAUNCHER_TARGET)['mode'] == 0o644
         record('HOLD_FINISH_RECOVERY', error_type=type(error).__name__, execution_held=held)
 
     result = finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
-                                plan['nonce'], check, reopen, on_failure=hold_failure)
+                                plan['nonce'], check, reopen, on_failure=hold_failure, commit=commit_release)
     record('FINISH_REOPENED_UNQUALIFIED', client_launcher_sha256=client_pin)
     return result
+
+
+def recover_finish_update(plan, client_pin):
+    """Return a same-boot interrupted finish to its exact owned held state."""
+    import json
+    import time
+    validate_plan(plan, time.time())
+    backup = installed_history(plan, client_pin, recovery=True)
+    expected = dict(plan, before=dict(plan['before']))
+    _, drain_raw = root_file_read('/run/oxidex-build-draining')
+    if drain_raw not in (b'', plan['nonce'].encode()):
+        raise ValueError('Recovery cannot replace a foreign drain')
+    existing_drain = bool(drain_raw)
+    phase = dict(started=False)
+
+    def record(stage, **facts):
+        root_file_state(backup / 'journal.jsonl')
+        with (backup / 'journal.jsonl').open('ab') as output:
+            output.write((json.dumps(dict(stage=stage, observed_at=time.time(), **facts),
+                                     sort_keys=True)+'\n').encode())
+            output.flush();os.fsync(output.fileno())
+
+    def check(*, owned=True):
+        validate_plan(plan, time.time())
+        if not phase['started']:
+            installed_history(plan, client_pin, recovery=True)
+        snapshot = live_snapshot(expected)
+        check_snapshot(expected, snapshot, owned_drain=owned)
+        if owned:mutation_idle_fence(plan)
+        admission_ready(plan, plan['service_pid'], plan['service_startticks'], wait=False)
+        guard = root_file_state(BOOT_GUARD)
+        if guard is None or guard['mode'] != 0o644 or guard['sha256'] != hashlib.sha256(BOOT_GUARD_BYTES).hexdigest():
+            raise ValueError('Unknown recovery boot guard')
+        pending, raw = root_file_read(PENDING_UPDATE)
+        if pending is not None and json.loads(raw) != dict(nonce=plan['nonce'], boot=plan['boot'], source_main=plan['source_main']):
+            raise ValueError('Foreign persistent recovery marker')
+        permit, raw = root_file_read(CURRENT_BOOT_PERMIT)
+        if permit is not None and raw != plan['nonce'].encode():
+            raise ValueError('Foreign current-boot recovery permit')
+
+    def restore_hold():
+        check()
+        record('FINISH_RECOVERY_START', client_launcher_sha256=client_pin)
+        phase['started'] = True
+        close_launcher_execution(LAUNCHER_TARGET, expected=plan['before'][LAUNCHER_TARGET])
+        expected['before'][LAUNCHER_TARGET] = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
+        check()
+        if root_file_state(CURRENT_BOOT_PERMIT) is None:
+            atomic_write(CURRENT_BOOT_PERMIT, plan['nonce'].encode(), 0o600, before_replace=check)
+        if root_file_state(PENDING_UPDATE) is None:
+            raw = (json.dumps(dict(nonce=plan['nonce'], boot=plan['boot'], source_main=plan['source_main']))+'\n').encode()
+            atomic_write(PENDING_UPDATE, raw, 0o600, before_replace=check)
+        check()
+        verify_boot_hold(plan)
+        record('FINISH_RECOVERED_HELD', service_pid=plan['service_pid'],
+               service_startticks=plan['service_startticks'], files=expected['before'])
+        return dict(status='RECOVERED_HELD', nonce=plan['nonce'], qualification_ready=False,
+                    requires_fresh_finish_capture=True)
+
+    if existing_drain:
+        return finish_owned_drain('/run/oxidex-build.lock', '/run/oxidex-build-draining',
+                                  plan['nonce'], check, restore_hold, release=False)
+    return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining', plan['nonce'],
+                          restore_hold, before_drain=lambda:check(owned=False), keep_drain=True)
 
 
 def plan_from_snapshot(source_main, assets, snapshot, observed_at, nonce, *, owned_drain=False):
@@ -898,6 +1013,7 @@ def main():
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument('--apply', action='store_true', help='Apply the reviewed plan; default checks only')
     actions.add_argument('--finish', action='store_true', help='Reopen an installed route; not qualification readiness')
+    actions.add_argument('--recover-finish', action='store_true', help='Restore a checked interrupted finish to held state')
     parser.add_argument('--finish-nonce', help='Capture fresh observations for this installed update nonce')
     parser.add_argument('--client-launcher-sha256', help='Explicit paired client launcher pin')
     args = parser.parse_args()
@@ -914,11 +1030,13 @@ def main():
         validate_assets(assets)
         observed_at = time.time()
         snapshot = live_snapshot({})
+        if args.recover_finish and not args.finish_nonce:
+            parser.error('Recovery capture requires the installed finish nonce')
         if args.finish_nonce and (not re.fullmatch('[a-f0-9]{32}', args.finish_nonce) or not args.client_launcher_sha256):
             parser.error('Finish capture requires exact nonce and paired client launcher pin')
         plan = plan_from_snapshot(args.source_main, assets, snapshot, observed_at,
-            args.finish_nonce or uuid.uuid4().hex, owned_drain=bool(args.finish_nonce))
-        if args.finish_nonce:installed_history(plan, args.client_launcher_sha256)
+            args.finish_nonce or uuid.uuid4().hex, owned_drain=bool(snapshot['drain_token']) if args.recover_finish else bool(args.finish_nonce))
+        if args.finish_nonce:installed_history(plan, args.client_launcher_sha256, recovery=args.recover_finish)
         validate_plan(plan, time.time())
         print(json.dumps(plan, sort_keys=True))
         return
@@ -935,13 +1053,16 @@ def main():
         parser.error('finish-nonce is only valid with capture-assets')
     if args.apply and args.client_launcher_sha256:
         parser.error('A client pin selects finish checks and cannot be combined with apply')
-    finishing = args.finish or bool(args.client_launcher_sha256)
-    check_snapshot(plan, snapshot, owned_drain=finishing)
+    finishing = args.finish or args.recover_finish or bool(args.client_launcher_sha256)
+    check_snapshot(plan, snapshot, owned_drain=bool(snapshot['drain_token']) if args.recover_finish else finishing)
     if finishing:
         if not args.client_launcher_sha256:parser.error('Finish requires paired client launcher pin')
-        installed_history(plan, args.client_launcher_sha256)
-        result = (finish_update(plan, args.client_launcher_sha256) if args.finish else
-                  dict(status='CHECKED_FINISH_ONLY', executed=False))
+        installed_history(plan, args.client_launcher_sha256, recovery=args.recover_finish)
+        if args.recover_finish:
+            result = recover_finish_update(plan, args.client_launcher_sha256)
+        else:
+            result = (finish_update(plan, args.client_launcher_sha256) if args.finish else
+                      dict(status='CHECKED_FINISH_ONLY', executed=False))
     else:
         result = apply_update(plan) if args.apply else dict(status='CHECKED_ONLY', executed=False)
     print(json.dumps(result, sort_keys=True))

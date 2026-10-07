@@ -61,6 +61,7 @@ class FinishCliTests(unittest.TestCase):
         self.assertIn('--finish',result.stdout)
         self.assertIn('--client-launcher-sha256',result.stdout)
         self.assertIn('--finish-nonce',result.stdout)
+        self.assertIn('--recover-finish',result.stdout)
 
     def test_apply_and_finish_are_mutually_exclusive(self):
         result=self.invoke('--plan','synthetic.json','--apply','--finish')
@@ -93,6 +94,22 @@ class LauncherRestoreTests(unittest.TestCase):
                     other=path.parent/'new';other.write_bytes(b'fixture');other.chmod(0o644);other.replace(path)
                 with self.subTest(changed=changed),self.assertRaises(ValueError):self.restore(path,expected)
                 self.assertEqual(path.stat().st_mode&0o777,0o644)
+
+    def test_failure_close_refuses_replaced_launcher(self):
+        self.assertIn('expected',inspect.signature(runtime.close_launcher_execution).parameters)
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(0o755);expected=self.state(path)
+            other=path.parent/'replacement';other.write_bytes(b'foreign');other.chmod(0o755);other.replace(path)
+            with self.assertRaises(ValueError):runtime.close_launcher_execution(path,expected=expected)
+            self.assertEqual(path.stat().st_mode&0o777,0o755)
+
+    def test_failure_close_changes_only_selected_launcher(self):
+        self.assertIn('expected',inspect.signature(runtime.close_launcher_execution).parameters)
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'launcher';path.write_bytes(b'fixture');path.chmod(0o755);expected=self.state(path)
+            runtime.close_launcher_execution(path,expected=expected)
+            self.assertEqual(path.stat().st_mode&0o777,0o644)
+            self.assertEqual(path.stat().st_ino,expected['inode'])
 
 class InstalledHistoryTests(unittest.TestCase):
     def fixture(self):
@@ -133,6 +150,31 @@ class InstalledHistoryTests(unittest.TestCase):
     def test_expired_finish_refused(self):
         original,current,journal,pin=self.fixture();current['observed_at']=1500.0
         with self.assertRaises(ValueError):self.verify(original,current,journal,pin)
+
+    def test_checked_recovery_accepts_interrupted_finish_without_rewriting_history(self):
+        self.assertIn('recovery',inspect.signature(runtime.verify_installed_history).parameters)
+        original,current,journal,pin=self.fixture();journal.append(dict(stage='FINISH_START',client_launcher_sha256=pin));journal.append(dict(stage='HOLD_FINISH_RECOVERY',execution_held=True))
+        prior=list(journal)
+        self.assertEqual(runtime.verify_installed_history(current,original,journal,pin,2001.0,recovery=True),pin)
+        self.assertEqual(journal,prior)
+
+    def test_recovery_refuses_failed_apply_and_unknown_suffix(self):
+        self.assertIn('recovery',inspect.signature(runtime.verify_installed_history).parameters)
+        for stage in ('HOLD_BEFORE_DRAIN_RELEASE','HOLD_EXPLICIT_RECOVERY','UNKNOWN'):
+            original,current,journal,pin=self.fixture();journal.append(dict(stage=stage))
+            with self.subTest(stage=stage),self.assertRaises(ValueError):runtime.verify_installed_history(current,original,journal,pin,2001.0,recovery=True)
+
+    def test_recovery_recognizes_exact_opened_launcher_inode(self):
+        self.assertIn('recovery',inspect.signature(runtime.verify_installed_history).parameters)
+        original,current,journal,pin=self.fixture()
+        current['before']={k:dict(v) for k,v in current['before'].items()};current['before'][runtime.LAUNCHER_TARGET]['mode']=0o755
+        journal.append(dict(stage='FINISH_READY_TO_RELEASE'))
+        self.assertEqual(runtime.verify_installed_history(current,original,journal,pin,2001.0,recovery=True),pin)
+
+    def test_recovered_held_record_can_be_finished_normally(self):
+        self.assertIn('recovery',inspect.signature(runtime.verify_installed_history).parameters)
+        original,current,journal,pin=self.fixture();journal[-1]['stage']='FINISH_RECOVERED_HELD'
+        self.assertEqual(self.verify(original,current,journal,pin),pin)
 
 class OwnedFinishTests(unittest.TestCase):
     def run_finish(self,lock,drain,action,check=lambda:None):
@@ -209,5 +251,34 @@ class OwnedFinishTests(unittest.TestCase):
             self.assertIn('on_failure',inspect.signature(runtime.finish_owned_drain).parameters)
             with self.assertRaises(ValueError):runtime.finish_owned_drain(lock,drain,'owned',lambda:None,action,on_failure=hold)
             self.assertEqual(seen,['ValueError'])
+
+    def test_release_commit_runs_after_final_check_while_drained(self):
+        self.assertIn('commit',inspect.signature(runtime.finish_owned_drain).parameters)
+        with tempfile.TemporaryDirectory() as directory:
+            lock,drain=self.fixture(directory);events=[]
+            def check():events.append('check')
+            def action():events.append('action');return 1
+            def commit():
+                self.assertEqual(drain.read_text(),'owned');events.append('commit')
+            self.assertEqual(runtime.finish_owned_drain(lock,drain,'owned',check,action,commit=commit),1)
+            self.assertEqual(events,['check','action','check','commit'])
+            self.assertFalse(drain.exists())
+
+    def test_failed_final_check_never_commits_release(self):
+        self.assertIn('commit',inspect.signature(runtime.finish_owned_drain).parameters)
+        with tempfile.TemporaryDirectory() as directory:
+            lock,drain=self.fixture(directory);events=[]
+            def check():
+                events.append('check')
+                if len(events)>1:raise ValueError('late failure')
+            with self.assertRaises(ValueError):runtime.finish_owned_drain(lock,drain,'owned',check,lambda:None,commit=lambda:self.fail('committed'))
+            self.assertEqual(drain.read_text(),'owned')
+
+    def test_recovery_transaction_retains_owned_drain(self):
+        self.assertIn('release',inspect.signature(runtime.finish_owned_drain).parameters)
+        with tempfile.TemporaryDirectory() as directory:
+            lock,drain=self.fixture(directory)
+            self.assertEqual(runtime.finish_owned_drain(lock,drain,'owned',lambda:None,lambda:3,release=False),3)
+            self.assertEqual(drain.read_text(),'owned')
 
 if __name__=='__main__':unittest.main()
