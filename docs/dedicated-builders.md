@@ -152,3 +152,9 @@ ordinary build checks before routing qualification work to the updated host. A s
 returns `INSTALLED_DRAINED`; it keeps the route off until an independently
 verified client-pin handoff authorizes removal of the exact owned drain. The
 updater never reopens the route automatically.
+
+The update also installs a fixed admission-service boot guard and a persistent
+pending marker. A private permit in `/run` allows only the current maintenance
+boot to restart admission while that marker exists. Reboot removes the permit,
+so admission stays off until explicit recovery or the verified handoff. The
+pending marker and volatile drain are separate from build leases.

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from lib.builder_runtime_update import TARGETS, validate_assets, validate_plan, atomic_write, drained_update, check_snapshot, plan_from_snapshot, active_work_processes, checked_json, valid_admission, validate_service_peer, validate_admission_response
+from lib.builder_runtime_update import TARGETS, validate_assets, validate_plan, atomic_write, drained_update, check_snapshot, plan_from_snapshot, active_work_processes, checked_json, valid_admission, validate_service_peer, validate_admission_response, mkdir_exact
 
 class BuilderRuntimeUpdateTests(unittest.TestCase):
     def assets(self):
@@ -192,6 +192,15 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
             root=Path(directory).resolve();lock=root/'build.lock';lock.touch();drain=root/'drain'
             self.assertEqual(drained_update(lock,drain,'owned',lambda:42,keep_drain=True),42)
             self.assertEqual(drain.read_text(),'owned')
+
+
+    def test_new_directory_mode_ignores_restrictive_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'new'
+            old=__import__('os').umask(0o077)
+            try:mkdir_exact(path,0o755)
+            finally:__import__('os').umask(old)
+            self.assertEqual(path.stat().st_mode & 0o777,0o755)
 
 
 if __name__=='__main__':unittest.main()

@@ -9,6 +9,14 @@ from pathlib import Path
 import stat
 import tempfile
 
+PENDING_UPDATE = Path('/var/lib/oxidex-builder/runtime-update-pending.json')
+CURRENT_BOOT_PERMIT = Path('/run/oxidex-runtime-update-allow')
+BOOT_GUARD = Path('/etc/systemd/system/gha-admission.service.d/20-runtime-update-hold.conf')
+BOOT_GUARD_BYTES = (b'[Unit]\n'
+    b'ConditionPathExists=|!/var/lib/oxidex-builder/runtime-update-pending.json\n'
+    b'ConditionPathExists=|/run/oxidex-runtime-update-allow\n')
+
+
 QUALIFICATION = '/opt/oxidex-builder/qualification_trust/'
 TARGETS = {
     '/usr/local/bin/oxidex-remote-build': 0o755,
@@ -224,6 +232,8 @@ def check_snapshot(plan, snapshot, *, owned_drain=False):
         raise ValueError('Builder is not idle')
     if snapshot.get('before') != plan['before']:
         raise ValueError('Current runtime files differ from reviewed observations')
+    if snapshot.get('pending_nonce') not in (None, plan['nonce'] if owned_drain else None):
+        raise ValueError('Persistent pending update requires explicit recovery')
     expected_drain = plan['nonce'] if owned_drain else None
     if snapshot.get('drain_token') != expected_drain:
         raise ValueError('Foreign or unexpected builder drain')
@@ -366,7 +376,15 @@ def live_snapshot(plan):
                       and not Path(p).stat().st_mode & 0o022
                       and os.access(p, os.X_OK) for p in executables)
     uploads = observed_work_processes()
+    pending_state, pending_raw = root_file_read(PENDING_UPDATE)
+    pending_nonce = None
+    if pending_state is not None:
+        pending = json.loads(pending_raw)
+        if pending.get('boot') != Path('/proc/sys/kernel/random/boot_id').read_text().strip():
+            raise ValueError('Pending update survived reboot; explicit recovery required')
+        pending_nonce = pending.get('nonce')
     return dict(
+        pending_nonce=pending_nonce,
         upload_processes=uploads,
         vm_id=checked_command(['/usr/bin/curl', '-q', '--fail', '--silent', '--show-error',
             '--max-time', '2', '-H', 'Metadata-Flavor:Google',
@@ -386,11 +404,23 @@ def live_snapshot(plan):
         drain_token=drain.read_text() if drain.exists() else None)
 
 
+
+def mkdir_exact(path, mode):
+    path = Path(path)
+    path.mkdir(mode=mode)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def trusted_directory(path, *, create=False):
     path = Path(path)
     for current in reversed((path, *path.parents)):
         if not current.exists() and not current.is_symlink() and create:
-            current.mkdir(mode=0o755)
+            mkdir_exact(current, 0o755)
         info = current.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
                 or info.st_mode & 0o022):
@@ -424,6 +454,42 @@ def file_mutation_fence(plan, target=None):
     validate_plan(plan, time.time())
 
 
+
+def prepare_boot_hold(plan):
+    import json
+    state = root_file_state(BOOT_GUARD)
+    if state is not None and state['sha256'] != hashlib.sha256(BOOT_GUARD_BYTES).hexdigest():
+        raise ValueError('Unknown admission boot guard')
+    if root_file_state(PENDING_UPDATE) is not None or root_file_state(CURRENT_BOOT_PERMIT) is not None:
+        raise ValueError('Existing update hold requires explicit recovery')
+    trusted_directory(BOOT_GUARD.parent, create=True)
+    file_mutation_fence(plan)
+    if state is None:
+        atomic_write(BOOT_GUARD, BOOT_GUARD_BYTES, 0o644,
+                     before_replace=lambda:file_mutation_fence(plan))
+    checked_command(['/usr/bin/systemctl', 'daemon-reload'])
+    file_mutation_fence(plan)
+    atomic_write(CURRENT_BOOT_PERMIT, plan['nonce'].encode(), 0o600,
+                 before_replace=lambda:file_mutation_fence(plan))
+    # Must become durable before the first of the fifteen runtime replacements.
+    atomic_write(PENDING_UPDATE, (json.dumps(dict(nonce=plan['nonce'], boot=plan['boot'],
+                 source_main=plan['source_main']))+'\n').encode(), 0o600,
+                 before_replace=lambda:file_mutation_fence(plan))
+
+
+
+def verify_boot_hold(plan):
+    import json
+    guard, _ = root_file_read(BOOT_GUARD)
+    _, pending = root_file_read(PENDING_UPDATE)
+    _, permit = root_file_read(CURRENT_BOOT_PERMIT)
+    expected = dict(nonce=plan['nonce'], boot=plan['boot'], source_main=plan['source_main'])
+    if (guard is None or guard['sha256'] != hashlib.sha256(BOOT_GUARD_BYTES).hexdigest()
+            or guard['mode'] != 0o644 or json.loads(pending) != expected
+            or permit != plan['nonce'].encode()):
+        raise ValueError('Persistent boot hold or current-boot permit differs')
+
+
 def apply_update(plan):
     """Replace only approved runtime files after actual idle-state confirmation."""
     import json
@@ -439,7 +505,7 @@ def apply_update(plan):
         validate_plan(plan, time.time())
         check_snapshot(plan, snapshot, owned_drain=True)
         validate_plan(plan, time.time())
-        backup.mkdir(mode=0o700)
+        mkdir_exact(backup, 0o700)
         validate_plan(plan, time.time())
         atomic_write(backup / 'plan.json', (json.dumps(plan, sort_keys=True) + '\n').encode(), 0o600)
         journal = backup / 'journal.jsonl'
@@ -461,6 +527,9 @@ def apply_update(plan):
                 if plan['before'][target] is not None:
                     atomic_write(backup / (str(index) + '.before'), Path(target).read_bytes(), 0o600)
             record('BACKUPS_COMPLETE', before=plan['before'])
+            prepare_boot_hold(plan)
+            verify_boot_hold(plan)
+            record('PERSISTENT_BOOT_HOLD_INSTALLED')
             for target in sorted(TARGETS):
                 validate_plan(plan, time.time())
                 mutation_idle_fence(plan)
@@ -496,6 +565,7 @@ def apply_update(plan):
                 state = after['before'][target]
                 if state['sha256'] != hashlib.sha256(data).hexdigest() or state['mode'] != TARGETS[target]:
                     raise ValueError('Installed runtime proof differs')
+            verify_boot_hold(plan)
             record('FILES_AND_SERVICE_VERIFIED', service_pid=after['service_pid'],
                    service_startticks=after['service_startticks'], files=after['before'])
             return dict(status='INSTALLED_DRAINED', source_main=plan['source_main'], backup=str(backup),
@@ -511,6 +581,7 @@ def apply_update(plan):
         check_snapshot(plan, snapshot)
     def before_release(result):
         try:
+            verify_boot_hold(plan)
             snapshot = live_snapshot(plan)
             validate_plan(plan, time.time())
             expected = dict(plan, service_pid=result['service_pid'],
