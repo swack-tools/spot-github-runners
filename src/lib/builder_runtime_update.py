@@ -317,13 +317,24 @@ def retained_file_selection(path, expected, read_state):
     """Read before authority checks; retain identity for metadata-only revalidation."""
     path = Path(path)
     fd = None
+    ancestors = []
     try:
+        for parent in path.parents:
+            directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            ancestors.append((parent, directory, os.fstat(directory)))
         if expected is not None:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             selected = os.fstat(fd)
         if read_state() != expected:
             raise ValueError('Selected file changed before authority check')
         def verify():
+            custody = ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink')
+            for parent, directory, original in ancestors:
+                retained = os.fstat(directory)
+                canonical = parent.lstat()
+                if (any(getattr(original,key) != getattr(retained,key) for key in custody)
+                        or any(getattr(retained,key) != getattr(canonical,key) for key in custody)):
+                    raise ValueError('Selected ancestor custody changed')
             if fd is None:
                 try:path.lstat()
                 except FileNotFoundError:return
@@ -339,6 +350,7 @@ def retained_file_selection(path, expected, read_state):
         yield verify
     finally:
         if fd is not None:os.close(fd)
+        for _, directory, _ in reversed(ancestors):os.close(directory)
 
 
 def root_file_read(path):

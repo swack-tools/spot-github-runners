@@ -110,6 +110,17 @@ class MarkerRemovalBoundaryTests(unittest.TestCase):
                 runtime.unlink_selected_marker(path,expected,guard,lambda:None)
             self.assertTrue(guarded[0]);self.assertFalse(path.exists())
 
+    def test_ancestor_custody_changed_during_guard_preserves_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'marker';path.write_bytes(b'owned')
+            expected=dict(inode=path.stat().st_ino)
+            def guard():path.parent.chmod(0o777)
+            try:
+                with patch.object(runtime,'root_file_state',return_value=expected):
+                    with self.assertRaises(ValueError):runtime.unlink_selected_marker(path,expected,guard,lambda:None)
+                self.assertEqual(path.read_bytes(),b'owned')
+            finally:path.parent.chmod(0o700)
+
     def test_absent_marker_retry_still_syncs_parent(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory).resolve()/'marker';synced=[]
@@ -440,6 +451,16 @@ class JournalPublicationTests(unittest.TestCase):
             with patch.object(runtime,'root_file_read',side_effect=read),patch.object(runtime.os,'replace',side_effect=publish):
                 runtime.append_journal_record(path,dict(stage='NEW'),before_publish=guard)
             self.assertTrue(guarded[0]);self.assertTrue(published[0])
+
+    def test_ancestor_custody_change_refuses_journal_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';old=b'{"stage":"OLD"}\n';path.write_bytes(old)
+            def guard():path.parent.chmod(0o777)
+            try:
+                with patch.object(runtime,'root_file_read',side_effect=self.reader):
+                    with self.assertRaises(ValueError):runtime.append_journal_record(path,dict(stage='NEW'),before_publish=guard)
+                self.assertEqual(path.read_bytes(),old)
+            finally:path.parent.chmod(0o700)
 
     def test_identical_foreign_inode_is_not_accepted_as_own_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
