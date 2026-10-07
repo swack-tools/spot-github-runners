@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from lib.builder_runtime_update import TARGETS, validate_assets, validate_plan, atomic_write, drained_update, check_snapshot, plan_from_snapshot
+from lib.builder_runtime_update import TARGETS, validate_assets, validate_plan, atomic_write, drained_update, check_snapshot, plan_from_snapshot, active_work_processes, checked_json, valid_admission, validate_service_peer, validate_admission_response
 
 class BuilderRuntimeUpdateTests(unittest.TestCase):
     def assets(self):
@@ -46,7 +46,7 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
     def plan(self):
         return dict(schema=1, nonce='a'*32, source_main='b'*40, vm_id='123',
             boot='0b99c4d2-ca5f-4471-bf84-ff4ab8dbefd3', image_id='sha256:'+'c'*64,
-            config_sha256='d'*64, service_sha256='e'*64, service_pid=123,
+            config_sha256='d'*64, service_sha256='e'*64, admission_sha256='f'*64, service_pid=123,
             service_startticks=456, observed_at=1000.0,
             assets=self.assets(), before={name:None for name in TARGETS})
 
@@ -98,6 +98,7 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
         plan=self.plan()
         return dict(vm_id=plan['vm_id'],boot=plan['boot'],image_id=plan['image_id'],
             config_sha256=plan['config_sha256'],service_sha256=plan['service_sha256'],
+            admission_sha256=plan['admission_sha256'],admission_valid=True,image_pin=plan['image_id'],
             service_pid=plan['service_pid'],service_startticks=plan['service_startticks'],
             cpu=16,role='builder',cpus=16,memory_gib=28,leases={},containers=[],
             before=plan['before'],drain_token=None,tools_ready=True,upload_processes=[])
@@ -105,7 +106,7 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
     def test_busy_changed_identity_or_config_refuses(self):
         for key,value in [('leases',{'real-worker':28}),('containers',['actual-id']),
                           ('vm_id','999'),('cpu',32),('image_id','sha256:'+'f'*64),
-                          ('drain_token','foreign'),('tools_ready',False),('service_pid',999),('upload_processes',[123])]:
+                          ('drain_token','foreign'),('tools_ready',False),('service_pid',999),('upload_processes',[123]),('image_pin','wrong'),('admission_sha256','wrong'),('admission_valid',False)]:
             state=self.snapshot();state[key]=value
             with self.subTest(key=key),self.assertRaises(ValueError):
                 check_snapshot(self.plan(),state)
@@ -125,6 +126,48 @@ class BuilderRuntimeUpdateTests(unittest.TestCase):
         snapshot['containers']=['actual-container']
         with self.assertRaises(ValueError):
             plan_from_snapshot('b'*40,self.assets(),snapshot,1000.0,'a'*32)
+
+
+    def test_queued_python_launcher_is_work_but_inline_metadata_is_not(self):
+        records=[{'pid':1,'comm':'python3','argv':[b'python3',b'/usr/local/bin/oxidex-remote-build',b'project']},
+                 {'pid':2,'comm':'python3','argv':[b'python3',b'-c',b"print('/usr/local/bin/oxidex-remote-build')"]}]
+        self.assertEqual(active_work_processes(records),[1])
+
+    def test_failed_freshness_fence_precedes_drain_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();lock=root/'build.lock';lock.touch();drain=root/'drain'
+            def stale():raise ValueError('expired actual observation')
+            with self.assertRaises(ValueError):
+                drained_update(lock,drain,'owned',lambda:self.fail('action ran'),before_drain=stale)
+            self.assertFalse(drain.exists())
+
+    def test_json_parser_uses_only_digest_bound_bytes(self):
+        raw=b'{"actual": true}'
+        self.assertEqual(checked_json(raw,hashlib.sha256(raw).hexdigest()),{'actual':True})
+        with self.assertRaises(ValueError):checked_json(b'{"changed": true}',hashlib.sha256(raw).hexdigest())
+
+
+    def test_dedicated_admission_policy_is_validated(self):
+        config=dict(role='builder',host_cpus=16,builder_cpus=16,work_gib=28,
+                    builder_gib=28,runner_gib=0,runner_names=[])
+        self.assertTrue(valid_admission(config))
+        for key,value in [('work_gib',57),('runner_names',['foreign']),('host_cpus',True)]:
+            changed=dict(config);changed[key]=value
+            self.assertFalse(valid_admission(changed))
+
+
+    def test_admission_socket_peer_must_match_root_process(self):
+        validate_service_peer(123,(123,0,0))
+        for peer in ((999,0,0),(123,1001,1001),(123,False,0)):
+            with self.subTest(peer=peer),self.assertRaises(ValueError):
+                validate_service_peer(123,peer)
+
+
+    def test_readiness_requires_exact_non_mutating_protocol_response(self):
+        validate_admission_response(b'{"error":"Admission kind does not match peer identity"}')
+        for response in (b'{"accepted":true}',b'{"error":"broken config"}',b'{}'):
+            with self.subTest(response=response),self.assertRaises(ValueError):
+                validate_admission_response(response)
 
 
 if __name__=='__main__':unittest.main()

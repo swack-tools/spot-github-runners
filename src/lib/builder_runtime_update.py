@@ -47,7 +47,7 @@ def validate_assets(assets):
 
 def validate_plan(plan, now):
     fields = {'schema', 'nonce', 'source_main', 'vm_id', 'boot', 'image_id',
-              'config_sha256', 'service_sha256', 'service_pid', 'service_startticks',
+              'config_sha256', 'admission_sha256', 'service_sha256', 'service_pid', 'service_startticks',
               'observed_at', 'assets', 'before'}
     if not isinstance(plan, dict) or set(plan) != fields or type(plan['schema']) is not int or plan['schema'] != 1:
         raise ValueError('Unknown runtime update plan')
@@ -60,7 +60,7 @@ def validate_plan(plan, now):
         raise ValueError('Expired or invalid runtime observation')
     for key, pattern in (('nonce', r'[a-f0-9]{32}'), ('source_main', r'[a-f0-9]{40}'),
                          ('vm_id', r'[0-9]{1,20}'), ('image_id', r'sha256:[a-f0-9]{64}'),
-                         ('config_sha256', r'[a-f0-9]{64}'), ('service_sha256', r'[a-f0-9]{64}')):
+                         ('config_sha256', r'[a-f0-9]{64}'), ('admission_sha256', r'[a-f0-9]{64}'), ('service_sha256', r'[a-f0-9]{64}')):
         if not isinstance(plan[key], str) or not re.fullmatch(pattern, plan[key]):
             raise ValueError('Unbound runtime identity: ' + key)
     try:
@@ -97,7 +97,7 @@ def atomic_write(path, data, mode):
             os.unlink(temporary)
 
 
-def root_file_state(path):
+def root_file_read(path):
     """Inspect root custody before trusting a live file or its absence."""
     path = Path(path)
     for parent in path.parents:
@@ -111,7 +111,7 @@ def root_file_state(path):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        return None
+        return None, b''
     try:
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
@@ -120,14 +120,39 @@ def root_file_state(path):
         raw = os.read(fd, 1048577)
         if len(raw) != info.st_size:
             raise ValueError('Runtime file changed while reading')
+        after = os.fstat(fd)
+        current = path.lstat()
+        if ((info.st_dev, info.st_ino) != (current.st_dev, current.st_ino)
+                or (info.st_size, info.st_mtime_ns, info.st_ctime_ns) !=
+                   (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError('File changed during bounded descriptor read')
         return {'sha256': hashlib.sha256(raw).hexdigest(),
                 'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid,
-                'gid': info.st_gid, 'device': info.st_dev, 'inode': info.st_ino}
+                'gid': info.st_gid, 'device': info.st_dev, 'inode': info.st_ino}, raw
     finally:
         os.close(fd)
 
 
-def drained_update(lock_path, drain_path, token, action):
+
+def root_file_state(path):
+    return root_file_read(path)[0]
+
+
+def checked_json(raw, digest):
+    import json
+    if not isinstance(raw, bytes) or len(raw) > 1048576 or hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError('JSON bytes differ from selected digest')
+    return json.loads(raw)
+
+
+def active_work_processes(records):
+    return [row['pid'] for row in records if
+            row['comm'] in ('scp', 'rsync', 'sftp-server', 'cargo', 'rustc')
+            or b'@internal-sftp' in b'\0'.join(row['argv'])
+            or b'/usr/local/bin/oxidex-remote-build' in row['argv']]
+
+
+def drained_update(lock_path, drain_path, token, action, *, before_drain=None, before_release=None):
     """Run under the existing lock; failures retain the protective owned drain."""
     import fcntl
     if not isinstance(token, str) or not re.fullmatch('[a-zA-Z0-9_-]{1,128}', token):
@@ -144,6 +169,8 @@ def drained_update(lock_path, drain_path, token, action):
         current = lock_path.lstat()
         if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
             raise ValueError('Build lock replaced')
+        if before_drain is not None:
+            before_drain()
         drain = os.open(drain_path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         raw = token.encode('ascii')
         with os.fdopen(os.dup(drain), 'wb') as stream:
@@ -160,6 +187,11 @@ def drained_update(lock_path, drain_path, token, action):
             os.lseek(drain, 0, os.SEEK_SET)
             if os.read(drain, 129) != raw:
                 raise ValueError('Owned drain changed; explicit recovery required')
+            if before_release is not None:
+                before_release(result)
+            current = drain_path.lstat()
+            if (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino):
+                raise ValueError('Owned drain replaced during final checks')
             os.unlink(drain_path)
             os.fsync(directory)
             return result
@@ -172,10 +204,12 @@ def drained_update(lock_path, drain_path, token, action):
 
 
 def check_snapshot(plan, snapshot, *, owned_drain=False):
-    for field in ('vm_id', 'boot', 'image_id', 'config_sha256', 'service_sha256',
+    for field in ('vm_id', 'boot', 'image_id', 'config_sha256', 'admission_sha256', 'service_sha256',
                   'service_pid', 'service_startticks'):
         if snapshot.get(field) != plan[field]:
             raise ValueError('Live builder binding changed: ' + field)
+    if snapshot.get('image_pin') != plan['image_id'] or snapshot.get('admission_valid') is not True:
+        raise ValueError('Image pin or dedicated admission policy differs')
     if (snapshot.get('cpu') != 16 or snapshot.get('role') != 'builder'
             or snapshot.get('cpus') != 16 or snapshot.get('memory_gib') != 28
             or snapshot.get('tools_ready') is not True):
@@ -190,41 +224,129 @@ def check_snapshot(plan, snapshot, *, owned_drain=False):
         raise ValueError('Foreign or unexpected builder drain')
 
 
-def checked_command(arguments):
+
+def valid_admission(config):
+    expected = dict(role='builder', host_cpus=16, builder_cpus=16, work_gib=28,
+                    builder_gib=28, runner_gib=0, runner_names=[])
+    if not isinstance(config, dict) or set(config) != set(expected):
+        return False
+    return all(config[k] == value and (type(config[k]) in (int, float)
+               if type(value) is int else type(config[k]) is type(value))
+               for k, value in expected.items())
+
+
+def checked_command(arguments, *, timeout=20):
     import subprocess
     result = subprocess.run(arguments, capture_output=True, text=True,
-                            check=True, timeout=20)
+                            check=True, timeout=timeout)
     if result.stderr:
         raise ValueError('Unexpected command diagnostics')
     return result.stdout.strip()
+
+
+
+def service_identity(*, strict=True, timeout=2):
+    pid = int(checked_command(['/usr/bin/systemctl', 'show', 'gha-admission.service',
+                              '--property=MainPID', '--value'], timeout=timeout))
+    if pid <= 0:
+        raise ValueError('Admission service is not running')
+    proc = Path('/proc') / str(pid)
+    if proc.stat().st_uid != 0:
+        raise ValueError('Admission process is not root-owned')
+    if strict and (proc / 'cmdline').read_bytes().split(b'\0')[:-1] != [
+            b'/usr/bin/python3', b'/opt/gha-runners/host_admission.py', b'serve']:
+        raise ValueError('Unexpected admission process')
+    ticks = int((proc / 'stat').read_text().rsplit(')', 1)[1].split()[19])
+    return pid, ticks
+
+
+def validate_service_peer(expected_pid, credentials):
+    if (len(credentials) != 3 or any(type(x) is not int for x in credentials)
+            or credentials[0] != expected_pid or credentials[1] != 0):
+        raise ValueError('Admission socket does not belong to the expected root process')
+
+
+
+def validate_admission_response(raw):
+    import json
+    if len(raw) > 4096 or json.loads(raw) != {'error': 'Admission kind does not match peer identity'}:
+        raise ValueError('Admission service did not return the expected no-action response')
+
+
+def admission_ready(plan, pid, ticks, *, wait=True):
+    import socket
+    import struct
+    import time
+    remaining = plan['observed_at'] + 120 - time.time()
+    if remaining <= 0:
+        raise ValueError('Admission readiness observation expired')
+    deadline = time.monotonic() + min(8 if wait else 1, remaining)
+    path = Path('/run/gha-admission/socket')
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError('Admission socket did not become ready')
+        if service_identity(strict=False, timeout=min(2, remaining)) != (pid, ticks):
+            raise ValueError('Admission process changed during readiness checks')
+        try:
+            service_identity(timeout=min(2, remaining))
+            trusted_directory(path.parent)
+            info = path.lstat()
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0:
+                raise ValueError('Untrusted admission socket')
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(min(.5, remaining))
+                client.connect(str(path))
+                credentials = struct.unpack('3i', client.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+                validate_service_peer(pid, credentials)
+                # No action or lease request: root's default runner kind is rejected
+                # before constructing/refreshing the admission pool.
+                client.sendall(b'{}')
+                response = bytearray()
+                while len(response) <= 4096:
+                    client.settimeout(min(.5, max(.01, deadline-time.monotonic())))
+                    chunk = client.recv(4097-len(response))
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+                validate_admission_response(bytes(response))
+            if service_identity(timeout=min(2, max(.01, deadline-time.monotonic()))) != (pid, ticks):
+                raise ValueError('Admission process changed after socket observation')
+            validate_plan(plan, time.time())
+            return
+        except ValueError as error:
+            if str(error) != 'Unexpected admission process' or not wait:
+                raise
+            time.sleep(min(.05, max(0, deadline-time.monotonic())))
+        except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
+            if not wait:
+                raise
+            time.sleep(min(.05, max(0, deadline-time.monotonic())))
 
 
 def live_snapshot(plan):
     """Read fixed host facts, never acquire leases or start containers."""
     import json
     config_path = Path('/etc/oxidex-remote-build.json')
-    config_state = root_file_state(config_path)
-    config = json.loads(config_path.read_bytes())
+    config_state, config_raw = root_file_read(config_path)
+    config = json.loads(config_raw)
+    admission_state, admission_raw = root_file_read('/etc/gha-admission.json')
+    admission = json.loads(admission_raw)
+    if config.get('image') != 'oxidex-remote-builder:1.99.0':
+        raise ValueError('Unexpected configured builder image tag')
     ledger = Path('/var/lib/gha-admission/leases.json')
     root_file_state(ledger)
     service = root_file_state('/etc/systemd/system/gha-admission.service')
     drain = Path('/run/oxidex-build-draining')
     root_file_state(drain)
-    service_pid = int(checked_command(['/usr/bin/systemctl', 'show', 'gha-admission.service',
-                                       '--property=MainPID', '--value']))
-    if service_pid <= 0:
-        raise ValueError('Admission service is not running')
-    proc = Path('/proc') / str(service_pid)
-    if proc.stat().st_uid != 0 or (proc / 'cmdline').read_bytes().split(b'\0')[:-1] != [
-            b'/usr/bin/python3', b'/opt/gha-runners/host_admission.py', b'serve']:
-        raise ValueError('Unexpected admission process')
-    service_ticks = int((proc / 'stat').read_text().rsplit(')', 1)[1].split()[19])
+    service_pid, service_ticks = service_identity()
     executables = ('/usr/bin/git', '/usr/bin/ssh-keygen', '/usr/bin/python3',
                    '/usr/bin/docker', '/usr/bin/systemctl')
     tools_ready = all(stat.S_ISREG(Path(p).stat().st_mode) and Path(p).stat().st_uid == 0
                       and not Path(p).stat().st_mode & 0o022
                       and os.access(p, os.X_OK) for p in executables)
-    uploads = []
+    work_records = []
     for proc_path in Path('/proc').iterdir():
         if not proc_path.name.isdecimal():
             continue
@@ -233,9 +355,8 @@ def live_snapshot(plan):
             argv = (proc_path / 'cmdline').read_bytes()
         except (FileNotFoundError, ProcessLookupError):
             continue
-        if (comm in ('scp', 'rsync', 'sftp-server', 'cargo', 'rustc')
-                or b'@internal-sftp' in argv):
-            uploads.append(int(proc_path.name))
+        work_records.append(dict(pid=int(proc_path.name),comm=comm,argv=argv.split(b'\0')))
+    uploads = active_work_processes(work_records)
     return dict(
         upload_processes=uploads,
         vm_id=checked_command(['/usr/bin/curl', '-q', '--fail', '--silent', '--show-error',
@@ -243,8 +364,10 @@ def live_snapshot(plan):
             'http://metadata.google.internal/computeMetadata/v1/instance/id']),
         boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
         image_id=checked_command(['/usr/bin/docker', 'image', 'inspect',
-                                 plan['image_id'], '--format={{.Id}}']),
+                                 config['image'], '--format={{.Id}}']),
         config_sha256=config_state['sha256'], service_sha256=service['sha256'],
+        image_pin=config.get('approved_image_id'), admission_sha256=admission_state['sha256'],
+        admission_valid=valid_admission(admission),
         service_pid=service_pid, service_startticks=service_ticks,
         cpu=os.cpu_count(), role=config.get('role'), cpus=config.get('cpus'),
         memory_gib=config.get('memory_gib'), tools_ready=tools_ready,
@@ -270,16 +393,18 @@ def apply_update(plan):
     import json
     import time
     assets = validate_plan(plan, time.time())
-    check_snapshot(plan, live_snapshot(plan))
     backup = Path('/var/lib/oxidex-builder') / ('runtime-update-' + plan['nonce'])
     trusted_directory(backup.parent)
     if backup.exists() or backup.is_symlink():
         raise ValueError('Update nonce already used')
 
     def install():
+        snapshot = live_snapshot(plan)
         validate_plan(plan, time.time())
-        check_snapshot(plan, live_snapshot(plan), owned_drain=True)
+        check_snapshot(plan, snapshot, owned_drain=True)
+        validate_plan(plan, time.time())
         backup.mkdir(mode=0o700)
+        validate_plan(plan, time.time())
         atomic_write(backup / 'plan.json', (json.dumps(plan, sort_keys=True) + '\n').encode(), 0o600)
         journal = backup / 'journal.jsonl'
 
@@ -294,6 +419,7 @@ def apply_update(plan):
         record('BACKUP_START')
         try:
             for index, target in enumerate(sorted(TARGETS)):
+                validate_plan(plan, time.time())
                 if root_file_state(target) != plan['before'][target]:
                     raise ValueError('Runtime changed before backup')
                 if plan['before'][target] is not None:
@@ -303,16 +429,22 @@ def apply_update(plan):
                 validate_plan(plan, time.time())
                 if (Path('/proc/sys/kernel/random/boot_id').read_text().strip() != plan['boot']
                         or root_file_state('/etc/oxidex-remote-build.json')['sha256'] != plan['config_sha256']
+                        or root_file_state('/etc/gha-admission.json')['sha256'] != plan['admission_sha256']
                         or root_file_state(target) != plan['before'][target]):
                     raise ValueError('Immediate file mutation fence failed')
                 trusted_directory(Path(target).parent, create=True)
                 atomic_write(target, assets[target], TARGETS[target])
                 record('FILE_REPLACED', target=target,
                        sha256=hashlib.sha256(assets[target]).hexdigest())
+            validate_plan(plan, time.time())
             trusted_directory('/mnt/runner-data/remote-build/qualification-sealed', create=True)
             validate_plan(plan, time.time())
             checked_command(['/usr/bin/systemctl', 'restart', 'gha-admission.service'])
+            new_pid, new_ticks = service_identity(strict=False)
+            admission_ready(plan, new_pid, new_ticks)
             after = live_snapshot(plan)
+            if (after['service_pid'], after['service_startticks']) != (new_pid, new_ticks):
+                raise ValueError('Admission identity changed after readiness proof')
             expected = dict(plan, service_pid=after['service_pid'],
                             service_startticks=after['service_startticks'], before=after['before'])
             check_snapshot(expected, after, owned_drain=True)
@@ -326,19 +458,55 @@ def apply_update(plan):
             record('FILES_AND_SERVICE_VERIFIED', service_pid=after['service_pid'],
                    service_startticks=after['service_startticks'], files=after['before'])
             return dict(status='UPDATED', source_main=plan['source_main'], backup=str(backup),
-                        service_pid=after['service_pid'], qualification_ready=False)
+                        service_pid=after['service_pid'], service_startticks=after['service_startticks'],
+                        qualification_ready=False)
         except BaseException as error:
             record('HOLD_EXPLICIT_RECOVERY', error_type=type(error).__name__)
             raise
 
-    return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining', plan['nonce'], install)
+    def before_drain():
+        snapshot = live_snapshot(plan)
+        validate_plan(plan, time.time())
+        check_snapshot(plan, snapshot)
+    def before_release(result):
+        try:
+            snapshot = live_snapshot(plan)
+            validate_plan(plan, time.time())
+            expected = dict(plan, service_pid=result['service_pid'],
+                            service_startticks=result['service_startticks'], before=snapshot['before'])
+            check_snapshot(expected, snapshot, owned_drain=True)
+            for target, raw in assets.items():
+                state = snapshot['before'][target]
+                if state['sha256'] != hashlib.sha256(raw).hexdigest() or state['mode'] != TARGETS[target]:
+                    raise ValueError('Installed runtime changed before drain release')
+            admission_ready(plan, result['service_pid'], result['service_startticks'], wait=False)
+            records = []
+            for proc in Path('/proc').iterdir():
+                if proc.name.isdecimal():
+                    try:
+                        records.append(dict(pid=int(proc.name),comm=(proc/'comm').read_text().strip(),
+                                            argv=(proc/'cmdline').read_bytes().split(b'\0')))
+                    except (FileNotFoundError, ProcessLookupError):
+                        continue
+            if active_work_processes(records):
+                raise ValueError('Launcher or upload appeared before drain release')
+            validate_plan(plan, time.time())
+        except BaseException as error:
+            import json
+            with (backup/'journal.jsonl').open('ab') as output:
+                output.write((json.dumps(dict(stage='HOLD_BEFORE_DRAIN_RELEASE',
+                    observed_at=time.time(),error_type=type(error).__name__),sort_keys=True)+'\n').encode())
+                output.flush();os.fsync(output.fileno())
+            raise
+    return drained_update('/run/oxidex-build.lock', '/run/oxidex-build-draining',
+                          plan['nonce'], install, before_drain=before_drain, before_release=before_release)
 
 
 def plan_from_snapshot(source_main, assets, snapshot, observed_at, nonce):
     plan = dict(schema=1, nonce=nonce, source_main=source_main,
                 observed_at=observed_at, assets=assets,
                 **{field: snapshot[field] for field in (
-                    'vm_id', 'boot', 'image_id', 'config_sha256', 'service_sha256',
+                    'vm_id', 'boot', 'image_id', 'config_sha256', 'admission_sha256', 'service_sha256',
                     'service_pid', 'service_startticks', 'before')})
     validate_plan(plan, observed_at)
     check_snapshot(plan, snapshot)
@@ -365,28 +533,27 @@ def main():
     if args.capture_assets:
         if args.apply or not args.source_main or not args.assets_sha256:
             parser.error('Capture requires source-main/assets-sha256 and cannot apply')
-        state = root_file_state(args.capture_assets)
+        state, raw = root_file_read(args.capture_assets)
         if state is None or state['sha256'] != args.assets_sha256:
             raise ValueError('Candidate assets differ from selected digest')
-        assets = json.loads(args.capture_assets.read_bytes())
+        assets = checked_json(raw, args.assets_sha256)
         validate_assets(assets)
-        config = Path('/etc/oxidex-remote-build.json')
-        root_file_state(config)
-        image = json.loads(config.read_bytes())['approved_image_id']
         observed_at = time.time()
-        snapshot = live_snapshot({'image_id': image})
+        snapshot = live_snapshot({})
         plan = plan_from_snapshot(args.source_main, assets, snapshot, observed_at, uuid.uuid4().hex)
         validate_plan(plan, time.time())
         print(json.dumps(plan, sort_keys=True))
         return
     if not args.plan_sha256:
         parser.error('Check/apply requires plan-sha256')
-    state = root_file_state(args.plan)
+    state, raw = root_file_read(args.plan)
     if state is None or state['sha256'] != args.plan_sha256:
         raise ValueError('Plan differs from the explicitly selected reviewed digest')
-    plan = json.loads(args.plan.read_bytes())
+    plan = checked_json(raw, args.plan_sha256)
     validate_plan(plan, time.time())
-    check_snapshot(plan, live_snapshot(plan))
+    snapshot = live_snapshot(plan)
+    validate_plan(plan, time.time())
+    check_snapshot(plan, snapshot)
     result = apply_update(plan) if args.apply else dict(status='CHECKED_ONLY', executed=False)
     print(json.dumps(result, sort_keys=True))
 
