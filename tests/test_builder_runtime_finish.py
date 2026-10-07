@@ -98,6 +98,18 @@ class MarkerRemovalBoundaryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):runtime.unlink_selected_marker(path,expected,guard,fresh)
             self.assertEqual(path.read_bytes(),b'owned')
 
+    def test_content_reads_finish_before_canonical_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'marker';path.write_bytes(b'owned')
+            expected=dict(inode=path.stat().st_ino);guarded=[False]
+            def read(_):
+                self.assertFalse(guarded[0], 'Blocking content read followed authority check')
+                return expected
+            def guard():guarded[0]=True
+            with patch.object(runtime,'root_file_state',side_effect=read):
+                runtime.unlink_selected_marker(path,expected,guard,lambda:None)
+            self.assertTrue(guarded[0]);self.assertFalse(path.exists())
+
     def test_absent_marker_retry_still_syncs_parent(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory).resolve()/'marker';synced=[]
@@ -358,7 +370,7 @@ class JournalPublicationTests(unittest.TestCase):
         path=Path(path)
         if not path.exists():return None,b''
         raw=path.read_bytes();info=path.stat()
-        return dict(sha256=hashlib.sha256(raw).hexdigest(),inode=info.st_ino,mode=info.st_mode&0o777),raw
+        return dict(sha256=hashlib.sha256(raw).hexdigest(),inode=info.st_ino,device=info.st_dev,uid=info.st_uid,gid=info.st_gid,mode=info.st_mode&0o777),raw
 
     def append(self,path,row):
         self.assertTrue(callable(getattr(runtime,'append_journal_record',None)), 'Crash-safe journal publication is missing')
@@ -415,6 +427,30 @@ class JournalPublicationTests(unittest.TestCase):
                 other=path.parent/'foreign';other.write_bytes(b'{"stage":"FOREIGN"}\n');other.replace(path)
                 with self.assertRaises(ValueError):runtime.append_journal_record(path,dict(stage='OWN_THREE'),selected_history=selected)
             self.assertEqual(path.read_bytes(),b'{"stage":"FOREIGN"}\n')
+
+    def test_publication_reads_finish_before_authority_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';path.write_bytes(b'{"stage":"OLD"}\n')
+            guarded=[False];published=[False];replace=os.replace
+            def read(selected):
+                if not published[0]:self.assertFalse(guarded[0])
+                return self.reader(selected)
+            def guard():guarded[0]=True
+            def publish(source,target):replace(source,target);published[0]=True
+            with patch.object(runtime,'root_file_read',side_effect=read),patch.object(runtime.os,'replace',side_effect=publish):
+                runtime.append_journal_record(path,dict(stage='NEW'),before_publish=guard)
+            self.assertTrue(guarded[0]);self.assertTrue(published[0])
+
+    def test_identical_foreign_inode_is_not_accepted_as_own_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'journal';path.write_bytes(b'{"stage":"OLD"}\n');sync=os.fsync;armed=[False]
+            def replaced(fd):
+                sync(fd)
+                if path.exists() and b'NEW' in path.read_bytes() and not armed[0]:
+                    other=path.parent/'foreign';other.write_bytes(path.read_bytes());other.chmod(0o600);other.replace(path);armed[0]=True
+            with patch.object(runtime,'root_file_read',side_effect=self.reader),patch.object(runtime.os,'fsync',side_effect=replaced):
+                with self.assertRaises(ValueError):runtime.append_journal_record(path,dict(stage='NEW'))
+            self.assertTrue(armed[0]);self.assertIn(b'NEW',path.read_bytes())
 
 class DrainPublicationTests(unittest.TestCase):
     def publish(self,path,callback=None):

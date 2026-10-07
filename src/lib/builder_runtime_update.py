@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+from contextlib import contextmanager
 
 PENDING_UPDATE = Path('/var/lib/oxidex-builder/runtime-update-pending.json')
 CURRENT_BOOT_PERMIT = Path('/run/oxidex-runtime-update-allow')
@@ -262,6 +263,7 @@ def atomic_write(path, data, mode, *, before_replace=None, exclusive=False):
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+            staged = os.fstat(stream.fileno())
         if before_replace is not None:
             before_replace()
         if exclusive:
@@ -273,6 +275,9 @@ def atomic_write(path, data, mode, *, before_replace=None, exclusive=False):
             os.fsync(parent)
         finally:
             os.close(parent)
+        return {'sha256': hashlib.sha256(data).hexdigest(),
+                'mode': stat.S_IMODE(staged.st_mode), 'uid': staged.st_uid,
+                'gid': staged.st_gid, 'device': staged.st_dev, 'inode': staged.st_ino}
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -295,16 +300,45 @@ def append_journal_record(path, record, *, before_publish=None, freshness=None, 
     if len(raw) > 1048576:
         raise ValueError('Journal size bound exceeded')
     def unchanged():
-        if root_file_read(path)[0] != state:
-            raise ValueError('Historical journal changed before publication')
-        if before_publish is not None:before_publish()
-        if root_file_read(path)[0] != state:
-            raise ValueError('Historical journal changed during publication guard')
-        if freshness is not None:freshness()
-    atomic_write(path, raw, 0o600, before_replace=unchanged)
+        with retained_file_selection(path, state, lambda:root_file_read(path)[0]) as verify:
+            if before_publish is not None:before_publish()
+            verify()
+            if freshness is not None:freshness()
+    published = atomic_write(path, raw, 0o600, before_replace=unchanged)
     updated = root_file_read(path)
-    if updated[1] != raw:raise ValueError('Own journal publication changed before receipt')
+    if (updated[1] != raw or updated[0] is None
+            or any(updated[0].get(key) != value for key,value in published.items())):
+        raise ValueError('Own journal publication changed before receipt')
     return updated
+
+
+@contextmanager
+def retained_file_selection(path, expected, read_state):
+    """Read before authority checks; retain identity for metadata-only revalidation."""
+    path = Path(path)
+    fd = None
+    try:
+        if expected is not None:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            selected = os.fstat(fd)
+        if read_state() != expected:
+            raise ValueError('Selected file changed before authority check')
+        def verify():
+            if fd is None:
+                try:path.lstat()
+                except FileNotFoundError:return
+                raise ValueError('Absent selected file appeared')
+            after = os.fstat(fd)
+            current = path.lstat()
+            fields = ('st_dev','st_ino','st_uid','st_gid','st_mode','st_nlink',
+                      'st_size','st_mtime_ns','st_ctime_ns')
+            if (any(getattr(selected,key) != getattr(after,key) for key in fields)
+                    or any(getattr(after,key) != getattr(current,key) for key in fields)):
+                raise ValueError('Selected descriptor or canonical file changed')
+        verify()
+        yield verify
+    finally:
+        if fd is not None:os.close(fd)
 
 
 def root_file_read(path):
@@ -948,13 +982,11 @@ def prepare_boot_hold(plan):
 def unlink_selected_marker(path, expected, canonical_guard, freshness):
     """Verify custody, then canonical authority, then time immediately before unlink."""
     path = Path(path)
-    if root_file_state(path) != expected:
-        raise ValueError('Selected maintenance marker ownership changed')
-    canonical_guard()
-    if root_file_state(path) != expected:
-        raise ValueError('Selected marker changed during canonical authority check')
-    freshness()
-    if expected is not None:os.unlink(path)
+    with retained_file_selection(path, expected, lambda:root_file_state(path)) as verify:
+        canonical_guard()
+        verify()
+        freshness()
+        if expected is not None:os.unlink(path)
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:os.fsync(parent)
     finally:os.close(parent)
