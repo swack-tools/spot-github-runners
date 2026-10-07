@@ -939,9 +939,10 @@ def unlink_selected_marker(path, expected, canonical_guard, freshness):
     if root_file_state(path) != expected:
         raise ValueError('Selected maintenance marker ownership changed')
     canonical_guard()
+    if root_file_state(path) != expected:
+        raise ValueError('Selected marker changed during canonical authority check')
     freshness()
-    if expected is None:return
-    os.unlink(path)
+    if expected is not None:os.unlink(path)
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:os.fsync(parent)
     finally:os.close(parent)
@@ -1039,6 +1040,7 @@ def apply_update(plan):
                     mutation_idle_fence(plan)
                     file_mutation_fence(plan, target, expected_file=expected_file)
                     lock_guard()
+                    validate_plan(plan, time.time())
                 installed_mode = 0o644 if target == LAUNCHER_TARGET else TARGETS[target]
                 atomic_write(target, assets[target], installed_mode, before_replace=before_replace)
                 record('FILE_REPLACED', target=target,

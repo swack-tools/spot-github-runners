@@ -98,6 +98,25 @@ class MarkerRemovalBoundaryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):runtime.unlink_selected_marker(path,expected,guard,fresh)
             self.assertEqual(path.read_bytes(),b'owned')
 
+    def test_absent_marker_retry_still_syncs_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'marker';synced=[]
+            with patch.object(runtime,'root_file_state',return_value=None),patch.object(runtime.os,'fsync',side_effect=lambda fd:synced.append(fd)):
+                runtime.unlink_selected_marker(path,None,lambda:None,lambda:None)
+            self.assertEqual(len(synced),1);self.assertFalse(path.exists())
+
+    def test_marker_replaced_during_canonical_guard_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory).resolve()/'marker';path.write_text('owned')
+            def state(selected):
+                info=Path(selected).stat();return dict(inode=info.st_ino,sha256=hashlib.sha256(Path(selected).read_bytes()).hexdigest())
+            expected=state(path)
+            def replaced():
+                other=path.parent/'other';other.write_text('foreign');other.replace(path)
+            with patch.object(runtime,'root_file_state',side_effect=state):
+                with self.assertRaises(ValueError):runtime.unlink_selected_marker(path,expected,replaced,lambda:None)
+            self.assertEqual(path.read_text(),'foreign')
+
 class InactiveServiceTests(unittest.TestCase):
     def parse(self,raw):
         self.assertTrue(callable(getattr(runtime,'parse_inactive_service_state',None)), 'Native inactive state parser is missing')
