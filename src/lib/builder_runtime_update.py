@@ -245,7 +245,7 @@ def verify_installed_history(plan, original, journal, client_pin, now, *, recove
                                     client_launcher_sha256=client_pin)
 
 
-def atomic_write(path, data, mode, *, before_replace=None):
+def atomic_write(path, data, mode, *, before_replace=None, exclusive=False):
     path = Path(path)
     if any(p.is_symlink() for p in (path, *path.parents)):
         raise ValueError('Symlinked runtime path')
@@ -260,7 +260,10 @@ def atomic_write(path, data, mode, *, before_replace=None):
             os.fsync(stream.fileno())
         if before_replace is not None:
             before_replace()
-        os.replace(temporary, path)
+        if exclusive:
+            rename_exclusive(temporary, path)
+        else:
+            os.replace(temporary, path)
         parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.fsync(parent)
@@ -904,15 +907,15 @@ def prepare_boot_hold(plan):
     file_mutation_fence(plan)
     if state is None:
         atomic_write(BOOT_GUARD, BOOT_GUARD_BYTES, 0o644,
-                     before_replace=lambda:file_mutation_fence(plan))
+                     before_replace=lambda:file_mutation_fence(plan), exclusive=True)
     checked_command(['/usr/bin/systemctl', 'daemon-reload'])
     file_mutation_fence(plan)
     atomic_write(CURRENT_BOOT_PERMIT, plan['nonce'].encode(), 0o600,
-                 before_replace=lambda:file_mutation_fence(plan))
+                 before_replace=lambda:file_mutation_fence(plan), exclusive=True)
     # Must become durable before the first of the fifteen runtime replacements.
     atomic_write(PENDING_UPDATE, (json.dumps(dict(nonce=plan['nonce'], boot=plan['boot'],
                  source_main=plan['source_main']))+'\n').encode(), 0o600,
-                 before_replace=lambda:file_mutation_fence(plan))
+                 before_replace=lambda:file_mutation_fence(plan), exclusive=True)
 
 
 
@@ -1184,8 +1187,9 @@ def finish_update(plan, client_pin):
         held = False
         current = root_file_state(LAUNCHER_TARGET)
         selected = plan['before'][LAUNCHER_TARGET]
-        if (current is not None and current['sha256'] == selected['sha256']
-                and (current['device'], current['inode']) == (selected['device'], selected['inode'])):
+        if current is not None and current.get('mode') in (0o644, 0o755):
+            if dict(current, mode=selected['mode']) != selected:
+                raise ValueError('Failure holding cannot adopt changed selected custody')
             record('HOLD_FINISH_INTENT', launcher=current, guard=canonical_guard)
             close_launcher_execution(LAUNCHER_TARGET, expected=current, before_change=canonical_guard)
             held = root_file_state(LAUNCHER_TARGET)['mode'] == 0o644
@@ -1407,10 +1411,10 @@ def recover_finish_update(plan, client_pin):
         expected['before'][LAUNCHER_TARGET] = dict(plan['before'][LAUNCHER_TARGET], mode=0o644)
         check()
         if root_file_state(CURRENT_BOOT_PERMIT) is None:
-            atomic_write(CURRENT_BOOT_PERMIT, plan['nonce'].encode(), 0o600, before_replace=check)
+            atomic_write(CURRENT_BOOT_PERMIT, plan['nonce'].encode(), 0o600, before_replace=check, exclusive=True)
         if root_file_state(PENDING_UPDATE) is None:
             raw = (json.dumps(dict(nonce=plan['nonce'], boot=plan['boot'], source_main=plan['source_main']))+'\n').encode()
-            atomic_write(PENDING_UPDATE, raw, 0o600, before_replace=check)
+            atomic_write(PENDING_UPDATE, raw, 0o600, before_replace=check, exclusive=True)
         check()
         verify_boot_hold(plan)
         record('FINISH_RECOVERED_HELD', service_pid=plan['service_pid'],
