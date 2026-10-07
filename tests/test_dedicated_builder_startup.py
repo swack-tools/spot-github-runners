@@ -94,7 +94,7 @@ class DedicatedBuilderStartupTests(unittest.TestCase):
                 self.assertEqual(result.stdout.strip(), str(output / 'launch-command.sh'))
                 expected = render_builder_startup(SimpleNamespace(**inputs()),
                                                   identity or 'builder-test')
-                self.assertTrue((output / 'startup.sh').read_text() == expected)
+                self.assertEqual((output / 'startup.sh').read_text(), expected)
 
     def test_policy_shape_mapping_and_performance_refusals(self):
         for key, value in [('runner_count', 1), ('cpu', 32), ('ram', 64), ('builder_memory_gib', 32),
