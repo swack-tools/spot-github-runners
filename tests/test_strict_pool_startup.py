@@ -42,6 +42,39 @@ class StrictPoolStartup(unittest.TestCase):
         for cached,targets in ((dict(ids,runner1=99),rows),(ids,[dict(rows[0],id=99),rows[1]]),(ids,[rows[0],rows[0]])):
             with self.assertRaises(RuntimeError):manager.validate_strict_identity_join(ids,cached,targets)
 
+    def test_public_repository_group_permission_required(self):
+        import json
+        args=self.args()
+        for allowed in (True,False,None):
+            group={'visibility':'selected','name':'OxiDex'}
+            if allowed is not None:group['allows_public_repositories']=allowed
+            replies=[json.dumps(group),json.dumps({'repositories':[{'full_name':'swack-tools/oxidex'}]})]
+            with patch.object(manager,'run',side_effect=replies):
+                if allowed is True:self.assertEqual(manager.verify_runner_group(args),group)
+                else:
+                    with self.assertRaises(RuntimeError):manager.verify_runner_group(args)
+
+    def test_retained_stopped_host_starts_once_before_identity_read(self):
+        from dataclasses import replace
+        args=self.args();args.existing_instance=True
+        for status in ('STOPPED','TERMINATED'):
+            vm=manager.GceVm(args.instance_name,'test-a',status,args.instance_type,True,instance_id='123')
+            args.deployment_vm=vm
+            with patch.object(manager,'gcloud')as cloud,patch.object(manager,'observed_deployment_vm',side_effect=[replace(vm,status='STAGING'),replace(vm,status='RUNNING')]),patch.object(manager.time,'sleep'):
+                manager.start_retained_strict_host(args,'test-a')
+            self.assertEqual(cloud.call_count,1)
+            self.assertEqual(cloud.call_args.args[0][:3],['compute','instances','start'])
+            self.assertTrue(args.deployment_vm.running)
+        with patch.object(manager,'gcloud')as cloud:
+            manager.start_retained_strict_host(args,'test-a')
+            cloud.assert_not_called()
+    def test_retained_start_rejects_changed_identity(self):
+        from dataclasses import replace
+        args=self.args();args.existing_instance=True
+        vm=manager.GceVm(args.instance_name,'test-a','STOPPED',args.instance_type,True,instance_id='123');args.deployment_vm=vm
+        with patch.object(manager,'gcloud'),patch.object(manager,'observed_deployment_vm',return_value=replace(vm,status='RUNNING',instance_id='999')),self.assertRaises(RuntimeError):
+            manager.start_retained_strict_host(args,'test-a')
+
     def test_canonical_startup_parity(self):
         self.assertEqual(STARTUP_SCRIPT,(Path(manager.ROOT)/'cloud-init/startup.sh').read_text())
 

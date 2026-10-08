@@ -236,6 +236,8 @@ def verify_runner_group(args: argparse.Namespace) -> dict:
     repos = json.loads(run(["gh", "api", f"orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/repositories"], quiet=True))
     if not any(repo.get("full_name") == f"{ORG}/oxidex" for repo in repos.get("repositories", [])):
         raise RuntimeError(f"Runner group {args.runner_group_id} is not enabled for {ORG}/oxidex")
+    if getattr(args,'heavy_runner_pool',None) and group.get('allows_public_repositories') is not True:
+        raise RuntimeError('Strict runner group must permit the public OxiDex repository')
     if getattr(args,'heavy_runner_pool',None) and [repo.get('full_name') for repo in repos.get('repositories',[])]!=[f'{ORG}/oxidex']:
         raise RuntimeError('Strict runner group must select only OxiDex')
     return group
@@ -505,6 +507,27 @@ def verify_strict_runner_membership(args) -> dict[str, int] | None:
     return {row['name']:row['id'] for row in selected}
 
 
+def start_retained_strict_host(args, zone):
+    if not (args.existing_instance and getattr(args,'heavy_runner_pool',None)):return
+    vm=args.deployment_vm
+    if not vm.instance_id or not vm.spot or vm.machine_type!=args.instance_type:
+        raise RuntimeError('Retained strict host identity/type/Spot policy differs')
+    if vm.running:return
+    if vm.status not in {'STOPPED','TERMINATED'}:raise RuntimeError('Retained strict host is transitioning')
+    if getattr(args,'min_cpu_platform',None):
+        gcloud(['compute','instances','update',args.instance_name,f'--zone={zone}',f'--min-cpu-platform={args.min_cpu_platform}','--quiet'])
+    gcloud(['compute','instances','start',args.instance_name,f'--zone={zone}','--quiet'])
+    deadline=time.monotonic()+min(120,args.registration_timeout_seconds)
+    while time.monotonic()<deadline:
+        actual=observed_deployment_vm(args,zone)
+        if actual.instance_id!=vm.instance_id or not actual.spot or actual.machine_type!=vm.machine_type:
+            raise RuntimeError('Retained strict host changed during start')
+        args.deployment_vm=actual
+        if actual.running:return
+        time.sleep(1)
+    raise RuntimeError('Retained strict host did not become running; no bootstrap applied')
+
+
 def read_cached_runner_ids(args):
     expected=[f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1,args.runner_count+1)]
     vm_id=getattr(getattr(args,'deployment_vm',None),'instance_id',None)
@@ -663,7 +686,9 @@ def main() -> int:
         return 0
 
     group = verify_runner_group(args)
-    if args.existing_instance:verify_strict_identities(args)
+    if args.existing_instance:
+        start_retained_strict_host(args,zone)
+        verify_strict_identities(args)
     token = run(["gh", "api", "--method", "POST", f"orgs/{ORG}/actions/runners/registration-token", "--jq", ".token"], quiet=True)
     if not token:
         raise RuntimeError("GitHub returned an empty org runner registration token")
