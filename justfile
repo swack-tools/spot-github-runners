@@ -8,14 +8,14 @@ test:
     #!/usr/bin/env bash
     set -euo pipefail
     if [[ -z "${OXIDEX_CONTROL_REPO:-}" || ! -f "$OXIDEX_CONTROL_REPO/justfile" ]]; then
-      echo 'Set OXIDEX_CONTROL_REPO to a reviewed OxiDex control checkout with test-infra-remote.' >&2
+      echo 'Set OXIDEX_CONTROL_REPO to a reviewed OxiDex control checkout with test-infra-ci-remote.' >&2
       exit 2
     fi
-    if ! just --justfile "$OXIDEX_CONTROL_REPO/justfile" --show test-infra-remote >/dev/null 2>&1; then
-      echo 'OxiDex control checkout lacks the reviewed test-infra-remote recipe.' >&2
+    if ! just --justfile "$OXIDEX_CONTROL_REPO/justfile" --show test-infra-ci-remote >/dev/null 2>&1; then
+      echo 'OxiDex control checkout lacks the reviewed test-infra-ci-remote recipe.' >&2
       exit 2
     fi
-    just --justfile "$OXIDEX_CONTROL_REPO/justfile" test-infra-remote "$(pwd -P)"
+    just --justfile "$OXIDEX_CONTROL_REPO/justfile" test-infra-ci-remote "$(pwd -P)"
 
 # Run only inside the admitted dedicated-builder image; no arguments accepted.
 infra-python-tests:
