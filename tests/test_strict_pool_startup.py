@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
-from src.lib import runner_manager as manager
-from src.lib.runner_assets import STARTUP_SCRIPT
+from lib import runner_manager as manager
+from lib.runner_assets import STARTUP_SCRIPT
 from pathlib import Path
 
 class StrictPoolStartup(unittest.TestCase):
