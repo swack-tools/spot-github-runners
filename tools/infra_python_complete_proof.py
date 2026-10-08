@@ -1,5 +1,7 @@
 """Complete signed-source unittest measurement for the neutral CI profile."""
 import hashlib
+import json
+import unittest
 import os
 from pathlib import Path
 import stat
@@ -22,13 +24,61 @@ def load_producer():
     exec(compile(data, str(path), 'exec'), module.__dict__)
     return module
 
-def measure(module):
+def measure(module, *, case_floor=774, module_floor=76):
     _, _, names = module._source_snapshot()
-    # Each exact signed manifest module must contribute a case. The producer
-    # also requires every discovered unique case to finish without skips.
-    module.MIN_CASES = len(names)
-    module.MIN_MODULES = len(names)
+    module.MIN_CASES = max(case_floor, len(names))
+    module.MIN_MODULES = max(module_floor, len(names))
     module.RUNNER_ARGV = ['python3', '-B', 'tools/infra_python_complete_proof.py']
+    # Private backend namespace: tests cannot change global unittest bindings
+    # through this adapter. Capture real classes before executing any test.
+    loader_class = unittest.TestLoader
+    runner_class = unittest.TextTestRunner
+    result_class = unittest.TextTestResult
+    state = {'discovered': None, 'executed': [], 'result': None}
+
+    class IdentityLoader(loader_class):
+        def discover(self, *args, **kwargs):
+            suite = super().discover(*args, **kwargs)
+            ids = [case.id() for case in module._cases(suite)]
+            if len(ids) != len(set(ids)):
+                raise ValueError('Duplicate discovered test identity')
+            state['discovered'] = tuple(ids)
+            return suite
+
+    class IdentityResult(result_class):
+        def startTest(self, test):
+            state['executed'].append(test.id())
+            super().startTest(test)
+
+    class IdentityRunner(runner_class):
+        def _makeResult(self):
+            result = IdentityResult(self.stream, self.descriptions, self.verbosity)
+            state['result'] = result
+            return result
+
+    module.unittest = types.SimpleNamespace(
+        TestLoader=IdentityLoader, TextTestRunner=IdentityRunner,
+        TestCase=unittest.TestCase, TestSuite=unittest.TestSuite)
+    publish = module._publish
+
+    def publish_complete(directory_fd, name, data):
+        discovered, executed = state['discovered'], state['executed']
+        result = state['result']
+        if (discovered is None or result is None or len(executed) != len(set(executed))
+                or set(executed) != set(discovered)
+                or len(executed) != len(discovered)
+                or len(executed) != result.testsRun):
+            raise ValueError('Executed test identities differ from discovery')
+        proof = json.loads(data)
+        digest = lambda ids: hashlib.sha256(json.dumps(sorted(ids), separators=(',', ':')).encode()).hexdigest()
+        proof['discovered_test_ids_sha256'] = digest(discovered)
+        proof['executed_test_ids_sha256'] = digest(executed)
+        data = (json.dumps(proof, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n').encode()
+        if len(data) > module.MAX_PROOF:
+            raise ValueError('Complete proof oversized')
+        publish(directory_fd, name, data)
+
+    module._publish = publish_complete
     return module.run()
 
 if __name__ == '__main__':
