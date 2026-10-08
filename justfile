@@ -17,16 +17,6 @@ test:
     fi
     just --justfile "$OXIDEX_CONTROL_REPO/justfile" test-infra-ci-remote "$(pwd -P)"
 
-# Run only inside the admitted dedicated-builder image; no arguments accepted.
-infra-python-tests:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ "$(uname -s)" != Linux || ! -f /run/oxidex-build-container || "$(id -u)" == 0 ]]; then
-      echo 'infra-python-tests requires the admitted non-root Linux builder container.' >&2
-      exit 2
-    fi
-    PYTHONPATH=src python3 -B tools/infra_python_test_proof.py
-
 # Complete the signed CI-only source suite inside the admitted builder.
 infra-python-complete-tests:
     #!/usr/bin/env bash
