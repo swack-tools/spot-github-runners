@@ -28,6 +28,14 @@ class StrictPoolStartup(unittest.TestCase):
         with self.assertRaises(RuntimeError):manager.strict_pool_settings(args)
         args.remote_builder=False;args.tier='bulky'
         with self.assertRaises(RuntimeError):manager.strict_pool_settings(args)
+    def test_actual_group_membership_required(self):
+        import json
+        args=self.args();args.runner_count=2
+        rows=[{'name':f'{args.runner_prefix}-{args.instance_name}-{n}','id':n}for n in (1,2)]
+        with patch.object(manager,'run',return_value='\n'.join(json.dumps(r)for r in rows)):manager.verify_strict_runner_membership(args)
+        for invalid in ([],rows[:1],[rows[0],dict(rows[0])]):
+            with patch.object(manager,'run',return_value='\n'.join(json.dumps(r)for r in invalid)),self.assertRaises(RuntimeError):manager.verify_strict_runner_membership(args)
+
     def test_canonical_startup_parity(self):
         self.assertEqual(STARTUP_SCRIPT,(Path(manager.ROOT)/'cloud-init/startup.sh').read_text())
 

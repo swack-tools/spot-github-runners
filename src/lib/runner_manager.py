@@ -492,8 +492,23 @@ def online_runners(args: argparse.Namespace) -> list[str]:
     return online
 
 
+def verify_strict_runner_membership(args):
+    if not getattr(args,'heavy_runner_pool',None):return
+    expected={f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1,args.runner_count+1)}
+    output=run(['gh','api','--paginate',f'orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/runners','--jq','.runners[] | @json'],quiet=True)
+    rows=[json.loads(line) for line in output.splitlines() if line.strip()]
+    selected=[row for row in rows if row.get('name') in expected]
+    if (len(selected)!=len(expected) or {row.get('name') for row in selected}!=expected
+        or any(type(row.get('id'))is not int for row in selected)
+        or len({row['id'] for row in selected})!=len(expected)):
+        raise RuntimeError('Registered strict runners are not in the verified OxiDex group')
+
+
 def sync_runner_labels(args: argparse.Namespace) -> None:
     """Ensure every Spot VM runner has the common scheduling labels."""
+    if getattr(args,'heavy_runner_pool',None):
+        verify_runner_group(args)
+        verify_strict_runner_membership(args)
     expected_names = {f"{args.runner_prefix}-{args.instance_name}-{n}": n
                       for n in range(1, args.runner_count + 1)}
     output = run(["gh", "api", "--paginate", f"orgs/{ORG}/actions/runners",
@@ -618,6 +633,7 @@ def main() -> int:
         return 0
 
     group = verify_runner_group(args)
+    if args.existing_instance:verify_strict_runner_membership(args)
     token = run(["gh", "api", "--method", "POST", f"orgs/{ORG}/actions/runners/registration-token", "--jq", ".token"], quiet=True)
     if not token:
         raise RuntimeError("GitHub returned an empty org runner registration token")
