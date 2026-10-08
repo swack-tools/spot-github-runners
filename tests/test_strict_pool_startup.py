@@ -75,6 +75,18 @@ class StrictPoolStartup(unittest.TestCase):
         with patch.object(manager,'gcloud'),patch.object(manager,'observed_deployment_vm',return_value=replace(vm,status='RUNNING',instance_id='999')),self.assertRaises(RuntimeError):
             manager.start_retained_strict_host(args,'test-a')
 
+    def test_strict_tool_mount_is_readonly_without_blocking_sudo(self):
+        import subprocess
+        line=next(line for line in STARTUP_SCRIPT.splitlines()if '--mount "type=volume,src=$RUST_VOLUME' in line)
+        for enabled in ('1','0'):
+            script='set -euo pipefail\nSTRICT_HEAVY_POOL='+enabled+'\nRUST_VOLUME=gha-rust-synthetic\ndocker_args=()\n'+line+'\nprintf "%s\\n" "${docker_args[@]}"'
+            result=subprocess.run(['bash','-c',script],capture_output=True,text=True,check=True)
+            values=[value for value in result.stdout.splitlines()if value]
+            if enabled=='1':
+                self.assertIn('type=volume,src=gha-rust-synthetic,dst=/opt/runner-rust,readonly',values)
+                self.assertNotIn('--security-opt=no-new-privileges:true',values)
+            else:self.assertEqual(values,[])
+
     def test_canonical_startup_parity(self):
         self.assertEqual(STARTUP_SCRIPT,(Path(manager.ROOT)/'cloud-init/startup.sh').read_text())
 
