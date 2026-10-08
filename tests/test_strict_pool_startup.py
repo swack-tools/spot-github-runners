@@ -36,6 +36,12 @@ class StrictPoolStartup(unittest.TestCase):
         for invalid in ([],rows[:1],[rows[0],dict(rows[0])]):
             with patch.object(manager,'run',return_value='\n'.join(json.dumps(r)for r in invalid)),self.assertRaises(RuntimeError):manager.verify_strict_runner_membership(args)
 
+    def test_cached_group_and_label_ids_must_match(self):
+        ids={'runner1':10,'runner2':20};rows=[{'name':name,'id':value}for name,value in ids.items()]
+        manager.validate_strict_identity_join(ids,dict(ids),rows)
+        for cached,targets in ((dict(ids,runner1=99),rows),(ids,[dict(rows[0],id=99),rows[1]]),(ids,[rows[0],rows[0]])):
+            with self.assertRaises(RuntimeError):manager.validate_strict_identity_join(ids,cached,targets)
+
     def test_canonical_startup_parity(self):
         self.assertEqual(STARTUP_SCRIPT,(Path(manager.ROOT)/'cloud-init/startup.sh').read_text())
 

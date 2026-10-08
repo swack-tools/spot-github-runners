@@ -502,6 +502,35 @@ def verify_strict_runner_membership(args):
         or any(type(row.get('id'))is not int for row in selected)
         or len({row['id'] for row in selected})!=len(expected)):
         raise RuntimeError('Registered strict runners are not in the verified OxiDex group')
+    return {row['name']:row['id'] for row in selected}
+
+
+def read_cached_runner_ids(args):
+    expected=[f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1,args.runner_count+1)]
+    vm_id=getattr(getattr(args,'deployment_vm',None),'instance_id',None)
+    if not isinstance(vm_id,str)or not vm_id.isdigit():raise RuntimeError('Observed VM identity required for cached runner verification')
+    prefix="import urllib.request;actual=urllib.request.urlopen(urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/instance/id',headers={'Metadata-Flavor':'Google'}),timeout=3).read().decode();assert actual=="+repr(vm_id)+"\n"
+    script=prefix+"import json,os,stat;from pathlib import Path;names="+repr(expected)+";rows={}\nfor name in names:\n p=Path('/mnt/runner-data/instances')/name/'.runner'\n if any(x.is_symlink() for x in [*p.parents,p]):raise ValueError('Symlinked cached runner')\n fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)\n with os.fdopen(fd,'rb')as f:\n  if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):raise ValueError('Nonregular cached runner')\n  raw=f.read(65537)\n if len(raw)>65536:raise ValueError('Oversized cached runner')\n row=json.loads(raw)\n if row.get('agentName')!=name or type(row.get('agentId'))is not int:raise ValueError('Cached identity invalid')\n rows[name]=row['agentId']\nprint(json.dumps(rows))"
+    output=gcloud(['compute','ssh',args.instance_name,f'--zone={args.zone or args.region+"-a"}',f'--project={args.project}','--quiet','--command='+shlex.join(['sudo','-n','python3','-I','-B','-c',script])],quiet=True)
+    return json.loads(output)
+
+
+def validate_strict_identity_join(group_ids,cached_ids,org_rows):
+    expected=set(group_ids)
+    selected=[row for row in org_rows if row.get('name')in expected]
+    if len(selected)!=len(expected) or any(type(row.get('id'))is not int for row in selected):raise RuntimeError('Ambiguous org runner identities')
+    targets={row['name']:row['id']for row in selected}
+    if set(targets)!=expected or cached_ids!=group_ids or targets!=group_ids:raise RuntimeError('Cached/group/label runner identities differ')
+
+
+def verify_strict_identities(args,org_rows=None):
+    if not getattr(args,'heavy_runner_pool',None):return
+    group_ids=verify_strict_runner_membership(args)
+    cached=read_cached_runner_ids(args)
+    if org_rows is None:
+        output=run(['gh','api','--paginate',f'orgs/{ORG}/actions/runners','--jq','.runners[] | @json'],quiet=True)
+        org_rows=[json.loads(line)for line in output.splitlines()if line.strip()]
+    validate_strict_identity_join(group_ids,cached,org_rows)
 
 
 def sync_runner_labels(args: argparse.Namespace) -> None:
@@ -513,6 +542,7 @@ def sync_runner_labels(args: argparse.Namespace) -> None:
                       for n in range(1, args.runner_count + 1)}
     output = run(["gh", "api", "--paginate", f"orgs/{ORG}/actions/runners",
                   "--jq", ".runners[] | @json"], quiet=True)
+    if getattr(args,'heavy_runner_pool',None):verify_strict_identities(args,[json.loads(line)for line in output.splitlines()if line.strip()])
     seen: set[str] = set()
     for line in output.splitlines():
         if not line.strip():
@@ -633,7 +663,7 @@ def main() -> int:
         return 0
 
     group = verify_runner_group(args)
-    if args.existing_instance:verify_strict_runner_membership(args)
+    if args.existing_instance:verify_strict_identities(args)
     token = run(["gh", "api", "--method", "POST", f"orgs/{ORG}/actions/runners/registration-token", "--jq", ".token"], quiet=True)
     if not token:
         raise RuntimeError("GitHub returned an empty org runner registration token")
