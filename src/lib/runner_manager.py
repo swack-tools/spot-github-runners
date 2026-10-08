@@ -88,6 +88,7 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disk-type", default=None,
                         help="Data disk type; defaults to the machine family's compatible storage")
     parser.add_argument("--disk-device-name", default="runner-data")
+    parser.add_argument("--heavy-runner-pool", type=int, choices=(2,3), help="Strict CI-only pool: each runner 8 CPU/32 GiB, no extra swap")
     parser.add_argument("--runner-count", type=int, default=4)
     parser.add_argument("--runner-cpu", type=int, default=4)
     parser.add_argument("--runner-memory-gb", type=int, default=15)
@@ -111,11 +112,32 @@ def args_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def strict_pool_settings(args):
+    count=getattr(args,'heavy_runner_pool',None)
+    if count is None:return None
+    if type(count)is not int or count not in (2,3):raise RuntimeError('Strict pool must contain two or three runners')
+    if getattr(args,'remote_builder',False):raise RuntimeError('Strict CI pool cannot host remote builders')
+    if getattr(args,'tier',None):raise RuntimeError('Strict pool is an explicit fixed mode, not a tier override')
+    if args.cpu < count*8+2 or args.ram < count*32+16:raise RuntimeError('Strict pool needs 2 CPU and 16 GiB host headroom')
+    return count
+
+
 def select_sizing(args: argparse.Namespace) -> None:
     if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
         raise RuntimeError('Remote builders require a tier host with shared memory admission')
     configure_storage(args)
     configure_cpu_platform(args)
+    strict=strict_pool_settings(args)
+    if strict:
+        args.runner_count=strict
+        args.runner_cpu=8
+        args.runner_memory_gb=32
+        args.fixed_runner_sizing=True
+        args.admission_work_gib=32*strict
+        args.builder_memory_gib=28
+        args.runner_label='spot-heavy32'
+        if len(f'{args.runner_prefix}-{args.instance_name}-{strict}')>64:raise RuntimeError('GitHub runner name exceeds64 characters')
+        return
     if getattr(args,'tier',None):
         from .runner_tiers import TIERS
         from .host_admission import admission_budget
@@ -214,6 +236,8 @@ def verify_runner_group(args: argparse.Namespace) -> dict:
     repos = json.loads(run(["gh", "api", f"orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/repositories"], quiet=True))
     if not any(repo.get("full_name") == f"{ORG}/oxidex" for repo in repos.get("repositories", [])):
         raise RuntimeError(f"Runner group {args.runner_group_id} is not enabled for {ORG}/oxidex")
+    if getattr(args,'heavy_runner_pool',None) and [repo.get('full_name') for repo in repos.get('repositories',[])]!=[f'{ORG}/oxidex']:
+        raise RuntimeError('Strict runner group must select only OxiDex')
     return group
 
 
@@ -247,7 +271,9 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
     if getattr(args,'remote_builder',False) and not getattr(args,'tier',None):
         raise RuntimeError('Remote builders require a tier host with shared memory admission')
     source = STARTUP_SCRIPT
-    tiered = bool(getattr(args,'tier',None))
+    strict=strict_pool_settings(args)
+    if strict and (args.runner_count!=strict or args.runner_memory_gb!=32 or args.runner_cpu!=8 or args.admission_work_gib!=32*strict or args.runner_label!='spot-heavy32'):raise RuntimeError('Strict pool sizing has not been selected')
+    tiered = bool(getattr(args,'tier',None) or strict)
     admission_source = Path(__file__).with_name('host_admission.py').read_bytes()
     evidence_source = Path(__file__).with_name('host_evidence.py').read_bytes()
     replacements = {
@@ -279,6 +305,7 @@ def render_startup(args: argparse.Namespace, token: str, group_name: str, deploy
         "EVIDENCE_B64":base64.b64encode(evidence_source).decode(),
         "JOB_STARTED_B64":base64.b64encode((ROOT/'runner/job-started.sh').read_bytes()).decode(),
         "TIERED":'1' if tiered else '0',
+        "STRICT_HEAVY_POOL":'1' if strict else '0',
         "ADMISSION_WORK_GIB":str(getattr(args,'admission_work_gib',0)),
     }
     for key, value in replacements.items():
