@@ -167,12 +167,9 @@ ORG_URL=https://github.com/{{ORG}}
 RUNNER_LABELS='{{RUNNER_LABELS}}'
 RUNNER_GROUP='{{RUNNER_GROUP}}'
 RUNNER_PREFIX='{{RUNNER_PREFIX}}'
-RUNNER_IMAGE=oxidex-self-hosted-runner:{{RUNNER_VERSION}}
-if [[ "$STRICT_HEAVY_POOL" == 1 ]]; then
-  RUNNER_IMAGE=$(docker image inspect "$RUNNER_IMAGE" | jq -er '.[0].Id')
-  [[ "$RUNNER_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
-  RUST_VOLUME="gha-rust-${RUNNER_IMAGE#sha256:}"
-fi
+RUNNER_IMAGE=$(docker image inspect oxidex-self-hosted-runner:{{RUNNER_VERSION}} | jq -er '.[0].Id')
+[[ "$RUNNER_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+RUST_VOLUME="gha-rust-${RUNNER_IMAGE#sha256:}"
 REGISTRATION_TOKEN={{REGISTRATION_TOKEN}}
 RUNNER_COUNT={{RUNNER_COUNT}}
 RUNNER_MEMORY_GB={{RUNNER_MEMORY_GB}}
@@ -209,7 +206,8 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
     docker_args+=(-e GHA_ADMISSION_REQUIRED=1 -v /run/gha-admission:/run/gha-admission:ro)
   fi
   [[ -z "$RUNNER_CPU_LIMIT" ]] || docker_args+=(--cpus="$RUNNER_CPU_LIMIT")
-  [[ "$STRICT_HEAVY_POOL" != 1 ]] || docker_args+=(--memory-swap="32g" --mount "type=volume,src=$RUST_VOLUME,dst=/opt/runner-rust,readonly")
+  docker_args+=(--mount "type=volume,src=$RUST_VOLUME,dst=/opt/runner-rust,readonly")
+  [[ "$STRICT_HEAVY_POOL" != 1 ]] || docker_args+=(--memory-swap="32g")
   docker_args+=("$RUNNER_IMAGE")
   docker run "${docker_args[@]}"
 done

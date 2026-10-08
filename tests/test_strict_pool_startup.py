@@ -85,7 +85,7 @@ class StrictPoolStartup(unittest.TestCase):
             if enabled=='1':
                 self.assertIn('type=volume,src=gha-rust-synthetic,dst=/opt/runner-rust,readonly',values)
                 self.assertNotIn('--security-opt=no-new-privileges:true',values)
-            else:self.assertEqual(values,[])
+            else:self.assertIn('type=volume,src=gha-rust-synthetic,dst=/opt/runner-rust,readonly',values)
 
     def test_canonical_startup_parity(self):
         self.assertEqual(STARTUP_SCRIPT,(Path(manager.ROOT)/'cloud-init/startup.sh').read_text())
