@@ -492,8 +492,8 @@ def online_runners(args: argparse.Namespace) -> list[str]:
     return online
 
 
-def verify_strict_runner_membership(args):
-    if not getattr(args,'heavy_runner_pool',None):return
+def verify_strict_runner_membership(args) -> dict[str, int] | None:
+    if not getattr(args,'heavy_runner_pool',None):return None
     expected={f'{args.runner_prefix}-{args.instance_name}-{n}' for n in range(1,args.runner_count+1)}
     output=run(['gh','api','--paginate',f'orgs/{ORG}/actions/runner-groups/{args.runner_group_id}/runners','--jq','.runners[] | @json'],quiet=True)
     rows=[json.loads(line) for line in output.splitlines() if line.strip()]

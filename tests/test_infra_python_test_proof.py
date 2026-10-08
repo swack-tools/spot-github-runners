@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest import mock
+import unittest.mock as mock
 
 
 RUNNER = Path(__file__).resolve().parents[1] / 'tools' / 'infra_python_test_proof.py'
