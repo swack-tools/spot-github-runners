@@ -20,6 +20,41 @@ from decimal import Decimal
 SHARED_CORE_SHAPES = frozenset(('e2-micro', 'e2-small', 'e2-medium', 'f1-micro', 'g1-small'))
 
 
+
+def catalog_component(description):
+    """Normalize observed predefined component labels, not custom premiums."""
+    match = re.fullmatch(r'(?:Spot Preemptible\s+)?(.+?)\s+Instance\s+(Core|RAM)(?:\s+.*)?', description, re.I)
+    if not match:
+        return None
+    label, component = match[1].lower(), match[2].lower()
+    aliases = {'compute optimized': 'c2', 'memory-optimized': 'memoryoptimized'}
+    if label in aliases:
+        return aliases[label], component
+    words = label.split()
+    if not re.fullmatch(r'[a-z]+[0-9][a-z0-9-]*', words[0]):
+        return None
+    if any(word not in {'amd', 'intel', 'arm', 'predefined', 'memory-optimized'} for word in words[1:]):
+        return None
+    return words[0].replace('-', ''), component
+
+
+def component_rates(region, name, rates):
+    parts = name.lower().split('-')
+    if name in SHARED_CORE_SHAPES or 'custom' in parts:
+        return None
+    # Legacy n1 memory-machine aliases use memory-optimized rates, not N1.
+    if parts[0] in ('m1', 'm2') or name.startswith(('n1-ultramem-', 'n1-megamem-')):
+        keys = ['memoryoptimized']
+    else:
+        keys = [name.replace('-', ''), name.removesuffix('-lssd').replace('-', ''),
+                ''.join(part for part in parts if not part.isdigit()), parts[0]]
+    for key in dict.fromkeys(keys):
+        core, ram = rates.get((region, key, 'core')), rates.get((region, key, 'ram'))
+        if core is not None or ram is not None:
+            return (core, ram) if core is not None and ram is not None else None
+    return None
+
+
 def positive(value):
     number = float(value)
     if not math.isfinite(number) or number <= 0:
@@ -67,8 +102,8 @@ def main():
             cat = sku.get('category', {})
             if cat.get('usageType','').lower() not in ('spot','preemptible'):
                 continue
-            match = re.fullmatch(r'(?:Spot Preemptible\s+)?([A-Za-z][0-9A-Za-z]*)\s+(?:(?:AMD|Intel|Arm)\s+)?(?:Predefined\s+)?Instance\s+(Core|RAM)(?:\s+.*)?', sku.get('description',''), re.I)
-            if not match:
+            component = catalog_component(sku.get('description', ''))
+            if component is None:
                 continue
             infos = [i for i in sku.get('pricingInfo',[]) if i.get('effectiveTime') and dt.datetime.fromisoformat(i['effectiveTime'].replace('Z','+00:00')) <= now]
             if not infos:
@@ -85,7 +120,7 @@ def main():
             if amount <= 0:
                 continue
             for region in sku.get('serviceRegions',[]):
-                key=(region,match[1].lower(),match[2].lower())
+                key=(region,*component)
                 if key in rates and rates[key] != amount:
                     raise RuntimeError('ambiguous catalog rates for '+str(key))
                 rates[key]=amount
@@ -100,6 +135,8 @@ def main():
             if warning and warning.get('code') != 'NO_RESULTS_ON_PAGE':
                 raise RuntimeError('inventory warning: '+str(warning))
             for m in scope.get('machineTypes',[]):
+                if (m.get('deprecated') or {}).get('state') in ('OBSOLETE', 'DELETED'):
+                    continue
                 name=m['name']; zone=m['zone'].rsplit('/',1)[-1]; region=zone.rsplit('-',1)[0]
                 if name.endswith('-metal') or (name not in SHARED_CORE_SHAPES and name.startswith(('ct','tpu','a','g'))):
                     continue  # Accelerator shapes require separate device pricing.
@@ -110,9 +147,10 @@ def main():
         if name in SHARED_CORE_SHAPES:
             missing.append(region+'/'+name)
             continue  # Dedicated CPU/RAM rates cannot price shared-core shapes.
-        core=rates.get((region,name.split('-')[0],'core')); ram=rates.get((region,name.split('-')[0],'ram'))
-        if core is None or ram is None:
+        selected=component_rates(region,name,rates)
+        if selected is None:
             missing.append(region+'/'+name); continue
+        core,ram=selected
         hourly=core*cpu+ram*Decimal(mb)/1024; daily=hourly*24
         if daily <= Decimal(str(a.price_per_day)):
             rows.append([region,name,cpu,mb/1024, str(hourly),str(daily),','.join(sorted(zones))])

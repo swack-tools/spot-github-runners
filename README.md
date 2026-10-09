@@ -62,6 +62,8 @@ active project, or `--csv offers.csv` to save the displayed results. Machine typ
 without supported catalog prices, including shared-core shapes, are omitted and
 counted in the diagnostics.
 Authentication, incomplete inventories, and ambiguous prices fail the command.
+M2 prices apply to an evaluation period; check the machine series requirements
+before launching it.
 
 ## Prerequisites
 
