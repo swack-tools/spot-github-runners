@@ -67,7 +67,7 @@ def main():
             cat = sku.get('category', {})
             if cat.get('usageType','').lower() not in ('spot','preemptible'):
                 continue
-            match = re.fullmatch(r'(?:Spot Preemptible\s+)?([A-Za-z][0-9A-Za-z]*)\s+(?:(?:AMD|Intel|Arm)\s+)?Instance\s+(Core|RAM)(?:\s+.*)?', sku.get('description',''), re.I)
+            match = re.fullmatch(r'(?:Spot Preemptible\s+)?([A-Za-z][0-9A-Za-z]*)\s+(?:(?:AMD|Intel|Arm)\s+)?(?:Predefined\s+)?Instance\s+(Core|RAM)(?:\s+.*)?', sku.get('description',''), re.I)
             if not match:
                 continue
             infos = [i for i in sku.get('pricingInfo',[]) if i.get('effectiveTime') and dt.datetime.fromisoformat(i['effectiveTime'].replace('Z','+00:00')) <= now]
