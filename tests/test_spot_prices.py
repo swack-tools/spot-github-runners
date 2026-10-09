@@ -24,6 +24,7 @@ class SpotPriceTests(unittest.TestCase):
         billing = {'skus': [sku('Core'), sku('RAM')]}
         inventory = {'items': {'zones/us-test1-a': {'machineTypes': [
             {'name': 'e2-micro', 'guestCpus': 2, 'memoryMb': 1024, 'zone': 'us-test1-a'},
+            {'name': 'g1-small', 'guestCpus': 1, 'memoryMb': 1740, 'zone': 'us-test1-a'},
             {'name': 'e2-standard-4', 'guestCpus': 4, 'memoryMb': 16384, 'zone': 'us-test1-a'}]}}}
         responses = [io.BytesIO(json.dumps(value).encode()) for value in (billing, inventory)]
         def gcloud(argv, **kwargs):
@@ -33,7 +34,7 @@ class SpotPriceTests(unittest.TestCase):
             self.assertEqual(module['main'](), 0)
         rows = list(csv.DictReader(io.StringIO(output.getvalue())))
         self.assertEqual([row['machine_type'] for row in rows], ['e2-standard-4'])
-        self.assertIn('1 additional shapes lack supported', diagnostic.getvalue())
+        self.assertIn('2 additional shapes lack supported', diagnostic.getvalue())
         self.assertEqual(rows[0]['USD_day'], '480')
 
 

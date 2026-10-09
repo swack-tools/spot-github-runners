@@ -101,7 +101,7 @@ def main():
                 raise RuntimeError('inventory warning: '+str(warning))
             for m in scope.get('machineTypes',[]):
                 name=m['name']; zone=m['zone'].rsplit('/',1)[-1]; region=zone.rsplit('-',1)[0]
-                if name.endswith('-metal') or name.startswith(('ct','tpu','a','g')):
+                if name.endswith('-metal') or (name not in SHARED_CORE_SHAPES and name.startswith(('ct','tpu','a','g'))):
                     continue  # Accelerator shapes require separate device pricing.
                 key=(region,name,m['guestCpus'],m['memoryMb'])
                 shapes.setdefault(key,set()).add(zone)
