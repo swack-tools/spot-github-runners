@@ -16,6 +16,9 @@ import urllib.parse
 import urllib.request
 from decimal import Decimal
 
+# Reported vCPU counts do not represent dedicated billable cores for these shapes.
+SHARED_CORE_SHAPES = frozenset(('e2-micro', 'e2-small', 'e2-medium', 'f1-micro', 'g1-small'))
+
 
 def positive(value):
     number = float(value)
@@ -104,6 +107,9 @@ def main():
                 shapes.setdefault(key,set()).add(zone)
     rows=[]; missing=[]
     for (region,name,cpu,mb),zones in shapes.items():
+        if name in SHARED_CORE_SHAPES:
+            missing.append(region+'/'+name)
+            continue  # Dedicated CPU/RAM rates cannot price shared-core shapes.
         core=rates.get((region,name.split('-')[0],'core')); ram=rates.get((region,name.split('-')[0],'ram'))
         if core is None or ram is None:
             missing.append(region+'/'+name); continue

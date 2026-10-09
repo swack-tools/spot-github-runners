@@ -59,7 +59,8 @@ reserve capacity.
 
 Use `--results 20` to limit the output, `--project PROJECT_ID` to override the
 active project, or `--csv offers.csv` to save the displayed results. Machine types
-without supported catalog prices are omitted and counted in the diagnostics.
+without supported catalog prices, including shared-core shapes, are omitted and
+counted in the diagnostics.
 Authentication, incomplete inventories, and ambiguous prices fail the command.
 
 ## Prerequisites
