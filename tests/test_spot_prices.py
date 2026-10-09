@@ -88,6 +88,14 @@ class SpotPriceTests(unittest.TestCase):
                  ('r', 'm4ultramem224', 'core'): Decimal(2)}
         self.assertIsNone(module['component_rates']('r', 'm4-ultramem-224', rates))
 
+    def test_ambiguous_components_exclude_only_affected_offers(self):
+        rows, diagnostic = self.query([('Memory-optimized', 1), ('Memory-optimized', 2), ('E2', 1)], [
+            {'name': 'm1-ultramem-40', 'guestCpus': 40, 'memoryMb': 961 * 1024},
+            {'name': 'e2-standard-4', 'guestCpus': 4, 'memoryMb': 16384}])
+        self.assertEqual([r['machine_type'] for r in rows], ['e2-standard-4'])
+        self.assertIn('2 catalog components have conflicting prices', diagnostic)
+        self.assertIn('1 additional shapes lack supported', diagnostic)
+
 
 if __name__ == '__main__':
     unittest.main()

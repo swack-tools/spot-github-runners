@@ -61,7 +61,8 @@ Use `--results 20` to limit the output, `--project PROJECT_ID` to override the
 active project, or `--csv offers.csv` to save the displayed results. Machine types
 without supported catalog prices, including shared-core shapes, are omitted and
 counted in the diagnostics.
-Authentication, incomplete inventories, and ambiguous prices fail the command.
+Conflicting catalog prices are omitted and reported as unsupported.
+Authentication failures and incomplete inventories fail the command.
 M2 prices apply to an evaluation period; check the machine series requirements
 before launching it.
 

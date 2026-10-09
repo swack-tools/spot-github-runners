@@ -17,6 +17,7 @@ import urllib.request
 from decimal import Decimal
 
 # Reported vCPU counts do not represent dedicated billable cores for these shapes.
+AMBIGUOUS_PRICE = object()
 SHARED_CORE_SHAPES = frozenset(('e2-micro', 'e2-small', 'e2-medium', 'f1-micro', 'g1-small'))
 
 
@@ -50,6 +51,8 @@ def component_rates(region, name, rates):
                 ''.join(part for part in parts if not part.isdigit()), parts[0]]
     for key in dict.fromkeys(keys):
         core, ram = rates.get((region, key, 'core')), rates.get((region, key, 'ram'))
+        if core is AMBIGUOUS_PRICE or ram is AMBIGUOUS_PRICE:
+            return None
         if core is not None or ram is not None:
             return (core, ram) if core is not None and ram is not None else None
     return None
@@ -122,8 +125,12 @@ def main():
             for region in sku.get('serviceRegions',[]):
                 key=(region,*component)
                 if key in rates and rates[key] != amount:
-                    raise RuntimeError('ambiguous catalog rates for '+str(key))
-                rates[key]=amount
+                    rates[key]=AMBIGUOUS_PRICE
+                else:
+                    rates[key]=amount
+    ambiguous_count=sum(value is AMBIGUOUS_PRICE for value in rates.values())
+    if ambiguous_count:
+        print(f'{ambiguous_count} catalog components have conflicting prices; affected offers are unsupported.',file=sys.stderr,flush=True)
     print('Reading machine types in all zones...',file=sys.stderr,flush=True)
     shapes = {}
     url='https://compute.googleapis.com/compute/v1/projects/'+urllib.parse.quote(project,safe='')+'/aggregated/machineTypes'
