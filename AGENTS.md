@@ -69,7 +69,7 @@ This repository provisions and operates persistent GitHub Actions runners and de
 | `src/spot_finder.py` | Find candidate Spot VM offers with deployment constraints | No |
 | `src/runner_fleet.py` | Inspect GitHub runner registrations and GCP VM fleet state | No |
 | `src/spot_runner_manager.py` | Preview or provision Spot runner hosts and strict heavy pools (`--heavy-runner-pool`) | Only with `--apply` |
-| `src/spot_runner_autoscaler.py` | Plan or manage runner capacity (`tiered`, `resource`, or `legacy` mode) or install the macOS LaunchAgent | Yes, except a tiered `--dry-run` (leaves provider resources and controller state unchanged) |
+| `src/spot_runner_autoscaler.py` | Plan or manage runner capacity (`tiered`, `resource`, or `legacy` mode) or install the macOS LaunchAgent | Yes, except a tiered `--dry-run` without `--install-launch-agent` (leaves provider resources and controller state unchanged; `--install-launch-agent` writes and bootstraps the LaunchAgent before the dry-run check) |
 | `src/render_builder_startup.py` | Validate configuration and approved uploader identity, then render `startup.sh`, `cloud-config.yaml`, `cargo-remote-env.toml`, and `launch-command.sh` | Writes local output directory; running `launch-command.sh` creates a billable VM |
 | `src/remote_rust_build.py` | Snapshot source, transfer, compile, verify checksums, and record evidence on a selected legacy host | Transfers source and starts a remote build |
 | `src/install_remote_commands.py` | Install `cargo-oxidex-remote` and `cargo-oxidex-auto` shims into `~/.cargo/bin` | Writes local executable shims |
@@ -109,7 +109,7 @@ Several modules embed or load canonical scripts and Dockerfiles that are tested 
 
 ## Operational safety and infrastructure guardrails
 
-- **No unauthorized cloud or live-fleet mutations**: a prompt to edit code or documentation does not authorize creating, modifying, draining, restarting, or deleting GCP VMs, persistent disks, GitHub runner registrations, or the local macOS LaunchAgent (`com.swacktools.spot-runner-autoscaler`). Always use read-only commands or `--dry-run` previews unless the user explicitly authorizes a live operational action.
+- **No unauthorized cloud or live-fleet mutations**: a prompt to edit code or documentation does not authorize creating, modifying, draining, restarting, or deleting GCP VMs, persistent disks, GitHub runner registrations, or the local macOS LaunchAgent (`com.swacktools.spot-runner-autoscaler`). Always use read-only commands or `--dry-run` previews without `--install-launch-agent` (since `--install-launch-agent` writes and bootstraps the live daemon before the dry-run branch executes) unless the user explicitly authorizes a live operational action.
 - **Keep runner and dedicated-builder lifecycles separate**:
   - Runner hosts (`oxidex-runners-*`) register GitHub Actions listeners (controller-managed hosts use runner group ID 10 for `swack-tools/oxidex`) and use auto-deleting data disks. Registered listener counts do not equal concurrent memory capacity; `host_admission.py` reserves memory before a job starts.
   - Dedicated builders (`builder-*`) fix the shape to `n4-highcpu-16` (16 vCPU, 32 GiB RAM), register zero GitHub runners, run builds inside one unprivileged UID/GID 1001 container capped at 16 CPUs and 28 GiB with no extra swap, and attach a persistent cache disk with `auto-delete=no`. Deleting a builder VM does not delete its cache disk.
@@ -148,10 +148,11 @@ A human task prompt authorizes agents to work on an isolated feature branch, com
 ### Branch, identity, and account setup
 
 - Develop on a dedicated branch or isolated Git worktree based on the latest `origin/main`. Never commit or push directly to `main`.
-- Ensure commits are authored and SSH-signed as `swackhamer` (`user.name=swackhamer`, `user.email=swackhamer@users.noreply.github.com`, `commit.gpgsign=true`). Verify signatures with `git log -n 1 --show-signature`.
-- When multiple GitHub command-line tool accounts are logged in on the workstation, select the `swackhamer` token explicitly for `swack-tools/spot-github-runners` operations:
+- Ensure commits are authored and SSH-signed as `swackhamer` (`user.name=swackhamer`, `user.email=swackhamer@users.noreply.github.com`, `commit.gpgsign=true`). Verify local commit signature headers (`git cat-file commit HEAD` or `git -c gpg.ssh.allowedSignersFile=... log -n 1 --show-signature`) and verify GitHub's verification status on the actual pushed pull request commits (`gh api repos/swack-tools/spot-github-runners/commits/<sha> --jq '.commit.verification'`). A synthetic unsigned commit created inside an ephemeral review sandbox (for example `Codex <codex@openai.com>`) does not establish the published pull request commit's author or signature status.
+- When multiple GitHub command-line tool accounts are logged in on the workstation, export the `swackhamer` token for the shell session or prefix every `gh` command (including `gh pr create`, `gh pr view`, `gh pr comment`, `gh pr checks`, and `gh pr merge`) so no operation falls back to another stored account:
   ```bash
-  GH_TOKEN="$(gh auth token --user swackhamer)" gh pr status --repo swack-tools/spot-github-runners
+  export GH_TOKEN="$(gh auth token --user swackhamer)"
+  gh pr status --repo swack-tools/spot-github-runners
   ```
 - Stage task files by explicit path (`git add <path>`) so scratch files, local `.vale/styles/`, and unrelated edits are never committed.
 
@@ -167,4 +168,8 @@ A human task prompt authorizes agents to work on an isolated feature branch, com
    - After resolving review comments, comment `@codex rereview` (or `@codex review` if required by the connector trigger) on the pull request and wait for the updated review on the new head commit.
    - Repeat this resolve-and-rerequest cycle until Codex reports no remaining issues (gives the go-ahead / `gtg` or 👍 reaction on the current head commit), all review threads are resolved, and required GitHub checks (such as CodeQL) pass.
 3. **Squash and merge**:
-   - Confirm that `origin/main` has not advanced in a conflicting way and that the reviewed head commit matches the pull request head, then squash-merge the pull request into `main` (`gh pr merge --squash --delete-branch`).
+   - Confirm that `origin/main` has not advanced in a conflicting way and that the reviewed head commit matches the pull request head, then squash-merge the pull request into `main` while pinning the reviewed head commit so the review and CI gate cannot be raced:
+     ```bash
+     GH_TOKEN="$(gh auth token --user swackhamer)" gh pr merge --repo swack-tools/spot-github-runners \
+       --squash --delete-branch --match-head-commit "$REVIEWED_HEAD_SHA"
+     ```
