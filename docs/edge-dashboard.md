@@ -336,7 +336,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `oxidex-runners-` (runner hosts) or `builder-` (dedicated builders). Control VMs and other VMs aren't
   listed. The control VM's service account needs `compute.instances.list` and
   `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
-  they show `pd-balanced`.
+  they show `pd-balanced`. Once a disk listing has succeeded, a failed one fails the whole refresh, so
+  known disk types are never replaced by the default.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
   `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted. When a VM starts
@@ -354,7 +355,10 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
-  inactive skips the listing and keeps the records the active slot last published. A listing that
+  inactive makes no Compute Engine calls and keeps the records the active slot last published.
+- The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
+  already existed, so they don't mark OOM events handled. Only later growth in runner slots or builder
+  VMs does. A listing that
   changes nothing writes nothing, so a quiet fleet doesn't publish a new snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
   empty and the instances tab says that the inventory isn't configured.
@@ -363,7 +367,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   such as `oxidex-runners-dallas-01`, and records that the old in-dashboard actions invented.
 - The delete and regional scale controls, `POST /api/instances/delete` and
   `POST /api/instances/scale-region`, are plans only. They check the request against budgets and caps
-  and report what would launch or retire. They don't change the instance list or any VM. The autoscaler
+  and report what would launch or retire. The budget projection includes the disks of stopped VMs. They don't change the instance list or any VM. The autoscaler
   (`src/spot_runner_autoscaler.py`) drains and retires runner hosts, `src/spot_runner_manager.py`
   provisions them, and `src/render_builder_startup.py` renders a dedicated builder.
 

@@ -4011,8 +4011,10 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.fleet: list[dict] = []
         from lib.dashboard_server import DashboardStore
 
-        self.store = DashboardStore(state_path=self.state_file, fleet_source=lambda: list(self.fleet))
+        self.store = DashboardStore(state_path=self.state_file)
         self.store.start()
+        # Set after start() so no background inventory loop races the explicit refreshes below.
+        self.store.fleet_source = lambda: list(self.fleet)
         self.addCleanup(self.store.close)
 
     def _record(self, name: str) -> dict:
@@ -4042,12 +4044,10 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertFalse(self.store.refresh_fleet_inventory())
         self.assertEqual(self.store.state_version(), version_before + 1)
         status = self.store.fleet_inventory_status()
-        self.assertEqual(status["source"], "gce")
         self.assertEqual(status["observed_count"], 1)
         self.assertEqual(status["last_error"], "")
         view = self.store.query_instances(include_deleted=False)
         self.assertEqual([r["name"] for r in view["instances"]], ["oxidex-runners-us-south1-a-1"])
-        self.assertEqual(view["fleet_inventory"]["source"], "gce")
 
     def test_unknown_utilization_never_reads_as_idle(self):
         self.fleet = [fleet_observation(f"12{i}", f"oxidex-runners-idle-{i}", "us-south1-a", runners_count=4,
@@ -4270,10 +4270,63 @@ class FleetInventoryReconcileTests(unittest.TestCase):
 
     def test_frozen_store_skips_reconcile(self):
         self.fleet = [fleet_observation("1007", "oxidex-runners-frozen-1", "us-south1-a", now=self.now)]
+        source = unittest.mock.Mock(side_effect=lambda: list(self.fleet))
+        self.store.fleet_source = source
         self.store.frozen = True
         self.assertFalse(self.store.refresh_fleet_inventory())
+        # Ineligible slots never call Compute Engine.
+        source.assert_not_called()
         self.assertEqual(self.store.state["instances"], [])
         self.assertIn("frozen", self.store.fleet_inventory_status()["last_error"])
+
+    def test_inventory_status_reports_source(self):
+        from lib.dashboard_server import DashboardStore
+
+        self.assertEqual(DashboardStore(fleet_source=lambda: []).fleet_inventory_status()["source"], "gce")
+        self.assertEqual(DashboardStore().fleet_inventory_status()["source"], "none")
+
+    def test_first_listing_is_a_baseline_not_growth(self):
+        from lib.dashboard_server import FLEET_BASELINE_STATE_KEY
+
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-b1", "instance_name": "builder-oxidex-a", "role": "rust_builder"}]
+        self.fleet = [fleet_observation("1900", "builder-oxidex-a", "us-south1-b", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state.get(FLEET_BASELINE_STATE_KEY))
+        event = self.store.state["scaling_telemetry"]["journal_oom_events"][0]
+        self.assertFalse(event.get("handled", False))
+        self.fleet.append(fleet_observation("1901", "builder-oxidex-b", "us-south1-b", now=self.now))
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
+
+    def test_empty_first_listing_still_records_baseline(self):
+        from lib.dashboard_server import FLEET_BASELINE_STATE_KEY
+
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state.get(FLEET_BASELINE_STATE_KEY))
+        version = self.store.state_version()
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self.store.state_version(), version)
+
+    def test_scale_plan_budget_counts_stopped_disks(self):
+        running = fleet_observation("2000", "oxidex-runners-run-1", "us-south1-a", machine_type="n4-standard-16",
+                                    now=self.now)
+        stopped = fleet_observation("2001", "oxidex-runners-stop-1", "us-south1-b", status="TERMINATED",
+                                    started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)
+        payload = {"region": "us-south1", "role": "cicd_runner", "target_instances": 2}
+        self.store.update_budget({"target": "cicd_runner", "max_hourly_usd": 5.0, "max_daily_usd": 100.0,
+                                  "max_monthly_usd": 3000.0})
+        self.fleet = [running]
+        self.store.refresh_fleet_inventory()
+        without_stopped = self.store.scale_region_instances(payload)["projected_fleet_hourly_usd"]
+        self.fleet = [running, stopped]
+        self.store.refresh_fleet_inventory()
+        with_stopped = self.store.scale_region_instances(payload)["projected_fleet_hourly_usd"]
+        pricing = self._record("oxidex-runners-stop-1")["pricing"]
+        disk_all_in = pricing["disk_hourly_usd"] * (1 + pricing["tax_rate_percent"] / 100.0)
+        self.assertGreater(without_stopped, 0.0)
+        self.assertAlmostEqual(with_stopped - without_stopped, disk_all_in, delta=0.0002)
 
     def test_seed_and_fabricated_records_are_dropped_on_load(self):
         from lib.dashboard_server import DashboardStore
@@ -4372,6 +4425,38 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                 unittest.mock.patch.object(compute_api, "list_instances", partial):
             with self.assertRaisesRegex(RuntimeError, "zones unreachable"):
                 gce_fleet_source("p")()
+
+    def test_gce_fleet_source_keeps_inventory_on_transient_disk_failure(self):
+        from lib import compute_api
+        from lib.fleet_inventory import gce_fleet_source
+
+        async def listing(api, project, *, instance_fields=compute_api.INSTANCE_LIST_FIELDS):
+            return [{"id": "1", "name": "builder-oxidex-x", "zone": "zones/us-south1-a", "status": "RUNNING",
+                     "machineType": "machineTypes/n4-highcpu-16",
+                     "disks": [{"boot": True, "diskSizeGb": "40", "source": "d/boot"}]}], []
+
+        async def capacity(api, project, zone, machine_type):
+            return {"vcpu": 16, "ram_gib": 32.0}
+
+        disk_results = [RuntimeError("HTTP 403"), {"d/boot": "hyperdisk-balanced"}, RuntimeError("HTTP 503")]
+
+        async def disks(api, project):
+            result = disk_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with unittest.mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("t", "p")), \
+                unittest.mock.patch.object(compute_api, "list_instances", listing), \
+                unittest.mock.patch.object(compute_api, "machine_type_capacity", capacity), \
+                unittest.mock.patch.object(compute_api, "list_disk_types", disks):
+            source = gce_fleet_source("p")
+            # Disk listing never worked yet (for example no permission): default disk type.
+            self.assertEqual(source()[0]["boot_disk_type"], "pd-balanced")
+            self.assertEqual(source()[0]["boot_disk_type"], "hyperdisk-balanced")
+            # It worked before, so a failure is transient: the listing fails rather than reporting defaults.
+            with self.assertRaisesRegex(RuntimeError, "disk listing failed"):
+                source()
 
     def test_lifecycle_endpoints_are_plan_only_in_the_ui(self):
         from lib.dashboard_ui_assets import DASHBOARD_HTML

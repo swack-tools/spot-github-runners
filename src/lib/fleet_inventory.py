@@ -162,6 +162,7 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
     It raises when any zone is unreachable: a partial listing must never make a VM look deleted.
     """
     shape_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    disk_listing = {"ok_before": False}
 
     def source() -> list[dict[str, Any]]:
         import asyncio
@@ -180,7 +181,12 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                                and str(i.get("name", "")).startswith(FLEET_NAME_PREFIXES)]
                 try:
                     disk_types = await compute_api.list_disk_types(api, auth.project) if fleet_items else {}
-                except Exception:  # noqa: BLE001 - unknown disk types fall back to the default type
+                    disk_listing["ok_before"] = True
+                except Exception as exc:
+                    if disk_listing["ok_before"]:
+                        # Transient: fail the whole listing so known disk types are not replaced by defaults.
+                        raise RuntimeError(f"disk listing failed: {type(exc).__name__}: {exc}") from exc
+                    # Never worked (for example no compute.disks.list): disk types fall back to the default.
                     disk_types = {}
                 wanted = {(str(i.get("zone", "")).rsplit("/", 1)[-1], str(i.get("machineType", "")).rsplit("/", 1)[-1])
                           for i in fleet_items}

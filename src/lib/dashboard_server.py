@@ -376,6 +376,8 @@ def _build_instance_record(
 INSTANCE_SOURCE_KEY = "inventory_source"
 INSTANCE_SOURCE_GCE = "gce"
 FLEET_INVENTORY_INTERVAL_SECONDS = 120.0
+# When the first successful inventory listing was applied (the baseline later growth is measured against).
+FLEET_BASELINE_STATE_KEY = "fleet_inventory_baseline_at"
 # Deleted VMs stay in the history this long (the longest cost window the dashboard offers is 30 days).
 DELETED_INSTANCE_RETENTION_SECONDS = 31 * 86_400.0
 MAX_INSTANCE_RECORDS = 400
@@ -465,6 +467,12 @@ def instance_cost_usd(pricing: dict[str, Any], compute_hours: float, disk_hours:
     compute_all_in = max(0.0, total_hourly - disk_all_in)
     return (round(compute_hours * compute_all_in + disk_hours * disk_all_in, 2),
             round(compute_hours * compute_hourly, 2))
+
+
+def _stopped_disk_hourly(pricing: dict[str, Any], *, include_tax: bool = True) -> float:
+    """Hourly USD a stopped VM still bills for its attached disks."""
+    disk = float(pricing.get("disk_hourly_usd", 0.0) or 0.0)
+    return disk * (1.0 + float(pricing.get("tax_rate_percent", 0.0) or 0.0) / 100.0) if include_tax else disk
 
 
 def _live_instance_record(
@@ -1572,6 +1580,15 @@ class DashboardStore:
         with self._lock:
             self._fleet_status["last_attempt_at"] = _iso_epoch(now)
         try:
+            # Check eligibility before listing, so a frozen, unreconciled, or inactive slot makes no cloud calls.
+            self._mutation_preflight()
+            with self._lock:
+                self._mutation_locked_checks()
+        except DashboardFrozenError as exc:
+            with self._lock:
+                self._fleet_status["last_error"] = f"skipped: {exc}"
+            return False
+        try:
             observed = list(self.fleet_source())
         except Exception as exc:  # noqa: BLE001 - keep the last known records; report the failure
             with self._lock:
@@ -1582,20 +1599,28 @@ class DashboardStore:
         def apply() -> tuple[int, Any]:
             records, changed = reconcile_instance_records(
                 self.state.get("instances", []), observed, project=self.project, now=self._clock())
-            if not changed:
+            # The first successful listing (after an upgrade, a migration, or enabling the inventory) is the
+            # baseline: the fleet it finds already existed, so it is not growth that handles an OOM event.
+            baselined = bool(self.state.get(FLEET_BASELINE_STATE_KEY))
+            if not changed and baselined:
                 return 200, {"changed": False}
             previous_instances = self.state.get("instances", [])
             previous_telemetry = copy.deepcopy(self.state.get("scaling_telemetry", {}))
             self.state["instances"] = records
             try:
-                self._consume_ooms_for_fleet_growth(previous_instances, records)
+                if baselined:
+                    self._consume_ooms_for_fleet_growth(previous_instances, records)
+                else:
+                    self.state[FLEET_BASELINE_STATE_KEY] = _iso_epoch(self._clock())
                 self._sync_fleet_telemetry()
                 self._persist()
             except Exception:
                 self.state["instances"] = previous_instances
                 self.state["scaling_telemetry"] = previous_telemetry
+                if not baselined:
+                    self.state.pop(FLEET_BASELINE_STATE_KEY, None)
                 raise
-            return 200, {"changed": True}
+            return 200, {"changed": changed}
 
         try:
             _status, body, _replayed = self.run_request(None, "POST", "/internal/fleet-inventory", apply)
@@ -3246,8 +3271,7 @@ class DashboardStore:
             # A stopped inventory VM still bills its attached disks (with tax) until it is deleted.
             stopped_disk_burn = (
                 sum(
-                    float(r["pricing"].get("disk_hourly_usd", 0.0) or 0.0)
-                    * (1.0 + float(r["pricing"].get("tax_rate_percent", 0.0) or 0.0) / 100.0)
+                    _stopped_disk_hourly(r["pricing"])
                     for r in rows
                     if is_live_instance_record(r) and r["status"] not in ("RUNNING", "DELETED")
                 )
@@ -4400,6 +4424,7 @@ class DashboardStore:
             now_ts = time.time()
             would_retire: list[dict[str, Any]] = []
             new_records: list[dict[str, Any]] = []
+            projected_fleet_hourly = 0.0
             if target_count < current_count:
                 would_retire = running_in_region[target_count:]
             elif target_count > current_count:
@@ -4628,8 +4653,21 @@ class DashboardStore:
                     ),
                     4,
                 )
+                # Stopped inventory VMs bill no compute but keep billing their disks.
+                stopped_disk_hourly = (
+                    sum(
+                        _stopped_disk_hourly(i["pricing"], include_tax=include_tax)
+                        for i in instances
+                        if is_live_instance_record(i)
+                        and i["status"] not in ("RUNNING", "DELETED")
+                        and (i["role"] == role or (shared_global and i["role"] == other_role))
+                    )
+                    if include_disk
+                    else 0.0
+                )
                 projected_fleet_hourly = round(
                     other_role_hourly
+                    + stopped_disk_hourly
                     + sum(
                         self._instance_hourly_for_budget(
                             i["pricing"], include_disk=include_disk, include_tax=include_tax
@@ -4668,6 +4706,8 @@ class DashboardStore:
                     for rec in new_records
                 ],
                 "would_retire": [i.get("name") for i in would_retire],
+                # Budget projection of a scale-up (0 otherwise), including stopped VMs' disks when configured.
+                "projected_fleet_hourly_usd": projected_fleet_hourly,
                 "planned_instances": planned_running,
                 "message": LIFECYCLE_ACTIONS_DISABLED_MESSAGE,
             }
