@@ -236,8 +236,10 @@ operation. See [Fleet and autoscaler](fleet-and-autoscaler.md) for the policies.
 
 - **Effect.** Without `--dry-run`, the controller creates, drains, rotates, and
   deletes VMs and runner registrations, and reruns eligible crashed jobs.
-- **Dry run.** `--dry-run` prints one JSON tier plan and changes no provider
-  resource or controller state. It evaluates the tier policy whatever
+- **Dry run.** `--dry-run` prints one JSON tier plan and changes no VM, disk,
+  runner registration, or controller state. It reads host evidence with
+  `gcloud compute ssh`, which can add your SSH key to project or instance
+  metadata, or to your OS Login profile, on the first connection. It evaluates the tier policy whatever
   `--scaling-mode` says. It still creates the log file, the state directory, and
   the state lock file on your machine.
 - **LaunchAgent.** `--install-launch-agent` writes

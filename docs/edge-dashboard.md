@@ -24,13 +24,13 @@ The dashboard listens only on `127.0.0.1:8787`. The control VM has no inbound fi
 The dashboard uses a GitHub OAuth 2.0 app with the authorization-code flow and PKCE. Sign-in succeeds only
 when all of these are true:
 
-- The user is the owner, GitHub login `swackhamer` with numeric user ID `619624`, or an administrator
+- The user is the owner, GitHub login `swackhamer` with the numeric user ID fixed in code, or an administrator
   that the owner added. Added administrators are matched by numeric user ID only, so a renamed
   account keeps access and a new account that takes an old login gets none. See
   [Dashboard administrators](#dashboard-administrators).
 - The user is a global administrator, or has administrator permission on every controlled target.
   `DASHBOARD_GLOBAL_ADMINS` lists global administrators as `login:numeric_id` entries and defaults to
-  `swackhamer:619624`, which is also the only identity it may list. While it lists the owner, added
+  the owner's `login:numeric_id` entry, which is also the only identity it may list. While it lists the owner, added
   administrators are global administrators too. A global administrator skips the per-target checks, and
   those skipped checks are never recorded in its session, so setting `none` takes effect for existing
   sessions too. On a managed control VM it travels as the `dashboard-global-admins` metadata, like the

@@ -8,8 +8,10 @@ and which guards protect running jobs.
 
 !!! warning "Live operations"
     Only `src/runner_fleet.py` and a tiered `--dry-run` without
-    `--install-launch-agent` leave provider resources and controller state
-    unchanged. Every other controller run can create, drain, or delete VMs and
+    `--install-launch-agent` leave VMs, disks, runner registrations, and controller
+    state unchanged. A tiered dry run still connects with `gcloud compute ssh`,
+    which can add your SSH key to project or instance metadata, or to your OS
+    Login profile. Every other controller run can create, drain, or delete VMs and
     runner registrations. Read [Dry run, once, and the state lock](#dry-run-once-and-the-state-lock)
     before you run the controller.
 

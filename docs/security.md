@@ -218,7 +218,7 @@ The Worker and the dashboard split the work:
 - **Worker:** the Worker only authenticates the cookie. It checks the signature, the expiry, the bulk
   sign-out cut-off, and the identity fields.
 - **Dashboard:** the dashboard authorizes every request from its durable state. Only the owner, GitHub user
-  `swackhamer` with ID `619624`, and the administrators that the owner added may sign in. Added
+  `swackhamer`, matched by login and numeric ID, and the administrators that the owner added may sign in. Added
   administrators are matched by numeric user ID. By default (`DASHBOARD_GLOBAL_ADMINS` unset), the per-target checks
   don't apply to the owner or to added administrators. Set `DASHBOARD_GLOBAL_ADMINS=none` to require every user to
   administer every controlled target. If the dashboard can't list the config repository, sign-in fails

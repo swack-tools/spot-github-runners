@@ -142,7 +142,9 @@ python3 src/spot_runner_autoscaler.py \
   --dry-run --once
 ```
 
-A tiered `--dry-run` leaves provider resources and controller state unchanged. Don't add
+A tiered `--dry-run` leaves VMs, disks, runner registrations, and controller state unchanged. It reads
+host evidence with `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or
+to your OS Login profile, the first time it connects. Don't add
 `--install-launch-agent` to a preview: that option writes and starts the macOS LaunchAgent before the dry-run
 check runs. See [Fleet and autoscaler](fleet-and-autoscaler.md#run-as-a-macos-launchagent).
 
