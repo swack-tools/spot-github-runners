@@ -53,7 +53,7 @@ python3 src/spot_finder.py \
 - The defaults are `--min-vcpu 32`, `--min-ram 128`, and `--top 10`. `--min-ram` accepts a number with an
   optional `GB` or `GiB` suffix.
 - Each row shows the hourly, daily, and monthly price (730 hours), the runner count, the vCPUs per runner, and
-  the cost per runner. By default a host gets one runner for every 4 vCPUs, so a 32 vCPU host has 8 runners. Set
+  the cost per runner. By default a host gets one runner for every 4 whole vCPUs, so a 32 vCPU host has 8 runners. A host below 4 vCPUs or with at most 8 GiB of RAM gets one runner, as the manager assigns. Set
   `--runners` to change that count. The cost per runner is the host's total price divided by the runner count,
   so the daily figure for a 32 vCPU host is one eighth of its daily price by default.
 - The finder prints a discount alert for each offer that is at least 95 percent below the on-demand price. It

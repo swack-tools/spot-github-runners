@@ -97,6 +97,19 @@ class SpotDiscoveryTests(unittest.TestCase):
         self.assertEqual(spot_finder.per_runner_usd(24.0, offer, 0), 0.0)
         self.assertEqual(spot_finder.vcpu_per_runner(offer, 0), 0.0)
 
+    def test_small_hosts_default_to_one_whole_runner(self):
+        for vcpu, ram in ((2, 8.0), (2, 16.0), (8, 8.0), (6, 24.0)):
+            offer = Offer('us-west4', f'shape-{vcpu}', vcpu, ram, 1.0)
+            expected = 1.0 if vcpu < 4 or ram <= 8 else float(vcpu // 4)
+            self.assertEqual(spot_finder.runner_count(offer, None), expected)
+            self.assertLessEqual(spot_finder.per_runner_usd(24.0, offer, None), 24.0)
+        offer = Offer('us-west4', 'e2-standard-2', 2, 8.0, 1.0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            spot_finder.print_offer(offer)
+        self.assertIn('1 runners, 2 vCPU/runner', out.getvalue())
+        self.assertIn('$24.0000/runner/day', out.getvalue())
+
     def test_capacity_history_waits_out_repeated_resource_not_ready(self):
         api = AsyncMock()
         api.post_json.side_effect = [RuntimeError('HTTP 400 resourceNotReady')] * 4 + [

@@ -208,7 +208,15 @@ async def find(auth: Auth, min_vcpu: int, min_ram: float, top: int | None,
 
 
 def runner_count(offer: Offer, runners: int | None) -> float:
-    return float(runners) if runners is not None else offer.vcpu / 4
+    """Runners on the host: ``runners`` when given, else the manager's default of one per 4 whole vCPUs.
+
+    Like ``runner_manager``, a host below 4 vCPUs or with at most 8 GiB of RAM gets exactly one runner.
+    """
+    if runners is not None:
+        return float(runners)
+    if offer.vcpu < 4 or offer.ram_gib <= 8:
+        return 1.0
+    return float(int(offer.vcpu // 4))
 
 
 def vcpu_per_runner(offer: Offer, runners: int | None) -> float:
