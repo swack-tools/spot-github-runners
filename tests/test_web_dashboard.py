@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -4713,6 +4714,7 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
     def _seeded_raw_state(self) -> dict:
         """The persisted state with the old seeds plus one real record of each kind."""
         raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+        raw.pop("demo_telemetry_migration")  # written by a version that still seeded demo telemetry
         seeds = seeded_demo_telemetry()
         telem = seeds["scaling_telemetry"]
         telem["github_oom_runs"].append({
@@ -4758,7 +4760,9 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         # A real run that reuses an old seed's run id is kept as reported, not rewritten into the seed.
         real_run = reloaded.state["scaling_telemetry"]["github_oom_runs"][0]
         self.assertEqual((real_run["run_id"], real_run["job_id"]), (38601924810, 1))
-        self._assert_seeds_dropped(json.loads(self.state_file.read_text(encoding="utf-8")))
+        on_disk = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self._assert_seeds_dropped(on_disk)
+        self.assertEqual(on_disk["demo_telemetry_migration"], 1)
 
     def test_seeded_telemetry_is_dropped_from_kv_snapshot_and_import(self):
         from lib.edge_state import build_snapshot
@@ -4778,6 +4782,22 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         ]}}
         self.assertEqual(drop_seeded_demo_telemetry(state), 2)
         self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [])
+
+    def test_migrated_state_keeps_reported_telemetry_that_matches_a_seed(self):
+        from lib.dashboard_server import DashboardStore
+        from lib.edge_state import build_snapshot
+
+        counters = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
+        self.store.update_scaling({"telemetry": dict(counters)})
+        self.store.record_rust_build(dict(seeded_demo_telemetry()["rust_builds"][0]))
+        reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        for state in (reloaded.state, json.loads(self.state_file.read_text(encoding="utf-8"))):
+            self.assertEqual({k: state["scaling_telemetry"][k] for k in counters}, counters)
+            self.assertEqual([b["build_id"] for b in state["rust_builds"]], ["rb-20261015-001"])
+        reloaded.import_snapshot(build_snapshot(copy.deepcopy(reloaded.state), reloaded.state_version() + 1, "a"))
+        self.assertEqual({k: reloaded.state["scaling_telemetry"][k] for k in counters}, counters)
+        self.assertEqual(len(reloaded.state["rust_builds"]), 1)
 
     def test_reported_job_counters_are_kept(self):
         from lib.dashboard_server import drop_seeded_demo_telemetry

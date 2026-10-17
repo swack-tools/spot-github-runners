@@ -394,9 +394,12 @@ LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
 # -- seeded demo telemetry ------------------------------------------------------------------------------------
 #
 # Earlier versions seeded demo Rust builds, GitHub CI failure runs, a journal OOM event, and job counters into the
-# default state, which then persisted to the state file and the Cloudflare KV snapshot and showed as real. Every
-# load drops these exact records (matched by id, across all seeded versions) and resets the counters when they
-# still hold the seeded values.
+# default state, which then persisted to the state file and the Cloudflare KV snapshot and showed as real. Loading
+# a state without the migration marker (one written by such a version) drops these exact records (matched by id,
+# across all seeded versions) and resets the counters when they still hold the seeded values. The default state
+# carries the marker, so later loads never touch telemetry reported after the migration.
+DEMO_TELEMETRY_MIGRATION_KEY = "demo_telemetry_migration"
+DEMO_TELEMETRY_MIGRATION_VERSION = 1
 SEEDED_RUST_BUILD_IDS = frozenset({f"rb-20261015-00{n}" for n in range(1, 6)})
 SEEDED_GITHUB_CI_RUN_IDS = frozenset({
     "gh-oom-37192272062",
@@ -939,6 +942,8 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         "dashboard_admins": [],
         # Bounded audit history of added-administrator changes.
         "dashboard_admins_history": [],
+        # Fresh states hold no seeded demo telemetry; see drop_seeded_demo_telemetry.
+        DEMO_TELEMETRY_MIGRATION_KEY: DEMO_TELEMETRY_MIGRATION_VERSION,
     }
 
 
@@ -1345,7 +1350,11 @@ class DashboardStore:
                 LOG.warning("Dropped %d dashboard instance record(s) that did not come from the live inventory",
                             len(instances) - len(kept))
             base["instances"] = kept
-        dropped_seeds = drop_seeded_demo_telemetry(base)
+        dropped_seeds = 0
+        if loaded.get(DEMO_TELEMETRY_MIGRATION_KEY) != DEMO_TELEMETRY_MIGRATION_VERSION:
+            # A state written before the migration: drop its seeds once (base already carries the marker).
+            dropped_seeds = drop_seeded_demo_telemetry(base)
+            base[DEMO_TELEMETRY_MIGRATION_KEY] = DEMO_TELEMETRY_MIGRATION_VERSION
         if dropped_seeds:
             LOG.warning("Dropped %d seeded demo telemetry record(s) and counter(s) from the dashboard state",
                         dropped_seeds)

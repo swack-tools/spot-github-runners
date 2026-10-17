@@ -379,14 +379,16 @@ GitHub CI failure runs, journal OOM events, or job counters.
 - Rust builds appear only after a caller records them with `POST /api/rust-builds`. GitHub CI failure
   runs, journal OOM events, and the job counters (`jobs_ran_past_hour`, `provisioned_jobs`, and
   `queued_jobs`) change only through `POST /api/scaling`. A new state starts every counter at 0.
-- On load, from the state file, a KV snapshot, or a handover import, the dashboard drops the demo
-  records that earlier versions seeded and logs how many it dropped. It matches the exact seeded IDs:
+- When the dashboard loads a state that an earlier version wrote, from the state file, a KV snapshot, or
+  a handover import, it drops the demo records that version seeded and logs how many it dropped. It
+  then marks the state with `demo_telemetry_migration`, so this runs once and later loads keep every
+  reported record and counter. It matches the exact seeded IDs:
   - The Rust builds `rb-20261015-001` through `rb-20261015-005`, on `builder-oxidex-turin-01` and
     `builder-oxidex-eu-01`.
   - The GitHub CI runs `gh-oom-37192272062`, `gh-oom-37192994059`, and `gh-timeout-38596411473`, and
     the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`.
   - The journal OOM event `oom-journal-01` on `oxidex-runners-dallas-01`.
-- The load also resets the job counters to 0 when all three still hold the seeded values, 14 jobs in the
+- The migration also resets the job counters to 0 when all three still hold the seeded values, 14 jobs in the
   past hour, 7 provisioned, and 3 queued. Any other combination stays as reported.
 - A reported record that only shares a run ID with a seed stays as reported.
 
