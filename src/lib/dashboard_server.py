@@ -391,6 +391,53 @@ LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
 )
 
 
+# -- seeded demo telemetry ------------------------------------------------------------------------------------
+#
+# Earlier versions seeded demo Rust builds, GitHub CI failure runs, a journal OOM event, and job counters into the
+# default state, which then persisted to the state file and the Cloudflare KV snapshot and showed as real. Every
+# load drops these exact records (matched by id, across all seeded versions) and resets the counters when they
+# still hold the seeded values.
+SEEDED_RUST_BUILD_IDS = frozenset({f"rb-20261015-00{n}" for n in range(1, 6)})
+SEEDED_GITHUB_CI_RUN_IDS = frozenset({
+    "gh-oom-37192272062",
+    "gh-oom-37192994059",
+    "gh-timeout-38596411473",
+    # Ids of the same seeds in older versions, before they were rewritten on load.
+    "gh-oom-38596411473",
+    "gh-oom-38601924810",
+})
+SEEDED_JOURNAL_OOM_EVENTS = frozenset({("oom-journal-01", "oxidex-runners-dallas-01")})
+SEEDED_JOB_COUNTERS = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
+
+
+def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
+    """Remove seeded demo telemetry from ``state`` in place; returns how many records or counters it dropped."""
+    dropped = 0
+    builds = state.get("rust_builds")
+    if isinstance(builds, list):
+        kept = [b for b in builds if not (isinstance(b, dict) and b.get("build_id") in SEEDED_RUST_BUILD_IDS)]
+        dropped += len(builds) - len(kept)
+        state["rust_builds"] = kept
+    telem = state.get("scaling_telemetry")
+    if not isinstance(telem, dict):
+        return dropped
+    for key, is_seed in (
+        ("github_oom_runs", lambda r: r.get("id") in SEEDED_GITHUB_CI_RUN_IDS),
+        ("journal_oom_events", lambda e: (e.get("id"), e.get("instance_name")) in SEEDED_JOURNAL_OOM_EVENTS),
+        ("builder_journal_oom_events", lambda e: (e.get("id"), e.get("instance_name")) in SEEDED_JOURNAL_OOM_EVENTS),
+    ):
+        records = telem.get(key)
+        if isinstance(records, list):
+            kept = [r for r in records if not (isinstance(r, dict) and is_seed(r))]
+            dropped += len(records) - len(kept)
+            telem[key] = kept
+    if all(telem.get(k) == v and type(telem.get(k)) is int for k, v in SEEDED_JOB_COUNTERS.items()):
+        for key in SEEDED_JOB_COUNTERS:
+            telem[key] = 0
+        dropped += len(SEEDED_JOB_COUNTERS)
+    return dropped
+
+
 def _iso_epoch(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -846,222 +893,19 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
     # DashboardStore.refresh_fleet_inventory); the dashboard never invents VM records.
     instances: list[dict[str, Any]] = []
 
-    scaling_telemetry = {
-        "current_runners": 10,
-        "jobs_ran_past_hour": 14,
-        "provisioned_jobs": 7,
-        "queued_jobs": 3,
-        "instance_cpu_percentages": [64.0, 72.0, 58.0],
-        "journal_oom_events": [
-            {
-                "id": "oom-journal-01",
-                "instance_name": "oxidex-runners-dallas-01",
-                "zone": "us-south1-a",
-                "observed_at": _iso_seconds_ago(420, ref_now),
-                "pid": 18492,
-                "process": "rustc",
-                "constraint": "CONSTRAINT_MEMCG",
-                "journal_line": (
-                    "kernel: oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),"
-                    "cpuset=docker-8f4a21.scope,mems_allowed=0,oom_memcg=/system.slice/docker-8f4a21.scope,"
-                    "task_memcg=/system.slice/docker-8f4a21.scope,task=rustc,pid=18492,uid=1001"
-                ),
-            },
-        ],
-        "github_oom_runs": [
-            {
-                "id": "gh-oom-37192272062",
-                "repository": "swack-tools/oxidex",
-                "workflow_name": "CI",
-                "run_id": 37192272062,
-                "job_id": 111407847874,
-                "job_name": "Verify Generated Tables / catalog join",
-                "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-2",
-                "step_number": 8,
-                "line_number": 106,
-                "failed_at": "2026-10-04T09:39:54Z",
-                "error_excerpt": (
-                    "line 14: 15780 Killed python3 tools/exiftool-tables — "
-                    "##[error]Process completed with exit code 137."
-                ),
-                "failure_classification": "OOM",
-                "is_oom": True,
-                "is_self_hosted_runner": True,
-                "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
-                "deep_link": build_github_oom_deep_link(
-                    "swack-tools/oxidex", 37192272062, 111407847874, 8, 106
-                ),
-            },
-            {
-                "id": "gh-oom-37192994059",
-                "repository": "swack-tools/oxidex",
-                "workflow_name": "CI",
-                "run_id": 37192994059,
-                "job_id": 111409747367,
-                "job_name": "Verify Generated Tables / tools 5/8",
-                "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-5",
-                "step_number": 7,
-                "line_number": 77,
-                "failed_at": "2026-10-04T10:01:39Z",
-                "error_excerpt": (
-                    "test_committed_rules_and_ledger_equal_fresh_native_generation ... "
-                    "##[error]Process completed with exit code 137."
-                ),
-                "failure_classification": "OOM",
-                "is_oom": True,
-                "is_self_hosted_runner": True,
-                "badge_text": "OOM Killed (Exit 137 · Self-Hosted Spot Runner)",
-                "deep_link": build_github_oom_deep_link(
-                    "swack-tools/oxidex", 37192994059, 111409747367, 7, 77
-                ),
-            },
-            {
-                "id": "gh-timeout-38596411473",
-                "repository": "Appz4Fun/nzbget",
-                "workflow_name": "docs",
-                "run_id": 38596411473,
-                "job_id": 115964282184,
-                "job_name": "deploy (Deploy to GitHub Pages)",
-                "runner_name": "GitHub Actions 1000014245",
-                "step_number": 2,
-                "line_number": 50,
-                "failed_at": "2026-10-14T16:25:26Z",
-                "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
-                "failure_classification": "TIMEOUT",
-                "is_oom": False,
-                "is_self_hosted_runner": False,
-                "badge_text": "Timeout · GitHub-Hosted Runner (Not Ours — Ignored)",
-                "deep_link": build_github_oom_deep_link(
-                    "Appz4Fun/nzbget", 38596411473, 115964282184, 2, 50
-                ),
-            },
-        ],
+    # Telemetry starts empty: GitHub CI runs, journal OOM events, job counters, and Rust builds are recorded only
+    # when reported (update_scaling, record_rust_build). Demo records earlier versions seeded here are dropped on
+    # load (see drop_seeded_demo_telemetry).
+    scaling_telemetry: dict[str, Any] = {
+        "current_runners": 0,
+        "jobs_ran_past_hour": 0,
+        "provisioned_jobs": 0,
+        "queued_jobs": 0,
+        "instance_cpu_percentages": [],
+        "journal_oom_events": [],
+        "github_oom_runs": [],
     }
-
-    raw_rust_builds = [
-        {
-            "build_id": "rb-20261015-001",
-            "project_name": "oxidex",
-            "profile": "release",
-            "target_triple": "x86_64-unknown-linux-gnu",
-            "commit_sha": "af7c14f8cb2c",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(920, ref_now),
-            "finished_at": _iso_seconds_ago(818, ref_now),
-            "delivered_at": _iso_seconds_ago(806, ref_now),
-            "cache_hits": 412,
-            "cache_misses": 18,
-            "total_crates": 430,
-            "instance_name": "builder-oxidex-turin-01",
-            "zone": "us-south1-b",
-            "machine_type": "c4d-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "AMD Turin",
-            "origin_ip": "185.159.157.42",
-            "origin_hostname": "node-ch-14.protonvpn.net",
-            "peak_ram_gib": 21.8,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 1184.5,
-        },
-        {
-            "build_id": "rb-20261015-002",
-            "project_name": "oxidex-cli",
-            "profile": "release",
-            "target_triple": "x86_64-unknown-linux-musl",
-            "commit_sha": "ce4af62b32cc",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(2450, ref_now),
-            "finished_at": _iso_seconds_ago(2290, ref_now),
-            "delivered_at": _iso_seconds_ago(2274, ref_now),
-            "cache_hits": 295,
-            "cache_misses": 94,
-            "total_crates": 389,
-            "instance_name": "builder-oxidex-eu-01",
-            "zone": "europe-west4-a",
-            "machine_type": "n4-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "Intel Emerald Rapids",
-            "origin_ip": "185.220.101.34",
-            "origin_hostname": "tor-exit-101.zwiebelfreunde.de",
-            "peak_ram_gib": 24.6,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 1892.0,
-        },
-        {
-            "build_id": "rb-20261015-003",
-            "project_name": "oxidex",
-            "profile": "debug",
-            "target_triple": "x86_64-unknown-linux-gnu",
-            "commit_sha": "f20f9f9b780f",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(4800, ref_now),
-            "finished_at": _iso_seconds_ago(4736, ref_now),
-            "delivered_at": _iso_seconds_ago(4728, ref_now),
-            "cache_hits": 424,
-            "cache_misses": 6,
-            "total_crates": 430,
-            "instance_name": "builder-oxidex-turin-01",
-            "zone": "us-south1-b",
-            "machine_type": "c4d-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "AMD Turin",
-            "origin_ip": "73.162.44.19",
-            "origin_hostname": "m4air-workstation.local",
-            "peak_ram_gib": 14.2,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 542.0,
-        },
-        {
-            "build_id": "rb-20261015-004",
-            "project_name": "nzbget-rust-ffi",
-            "profile": "release",
-            "target_triple": "aarch64-apple-darwin",
-            "commit_sha": "e3c84b8190aa",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(7600, ref_now),
-            "finished_at": _iso_seconds_ago(7455, ref_now),
-            "delivered_at": _iso_seconds_ago(7441, ref_now),
-            "cache_hits": 318,
-            "cache_misses": 42,
-            "total_crates": 360,
-            "instance_name": "builder-oxidex-eu-01",
-            "zone": "europe-west4-a",
-            "machine_type": "n4-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "Intel Emerald Rapids",
-            "origin_ip": "193.138.218.77",
-            "origin_hostname": "se-got-wg-004.mullvad.net",
-            "peak_ram_gib": 19.7,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 1510.4,
-        },
-        {
-            "build_id": "rb-20261015-005",
-            "project_name": "oxidex-bench",
-            "profile": "release",
-            "target_triple": "x86_64-unknown-linux-gnu",
-            "commit_sha": "3317b1b902ef",
-            "status": "DELIVERED",
-            "requested_at": _iso_seconds_ago(11200, ref_now),
-            "finished_at": _iso_seconds_ago(11010, ref_now),
-            "delivered_at": _iso_seconds_ago(10996, ref_now),
-            "cache_hits": 260,
-            "cache_misses": 170,
-            "total_crates": 430,
-            "instance_name": "builder-oxidex-turin-01",
-            "zone": "us-south1-b",
-            "machine_type": "c4d-highcpu-16",
-            "vcpu": 16,
-            "cpu_platform": "AMD Turin",
-            "origin_ip": "24.28.119.82",
-            "origin_hostname": "dev-macbook-pro.tx.rr.com",
-            "peak_ram_gib": 26.1,
-            "container_ram_cap_gib": 28.0,
-            "cpu_time_seconds": 2480.0,
-        },
-    ]
-
-    rust_builds = [enrich_rust_build_record(row, project=project) for row in raw_rust_builds]
+    rust_builds: list[dict[str, Any]] = []
 
     return {
         "schema": "spot-web-dashboard-v1",
@@ -1501,6 +1345,10 @@ class DashboardStore:
                 LOG.warning("Dropped %d dashboard instance record(s) that did not come from the live inventory",
                             len(instances) - len(kept))
             base["instances"] = kept
+        dropped_seeds = drop_seeded_demo_telemetry(base)
+        if dropped_seeds:
+            LOG.warning("Dropped %d seeded demo telemetry record(s) and counter(s) from the dashboard state",
+                        dropped_seeds)
         previous = getattr(self, "state", None)
         self.state = base
         try:
@@ -2849,34 +2697,6 @@ class DashboardStore:
     def _normalize_github_ci_runs(self) -> None:
         runs = self.state.get("scaling_telemetry", {}).get("github_oom_runs", [])
         for r in runs:
-            if int(r.get("run_id", 0)) == 38601924810:
-                r["id"] = "gh-oom-37192272062"
-                r["repository"] = "swack-tools/oxidex"
-                r["workflow_name"] = "CI"
-                r["run_id"] = 37192272062
-                r["job_id"] = 111407847874
-                r["job_name"] = "Verify Generated Tables / catalog join"
-                r["runner_name"] = "gha-oxidex-runners-asianortheast2-a-1791098074-2"
-                r["step_number"] = 8
-                r["line_number"] = 106
-                r["failed_at"] = "2026-10-04T09:39:54Z"
-                r["error_excerpt"] = (
-                    "line 14: 15780 Killed python3 tools/exiftool-tables — "
-                    "##[error]Process completed with exit code 137."
-                )
-                r["deep_link"] = build_github_oom_deep_link(
-                    "swack-tools/oxidex", 37192272062, 111407847874, 8, 106
-                )
-            if int(r.get("run_id", 0)) == 38596411473 and int(r.get("job_id", 0)) == 115964282184:
-                if "nzbget-core" in str(r.get("error_excerpt", "")):
-                    r["id"] = "gh-timeout-38596411473"
-                    r["workflow_name"] = "docs"
-                    r["job_name"] = "deploy (Deploy to GitHub Pages)"
-                    r["runner_name"] = "GitHub Actions 1000014245"
-                    r["error_excerpt"] = (
-                        "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)"
-                    )
-                    r.pop("is_oom", None)
             cls_info = classify_github_ci_failure(
                 str(r.get("error_excerpt", "")),
                 runner_name=r.get("runner_name"),

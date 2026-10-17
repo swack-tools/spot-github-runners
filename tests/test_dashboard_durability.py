@@ -1121,6 +1121,9 @@ class PublishSafetyTests(unittest.TestCase):
         new.import_snapshot(old.snapshot_envelope())
         self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=5).to_json()
         puts = len(self.puts())
+        self.assertEqual(new._publish_snapshot(), old.state_version())  # identical content: idempotent
+        new.kv_last_written_version = None
+        new.state["scaling_telemetry"]["queued_jobs"] = 1  # local normalization drift after the import
         with self.assertLogs("spot_dashboard", "WARNING"):
             new._publish_snapshot()  # equal version: KV already holds that history, so nothing is rewritten
         self.assertEqual(len(self.puts()), puts)
