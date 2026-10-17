@@ -1,4 +1,4 @@
-# Edge dashboard on a spot control VM
+# Edge hosting and the control VM
 
 The web dashboard runs on one small VM, the control VM, behind a Cloudflare Worker at
 `https://spot.swacktech.com`. The control VM is a Spot VM by default, or the always-on free-tier e2-micro
@@ -13,7 +13,7 @@ controlled repository unless global administrators are enabled, which they are b
 | Cloudflare Worker | `cloudflare/worker.js` | Verifies the session cookie's signature and expiry, proxies to the active control VM, and returns a wait response while the control VM is down. |
 | Workers KV | Binding `SPOT_KV` | `origin:active` names the active slot. `dashboard:state` holds the latest dashboard state snapshot. |
 | Control VM | `spot-control-a` or `spot-control-b` | Runs the dashboard container and a `cloudflared` tunnel. Created by `src/control_vm.py` as a Spot VM or a free-tier e2-micro. |
-| Tunnel hostnames | `spot-origin-a.swacktech.com`, `spot-origin-b.swacktech.com` | One Cloudflare Tunnel per slot, protected by a Cloudflare Access service token. |
+| Tunnel hostnames | One per slot, under the domain in `SPOT_CONTROL_ORIGIN_DOMAIN` | One Cloudflare Tunnel per slot, protected by a Cloudflare Access service token. |
 | Startup script | `cloud-init/control-vm-startup.sh` | Fetches secrets, pulls or builds the image, and starts both containers on every boot. |
 | Dashboard image | `dashboard/Dockerfile` | Built on the VM from a pinned commit, or pulled from `ghcr.io/swack-tools/spot-dashboard`. |
 
@@ -43,8 +43,8 @@ when all of these are true:
 
 The session cookie `__Host-spot_session` is HMAC-signed with `DASHBOARD_SESSION_SECRET`. The Worker and
 every control VM share that secret, so sessions survive VM replacement. The `__Host-` prefix makes browsers
-reject the cookie unless it is `Secure`, has `Path=/`, and has no `Domain`, so another `swacktech.com`
-subdomain can't set or shadow it. The sign-in `state` cookie is `__Host-spot_oauth_state`.
+reject the cookie unless it is `Secure`, has `Path=/`, and has no `Domain`, so another subdomain of
+the same domain can't set or shadow it. The sign-in `state` cookie is `__Host-spot_oauth_state`.
 
 The Worker only authenticates the cookie: it checks the signature, the expiry, the cut-off below, and
 that the payload holds a well-formed GitHub login and numeric ID. It doesn't decide who may sign in. The
@@ -70,7 +70,7 @@ rejects every session issued before it:
    ```
 
 The startup script stops with an error when the value isn't Unix seconds or is in the future, because the
-dashboard would refuse to start. Rotating `spot-dashboard-session-secret` together with the Worker's
+dashboard would refuse to start. Rotating the dashboard session secret in Secret Manager together with the Worker's
 `SESSION_SECRET` also signs everyone out.
 
 Sign-in routes are rate limited per browser IP and globally, and answer HTTP 429 with `Retry-After` when
@@ -118,7 +118,7 @@ dashboard token. The tab lists the owners, which are read-only, and the added ad
 ### Controlled target changes
 
 `POST /api/auth/targets` changes the targets saved in the dashboard, and only a GitHub session can call
-it. The request doesn't change anything yet. It answers HTTP 202 with `"status": "reauth_required"` and
+it. An unchanged list answers HTTP 200 with `"status": "unchanged"`. Otherwise the request doesn't change anything yet. It answers HTTP 202 with `"status": "reauth_required"` and
 either an `authorize_url` or a device code. The change commits only after that new GitHub sign-in shows
 that the same GitHub account administers every static, config repository, current, and proposed target.
 That check skips the cache of earlier administrator checks.
@@ -184,7 +184,7 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
 | `GET /api/patches` | Lists the manifests at the default branch HEAD. |
 | `GET /api/patches/manifest?path=...` | Returns a manifest, its blob and base commit, and the effective patch with its sha256. |
 | `POST /api/patches/validate` | Returns field errors such as `host.apt_packages`. A repository manifest is an override: checks that depend on inherited settings, such as `hardware.isa` against the architecture, use the settings merged with `defaults.yaml`. |
-| `POST /api/patches/preview` | Classifies each runner host as `noop`, `hot_patch`, `recreate_containers`, or `replace_vm`. |
+| `POST /api/patches/preview` | Classifies each runner host as `noop`, `hot_patch`, `recreate_containers`, `replace_vm`, or `unknown`. |
 | `POST /api/patches/save` | Opens a pull request. Needs an `Idempotency-Key`. |
 | `POST /api/patches/hot-patch` | Hot-patches the recorded runner hosts. Needs `"confirm": true` and an `Idempotency-Key`. |
 
@@ -201,7 +201,7 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   reports the same errors for `defaults.yaml`, or a `warning` when it can't read the manifests.
 - `src/spot_runner_manager.py` records the patch on each runner host as instance metadata, but only after
   the host confirms it. A provisioned host confirms it when its bootstrap writes the completion marker
-  for this deployment, every runner is online, and the storage check passes. A live patch confirms it
+  for this deployment, every runner is online, the GitHub labels sync, and the storage check passes. A live patch confirms it
   when the host reports `LIVE_PATCH_APPLIED:<sha256>`. The keys are:
   - `spot-runner-patch-boot`: the GCE `lastStartTimestamp` of the boot that the confirmation belongs to.
     The manager observes the boot before it waits for the bootstrap marker. If the VM restarts at any
@@ -230,7 +230,7 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   write the applied keys and remove the pending keys. When the label sync fails, the host stays pending,
   and `--patch-live` again re-applies the patch and retries the sync. A `--patch-live` run on a host that's
   already at the patch also syncs its labels before it records the patch. A dashboard hot-patch syncs
-  the labels of each `noop` host too. When that sync fails, the host's result is `failed`.
+  the labels of each `noop` host too. When that sync fails, the host's result is `refused` or `failed`.
 - On the host, the patch steps first write the pending marker `/var/lib/gha-runner-patch/pending.json`.
   Only after every step succeeds do they write the completion receipt `state.json`, with an atomic
   rename, and then remove the marker. For a live patch, the steps include the image build and every
@@ -246,7 +246,7 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   host was provisioned before patch recording, so its repository and patch are unknown. It shows as
   `unknown` in the preview of every repository and blocks hot-patching until it's reprovisioned or
   patched once with `--patch-live`. VMs with other names, and control VMs, aren't listed. The control
-  VM's service account needs `compute.instances.list`. Elsewhere the preview uses the host records in
+  VM's service account needs `compute.instances.list` and `compute.machineTypes.get`; without the second, a host's vCPU and RAM stay unknown, and a patch with hardware minimums classifies it as `unknown`. Elsewhere the preview uses the host records in
   the dashboard state.
 - The preview checks each host's observed capacity against every hardware constraint of the patch first:
   `hardware.min_vcpu`, `hardware.min_ram_gib`, the architecture, and the CPU platform for `hardware.isa`. A
@@ -314,8 +314,8 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   includes their results. If they're still running after that, the freeze answers HTTP 409 with
   `"retryable": true`, and the autoscaler tries again.
 
-When `GITHUB_OAUTH_DEVICE_FLOW=1`, the Worker also passes `/auth/device/code` and `/auth/device/token`
-through without a session cookie. The dashboard still refuses them unless device login is enabled. The
+The Worker always passes `/auth/device/code` and `/auth/device/token` through without a session cookie.
+The dashboard refuses them unless `GITHUB_OAUTH_DEVICE_FLOW=1` turns device login on. The
 GitHub device code stays on the control VM behind a random handle, and the dashboard enforces the polling
 interval. A VM replacement ends a device sign-in in progress, so request a new code.
 
@@ -494,6 +494,9 @@ summary prints the digest.
   `ghcr.io/swack-tools/spot-dashboard:<commit>`. When only `SPOT_DASHBOARD_SOURCE_REF` is set and
   `SPOT_DASHBOARD_REPO` is the default, the standard mode pulls that commit's tag. The tag exists only for a
   commit that the workflow published.
+- The package is private. The startup script signs in to `ghcr.io` with the GitHub token from Secret Manager
+  and runs `docker pull`. That token needs the `read:packages` scope. Without it the pull fails with an
+  access-denied error and the startup script stops with `could not pull <image>`. See [Operations and troubleshooting](operations.md).
 - Without either, the autoscaler and `src/control_vm.py` refuse to create the VM, and they don't begin the
   switch from Spot. The startup script also stops with an error on an e2-micro without a pinned image, and
   it never installs `git` there.
@@ -536,6 +539,10 @@ Prerequisites:
   `docker buildx imagetools inspect ghcr.io/swack-tools/spot-dashboard:<commit>`.
 
 To switch:
+
+!!! warning "This changes live resources"
+    The restart in step 3 starts a live make-before-break switch of the control VM.
+    Run the preview in step 2 first, and make sure no other change to the control VM is in progress.
 
 1. Add these settings to the autoscaler's environment file:
 
@@ -595,10 +602,9 @@ dashboard parses them. The startup script applies the same checks and stops with
 value. A running control VM keeps its creation-time values. To change them on that VM, update its metadata
 and then reboot it. Rotating to the other slot also applies the new values.
 
-The control VM reads its secrets from Secret Manager at boot: `spot-dashboard-session-secret`,
-`spot-dashboard-oauth-client-id`, `spot-dashboard-oauth-client-secret`, `spot-dashboard-control-secret`,
-`spot-dashboard-cloudflare-kv-token`, `spot-dashboard-github-token`, `spot-dashboard-tunnel-token-a`, and
-`spot-dashboard-tunnel-token-b`.
+The control VM reads its secrets from Secret Manager at boot: the session key, the OAuth 2.0 client ID and secret,
+the control secret, the Workers KV token, a GitHub token, and one tunnel token for each slot. The control VM's
+service account needs access to those secrets. Keep their values out of instance metadata and out of Git.
 
 ## Commands
 

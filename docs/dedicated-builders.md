@@ -28,7 +28,7 @@ website tools are installed on previously launched builders.
 Prepare the private JSON configuration below and a separate explicitly approved
 public uploader mapping file. Do not use a private SSH key. The mapping must
 contain exactly `schema` (`root-approved-ssh-mapping-v1`),
-`principal`, `username`, numeric `uid` (2000 is the deployment example),
+`principal`, `username`, numeric `uid` (at least 1000 and not 1001),
 `identity_receipt_sha256`, the complete single-line Ed25519 `public_key`, and
 `public_key_sha256` (SHA-256 of that complete key string). The renderer validates
 the selected mapping and computes its canonical checksum. Selecting the file
@@ -74,6 +74,34 @@ marker. No manual SSH installation or repository checkout is needed on the host.
 Rendering refuses an existing output directory; fresh-host startup must not be
 replayed to upgrade an occupied VM. Replacements need a new name and matching
 rendered payload.
+
+## Verify startup and readiness
+
+Startup records two files on the builder:
+
+```text
+/var/lib/oxidex-builder-bootstrap.complete
+/var/lib/oxidex-builder-readiness.json
+```
+
+The readiness JSON joins the deployment, boot, source hashes, image and container, actual cgroup limits, tool
+results, and the mounted cache identity. It sets `workload_qualified` to false: tool installation isn't
+compilation, cache-reuse, concurrency, or full qualification proof. Run the intended workload and keep its
+result before you declare the host ready for that workload.
+
+The standalone image includes:
+
+- Rust 1.99.0, rustfmt, clippy, and Linux musl and Darwin cross targets.
+- Build tools, Clang, CMake, pkg-config, OpenSSL, and archive development libraries.
+- Git, SSH, GnuPG, Perl, Python 3.11, rsync, GNU time, and compression tools.
+- `just`, cargo-nextest, cbindgen 0.29.2, Zig 0.15.2, cargo-zigbuild 0.23.4, `uv`, and LLVM tools.
+
+Some auxiliary tool installs resolve versions during the image build. Use the actual tool receipt and the
+immutable image ID rather than assuming that every dependency has a fixed version.
+
+The older shared-host image in `builder/Dockerfile` still pins Rust 1.97.1. Ordinary runner images don't
+establish the standalone builder's toolchain, because workflows select their Rust version separately.
+Provisioning a new standalone builder doesn't upgrade existing runner containers.
 
 ## Configure the build client
 
