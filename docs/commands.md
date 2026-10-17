@@ -18,10 +18,10 @@ The last column names the exact flag or action that makes it change something.
 | [`tools/spot_prices.py`](#spot-prices) | Reads prices and inventory | `--csv` writes a local file |
 | [`src/spot_finder.py`](#spot-finder) | Reads prices and inventory | Nothing in the cloud. A quota error writes a local cooldown marker, `gcp-spot-finder-quota-<project>.timestamp`, in the temporary directory, and later runs wait out that cooldown |
 | [`src/runner_fleet.py`](#runner-fleet) | Reads runners and VMs | Nothing |
-| [`src/spot_runner_manager.py`](#spot-runner-manager) | Prints a plan after read-only checks | `--apply`, or `--patch-live` (which needs no `--apply`) |
+| [`src/spot_runner_manager.py`](#spot-runner-manager) | Prints a plan after read-only checks | `--apply`, which also deletes old unattached manager-labeled disks in the zone, or `--patch-live` (which needs no `--apply`) |
 | [`src/spot_runner_autoscaler.py`](#spot-runner-autoscaler) | Manages the fleet | `--dry-run` leaves VMs, disks, registrations, and controller state unchanged, but its `gcloud compute ssh` can add your SSH key; `--install-launch-agent` installs the macOS agent |
 | [`src/control_vm.py`](#control-vm) | `status` and `plan` read only | `ensure --apply`, `rotate --apply`; `render-startup` always writes its `--output` file |
-| [`src/web_dashboard.py`](#web-dashboard) | Serves HTTP | `--state-file` persists state; served POST routes can change state. With `SPOT_CONFIG_REPO` configured, `POST /api/patches/save` opens a pull request on the config repository, and with `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts |
+| [`src/web_dashboard.py`](#web-dashboard) | Serves HTTP | `--state-file` persists state, including with `--dump-overview`; served POST routes can change state. With `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` set, `POST /api/patches/save` opens a pull request on the config repository, and with `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts |
 | [`src/render_builder_startup.py`](#render-builder-startup) | Writes a local directory | Running the rendered `launch-command.sh` creates a billable VM |
 | [`src/lib/builder_runtime_update.py`](#builder-runtime-update) | Captures and checks only | `--apply`, `--finish`, `--recover-committed`, `--recover-finish` |
 | [`src/remote_rust_build.py`](#remote-rust-build) | Uploads source and builds | Always changes the selected host |
@@ -99,10 +99,10 @@ below the on-demand price.
 | `--project` | String | Active `gcloud` project | GCP project ID. |
 | `--min-vcpu` | Positive integer | `32` | Minimum vCPU count. |
 | `--min-ram` | Positive number, optional `GB` or `GiB` suffix | `128` | Minimum RAM in GiB. |
-| `--runners` | Positive integer | vCPU divided by 4 | Runner count per instance, used for per-runner prices. |
+| `--runners` | Positive integer | `1` for hosts below 4 vCPUs or with at most 8 GiB of RAM, otherwise vCPU `// 4` | Runner count per instance, used for per-runner prices. |
 | `--top` | Positive integer | `10` | Number of cheapest results. |
 | `--concurrency` | Positive integer | `600` | Concurrent API requests. |
-| `--list-price` | Positive number | None | On-demand hourly price baseline in USD for the 95 percent alerts. |
+| `--list-price` | Positive number | None | On-demand hourly price baseline in USD for the 95 percent alerts. The finder applies this one value to every offer, whatever its shape. |
 | `--billing-api-key` | String | `GOOGLE_CLOUD_API_KEY` | Billing Catalog API key for automatic 95 percent alerts. |
 | `-v` | Repeatable flag | Off | More diagnostic detail. Repeat as `-v`, `-vv`, or `-vvv`. |
 
@@ -151,14 +151,33 @@ Spot price, compatible storage, and quota before it changes anything. It loads
 `.env` from the repository root for credentials such as `GH_TOKEN`.
 
 - **Effect.** Without `--apply`, the command exits after read-only checks and
-  prints a plan. With `--apply`, it provisions the VM, passes a startup
-  script through instance metadata, registers the runners, waits for them to
-  come online, and removes the one-use registration token from the metadata.
+  prints a plan. With `--apply`, it creates a runner registration token,
+  provisions the VM, passes a startup script through instance metadata,
+  registers the runners, waits for them to come online, and then removes the
+  whole `startup-script` metadata key, which holds the one-use token. It also
+  connects with `gcloud compute ssh` to wait for bootstrap and check storage,
+  which can add your SSH key to project or instance metadata, or to your OS
+  Login profile. It rewrites the GitHub labels of the host's runners, records
+  the applied patch in instance metadata and labels, writes the
+  `--deployment-receipt` file when you pass one, and, with a billing export
+  table, queries BigQuery for project costs.
+- **Disk cleanup.** Every `--apply` run that passes the GitHub checks and
+  obtains a registration token deletes orphaned runner data disks before it
+  creates or adopts the VM. It deletes every disk in the selected zone and
+  project that is labeled `managed-by=spot-runner-manager`, is `READY`, is
+  attached to no VM, and is older than six hours. The deletion happens even
+  when the deployment then fails, and a deleted disk can't be recovered.
+  Controller launches run the same cleanup.
 - **Live patch.** `--patch-live` changes a running VM and its runner containers
-  over SSH. It does this without `--apply`, so treat it as a mutating flag.
+  over SSH, rewrites the runners' GitHub labels, and records the patch in
+  instance metadata, even when the host already runs that patch. It does this
+  without `--apply` and before the price and quota checks, so treat it as a
+  mutating flag.
 - **Sizing.** `--runner-count`, `--runner-cpu`, and `--runner-memory-gb` take
   effect with `--fixed-runner-sizing`. A `--runner-count` of 1 is also honored without it. Without it, the command derives
-  one runner per 4 vCPU from `--cpu` and `--ram`. A tier or strict pool
+  one runner per 4 vCPU from `--cpu` and `--ram`. A host below 4 vCPUs or with
+  at most 8 GiB of RAM gets one runner, and so does a host where that count
+  would leave a runner less than 2 GiB of memory. A tier or strict pool
   overrides these values.
 - **Name limit.** The runner name `<prefix>-<instance>-<count>` can have at most
   64 characters.
@@ -168,8 +187,8 @@ Spot price, compatible storage, and quota before it changes anything. It loads
 | `--project` | String | Owner's project | GCP project. |
 | `--org` | String | `swack-tools` | GitHub organization. |
 | `--target` | `owner/repo` or organization | Value of `--org` | Target repository or organization. Overrides `--org`. |
-| `--max-cost` | Decimal | Required | Maximum compute price in USD per hour for this VM. |
-| `--max-total-daily-usd` | Decimal | None | Maximum compute plus boot and data storage cost in USD per day. A tier caps it at the tier maximum. |
+| `--max-cost` | Decimal | Required | Compute price cap in USD per hour for this VM. The live price must be strictly below it. |
+| `--max-total-daily-usd` | Decimal | None | Compute plus boot and data storage cost cap in USD per day. The total must be strictly below it. A tier caps it at the tier maximum. |
 | `--cheapest-storage` | Flag | Off | Choose compatible storage from current regional prices. |
 | `--billing-export-table` | `project.dataset.table` | `GCP_BILLING_EXPORT_TABLE` | Billing export table for project-wide cost logs during `--apply`. |
 | `--instance-type` | String | `n2-standard-32` | Machine type. |
@@ -181,16 +200,16 @@ Spot price, compatible storage, and quota before it changes anything. It loads
 | `--instance-name` | String | `oxidex-spot-runners-asia` | VM name. |
 | `--disk-size-gb` | Integer | `100` | Data disk size in GiB. |
 | `--disk-type` | String | Compatible type for the machine family | Data disk type. |
-| `--disk-device-name` | String | `runner-data` | Data disk device name. |
+| `--disk-device-name` | String | `runner-data` | Name of the data disk resource in the zone, and its device name. An unattached disk with that name and a matching type, size, and performance is reused. |
 | `--heavy-runner-pool` | `2`, `3` | None | Strict CI-only pool of that many runners, each with 8 vCPU and 32 GiB and no extra swap. |
 | `--runner-count` | Integer | `4` | Runner count. Takes effect with `--fixed-runner-sizing`. |
 | `--runner-cpu` | Integer | `4` | vCPU cap per runner. Takes effect with `--fixed-runner-sizing`. |
 | `--runner-memory-gb` | Integer | `15` | Memory cap per runner in GiB. Takes effect with `--fixed-runner-sizing`. |
 | `--fixed-runner-sizing` | Flag | Off | Use the explicit runner sizing values. |
-| `--runner-label` | String | `oxidex-spot-7x27` | Custom runner label. A strict pool forces `spot-heavy32`. |
-| `--runner-group-id` | Integer | `10` | Organization runner group ID. Applies to organization targets. |
+| `--runner-label` | String | `oxidex-spot-7x27` | Primary custom runner label. Runners also get the machine type, the region, and any patch labels as labels. A strict pool forces `spot-heavy32`. |
+| `--runner-group-id` | Integer | The runner group ID that controller launches use | Organization runner group ID. Applies to organization targets. |
 | `--runner-prefix` | String | `oxidex-asia` | Runner name prefix. |
-| `--existing-instance` | Flag | Off | Attach and bootstrap an existing Spot VM instead of creating one. |
+| `--existing-instance` | Flag | Off | Adopt and bootstrap an existing Spot VM instead of creating one. With `--apply`, it labels the VM, attaches the data disk or turns on its auto-delete, writes startup metadata, and resets a running VM or starts a stopped one. |
 | `--deployment-receipt` | Path | None | Save the created VM identity before waiting for runner registration. |
 | `--registration-timeout-seconds` | Integer | `1200` | Fail when bootstrap has not finished this long after deployment starts. |
 | `--apply` | Flag | Off | Run provisioning and startup-script deployment. |
@@ -199,7 +218,7 @@ Spot price, compatible storage, and quota before it changes anything. It loads
 | `--tier` | `small`, `starting`, `expanded`, `large`, `bulky` | None | Tier host with shared memory admission. The `--cpu` and `--ram` values must match the tier shape. |
 | `--tier-slots` | Integer | Tier's initial slot count | Number of runner listeners on a tier host. |
 | `--tier-job-memory-gib` | Number | `15` | Per-job memory cap and reservation. `15` is a verified compatible workload cap, not a measured peak. |
-| `--host-overhead-gib` | Number | `2` | Host memory reserved for the operating system and services in the tier admission budget. |
+| `--host-overhead-gib` | Number | `2` | Host memory for the operating system and services. A tier host reserves the larger of this value and 2 GiB, plus 0.25 GiB for each listener slot. Without a tier, it applies only to hosts with 8 GiB of RAM or less. |
 | `--config-repo` | `owner/repo` | `<org>/spot-runners-config` | Central runner configuration repository. |
 | `--patch-repo` | `owner/repo` | None | Repository whose patch manifest the command loads from the configuration repository. |
 | `--patch-file` | Path | None | Local `spot-runner-patch-v1` YAML or JSON manifest. Choose at most one of `--patch-file` and `--patch-repo`. |
@@ -245,11 +264,17 @@ operation. See [Fleet and autoscaler](fleet-and-autoscaler.md) for the policies.
   `gcloud compute ssh`, which can add your SSH key to project or instance
   metadata, or to your OS Login profile, on the first connection. It evaluates the tier policy whatever
   `--scaling-mode` says. It still creates the log file, the state directory, and
-  the state lock file on your machine.
+  the state lock file on your machine. It takes the same lock as a running
+  controller, so it fails while a controller uses that state file: pass another
+  `--state-file` to preview next to a running controller. With
+  `--manage-control-vm`, it also prints a `Control VM plan (dry run):` text line
+  before the JSON and creates the project control VM lock file.
 - **LaunchAgent.** `--install-launch-agent` writes
   `~/Library/LaunchAgents/com.swacktools.spot-runner-autoscaler.plist`, runs
-  `launchctl bootstrap`, and exits. It runs before the `--dry-run` branch, so
-  `--dry-run` does not make it safe.
+  `launchctl bootstrap`, and exits. The agent has `RunAtLoad` and `KeepAlive`,
+  so a live controller starts at once, and its arguments never include
+  `--dry-run`. It runs before the `--dry-run` branch, so `--dry-run` does not
+  make it safe. The command doesn't check the `launchctl` exit status.
 - **Single controller.** An exclusive lock on the sibling `<state file>.lock` allows one
   controller for each state file. A state file binds to one target. Use a
   separate `--state-file` for each `--target`.
@@ -264,15 +289,15 @@ operation. See [Fleet and autoscaler](fleet-and-autoscaler.md) for the policies.
 | --- | --- | --- | --- |
 | `--org` | String | `swack-tools` | GitHub organization. |
 | `--target` | `owner/repo` or organization | Value of `--org` | Target repository or organization. |
-| `--make-before-break`, `--no-make-before-break` | Flag pair | Off | Run zero-downtime make-before-break rotation on price spikes. |
+| `--make-before-break`, `--no-make-before-break` | Flag pair | Off | Run zero-downtime make-before-break rotation on price spikes. A controller with `--target` always rotates this way, whatever this flag says. The `tiered` mode skips price rotation. |
 | `--github-user` | String | None | Use an existing `gh` account for this process without saving its credential. |
 | `--project` | String | Owner's project | GCP project. |
-| `--minimum-runners` | Integer | `1` | Online runner floor. Must be at least 1. |
+| `--minimum-runners` | Integer | `1` | Online runner floor for the `resource` and `legacy` modes. Must be at least 1. The `tiered` mode ignores it. |
 | `--label` | String | `spot` | Runner label that the controller manages. |
 | `--max-daily-usd` | Decimal | `10` | Maximum daily compute plus boot and data storage cost per VM. A tier uses its own cap. |
 | `--interval-seconds` | Integer | `300` | Seconds between checks. |
 | `--scaling-mode` | `tiered`, `resource`, `legacy` | `resource` | Scaling policy. `resource` uses CPU and memory over two 5-minute checks at the 75 percent threshold. `legacy` uses runner occupancy. `tiered` uses tier evidence. |
-| `--maximum-hosts` | Integer | `5` | Maximum number of Spot hosts. |
+| `--maximum-hosts` | Integer | `5` | Maximum number of Spot hosts for `resource` scale-up and tier migrations, plus one host of overlap during a rotation or migration. The `legacy` scale-up doesn't check it. |
 | `--tier-job-memory-gib` | Positive finite number | `15` | Per-job memory cap and reservation. `15` is a verified compatible workload cap, not a measured peak. |
 | `--dry-run` | Flag | Off | Tier decision only; changes no VM, disk, registration, or controller state. Its `gcloud compute ssh` can add your SSH key. |
 | `--manage-control-vm` | Flag | Off | Also manage the control VM that hosts the dashboard. With `--dry-run`, print only its plan. |
@@ -317,8 +342,10 @@ The top-level help says that nothing is written without `--apply`. That is
 accurate for the control VM, the disks, and the state files, but
 `render-startup` writes its `--output` file without `--apply`. Only `ensure` and
 `rotate` accept `--apply`. With `--apply`, the command takes the project-wide
-control VM lock, creates or deletes VMs, and writes Cloudflare Workers KV
-entries. Without it, the command plans on an in-memory copy of the state.
+control VM lock, creates, starts, stops, or deletes VMs, writes Cloudflare
+Workers KV entries, and saves the project control VM state. It also moves any
+control VM state saved in the autoscaler `--state-file` into the project state
+and rewrites that file. Without it, the command plans on an in-memory copy of the state.
 
 ### Shared options
 
@@ -336,7 +363,7 @@ variable.
 | `--no-external-ip` | Flag | External IP on; `SPOT_CONTROL_EXTERNAL_IP` set to `0`, `false`, `no`, or `off` also turns it off | Create the VM without an external IP. Needs a NAT gateway for egress. |
 | `--service-account` | String (email address) | None; `SPOT_CONTROL_SERVICE_ACCOUNT` | VM service account. |
 | `--dashboard-image` | Digest-pinned image reference | None; `SPOT_DASHBOARD_IMAGE` | Dashboard image. |
-| `--dashboard-repo` | `owner/repo` | `swack-tools/spot-github-runners`; `SPOT_DASHBOARD_REPO` | Repository that the VM builds when no image is set. |
+| `--dashboard-repo` | `owner/repo` | `swack-tools/spot-github-runners`; `SPOT_DASHBOARD_REPO` | Repository that a `spot` VM builds when no image is set. A `standard` VM never builds: it pulls the published image for `--dashboard-source-ref`, and only when this is the default repository. |
 | `--dashboard-source-ref` | 40-character commit hash | None; `SPOT_DASHBOARD_SOURCE_REF` | Commit to build. |
 | `--public-url` | URL | `https://spot.swacktech.com`; `SPOT_DASHBOARD_PUBLIC_URL` | Public dashboard URL. |
 | `--cloudflared-image` | Image reference with a version tag or digest (`:latest` is refused) | A pinned `cloudflared` release; `SPOT_CLOUDFLARED_IMAGE` | Tunnel client image. |
@@ -369,13 +396,19 @@ initial overview. See [Dashboard](dashboard.md) for the interface and
 [Edge hosting and control VM](edge-dashboard.md) for sign-in and state
 durability.
 
-- **Effect.** The server writes local state only when you pass `--state-file`.
-  The server also exposes POST routes, such as `/api/instances/delete` and
-  `/api/patches/hot-patch`, so treat a running dashboard as able to change
-  state. With `SPOT_CONFIG_REPO` (or `--config-repo`) configured,
-  `POST /api/patches/save` creates a branch, commits, and opens a pull request
-  on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`,
-  `/api/patches/hot-patch` changes running hosts.
+- **Effect.** The server writes local files only when you pass `--state-file`:
+  the state file, plus freeze markers, recovery markers, and renamed copies of
+  an unreadable state file next to it. `--dump-overview` with `--state-file`
+  still creates or rewrites that file, so omit `--state-file` for a dump
+  without local writes. The server also exposes POST routes, so treat a
+  running dashboard as able to change state. `/api/instances/delete` and
+  `/api/instances/scale-region` change only the dashboard's own records, not
+  VMs. When `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` is set in the server's
+  environment, `POST /api/patches/save` creates a branch, commits, and opens a
+  pull request on the config repository, which is `--config-repo`,
+  `SPOT_CONFIG_REPO`, or `<org>/spot-runners-config`. With
+  `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes
+  running hosts.
 - **Binding.** The default bind address is loopback. A non-loopback `--host`
   needs authentication (`--auth-token` or GitHub OAuth 2.0) and either TLS or
   `--allow-insecure-non-loopback` behind a trusted TLS-terminating proxy. The
@@ -397,11 +430,11 @@ durability.
 | `--allow-insecure-non-loopback` | Flag | `DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK` set to `1`, `true`, `yes`, or `on` | Allow plaintext HTTP on a non-loopback host behind a trusted TLS-terminating proxy. |
 | `--control-slot` | `a`, `b` | None | Control VM slot. Enables KV hydration and write-behind when the KV credentials exist, and `/api/control/*` when `DASHBOARD_CONTROL_SECRET` is set. |
 | `--controlled-targets` | Comma-separated targets | `DASHBOARD_CONTROLLED_TARGETS`, else none | Organizations and `owner/repo` targets on which OAuth 2.0 users must be administrators, in addition to every repository in the configuration repository. |
-| `--oauth-redirect-uri` | Absolute URL | `GITHUB_OAUTH_REDIRECT_URI`, else derived from the `Host` header | GitHub OAuth 2.0 callback URL. |
+| `--oauth-redirect-uri` | Absolute URL | `GITHUB_OAUTH_REDIRECT_URI`, else the public origin plus `/auth/github/callback`, else derived from the `Host` header | GitHub OAuth 2.0 callback URL. |
 | `--config-repo` | `owner/repo` | `SPOT_CONFIG_REPO`, else `<org>/spot-runners-config` | Repository whose `repos/<owner>/<repo>.yaml` files are controlled targets. |
 | `--public-origin` | Origin URL | `DASHBOARD_PUBLIC_ORIGIN`, else the origin of the OAuth 2.0 redirect URI | Browser-facing origin that POSTs accept when a proxy forwards under a different `Host`. |
-| `--state-file` | Path | None | Persist dashboard state JSON to this path. |
-| `--dump-overview` | Flag | Off | Print the initial JSON overview and exit without serving. |
+| `--state-file` | Path | None | Persist dashboard state JSON to this path. Freeze and recovery markers go next to it. |
+| `--dump-overview` | Flag | Off | Print the initial JSON overview and exit without serving. With `--state-file`, it still creates or rewrites that file. |
 
 ```bash
 python3 src/web_dashboard.py --dump-overview
@@ -590,8 +623,10 @@ you install the shims, run it as `cargo oxidex-auto`.
    and keeps hosts below 75 percent on both.
 3. It probes each candidate over SSH for `/etc/oxidex-remote-build.json` and no
    `/run/oxidex-build-draining`, and picks the best-ranked match.
-4. It runs `cargo remote-build` with the chosen instance and zone and writes
-   evidence under `~/oxidex-ops/evidence/auto-remote-<UTC timestamp>/<attempt>`.
+4. It runs `cargo remote-build` with the chosen instance and zone, writes
+   `selection.json` and the build evidence under
+   `~/oxidex-ops/evidence/auto-remote-<UTC timestamp>/<attempt>`, and downloads
+   the artifact into `target/remote-linux/<profile>` in the checkout.
 5. After a retryable failure, it excludes that host and selects again, up to
    `--max-attempts` times.
 
@@ -636,8 +671,11 @@ admitted Linux builder container. Neither accepts flags, and you do not run them
 by hand. For local test runs, see [Development](development.md).
 
 - **Inputs.** Both expect a read-only `/src` mount with the source tree, a
-  `fleet-source-head` file, and an `infra-python-test-manifest.json` signed
-  manifest, plus a writable `/target` directory.
+  `fleet-source-head` file, and an `infra-python-test-manifest.json`
+  manifest, plus a writable `/target` directory. The runners don't verify a
+  signature themselves: they require the manifest's `source_commit` to equal
+  `fleet-source-head` and each test module to match its SHA-256 in the
+  manifest.
 - **Outputs.** They write `infra-python-test-proof.json` and
   `infra-python-test.log` to `/target` with exclusive creation, and refuse to run
   when either file exists.
@@ -645,10 +683,12 @@ by hand. For local test runs, see [Development](development.md).
   and `2` when the runner refuses the input.
 - **Producer.** `infra_python_test_proof.py` verifies that the test modules match
   the manifest, runs `unittest` discovery, and enforces floors for test cases
-  (`MIN_CASES`) and modules (`MIN_MODULES`).
+  (`MIN_CASES`) and modules (`MIN_MODULES`). A skipped test, an expected
+  failure, an unexpected success, or a module with no test cases fails the run.
 - **Complete proof.** `infra_python_complete_proof.py` loads the producer only if
-  its SHA-256 equals the pinned `PRODUCER_SHA`, raises the floors to the
-  discovered counts, and adds digests of the discovered and executed test IDs to
+  its SHA-256 equals the pinned `PRODUCER_SHA`, replaces the producer's floors
+  with `max(774, module count)` cases and `max(76, module count)` modules,
+  requires the executed test IDs to equal the discovered IDs, and adds digests of the discovered and executed test IDs to
   the proof. After a reviewed change to the producer, update `PRODUCER_SHA` and
   rerun the proof tests.
 

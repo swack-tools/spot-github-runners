@@ -14,7 +14,7 @@ Inspect the deployed configuration and the actual tool versions before you route
 | Dedicated builders | `builder-*` VMs that register no GitHub runner. They run Rust builds in one resource-limited, unprivileged container with persistent caches. |
 | Dashboard | A web UI for fleet telemetry, runner patches, and administrators. It runs on a small control VM behind a Cloudflare Worker. |
 | Local runners | Two persistent ARM64 Docker runners that run on a local host, outside the GCP fleet. |
-| Price tools | Read-only commands that query the official Billing Catalog and machine inventory. |
+| Price tools | Commands that read Spot prices, from the official Billing Catalog or Compute Engine price lookups, and the machine inventory. |
 
 ## Architecture
 
@@ -40,8 +40,9 @@ flowchart LR
 ```
 
 The autoscaler is the only long-running component that changes the fleet. It reads GitHub and GCP state, keeps its own
-persisted operation state, and changes one host at a time. The dashboard doesn't run on runner hosts and has no
-`gcloud` or SSH path to them. See the [security model](security.md).
+persisted operation state, and changes one host at a time. The dashboard doesn't run on runner hosts, and the control
+VM dashboard has no `gcloud` or SSH path to them. A dashboard that an operator runs with
+`DASHBOARD_HOT_PATCH_EXECUTOR=gcloud` can reach them over `gcloud compute ssh`. See the [security model](security.md).
 
 ## Where to start
 
@@ -66,7 +67,7 @@ persisted operation state, and changes one host at a time. The dashboard doesn't
 | Render a dedicated builder launch | `src/render_builder_startup.py` | Writes local files. The generated launch command creates a VM. |
 | Build on an explicitly selected legacy host | `src/remote_rust_build.py` | Transfers source and starts a remote build |
 | Install Cargo client commands | `src/install_remote_commands.py` | Writes local executable shims |
-| Run the web dashboard | `src/web_dashboard.py` | Updates the local dashboard state file. With `SPOT_CONFIG_REPO` configured, `POST /api/patches/save` creates a branch, commits, and opens a pull request on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts. |
+| Run the web dashboard | `src/web_dashboard.py` | Updates the local dashboard state file. With `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` set, `POST /api/patches/save` creates a branch, commits, and opens a pull request on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts. |
 | Inspect, plan, or manage the control VM that hosts the dashboard | `src/control_vm.py` | Only with `--apply`; `render-startup` writes a local file |
 | Update an occupied dedicated builder in place | `src/lib/builder_runtime_update.py` | Only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed` |
 

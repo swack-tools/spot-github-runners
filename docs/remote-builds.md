@@ -7,8 +7,8 @@ runs jobs, see [Runtime updates](builder-runtime-updates.md).
 ## Host launcher
 
 The host launcher is `/usr/local/bin/oxidex-remote-build`. Its configuration is `/etc/oxidex-remote-build.json`.
-It checks project identifiers, allowed commands, image identity, mounts, limits, and the admission ledger before
-it starts a container. Containers run as UID and GID 1001 without a Docker socket, added capabilities, or
+It checks the project identifier, the allowed command, and the image identity. The Docker admission wrapper
+then checks the mounts and limits and takes the admission ledger lease before the container starts. Containers run as UID and GID 1001 without a Docker socket, added capabilities, or
 privilege escalation. See the [security model](security.md).
 
 Use the approved uploader account for source transfer. A control account with `sudo` access isn't necessarily
@@ -22,10 +22,13 @@ sudo -n /usr/local/bin/oxidex-remote-build oxidex-example \
   cargo build --release --locked --bin oxidex
 ```
 
-- `prepare` creates the project directories and gives the uploader source access. It doesn't erase existing
-  source or stop a build.
-- `cleanup` removes owned source content after it checks the cache locks and container mounts. It keeps the
-  targets.
+- `prepare` creates the project directories, gives the uploader source access, and gives UID 1001 the
+  project's target directory and the shared Cargo directory. It doesn't erase existing source or stop a
+  build. It's refused while the builder drains.
+- Every launcher call on a dedicated builder resets the shared parent directories to `root:1001` with mode
+  `0710` and refuses symbolic links in those paths.
+- `cleanup` removes everything in the project's source directory after it checks the cache locks and
+  container mounts. It keeps the targets, and it runs during a drain.
 - Transfer the source completely before you start the build. Don't prepare or synchronize a project that
   another build is using.
 - Cancellation and reconciliation checks in the admission and Docker adapter paths depend on exact run and
@@ -57,8 +60,11 @@ python3 src/remote_rust_build.py \
 ```
 
 - Use a new evidence directory for each attempt to keep earlier receipts.
-- The client snapshots the tracked files, transfers and verifies the archive, runs the build, checks the
-  artifact checksum, and records source and timing evidence.
+- The client snapshots the working-tree contents of tracked files, so uncommitted edits are included. It skips
+  paths under `.git`, `.codex`, `.claude`, `.agents`, `target`, `node_modules`, and `.venv`, files named
+  `.env*`, `*.pem`, or `*.key`, and symbolic links. It transfers and verifies the archive, runs the build,
+  checks the artifact checksum, and records source and timing evidence. The archive
+  (`remote-source.tar.gz`), the transaction log, and the receipt stay in the evidence directory.
 - `--artifact-dir` downloads the verified `oxidex` binary into that directory. Without it, the client keeps a
   receipt and doesn't download the binary.
 - The client uses `gcloud compute ssh` and `gcloud compute scp`. Verify that the selected account and host
@@ -78,8 +84,10 @@ The installer writes `cargo-oxidex-remote` and `cargo-oxidex-auto` into `$CARGO_
 and `--bin-dir` overrides the location. The shims run scripts from this checkout, so keep the checkout in place.
 The command names are `cargo oxidex-remote` and `cargo oxidex-auto`.
 
-- The configured OxiDex checkout supplies the remote instance, zone, project, and worktree settings through its
-  environment or `.cargo/config.toml`.
+- For `cargo oxidex-remote`, the configured OxiDex checkout supplies the remote instance, zone, project, and
+  worktree settings through its environment or `.cargo/config.toml`. `cargo oxidex-auto` reads only the project
+  and selects the instance and zone itself. Its selection connects to each candidate with `gcloud compute ssh`,
+  and it always downloads the artifact into `target/remote-linux/<profile>` in the checkout.
 - Use `--profile debug` or `--profile release` with the explicit client.
 - `cargo oxidex-auto` picks a lightly used worker and delegates the build over SSH. It makes up to three
   attempts by default (`--max-attempts`). It retries only when the failed attempt's receipt is marked retryable,
@@ -116,7 +124,7 @@ qualified from a successful source-only test suite or a bootstrap tool probe.
 | Build source | `/mnt/runner-data/remote-build/sources/<project>` |
 | Cargo downloads | `/mnt/runner-data/remote-build/cargo` |
 | Per-project targets | `/mnt/runner-data/remote-build/targets/<project>` |
-| Exported artifacts | `/mnt/runner-data/remote-build/exports/<run>` |
+| Exported artifacts (legacy client transactions only, created and removed for each run) | `/mnt/runner-data/remote-build/exports/<run>` |
 
 Mounting only the Docker data root isn't enough if containerd still stores layers on the boot disk. Bootstrap
 configures both on attached storage. Caches persist across builds on the same surviving disk. That retention

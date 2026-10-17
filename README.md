@@ -50,7 +50,7 @@ Pages. You can also read the Markdown sources directly.
 | Render a dedicated builder launch | `src/render_builder_startup.py` | Writes local files; the generated launch command creates a VM |
 | Build on an explicitly selected legacy host | `src/remote_rust_build.py` | Transfers source and starts a remote build |
 | Install Cargo client commands | `src/install_remote_commands.py` | Writes local executable shims |
-| Run the Web UI control plane and telemetry dashboard | `src/web_dashboard.py` | Updates the local dashboard state file. With `SPOT_CONFIG_REPO` configured, `POST /api/patches/save` creates a branch, commits, and opens a pull request on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts. |
+| Run the Web UI control plane and telemetry dashboard | `src/web_dashboard.py` | Updates the local dashboard state file. With `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` set, `POST /api/patches/save` creates a branch, commits, and opens a pull request on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts. |
 | Update an occupied dedicated builder in place | `src/lib/builder_runtime_update.py` | Only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed` |
 | Inspect, plan, or manage the Spot control VM that hosts the dashboard | `src/control_vm.py` | Only with `--apply`; `render-startup` writes a local file |
 
@@ -83,9 +83,12 @@ renewable `GH_TOKEN`. Git ignores the file. See
 
 - A request to edit code or documentation does not authorize changing live
   resources. Use read-only commands or previews (`--dry-run`, the `plan` and
-  `status` subcommands) unless you explicitly want a live operation. A tiered
-  `--dry-run` still connects with `gcloud compute ssh`, which can add your SSH key
-  to project or instance metadata, or to your OS Login profile.
+  `status` subcommands) unless you explicitly want a live operation. An
+  autoscaler `--dry-run` still connects with `gcloud compute ssh`, which can add
+  your SSH key to project or instance metadata, or to your OS Login profile. It
+  also writes the local state lock file and controller log.
+- `spot_runner_manager.py --apply` deletes old, unattached, manager-labeled disks
+  in the selected zone before it provisions, even if the deployment then fails.
 - Do not add `--install-launch-agent` to a preview: it writes and starts the macOS
   LaunchAgent before the dry-run check.
 - Never replay fresh-host bootstrap on an occupied runner or builder. Use the staged

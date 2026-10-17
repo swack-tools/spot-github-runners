@@ -15,13 +15,13 @@ The dashboard is one page with tabs. The **Admins** tab appears only for a signe
 | Sizing and Benchmark Qualifier | Sets per-runner vCPU and RAM, minimum counts, the CPU benchmark floor, disk types, and templates for runners and for Rust builders. Shows which machine offers currently qualify at the Spot price. |
 | Scaling and OOM Deep-Links | Edits the autoscaling triggers and budget caps. Lists out-of-memory (OOM) events with deep links to the exact GitHub Actions step and log line. |
 | `Cloud-Init` and VM templates | Edits and validates `#cloud-config` templates and saves VM templates from running instances. |
-| Regions and Latency Filter | Enables or disables regions by latency, continent, machine families, CPU platforms, and disk types. |
+| Regions and Latency Filter | Enables or disables regions by latency, continent, machine families, CPU platforms, and disk types. Its latency probe opens a TCP connection to a regional Google API endpoint in each catalog region. |
 | Rust Builders Telemetry and IP Intel | Records and summarizes remote build runs: cache hits, peak RAM, CPU time, CPU points, and an origin IP lookup. |
 | Runner Patches | Edits the patch manifests in the configuration repository. See [The patch console](#the-patch-console). |
 | Admins | Owner only. Manages the added administrators. See [Manage administrators](#manage-administrators). |
 
 !!! note "The dashboard keeps its own state"
-    A new dashboard starts from built-in example data (sample instances, templates, and policies) and stores everything you change in its own state. The handlers for instance delete, region scaling, and policy edits update the dashboard's state record and make no Compute Engine call. The autoscaler and `spot_runner_manager.py` are the tools that create and delete VMs. The one dashboard feature that can change running hosts is the opt-in patch hot-patch executor.
+    A new dashboard starts from built-in example data (sample instances, templates, and policies) and stores everything you change in its own state. The handlers for instance delete, region scaling, and policy edits update the dashboard's state record and make no Compute Engine call that creates, changes, or deletes a VM. Price calculations can still read Compute Engine Spot prices when credentials exist. The autoscaler and `spot_runner_manager.py` are the tools that create and delete VMs. The one dashboard feature that can change running hosts is the opt-in patch hot-patch executor.
 
 ## Run the dashboard locally
 
@@ -43,12 +43,12 @@ Open `http://127.0.0.1:8787`. The server doesn't read the `.env` file, so export
 | `--tls-certfile`, `--tls-keyfile` | None | PEM certificate and key for HTTPS. Also read from `DASHBOARD_TLS_CERTFILE` and `DASHBOARD_TLS_KEYFILE`. You must pass both or neither. |
 | `--allow-insecure-non-loopback` | Off | Allows plain HTTP on a non-loopback host behind a trusted TLS-terminating proxy. Also read from `DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK`. |
 | `--controlled-targets` | None | Comma-separated organizations and `owner/repo` targets that signed-in users must administer. Overrides `DASHBOARD_CONTROLLED_TARGETS`. |
-| `--oauth-redirect-uri` | Derived from the request `Host` header | Absolute GitHub OAuth 2.0 callback URL. Also read from `GITHUB_OAUTH_REDIRECT_URI`. |
+| `--oauth-redirect-uri` | The public origin plus `/auth/github/callback`, else derived from the request `Host` header | Absolute GitHub OAuth 2.0 callback URL. Also read from `GITHUB_OAUTH_REDIRECT_URI`. |
 | `--config-repo` | `<org>/spot-runners-config` | Runner configuration repository. Also read from `SPOT_CONFIG_REPO`. |
 | `--public-origin` | The origin of the OAuth 2.0 redirect URI | Browser-facing origin that the server accepts on `POST` when a proxy forwards under another host. Also read from `DASHBOARD_PUBLIC_ORIGIN`. |
 | `--state-file` | None (state stays in memory) | Path of the JSON state file. The server writes it atomically with mode `0600`. |
 | `--control-slot` | None | Control VM slot, `a` or `b`. Turns on Cloudflare KV hydration and write-behind when the KV credentials are set, and `/api/control/*` when `DASHBOARD_CONTROL_SECRET` is set. |
-| `--dump-overview` | Off | Prints the initial overview JSON to standard output and exits without serving. |
+| `--dump-overview` | Off | Prints the initial overview JSON to standard output and exits without serving. With `--state-file`, it still creates or rewrites that file. |
 
 The server refuses to start in these cases:
 
@@ -72,11 +72,11 @@ When `GITHUB_OAUTH_CLIENT_ID` is set, the dashboard signs users in with GitHub. 
 - **Rate limits.** Sign-in routes allow 10 start requests per client IP and 30 overall per 60 seconds. Completion routes allow 60 per IP and 240 overall. Over the limit, the dashboard answers HTTP 429 with `Retry-After`.
 - **Local token.** `--auth-token` enables a bearer token (`Authorization: Bearer` or `X-Dashboard-Token`). The dashboard honors it only from a direct loopback connection that carries no `Cf-Connecting-Ip`, `Cf-Ray`, `X-Forwarded-For`, or `X-Spot-Client-Ip` header. It never works through the proxy.
 
-Changing the saved controlled targets (`POST /api/auth/targets`) doesn't commit at once. It answers HTTP 202 with `"status": "reauth_required"`, and the change commits only after a fresh GitHub sign-in confirms that the same account administers every target. See [Controlled target changes](edge-dashboard.md#controlled-target-changes).
+`POST /api/auth/targets` updates the saved controlled targets. When the submitted list, after case-insensitive de-duplication, is identical to the saved list in the same order, it answers HTTP 200 with `"status": "unchanged"` and the current target lists, and nothing changes. Any other list doesn't commit at once. It answers HTTP 202 with `"status": "reauth_required"`, and the change commits only after a fresh GitHub sign-in confirms that the same account administers every target. See [Controlled target changes](edge-dashboard.md#controlled-target-changes).
 
 ## Manage administrators
 
-The **Admins** tab and the `/api/admins` routes manage the dashboard administrators. Only an owner with a GitHub session can use them. Every other caller gets HTTP 403 with `"code": "owner_required"`. That includes added administrators and the local token.
+The **Admins** tab and the `/api/admins` routes manage the dashboard administrators. Only an owner with a GitHub session can use them. Every other signed-in caller gets HTTP 403 with `"code": "owner_required"`. That includes added administrators and the local token. A signed-out caller gets HTTP 401.
 
 | Route | Purpose |
 | --- | --- |
@@ -87,7 +87,7 @@ The **Admins** tab and the `/api/admins` routes manage the dashboard administrat
 - The owners are fixed in code and can't be added or removed. A request to add an owner answers HTTP 409, and a request to remove one answers HTTP 400.
 - At most 50 administrators can be added. An add over the limit answers HTTP 409.
 - An add resolves the login with `GET /users/<login>` on the GitHub API, using `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` when set. The dashboard stores the login, the numeric user ID, who added it, and when. An invalid login, or an account that isn't a user (an organization, for example), answers HTTP 400. An unknown login answers HTTP 404, and a user who is already an administrator answers HTTP 409.
-- When GitHub fails, the add answers HTTP 424 with `"retry_same_key": true` and changes nothing.
+- When GitHub fails, the add answers HTTP 424 with `"retry_same_key": true` and changes nothing. A lookup that returns a different account also answers HTTP 424, without `retry_same_key`.
 - A remove of an ID that isn't an added administrator answers HTTP 404.
 - A change without `"confirm": true` answers HTTP 400.
 - Each change writes a line to the `spot_dashboard.auth` audit log and appends to a history of the last 50 changes.
@@ -127,15 +127,15 @@ A save of `defaults.yaml` also validates every `repos/<owner>/<repo>.yaml` file 
 
 The route applies the patch only when every host is `hot_patch` or `noop`, an executor is available, and the `patch_sha256` from the preview still matches the current effective patch. Otherwise the route answers HTTP 409: `refused` with the per-host table when a host is blocked, `stale_patch` when the patch changed, or an error when no host is recorded. A result per host reports `applied`, `noop`, `refused`, or `failed`, and the overall status is `applied`, `noop`, `partial`, or `failed`. A host that is already at the patch also has its GitHub labels reconciled, and a refused or failed reconcile makes that host `refused` or `failed`.
 
-The preview lists runner hosts from the dashboard state. With `DASHBOARD_FLEET_INVENTORY=gce` on a control VM, it lists them from Compute Engine, which also finds hosts that predate patch recording as `unknown`.
+A local dashboard preview lists runner hosts from the dashboard state. With `DASHBOARD_FLEET_INVENTORY=gce`, which the control VM startup script always sets, it lists them from Compute Engine, which also finds hosts that predate patch recording as `unknown`. With a hot-patch executor, the preview also reads each host's receipt over `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or to your OS Login profile.
 
 ### When hot-patching is unavailable
 
-The control VM image has no `gcloud` and no SSH path to the runner hosts. By default, the hot-patch route therefore answers HTTP 501 with `"code": "hot_patch_unavailable"`, and the preview and list report the reason. The 501 status is deliberate: the Worker turns a 503 into an endless wait.
+The control VM image has no `gcloud` and no SSH path to the runner hosts. By default, the hot-patch route therefore answers HTTP 501 with `"code": "hot_patch_unavailable"`, and the preview and list report the reason. The 501 status keeps this failure distinct from the control VM wait response.
 
 To apply a patch from outside the dashboard, use an operator workstation with `src/spot_runner_manager.py --patch-live`. See [Apply a patch](runner-patches.md#apply-a-patch).
 
-Set `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud` only where `gcloud` and operator credentials exist. If `gcloud` isn't on `PATH`, the executor reports that it is unavailable. The executor takes every deployment value (region, runner label, runner prefix, runner count, heavy pool size, and for organizations the runner group) from the host's recorded metadata, and it refuses a host that lacks any of them. It never falls back to the `spot_runner_manager.py` defaults, which would rewrite the host's GitHub labels.
+Set `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud` only where `gcloud` and operator credentials exist. If `gcloud` isn't on `PATH`, the executor reports that it is unavailable. The executor takes every deployment value (zone, machine type, region, runner label, runner prefix, runner count, patch repository, registration scope, and for organizations the runner group) from the host's recorded metadata, and it refuses a host that lacks any of them. It also passes the heavy pool size when the host records one. It never falls back to the `spot_runner_manager.py` defaults, which would rewrite the host's GitHub labels.
 
 ## Changes and idempotency
 
@@ -145,7 +145,7 @@ Every change from the browser carries an `Idempotency-Key` header. The page gene
 | --- | --- |
 | Where the key is required | `/api/patches/save`, `/api/patches/hot-patch`, `/api/admins/add`, and `/api/admins/remove` answer HTTP 400 without one. Other change routes accept it and run without replay protection when you omit it. |
 | Key format | 8 to 128 characters from `A-Za-z0-9._:-`. Anything else answers HTTP 400. |
-| Stored responses | The dashboard stores the response with the change, in the same state write. A retry with the same key replays the stored response and adds `Idempotent-Replay: true`. Records last 24 hours, up to 500 keys, and a stored body larger than 64 KiB is replaced by a short placeholder. |
+| Stored responses | For a state change, the dashboard stores the response with the change, in the same state write. For a patch save or hot patch, it stores the response right after the GitHub or host action completes; if that write fails, the response carries a `warning` and the record stays in memory. A retry with the same key replays the stored response and adds `Idempotent-Replay: true`. Records last 24 hours, up to 500 keys, and a stored body larger than 64 KiB is replaced by a short placeholder. |
 | Mismatch | The same key with a different method, path, or body answers HTTP 422. |
 | Still running | A retry of a patch save or hot patch that is still running answers HTTP 202 with `"status": "pending"` and `Retry-After`. The browser keeps asking with the same key until it gets the stored result. |
 | Unconfirmed GitHub outcome | A save whose GitHub result is unknown answers HTTP 424 with `"retry_same_key": true`. The dashboard never stores that answer, so the retry runs again and reconciles with GitHub instead of opening a second pull request. |
@@ -161,7 +161,7 @@ If you select **Save** again for the same change, the panel reuses the key until
 
 ### Freeze and wait responses
 
-While the dashboard is hydrating, frozen for a control VM handover, not reconciled with Cloudflare KV, or not the active slot, it answers every change with the wait response, which is HTTP 503 with `Retry-After: 10` and a body of `{"error": "control_vm_unavailable", "message": "...", "retry_after_seconds": 10}`. Reads work while frozen, but every request waits until the dashboard has loaded its state. A freeze waits up to 45 seconds for running saves and hot patches to finish. See [State durability](edge-dashboard.md#state-durability) and [Outages and recovery](edge-dashboard.md#outages-and-recovery).
+While the dashboard is hydrating, frozen for a control VM handover, not reconciled with Cloudflare KV, or not the active slot, it answers every `POST` with the wait response, which is HTTP 503 with `Retry-After: 10` and a body of `{"error": "control_vm_unavailable", "message": "...", "retry_after_seconds": 10}`. That includes `POST` routes that only read or compute, such as validation and previews, and sign-in and sign-out. `GET` requests work while frozen, but every request except `/api/health` and `/api/control/*` waits until the dashboard has loaded its state. A freeze waits up to 45 seconds for running saves and hot patches to finish. See [State durability](edge-dashboard.md#state-durability) and [Outages and recovery](edge-dashboard.md#outages-and-recovery).
 
 ## Other API behavior
 
@@ -182,10 +182,10 @@ While the dashboard is hydrating, frozen for a control VM handover, not reconcil
 ### Request rules
 
 - Every `POST` must send `Content-Type: application/json` (otherwise HTTP 415). A cross-site `POST` answers HTTP 403. When a `POST` carries an `Origin` header, it must match the request `Host` or the public origin, and `null` is refused (HTTP 403). The dashboard never trusts `X-Forwarded-Host` for this check.
-- A request body is at most 262,144 bytes (HTTP 413), and 4,096 bytes on the sign-in and sign-out routes. The server requires a bounded `Content-Length` and doesn't support `Transfer-Encoding`.
+- A request body is at most 262,144 bytes (HTTP 413), and 4,096 bytes on the sign-in and sign-out routes. `/api/control/import` accepts up to 25 MiB plus 64 KiB. A request without `Content-Length` counts as an empty body. The server refuses `Transfer-Encoding` and a malformed or negative `Content-Length`.
 - `PUT`, `PATCH`, and `DELETE` answer HTTP 405. An unknown route answers HTTP 404.
-- Every response that the dashboard produces carries `X-Spot-Origin: dashboard`. The Worker passes a marked 5xx response through unchanged and treats only unmarked 5xx responses and timeouts as an outage.
-- GitHub and Compute Engine failures in the patch console answer HTTP 424 with `"code": "upstream_error"`, never 502, so the Worker doesn't retry them as an outage.
+- Every response from the dashboard's routes carries `X-Spot-Origin: dashboard`. The Worker passes a marked 5xx response through unchanged unless its body is the wait response. It treats an unmarked 502, 503, 504, or 520 to 530 response, a failed connection, a timeout, or a missing origin record as an outage.
+- GitHub and Compute Engine failures in the patch console answer HTTP 424 with `"code": "upstream_error"`, never 502.
 - `/api/control/*` (`snapshot`, `freeze`, `unfreeze`, `import`) is for the control VM controller. It uses a short-lived control token instead of a session, and the Worker doesn't route it.
 
 ### Routes

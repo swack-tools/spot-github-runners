@@ -7,9 +7,10 @@ explains how the controller decides, how it retires a host without losing work,
 and which guards protect running jobs.
 
 !!! warning "Live operations"
-    Only `src/runner_fleet.py` and a tiered `--dry-run` without
+    Only `src/runner_fleet.py`, `src/spot_runner_manager.py` without `--apply` or
+    `--patch-live`, and `src/spot_runner_autoscaler.py --dry-run` without
     `--install-launch-agent` leave VMs, disks, runner registrations, and controller
-    state unchanged. A tiered dry run still connects with `gcloud compute ssh`,
+    state unchanged. A dry run still connects with `gcloud compute ssh`,
     which can add your SSH key to project or instance metadata, or to your OS
     Login profile. Every other controller run can create, drain, or delete VMs and
     runner registrations. Read [Dry run, once, and the state lock](#dry-run-once-and-the-state-lock)
@@ -38,8 +39,11 @@ The autoscaler runs the same loop in every mode. Each check does the following:
    most one host.
 
 The autoscaler launches new hosts by calling `src/spot_runner_manager.py
---apply` as a child process. It names each host
-`oxidex-runners-<region>-<zone letter>-<target tag>-<time and random suffix>`
+--apply` as a child process, so each launch also deletes the zone's
+unattached, `READY` runner data disks that carry the manager's label and are
+older than six hours. See [Apply the reviewed plan](provisioning.md#apply-the-reviewed-plan).
+It names each host
+`oxidex-runners-<region without hyphens>-<zone letter>-<target tag>-<time and random suffix>`
 and gives its runners names of the form `gha-<host name>-<slot>`.
 
 ### Registered listeners and concurrent capacity
@@ -65,8 +69,10 @@ Pass `--scaling-mode tiered` explicitly for production use.
 Use tiered mode. Resource and legacy modes can delete an overpriced host even
 while jobs are active, unless you enable
 [make-before-break rotation](#price-rotation-and-make-before-break). Tiered mode
-replaces hosts only after the replacement is registered and healthy, and drains
-the old host first.
+normally launches the replacement first and drains the old host only after the
+replacement is registered and healthy. When the five-host, 80-vCPU, or
+100-slot ceiling leaves no room for the overlap, it drains the old host first,
+and only when the remaining hosts can carry current demand.
 
 ### Polling and host-count rules
 
@@ -105,23 +111,30 @@ reservation does not fit a tier, the controller skips that tier and moves up the
 ladder. Pass `--tier-job-memory-gib` to match your workload.
 
 **Topology limits.** A tiered fleet has at most five hosts, 80 vCPU, and 100
-listener slots in total, including any replacement that overlaps a source. Only
-the last host can be a `small`, `starting`, or `expanded` tail host; every host
-before it is `large` or `bulky`. An unaffordable, unavailable, or incompatible
+listener slots in total, counting each host's tier maximum and including any
+replacement that overlaps a source. `starting` is valid only as the sole host.
+In a fleet of more than one host, every host before the last is `large` or
+`bulky`, and the last host is `small`, `expanded`, `large`, or `bulky`: a
+multi-host fleet ends in a `small` or `expanded` tail host or in another
+`large` or `bulky` host. An unaffordable, unavailable, or incompatible
 target holds the operation instead of selecting an arbitrary fallback.
 
 **Growth and shrinkage.** The planner reads absolute demand, not fleet averages:
 
 - One host over 75 percent CPU or memory, or a compatible queue delay or
   job-duration regression, grows the fleet when the signal holds in two
-  distinct windows. Only a host OOM grows it after a single observation.
+  distinct windows. Only a host OOM grows it after a single observation, and
+  only when the job inventory and the host events from every host are
+  complete.
 - Six low windows, no pending compatible jobs, healthy IO, and projected peaks
   that fit the smaller topology shrink the fleet. The projection keeps CPU peaks
   below 60 percent and RAM peaks (plus 25 percent and 2 GiB per host) within
   the target RAM.
 - A completed tier migration starts a 900-second cooldown. A host OOM bypasses the cooldown.
-- A queue delay with CPU and memory headroom first raises listener density by
-  four slots, up to the tier maximum, before it adds a host.
+- A queue delay with CPU and memory headroom first raises listener density
+  before it adds a host: it replaces the tail host with one of the same tier
+  that registers four more listeners, up to the tier maximum. A `starting` tail
+  is already at its maximum, so it can't use this step.
 - Incomplete job inventory, missing metrics, or unhealthy IO pressure holds
   optimization.
 
@@ -163,8 +176,9 @@ either an organization (for example `swack-tools`) or a repository
   earlier versions belong to the organization target named by `--org`.
 - The controller binds its state file to one target and refuses a state file
   that another target created. Use a separate `--state-file` for each target.
-- Organization targets register runners in runner group 10, the default that
-  `spot_runner_manager.py` uses. The manager requires the group to be
+- Organization targets register runners in the runner group your controller
+  uses, which is the `--runner-group-id` default that `spot_runner_manager.py`
+  uses. The manager requires the group to be
   repository-scoped and enabled for `<org>/oxidex`. Repository targets have no
   runner groups.
 
@@ -191,16 +205,18 @@ What happens next depends on the mode:
 | `resource` or `legacy`, `--make-before-break` | The controller rotates the host with the sequence below. Passing `--target` also selects rotation. |
 | `resource` or `legacy`, default (`--no-make-before-break`) | The controller deletes the overpriced VM and its disks immediately, including any active jobs, and then launches a replacement. |
 
-`--make-before-break` and `--no-make-before-break` are mutually exclusive. The
-default is off. The `--manage-control-vm` option rotates the dashboard control
+`--make-before-break` and `--no-make-before-break` set one option, so when you
+pass both, the last one wins. The default is off. The `--manage-control-vm` option rotates the dashboard control
 VM with its own sequence, which the
 [edge hosting reference](edge-dashboard.md) describes.
 
-A host that runs a [runner patch](runner-patches.md) stays in service over the
-cap unless this controller has a matching `--patch-repo`, because a replacement
-without the patch would pass readiness while missing packages, mounts, and
-labels. The controller logs the hold on both the rotation and the delete-first
-path.
+In `resource` and `legacy` modes, a host that runs a
+[runner patch](runner-patches.md) stays in service over the cap unless this
+controller has a matching `--patch-repo`, because a replacement without the
+patch would pass readiness while missing packages, mounts, and labels. The
+controller logs the hold on both the rotation and the delete-first path. The
+`tiered` mode has no such hold: a replacement gets the patch only when this
+controller has `--patch-repo`.
 
 ### Rotation sequence
 
@@ -226,8 +242,7 @@ flowchart LR
    after failures.
 2. **Provision.** It launches the replacement. Three failed attempts return the
    rotation to selection with a different offer. A launch that misses its
-   deadline (600 seconds, or 2400 for a tiered host with remote builders) is
-   abandoned: the controller deletes the VM, its disks, and the runner records.
+   deadline (600 seconds) is abandoned: the controller deletes the VM, its disks, and the runner records.
 3. **Boot.** It waits up to 600 seconds for the replacement to reach `RUNNING`.
 4. **Verify readiness.** It waits up to 900 seconds until every expected
    listener of the replacement is online. The expected count comes from the
@@ -334,8 +349,10 @@ re-checks them before it deletes anything.
   runners succeed.
 - A fresh inventory shows the runner registrations absent.
 
-The controller then deletes the VM and its disks and waits for provider
-confirmation that both are gone. Stopping the controller does not drain a VM or
+The controller then deletes the VM with its attached disks and waits until the
+VM and the runner registrations are gone. In `tiered` mode it first checks the
+recorded disk identities, and a tier migration also confirms that each recorded
+disk is gone. Stopping the controller does not drain a VM or
 stop a job.
 
 For operator procedures such as finding a stuck drain, see
@@ -380,8 +397,8 @@ enforce these limits.
 
 The controller protects a host that has any `spot-heavy32` runner. While a
 heavy route has no verified replacement, tier changes, price replacement, and
-automatic launches hold, and a retirement logs `Retirement held: heavy route
-has no verified replacement`.
+automatic launches hold, and a retirement logs `Retirement held: live heavy
+route has no verified replacement`.
 
 ### Out-of-memory handling
 
@@ -393,7 +410,7 @@ as follows:
 | Evidence | Reaction |
 | --- | --- |
 | Host OOM | Grow the fleet after one observation and reset listener density. |
-| Container OOM with host headroom | Raise the reservation and container caps, but only on an idle host. If the new cap exceeds the host envelope, migrate to a larger tier. |
+| Container OOM with host headroom | Double the reservation for future jobs, up to 95 percent of the host's observed memory envelope, and raise the cap only on containers that hold no lease. A busy container keeps its cap until it is lease-free. If the new cap exceeds the host envelope, migrate to a larger tier. |
 | Container OOM with host memory over 75 percent | Treat it as host pressure. |
 | Unattributed OOM | Hold until identity evidence arrives. |
 
@@ -464,8 +481,14 @@ The controller loads `.env` from the repository root. See
   SSH keys to your project or OS Login settings on first use. It runs the tier
   planner whatever `--scaling-mode` says. It never launches, drains, or
   deletes, never runs job recovery, and never writes controller state. It still
-  opens the state lock and the log file. With `--manage-control-vm`, it also
-  prints that VM's plan.
+  creates the state directory and the state lock file, appends to the log file,
+  and lets `gcloud` create its local SSH key and known-hosts files. With
+  `--manage-control-vm`, it also prints that VM's plan as a text line before the
+  JSON and creates the project control VM lock file.
+- A dry run takes the same exclusive state lock as a running controller, so it
+  fails with `Another controller owns state` while the LaunchAgent controller
+  uses that state file. Pass a separate `--state-file` to preview next to a
+  running controller. A new state file has no saved evidence history.
 - `--once` runs one check and exits. Without `--dry-run`, that check can
   provision or retire resources.
 - `--install-launch-agent` is not a dry-run. The controller writes and

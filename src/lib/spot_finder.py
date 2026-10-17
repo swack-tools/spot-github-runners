@@ -274,7 +274,7 @@ def main() -> int:
     parser.add_argument("--min-vcpu", type=int, default=32, help="Minimum vCPU count (default: 32)")
     parser.add_argument("--min-ram", type=parse_ram, default=128, metavar="GB", help="Minimum RAM (e.g. 128 or 128GB; default: 128)")
     parser.add_argument("--runners", type=int,
-                        help="Runner count per instance (default: vCPU / 4; one runner per 4 vCPU)")
+                        help="Runner count per instance (default: 1 below 4 vCPU or at most 8 GiB RAM, else vCPU // 4)")
     parser.add_argument("--top", type=int, default=10, help="Number of cheapest results (default: 10)")
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, help="Concurrent API requests (default: 600)")
     parser.add_argument("--list-price", type=float, help="Optional on-demand hourly price baseline (USD) for 95%%-off alerts")

@@ -16,8 +16,8 @@ fixed `/usr/local/bin/oxidex-remote-build` launcher.
 The website tool additions pin Node 24.21.0 and Playwright 1.63.0, including
 Chromium revision 1243. The package lock verifies npm archives; the official
 Node archive has a fixed SHA-256. Browser downloads and Linux libraries are
-installed during image construction. Browser files live at the read-only
-`/opt/playwright-browsers` path, selected by `PLAYWRIGHT_BROWSERS_PATH`.
+installed during image construction. Browser files live at the root-owned
+`/opt/playwright-browsers` path, which UID 1001 can read but not write,, selected by `PLAYWRIGHT_BROWSERS_PATH`.
 The tool probe checks the browser executable and shared libraries as UID 1001.
 The website audit must separately prove an actual browser launch and rendering. These source additions need a reviewed image build and actual
 tool proof before an existing host is upgraded; they do not establish that
@@ -67,7 +67,8 @@ required. `cloud-config.yaml` contains the equivalent payload for images with a
 cloud-init agent, but that alternative execution path has not been live-tested.
 
 Startup verifies fresh-host identity and the absence of existing runners/work,
-installs Docker, mounts storage before starting Docker/containerd, builds, and pins
+mounts the cache disk, installs Docker, stops Docker and containerd, points both at the cache disk and
+restarts them, builds, and pins
 the immutable image, starts aggregate admission, checks actual tool/cgroup/cache
 observations, enrolls the approved restricted uploader, and writes a completion
 marker. No manual SSH installation or repository checkout is needed on the host.
@@ -120,8 +121,9 @@ Then use `just build`; use `just build-local` for an explicit local build.
 
 The launch command uses a 40 GiB Hyperdisk Balanced boot disk and a 100 GiB
 Hyperdisk Balanced cache disk through NVMe, with 3,000 IOPS and 140 MiB/s baseline
-provisioning. The renderer also accepts the explicitly reviewed 4,000 IOPS /
-250 MiB/s pair; price that pair before launching. Compute and both disks were
+provisioning. For the cache disk only, the renderer also accepts the explicitly
+reviewed 4,000 IOPS / 250 MiB/s pair; price that pair before launching. The boot
+disk is always 3,000 IOPS / 140 MiB/s. Compute and both disks were
 quoted at $2.573746849/day in asia-east2-a on 2026-10-05; this is a historical
 quote, not a promise of future pricing or Spot availability.
 
@@ -133,8 +135,11 @@ the established host key for `oxidex-uploader`. `gcloud compute ssh/scp` can enr
 the account into broader guest permissions and is not the restricted uploader
 transport.
 
-The launcher prepares a project, executes the allowed build command under one
-aggregate lease/cache lock, exports artifacts, and cleans only owned source.
+The launcher prepares a project and starts the allowed build command in an
+admitted container; the Docker admission wrapper takes the aggregate lease and
+cache lock. The launcher's `cleanup` empties the project's source directory
+after it checks the locks and container mounts. Artifact export isn't a launcher
+step.
 Draining refuses new builds and lets actual active builds, leases and cache/upload
 locks finish before replacement. Persistent Cargo downloads and targets are not
 deleted after each build. GitHub runner drains are separate from this lifecycle.

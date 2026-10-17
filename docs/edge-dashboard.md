@@ -87,8 +87,8 @@ unchanged, so a retry with the same `Idempotency-Key` sends the same bytes.
 ### Dashboard administrators
 
 The **Admins** tab appears only for the owner, and `/api/admins` answers HTTP 403 with
-`"code": "owner_required"` to everyone else. That includes added administrators and the local
-dashboard token. The tab lists the owners, which are read-only, and the added administrators, each with a
+`"code": "owner_required"` to every other signed-in caller. That includes added administrators and the
+local dashboard token. A signed-out caller gets HTTP 401. The tab lists the owners, which are read-only, and the added administrators, each with a
 **Remove** button.
 
 | Route | Purpose |
@@ -97,7 +97,7 @@ dashboard token. The tab lists the owners, which are read-only, and the added ad
 | `POST /api/admins/add` | Adds `{"login": "<github username>", "confirm": true}`. Needs an `Idempotency-Key`. |
 | `POST /api/admins/remove` | Removes `{"uid": <numeric user ID>, "confirm": true}`. Needs an `Idempotency-Key`. |
 
-- Owners are set at deploy time and can't be added or removed here. At most 50 administrators can be
+- Owners are fixed in code and can't be added or removed here. At most 50 administrators can be
   added.
 - Adding a user looks up the login with `GET https://api.github.com/users/<login>`, using
   `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` when set. The dashboard stores the login, the numeric user ID,
@@ -105,7 +105,8 @@ dashboard token. The tab lists the owners, which are read-only, and the added ad
   organization, with HTTP 400. An unknown login gets HTTP 404, and a user who is already an owner or an
   administrator gets HTTP 409.
 - When GitHub fails, the add answers HTTP 424 with `"retry_same_key": true` and changes nothing, so the
-  browser retries with the same key.
+  browser retries with the same key. A lookup that returns a different account also answers HTTP 424,
+  without `retry_same_key`.
 - A retry with the same `Idempotency-Key` replays the stored answer without a second lookup. The same
   key with a different body gets HTTP 422.
 - Every change is logged to the `spot_dashboard.auth` audit log and kept in a history of the last 50
@@ -118,7 +119,9 @@ dashboard token. The tab lists the owners, which are read-only, and the added ad
 ### Controlled target changes
 
 `POST /api/auth/targets` changes the targets saved in the dashboard, and only a GitHub session can call
-it. An unchanged list answers HTTP 200 with `"status": "unchanged"`. Otherwise the request doesn't change anything yet. It answers HTTP 202 with `"status": "reauth_required"` and
+it. A list that, after case-insensitive de-duplication, is identical to the saved list in the same order
+answers HTTP 200 with `"status": "unchanged"` and starts no sign-in. A reordered list counts as a change.
+Otherwise the request doesn't change anything yet. It answers HTTP 202 with `"status": "reauth_required"` and
 either an `authorize_url` or a device code. The change commits only after that new GitHub sign-in shows
 that the same GitHub account administers every static, config repository, current, and proposed target.
 That check skips the cache of earlier administrator checks.
@@ -240,8 +243,8 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   patch. `--patch-live` skips the live script only on such proof. The console's hot-patch executor
   classifies a host whose unproven receipt names the target as `hot_patch`, so the live script runs
   again and writes a completion receipt. Receipts written before this change don't count as proof.
-- On the control VM, `DASHBOARD_FLEET_INVENTORY=gce` makes the preview list runner hosts from Compute
-  Engine. A runner host carries the `spot-target` label or the patch metadata. The preview also lists
+- The control VM startup script always sets `DASHBOARD_FLEET_INVENTORY=gce`, which makes the preview
+  list runner hosts from Compute Engine. A runner host carries the `spot-target` label or the patch metadata. The preview also lists
   a VM that has neither, when its name starts with a runner host prefix such as `oxidex-runners-`. Such a
   host was provisioned before patch recording, so its repository and patch are unknown. It shows as
   `unknown` in the preview of every repository and blocks hot-patching until it's reprovisioned or
@@ -278,10 +281,11 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   there answers HTTP 501 with `"code": "hot_patch_unavailable"`. Run
   `src/spot_runner_manager.py --patch-repo OWNER/REPO --patch-live` from an operator workstation instead. A
   dashboard that runs where `gcloud` and operator credentials exist can set
-  `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`. That path takes the region, runner label, repository, runner
-  count, and heavy pool size from the host's recorded metadata. It refuses a host that's missing any
-  of them, because the live patch would otherwise reset the host's GitHub scheduling labels to the
-  `spot_runner_manager.py` defaults. An org-registered host also needs its runner group.
+  `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`. That path takes the zone, machine type, region, runner label,
+  runner prefix, runner count, patch repository, and registration scope from the host's recorded
+  metadata. It refuses a host that's missing any of them, because the live patch would otherwise reset
+  the host's GitHub scheduling labels to the `spot_runner_manager.py` defaults. An org-registered host
+  also needs its runner group. The heavy pool size is passed when the host records one.
 - A live patch first checks everything that label sync needs: the runner group, strict-pool membership,
   and that GitHub lists every expected runner. Only then does it change the host, so label sync can't
   fail after the patch applied.
@@ -307,9 +311,10 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
 - A retry with the same `Idempotency-Key` while the first request still runs gets HTTP 202 with
   `"status": "pending"` and `Retry-After`. That happens, for example, after the Worker's 30-second
   timeout. The browser keeps asking with the same key until it gets the stored result.
-- GitHub and Compute Engine failures answer HTTP 424 with `"code": "upstream_error"`. Every dashboard
-  response carries `X-Spot-Origin: dashboard`. The Worker passes a marked 5xx response through
-  unchanged, and treats only unmarked 5xx responses and timeouts as an outage.
+- GitHub and Compute Engine failures answer HTTP 424 with `"code": "upstream_error"`. Every response from
+  the dashboard's routes carries `X-Spot-Origin: dashboard`. The Worker passes a marked 5xx response
+  through unchanged unless its body is the wait response. It treats an unmarked 502, 503, 504, or 520
+  to 530 response, a failed connection, a timeout, or a missing origin record as an outage.
 - A freeze waits up to 45 seconds for running saves and hot-patches to finish, so the handover snapshot
   includes their results. If they're still running after that, the freeze answers HTTP 409 with
   `"retryable": true`, and the autoscaler tries again.
@@ -320,8 +325,8 @@ GitHub device code stays on the control VM behind a random handle, and the dashb
 interval. A VM replacement ends a device sign-in in progress, so request a new code.
 
 The Worker reaches the control VM through its tunnel hostname, so the request `Host` differs from the
-browser `Origin`. The dashboard accepts a `POST` only when `Origin` matches its own `Host` or its public
-origin, and it never trusts `X-Forwarded-Host` for this check. The public origin comes from
+browser `Origin`. When a `POST` carries an `Origin` header, the dashboard accepts it only when `Origin` matches its own
+`Host` or its public origin, and it never trusts `X-Forwarded-Host` for this check. The public origin comes from
 `--public-origin`, then `DASHBOARD_PUBLIC_ORIGIN`, then the origin of `GITHUB_OAUTH_REDIRECT_URI`. The
 startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` metadata value.
 
@@ -355,8 +360,10 @@ startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` 
   the active dashboard.
 - When the local file is newer than the KV copy at startup, for example because a preemption cut off a
   write after a local save, the active slot publishes the local copy.
-- The browser sends an `Idempotency-Key` header with every change. The dashboard stores the response in
-  the same atomic save as the change, so a retried request never applies twice.
+- The browser sends an `Idempotency-Key` header with every change. For a state change, the dashboard
+  stores the response in the same atomic save as the change, so a retried request never applies twice.
+  A patch save or hot patch stores its response right after the GitHub or host action, and a retry
+  reconciles with GitHub or the hosts instead of acting twice.
 - A freeze writes the marker file `state.json.frozen` next to the state file. If the container restarts
   while frozen, the dashboard starts frozen and `/api/health` reports `frozen`. The marker stays until an
   explicit unfreeze or a successful import.

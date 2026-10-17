@@ -43,10 +43,13 @@ exact command and environment for every verification claim.
 
 - `tools/infra_python_complete_proof.py` pins the SHA-256 of `tools/infra_python_test_proof.py` in
   `PRODUCER_SHA`. After a reviewed change to the producer, update `PRODUCER_SHA` and run
-  `tests/test_infra_python_test_proof.py`.
-- `tools/infra_python_test_proof.py` enforces minimum counts for test cases (`MIN_CASES`) and test modules
-  (`MIN_MODULES`). It also checks that every `tests/test_*.py` module matches the signed manifest, with no
-  duplicate test identities. Don't delete or merge test modules below those floors without a reviewed contract
+  `tests/test_infra_python_test_proof.py`. That test checks the producer's behavior, not the pin: only
+  `tools/infra_python_complete_proof.py` itself, run through `just test` or
+  `just infra-python-complete-tests` in the admitted builder, detects a stale `PRODUCER_SHA`.
+- `tools/infra_python_test_proof.py` enforces minimum counts for test cases (`MIN_CASES`, 854) and test
+  modules (`MIN_MODULES`, 82). The complete proof replaces those floors with `max(774, module count)` cases
+  and `max(76, module count)` modules. The producer also checks that every `tests/test_*.py` module matches
+  its digest in the manifest, with no duplicate test identities. Don't delete or merge test modules below those floors without a reviewed contract
   update.
 
 ## Keep embedded assets in sync
@@ -55,7 +58,7 @@ Some modules embed scripts that tests compare byte for byte with the files on di
 
 | Module | Embeds or reads |
 | --- | --- |
-| `src/lib/runner_assets.py` | `runner/clean_target.py`, `runner/job-completed.sh`, `runner/Dockerfile`, `runner/entrypoint.sh`, and `cloud-init/startup.sh`. Update the constant in the same commit as the file. |
+| `src/lib/runner_assets.py` | `runner/clean_target.py`, `runner/docker-wrapper.py`, `runner/job-completed.sh`, `runner/Dockerfile`, `runner/entrypoint.sh`, and `cloud-init/startup.sh`. Update the constant in the same commit as the file. |
 | `src/lib/builder_assets.py` | The legacy shared-host builder files: `builder/Dockerfile`, `builder/entrypoint.py`, and `builder/host-launcher.py`. |
 | `src/lib/builder_only_assets.py` | Dedicated builder files from `builder/standalone/`, `builder/dedicated/`, and `cloud-init/builder-startup.sh`. Keep the file lists, permissions, and runtime-update target manifests in `src/lib/builder_runtime_update.py` aligned. |
 
@@ -96,7 +99,7 @@ python3 -m venv "$HOME/oxidex-ops/docs-venv"
 
 `mkdocs serve` previews the site at `http://127.0.0.1:8000`. The `site/` directory is ignored by Git. The
 **Documentation** workflow (`.github/workflows/docs.yml`) runs the same strict build on pull requests that
-change the documentation. On pushes to `main` it also deploys the site to GitHub Pages through the
+change the documentation. On pushes to `main` that change the documentation it also deploys the site to GitHub Pages through the
 `github-pages` environment. In the repository settings, set **Pages** > **Source** to **GitHub Actions** once.
 
 !!! warning "The site is public"

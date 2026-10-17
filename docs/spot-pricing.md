@@ -1,12 +1,14 @@
 # Spot pricing and offers
 
-Two read-only tools help you choose a machine shape before you provision anything. Neither tool creates a VM,
-reserves capacity, or changes a GitHub setting.
+Two tools help you choose a machine shape before you provision anything. Neither tool creates a VM,
+reserves capacity, or changes a cloud or GitHub setting. They can write local files: `spot_prices.py --csv`
+saves its rows, and `spot_finder.py` writes a quota cooldown marker in the temporary directory after a quota
+error.
 
 | Tool | Use it to | Data source |
 | --- | --- | --- |
 | `tools/spot_prices.py` | List every machine type that meets a minimum CPU and RAM and costs at most a daily cap. | Official Billing Catalog and the machine-type inventory. |
-| `src/spot_finder.py` | Rank the cheapest Spot offers across all active regions and show per-runner costs. | Billing Catalog rates when available, with Compute Engine price lookups as a fallback. |
+| `src/spot_finder.py` | Rank the cheapest Spot offers across all active regions and show per-runner costs. | Billing Catalog rates when a Billing Catalog API key is set and `--list-price` isn't. Otherwise, Compute Engine Spot price lookups. |
 
 Both tools use the active `gcloud` account and project, or the project that you pass with `--project`. See
 [Getting started](getting-started.md) for the prerequisites.
@@ -26,9 +28,9 @@ python3 tools/spot_prices.py --min-cpu 4 --min-ram 8 \
 - The command prints CSV to standard output with the columns `region`, `machine_type`, `vCPU`, `RAM_GiB`,
   `USD_hour`, `USD_day`, and `zones`. Progress and diagnostics go to standard error. `--csv PATH` also saves the
   displayed rows to a file.
-- Machine types without a supported catalog price are omitted and counted in the diagnostics. That includes
-  shared-core shapes, accelerator and TPU families, and bare-metal shapes. A catalog component with conflicting
-  prices is also omitted and reported as unsupported.
+- Accelerator and TPU families, bare-metal shapes, and obsolete or deleted machine types are skipped without a
+  diagnostic. Shared-core shapes and machine types without a supported catalog price are omitted and counted in
+  the diagnostics. A catalog component with conflicting prices is also omitted and reported as unsupported.
 - An authentication failure or an incomplete machine inventory fails the command instead of printing partial
   results.
 
@@ -61,7 +63,8 @@ python3 src/spot_finder.py \
   with `--billing-api-key` or `GOOGLE_CLOUD_API_KEY`, against the public on-demand rates. Without either, the
   alerts are turned off and the tool says so.
 - `--concurrency` limits parallel API requests (default 600). Repeat `-v` for more diagnostic detail.
-- The exit status is 2 when no matching Spot price data exists, and 1 for an authentication or inventory error.
+- The exit status is 2 when no matching Spot price data exists, and 1 for an authentication or API error. An unreachable zone in the machine inventory
+  only logs a warning.
   A partial scan exits 0 and prints a warning on stderr. In a partial scan, some regional price requests fail but
   offers remain. If every request fails, the status is 2.
 

@@ -6,8 +6,11 @@ each component, follow the links to the pages that own those topics.
 
 !!! warning "Keep the boundaries intact"
     Don't weaken `host-launcher.py`, `docker-admission.py`, `host_admission.py`, `builder_access.py`, or
-    the `qualification_trust` checks to work around a failure. Every check on this page fails closed: when a
-    check can't confirm an identity, a limit, or an owner, it refuses the action and keeps the evidence.
+    the `qualification_trust` checks to work around a failure. When one of these checks can't confirm an
+    identity, a limit, or an owner, it refuses the action and keeps the evidence. Two paths sit outside the
+    checks: the Docker admission wrapper passes a `docker run` without the remote-build label straight to
+    Docker, which is safe only because the uploader can't reach Docker, and runner hosts without a tier get no
+    memory admission at all.
 
 ## Trust boundaries
 
@@ -161,8 +164,9 @@ also disables OS Login and blocks project-wide SSH keys, so the enrolled key is 
 
 When a transfer or build fails with a permission error, fix the identity, not the permissions. Don't add the
 uploader to another group, make directories group- or world-writable, or pass the Docker socket to a
-container to get past an uploader or control account mismatch. The launcher, the wrapper, and admission
-check ownership and modes so that one account can't read or alter another account's work.
+container to get past an uploader or control account mismatch. The launcher sets the ownership and modes of
+the shared directories and refuses symbolic links, the wrapper pins the container mounts and limits, and
+admission authenticates the calling container, so one account can't read or alter another account's work.
 
 ## Qualification trust
 
@@ -306,7 +310,8 @@ Handle them this way:
 - The control VM uses one GitHub token from Secret Manager for several jobs. The dashboard uses it as `GH_TOKEN`
   and `SPOT_CONFIG_GH_TOKEN`, a Spot VM that builds the image from source uses it to fetch the source, and the startup script signs in to `ghcr.io` with it before it pulls the
   private image `ghcr.io/swack-tools/spot-dashboard`. Pulling a private package needs the `read:packages`
-  scope. The standard e2-micro control VM always pulls the image, so it can't start without that scope. See
+  scope. The standard e2-micro control VM pulls the image whenever the pinned image isn't already on the VM, so a
+first start or a new image can't succeed without that scope. See
   [Operations and troubleshooting](operations.md#troubleshooting).
 
 ### Runner registration tokens

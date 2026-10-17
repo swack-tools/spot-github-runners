@@ -52,7 +52,8 @@ Two rules apply to the values:
 
 The tables mark a variable as **Secret** when it holds a credential or a signing key. Keep secret values in
 `.env` (mode `0600`) or in your secret manager, never in a Git checkout that you commit, a shell history, or
-instance metadata. This page never prints example secret values. On the control VM, the startup script reads
+instance metadata. The one exception is the one-use runner registration token, which the manager places in the
+startup script metadata for one deployment and then removes. This page never prints example secret values. On the control VM, the startup script reads
 the secrets from Secret Manager at each boot and writes them to a root-owned environment file. See
 [Edge hosting and the control VM](edge-dashboard.md).
 
@@ -160,8 +161,8 @@ slot's tunnel token from Secret Manager. None of those secrets travel as instanc
 | --- | --- | --- | --- |
 | `GOOGLE_CLOUD_API_KEY` | None. | `src/spot_finder.py` (the `--billing-api-key` flag wins) and the dashboard. | **Secret.** An optional billing catalog API key. Without it, `spot_finder.py` can't compare against public on-demand rates and turns off its 95 percent discount alerts. The dashboard also accepts the two alternate names in the next row. |
 | `GCP_BILLING_API_KEY`, `GOOGLE_CLOUD_BILLING_API_KEY` | None. | The dashboard's live pricing lookup. | **Secret.** Alternate names for the same key. The dashboard tries `GOOGLE_CLOUD_API_KEY`, then `GCP_BILLING_API_KEY`, then `GOOGLE_CLOUD_BILLING_API_KEY`. |
-| `GCP_ACCESS_TOKEN`, `CLOUDSDK_AUTH_ACCESS_TOKEN` | None. | The dashboard's live pricing lookup. | **Secret.** An OAuth 2.0 access token for the pricing lookup, tried in that order. Without a key or token, the dashboard tries the active `gcloud` credentials and otherwise falls back to its static catalog baseline. |
-| `GCP_BILLING_EXPORT_TABLE` | None. | `src/spot_runner_manager.py` and the autoscaler (the `--billing-export-table` flag wins). | A standard or detailed billing usage export table, `project.dataset.table`, used for project-wide cost logs. It needs the `bq` command-line tool and permission to query the table. |
+| `GCP_ACCESS_TOKEN`, `CLOUDSDK_AUTH_ACCESS_TOKEN` | None. | The dashboard's live pricing lookup. | **Secret.** An OAuth 2.0 access token for the pricing lookup, tried in that order. Without a token, the dashboard tries the active `gcloud` credentials, even when an API key is set, and then uses the `gcloud` project. With neither a key nor a token, it falls back to its static catalog baseline. |
+| `GCP_BILLING_EXPORT_TABLE` | None. | `src/spot_runner_manager.py` and the autoscaler (the `--billing-export-table` flag wins). | A standard or detailed billing usage export table, `project.dataset.table`, used for project-wide cost logs. It needs `gcloud` credentials that can query the table through the BigQuery API. No `bq` command-line tool is involved. |
 | `GCP_ENABLE_LIVE_PRICING` | None. | The dashboard's pricing module. | A test gate only. Under `unittest`, the value `1` lets the pricing code discover `gcloud` credentials. It has no effect in normal runs. |
 
 ## Runner host and container variables
@@ -176,7 +177,7 @@ renders the script from the deployment settings, which come from the command-lin
 | `RUNNER_STATE` | `/runner-state`. | `runner/entrypoint.sh` | The directory that holds the runner installation and its registration (`.runner`). |
 | `RUNNER_CONFIGURE_ONLY` | `0`. | `runner/entrypoint.sh` | When `1`, the container registers the runner and exits, or exits at once if `.runner` already exists. Otherwise it runs `./run.sh` and fails if the runner isn't registered. |
 | `GITHUB_RUNNER_URL` | None. Required when `RUNNER_CONFIGURE_ONLY=1`. | `runner/entrypoint.sh` | The GitHub URL to register against, such as the organization URL. |
-| `GITHUB_RUNNER_TOKEN` | None. Required for the first registration. | `runner/entrypoint.sh` | **Secret.** A short-lived registration token. The startup script writes it to a `0600` file under `/run`, passes it with `--env-file`, and removes the file after registration. |
+| `GITHUB_RUNNER_TOKEN` | None. Required for the first registration. | `runner/entrypoint.sh` | **Secret.** A short-lived registration token. The manager renders it into the VM's `startup-script` metadata for the deployment and removes that metadata key afterward. The startup script writes it to a `0600` file under `/run`, passes it with `--env-file`, and removes the file after registration. |
 | `RUNNER_NAME` | None. Required when registering. | `runner/entrypoint.sh` and `runner/docker-wrapper.py` | The runner name, `<prefix>-<hostname>-<n>`. |
 | `RUNNER_LABELS` | None. Required when registering. | `runner/entrypoint.sh` | Comma-separated runner labels. |
 | `RUNNER_GROUP_NAME` | Empty, which uses the default group. | `runner/entrypoint.sh` | The runner group to register into. |
@@ -190,7 +191,7 @@ renders the script from the deployment settings, which come from the command-lin
 
 The Dockerfile also sets `CARGO_HOME`, `RUSTUP_HOME`, and `PATH` so job steps find the pinned Rust toolchain.
 `runner/compose.yaml` is a reference Compose file, not something that the controller deploys. It requires
-`RUNNER_IMAGE` and reads optional `RUNNER_MEMORY_GB` (default `27`), `RUNNER_GROUP_ID` (default `10`),
+`RUNNER_IMAGE` and reads optional `RUNNER_MEMORY_GB` (default `27`), `RUNNER_GROUP_ID` (with a built-in default group ID),
 `RUNNER_LABELS` (default `oxidex-spot-7x27,oxidex,spot`), and `RUNNER_NAME` (default `oxidex-runner`). The entrypoint reads `RUNNER_GROUP_NAME`, not `RUNNER_GROUP_ID`, so the Compose value of `RUNNER_GROUP_ID` has no effect.
 
 For the memory lease behavior and the files that `host_admission.py` uses, see

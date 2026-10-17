@@ -77,7 +77,7 @@ When a manifest lists several ISA names, a host needs a platform that appears in
 | `sysctl` | Mapping of kernel parameter keys, such as `vm.max_map_count`, to values. A key matches `^[a-z0-9_]+(\.[a-z0-9_-]+)+$`. A value is a string or number, never a boolean, and it must be a single non-empty line. |
 | `files` | List of mappings with `path`, `content`, `mode`, and `owner`. `path` is an absolute normalized path that isn't `/` and has no `//` or control characters. `content` is a string (default empty). `mode` is 3 or 4 octal digits (default `0644`). `owner` is `user:group` (default `root:root`). Duplicate paths are refused. |
 | `boot_mkdirs` | List of absolute normalized directory paths to create. Duplicates are removed. |
-| `boot_script` | Shell script text that runs once as root with `bash -euo pipefail`. |
+| `boot_script` | Shell script text that runs as root with `bash -euo pipefail` at provisioning, and again on every live apply of the patch, so write it to be safe to repeat. |
 
 ### The `container` section
 
@@ -87,7 +87,7 @@ When a manifest lists several ISA names, a host needs a platform that appears in
 | `sysctl` | Same rules as `host.sysctl`. Passed to the container as `--sysctl` flags. |
 | `files` | Same rules as `host.files`. Written into the runner image. |
 | `mounts` | List of mappings with `source`, `target`, and `read_only` (boolean, default `false`). Both paths are absolute and normalized, and neither contains `:`. Duplicate targets are refused. |
-| `dockerfile_run` | Shell script text that runs during the image build. |
+| `dockerfile_run` | Shell script text that runs during the image build, and on a live apply also inside each running runner container. |
 
 A mount source can't be the Docker socket (`/var/run/docker.sock` or `/run/docker.sock`), `/run/gha-admission`, `/var/lib/gha-admission`, `/etc`, `/root`, `/proc`, `/sys`, or `/dev`. The check also refuses any path inside one of those paths, and any parent directory of one, such as `/var/lib`.
 
@@ -234,7 +234,7 @@ Label sync runs at three points:
 
 - **After provisioning.** It runs once every expected runner is online and before the storage check and the patch record. A failure fails the deployment, and the host stays pending.
 - **After a live patch.** It runs after `LIVE_PATCH_APPLIED` and before the applied record. A failure leaves the host pending, and running `--patch-live` again re-applies the patch and retries the sync.
-- **For a host already at the patch.** A `--patch-live` run on a verified `noop` host syncs labels before it records the patch. A dashboard hot patch does the same for each `noop` host.
+- **For a host already at the patch.** A `--patch-live` run on a verified `noop` host syncs labels before it records the patch. A dashboard hot patch only syncs the labels of each `noop` host, and it doesn't record the patch.
 
 Before a live patch changes anything, it checks everything that label sync needs: the runner group, strict-pool membership, and that GitHub lists every expected runner. Label sync therefore can't fail because of missing inputs after the host changed. Label sync raises an error when GitHub doesn't list an expected runner or when the labels read back differ.
 
@@ -257,7 +257,7 @@ When the plan is correct, add `--apply` to the same command. The manager renders
 
 ### Hot-patch a running host
 
-`--patch-live` applies a patch to a running VM and its runner containers. The command has no preview mode and doesn't need `--apply`: it acts as soon as the checks pass. Preview the effect first in the dashboard, which classifies every recorded host for a repository without changing anything. See [Preview and hot-patch](dashboard.md#the-patch-console).
+`--patch-live` applies a patch to a running VM and its runner containers. The command has no preview mode and doesn't need `--apply`: it acts as soon as the checks pass. Preview the effect first in the dashboard, which classifies every recorded host for a repository and changes no host. With a hot-patch executor, the preview reads each host's receipt over `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or to your OS Login profile. See [Preview and hot-patch](dashboard.md#the-patch-console).
 
 You must pass the same deployment values that the host was provisioned with, because the live patch derives the runner names, labels, and runner group from them. The values include `--instance-name`, `--instance-type`, `--region`, `--zone`, `--runner-prefix`, `--runner-count`, `--runner-label`, `--target`, and `--runner-group-id`.
 
@@ -281,7 +281,7 @@ PYTHONPATH=src python3 -B src/spot_runner_manager.py \
 
 The example doesn't include a sizing mode. Add the `--tier`, `--fixed-runner-sizing`, or `--heavy-runner-pool` flags that match your host. A strict heavy pool also replaces `--runner-count` and `--runner-label` with its own values.
 
-The command refuses, and changes nothing, in these cases:
+The command refuses, and changes no VM, metadata, or GitHub label, in these cases. The receipt check and the later checks run after a receipt read over `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or to your OS Login profile:
 
 - The VM isn't running, or its machine type differs from `--instance-type`.
 - The observed host violates a hardware constraint, or a constraint can't be verified.

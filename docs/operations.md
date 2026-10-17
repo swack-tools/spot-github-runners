@@ -13,10 +13,10 @@ or the macOS LaunchAgent, get explicit approval for that operation. Use the read
 
 | Command | What it does without a mutation flag |
 | --- | --- |
-| `src/spot_runner_manager.py` | Prints the deployment plan. It provisions only with `--apply`. The exception is `--patch-live`, which hot-patches a running host immediately with no preview. |
-| `src/spot_runner_autoscaler.py --dry-run` | Prints one tier decision. It never launches, drains, or deletes, and never writes controller state. It reads host evidence with `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or to your OS Login profile, on the first connection. With `--manage-control-vm`, it also prints the control VM plan. |
+| `src/spot_runner_manager.py` | Prints the deployment plan. It provisions only with `--apply`, and every `--apply` run that gets a registration token first deletes the zone's unattached, `READY`, manager-labeled disks that are older than six hours, even if the deployment then fails. The exception is `--patch-live`, which hot-patches a running host immediately with no preview. |
+| `src/spot_runner_autoscaler.py --dry-run` | Prints one tier decision. It never launches, drains, or deletes, and never writes controller state. It reads host evidence with `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or to your OS Login profile, on the first connection. Locally it creates the state directory and lock file and appends to the controller log, and it takes the same state lock as a running controller. With `--manage-control-vm`, it also prints the control VM plan and creates the project control VM lock file. |
 | `src/control_vm.py status` and `src/control_vm.py plan` | Show the control VMs, `origin:active`, health, and transition state, and the next lifecycle step. `ensure` and `rotate` change nothing without `--apply`. |
-| `src/lib/builder_runtime_update.py --plan` | Checks a reviewed runtime-update plan. It mutates only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed`. |
+| `src/lib/builder_runtime_update.py --plan` | Checks a reviewed runtime-update plan, given with its `--plan-sha256`, on the builder. It runs only as root through the authenticated control path with `python3 -I -B`. With `--plan`, it mutates only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed`. `--capture-assets` is a separate read-only capture. |
 | `src/runner_fleet.py` | Reads GitHub runner registrations and VM inventory. It never creates or deletes resources. |
 
 !!! warning "`--install-launch-agent` isn't a preview"
@@ -59,9 +59,9 @@ A hold records why it stopped. Fix that cause, and let the component that placed
 | | Runner host | Dedicated builder |
 | --- | --- | --- |
 | Name | `oxidex-runners-*` | `builder-*` |
-| GitHub runners | Registers listeners. Controller-managed hosts use runner group ID 10. | Registers none. |
+| GitHub runners | Registers listeners. Controller-managed hosts join the fixed runner group your controller uses. | Registers none. |
 | Data disk | Created with `auto-delete=yes`, so deleting the VM deletes the disk. | Cache disk created with `auto-delete=no`, so it survives VM deletion and keeps incurring storage charges. |
-| Drain | Cordon, wait until no `Runner.Worker` process runs, then deregister. | Refuse new builds, then wait for active builds, leases, and cache, upload, and export locks. |
+| Drain | Repository targets: cordon the host, wait until no `Runner.Worker` process runs, then deregister. Organization targets in `resource` and `tiered` modes: move the runners into an isolated drain group, wait until they're idle and the tracked jobs finish, then deregister. | Refuse new builds, then wait for active builds, leases, and cache, upload, and export locks. |
 
 GitHub runner idleness never proves that a builder is idle, and a builder drain never applies to runner
 hosts. See [Fleet and autoscaler](fleet-and-autoscaler.md) and [Set up a builder](dedicated-builders.md).
@@ -186,7 +186,7 @@ that cause.
 | No affordable offer | Confirm complete current compute and disk prices, zone compatibility, and quota. Keep the hold reason that the controller logs. |
 | No memory observations | Check the host's Ops Agent, the controller identity's monitoring access, the sample timestamps, and the boot identity. Runner hosts install the agent only with `--resource-monitoring`. |
 | Registration timeout: `Startup script did not complete deployment <id>` | The bootstrap didn't write this deployment's marker within `--registration-timeout-seconds` (default 1200). Read `/var/log/gha-runner-bootstrap.log`, then check the token scope, the runner group, and the expected runner names. The manager removes the token from instance metadata either way, so rerun to get a fresh one. |
-| `Some runners did not come online; the one-use token was removed` | The message is the manager's own wording: it removes the token from instance metadata, but GitHub keeps the registration token valid until it expires. Rerun the deployment to bootstrap the missing runners with a fresh token. |
+| `Only <n>/<m> expected runners are online`, or `Some runners did not come online; the one-use token was removed` | The first message is the usual one. The second appears when the count drops between the manager's two final checks. Both are the manager's own wording: it removes the token from instance metadata, but GitHub keeps the registration token valid until it expires. Rerun the deployment to bootstrap the missing runners with a fresh token. |
 | Admission denied, or a build exits with status 75 | The builder is draining, its bootstrap isn't complete, or admission refused the lease. Check `/run/oxidex-build-draining`, the owned leases, the limits, and the full container inventory. Wait for active work to finish. |
 | Transfer permission denied | Verify the approved uploader identity, its key, and its `oxidex-build` membership. Don't broaden permissions. See [Dedicated builder access](security.md#dedicated-builder-access). |
 | Exit 137 | Join kernel or cgroup OOM evidence to the job interval before you assign a cause. See [Classify out-of-memory exits with evidence](#classify-out-of-memory-exits-with-evidence). |
