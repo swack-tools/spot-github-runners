@@ -440,6 +440,10 @@ def instance_usage(record: dict[str, Any], now: float, window_start: float | Non
     deleted = record.get("deleted_epoch")
     disk_end = float(deleted) if isinstance(deleted, (int, float)) and not isinstance(deleted, bool) else now
     disk_start = min(s for s, _e in runs)
+    created = record.get("disk_start_epoch")
+    if isinstance(created, (int, float)) and not isinstance(created, bool) and math.isfinite(created):
+        # Disks exist from creation, including any earlier runs pruned from prior_runs.
+        disk_start = min(disk_start, float(created))
     disk_end = max(disk_start, disk_end)
     window = window_start if window_start is not None else float("-inf")
     return {
@@ -544,8 +548,13 @@ def _live_instance_record(
             prev_end = stop if isinstance(stop, (int, float)) and previous_start <= stop <= started_epoch else started_epoch
         prior_runs.append((float(previous_start), min(float(prev_end), started_epoch)))
     prior_runs = [run for run in prior_runs if now - run[1] <= DELETED_INSTANCE_RETENTION_SECONDS][-MAX_PRIOR_RUNS:]
+    created = obs.get("created_epoch")
+    if not isinstance(created, (int, float)) and previous is not None:
+        created = previous.get("disk_start_epoch")
+    disk_start = min(float(created), started_epoch) if isinstance(created, (int, float)) else started_epoch
     record.update({"started_epoch": started_epoch, "stopped_epoch": stopped_epoch, "deleted_epoch": None,
-                   "status": status, "prior_runs": [list(run) for run in prior_runs]})
+                   "status": status, "prior_runs": [list(run) for run in prior_runs],
+                   "disk_start_epoch": disk_start})
     usage = instance_usage(record, now)
     runtime_hours = round(usage["compute_hours"], 2)
     total_cost, compute_cost = instance_cost_usd(record["pricing"], usage["compute_hours"], usage["disk_hours"])
@@ -3115,9 +3124,12 @@ class DashboardStore:
                 deleted_ts = _instance_end_epoch(inst)
                 started_ts = float(inst.get("started_epoch", now_ts - 3600.0))
                 end_ts = float(deleted_ts) if (is_deleted and deleted_ts is not None) else now_ts
-                if is_live_instance_record(inst) and inst["status"] != "DELETED":
-                    # A stopped VM still bills its disks, so it stays in every window until it is deleted.
-                    end_ts = now_ts
+                if is_live_instance_record(inst):
+                    # Disks bill until deletion: a stopped VM stays in every window until it is deleted, and a
+                    # deleted one stays in the windows that include its deletion (not just its last stop).
+                    deleted_epoch = inst.get("deleted_epoch")
+                    end_ts = (float(deleted_epoch) if inst["status"] == "DELETED" and isinstance(deleted_epoch, (int, float))
+                              else now_ts)
 
                 # Exclude deleted instances whose deletion occurred before the selected window
                 if is_deleted and end_ts < window_start_ts:

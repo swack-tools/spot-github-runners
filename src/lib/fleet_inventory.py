@@ -50,7 +50,14 @@ def fleet_role(name: str) -> str | None:
     return None
 
 
+_CUSTOM_MACHINE_VCPU_RE = re.compile(r"custom-(\d+)-\d+(?:-ext)?$")
+
+
 def _vcpu_from_machine_type(machine_type: str) -> int:
+    """vCPUs encoded in a machine type name (0 when unknown): ``n4-standard-16`` -> 16, ``n2-custom-32-112640`` -> 32."""
+    if "custom" in machine_type:
+        custom = _CUSTOM_MACHINE_VCPU_RE.search(machine_type)
+        return int(custom.group(1)) if custom else 0
     match = _MACHINE_VCPU_RE.search(machine_type)
     return int(match.group(1)) if match else 0
 

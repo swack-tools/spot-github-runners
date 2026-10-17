@@ -4099,6 +4099,38 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                             ["instances"] if r["name"] == "builder-oxidex-disk-1")
         self.assertEqual(compute_only["total_cost_in_window_usd"], 0.0)
 
+    def test_vm_stopped_before_window_and_deleted_inside_it_stays_listed(self):
+        from lib.dashboard_server import _mark_instance_deleted
+
+        self.fleet = [fleet_observation("1500", "builder-oxidex-gone-1", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=12.0, stopped_hours_ago=10.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["instances"] = [_mark_instance_deleted(self._record("builder-oxidex-gone-1"),
+                                                                    time.time() - 3600.0)]
+        rows = self.store.query_instances(window_hours=4)["instances"]
+        self.assertEqual([r["name"] for r in rows], ["builder-oxidex-gone-1"])
+        pricing = rows[0]["pricing"]
+        disk_all_in = pricing["disk_hourly_usd"] * (1 + pricing["tax_rate_percent"] / 100.0)
+        self.assertEqual(rows[0]["hours_in_window"], 0.0)
+        self.assertAlmostEqual(rows[0]["total_cost_in_window_usd"], round(3.0 * disk_all_in, 2), delta=0.011)
+
+    def test_long_stop_then_restart_keeps_disk_lifetime(self):
+        from lib.dashboard_server import instance_usage
+
+        self.fleet = [fleet_observation("1600", "builder-oxidex-long-1", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=36 * 24.0, stopped_hours_ago=35 * 24.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [fleet_observation("1600", "builder-oxidex-long-1", "us-south1-b", started_hours_ago=1.0,
+                                        stopped_hours_ago=35 * 24.0, now=self.now)]
+        self.fleet[0]["created_epoch"] = self.now - 36 * 24 * 3600.0 - 60.0
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-long-1")
+        self.assertEqual(rec["prior_runs"], [])  # The 35-day-old run is past retention.
+        usage = instance_usage(rec, self.now, self.now - 24 * 3600.0)
+        self.assertAlmostEqual(usage["disk_hours_in_window"], 24.0, delta=0.01)
+        self.assertAlmostEqual(usage["compute_hours_in_window"], 1.0, delta=0.01)
+
     def test_unchanged_shape_reuses_pricing(self):
         self.fleet = [fleet_observation("1010", "oxidex-runners-price-1", "us-south1-a", now=self.now)]
         self.store.refresh_fleet_inventory()
@@ -4264,6 +4296,15 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(builder["status"], "TERMINATED")
         self.assertEqual((builder["vcpu"], builder["specs_known"]), (16, False))
         self.assertIsNotNone(builder["last_stop_epoch"])
+
+    def test_custom_machine_type_vcpu_fallback(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        observed = observe_fleet_items([
+            {"id": "21", "name": "oxidex-runners-custom-1", "zone": "zones/us-south1-a", "status": "RUNNING",
+             "machineType": "machineTypes/n2-custom-32-112640"},
+        ])
+        self.assertEqual((observed[0]["vcpu"], observed[0]["specs_known"]), (32, False))
 
     def test_fleet_source_from_env(self):
         from lib.fleet_inventory import fleet_source_from_env
