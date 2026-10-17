@@ -57,6 +57,7 @@ from .dashboard_auth import (
     ENV_DEVICE_FLOW,
     ENV_REDIRECT_URI,
 )
+from .fleet_inventory import fleet_source_from_env
 from .patch_console import PatchConsole, PatchConsoleError, config_repo_token, executor_from_env, host_source_from_env
 from .edge_state import (
     CONTROL_OPS,
@@ -365,6 +366,219 @@ def _build_instance_record(
     }
 
 
+# -- live instance inventory --------------------------------------------------------------------------------
+#
+# Instance records are written only by refresh_fleet_inventory from a read-only Compute Engine listing and carry
+# ``inventory_source: "gce"``. Records without it (the demo instances earlier versions seeded into the default
+# state, and records the old in-dashboard delete or scale-region actions fabricated) are dropped on load.
+INSTANCE_SOURCE_KEY = "inventory_source"
+INSTANCE_SOURCE_GCE = "gce"
+FLEET_INVENTORY_INTERVAL_SECONDS = 120.0
+# Deleted VMs stay in the history this long (the longest cost window the dashboard offers is 30 days).
+DELETED_INSTANCE_RETENTION_SECONDS = 31 * 86_400.0
+MAX_INSTANCE_RECORDS = 400
+# Compute Engine states in which the VM is stopped: compute billing ended at lastStopTimestamp.
+GCE_STOPPED_STATUSES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED"})
+LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
+    "The dashboard does not create, stop, or delete VMs: its instance list mirrors the live Compute Engine "
+    "inventory. Run lifecycle changes with the reviewed tools instead (spot_runner_autoscaler.py drains and "
+    "retires runner hosts; spot_runner_manager.py provisions them; render_builder_startup.py renders a dedicated "
+    "builder). This response is a plan only; nothing changed."
+)
+
+
+def _iso_epoch(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def is_live_instance_record(record: Any) -> bool:
+    """True for an instance record written from the live Compute Engine inventory."""
+    return isinstance(record, dict) and record.get(INSTANCE_SOURCE_KEY) == INSTANCE_SOURCE_GCE
+
+
+def _instance_end_epoch(record: dict[str, Any]) -> float | None:
+    """When compute billing for a record ended: its stop time, else its deletion time (None while running)."""
+    for key in ("stopped_epoch", "deleted_epoch"):
+        value = record.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            return float(value)
+    return None
+
+
+def _live_instance_record(
+    obs: dict[str, Any],
+    *,
+    project: str,
+    now: float,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A dashboard instance record for one Compute Engine observation (see fleet_inventory.observe_fleet_items)."""
+    status = str(obs.get("status") or "UNKNOWN").upper()
+    started = obs.get("last_start_epoch") or obs.get("created_epoch")
+    if not isinstance(started, (int, float)) and previous is not None:
+        started = previous.get("started_epoch")
+    started_epoch = float(started) if isinstance(started, (int, float)) else now
+    started_epoch = min(started_epoch, now)
+    role = str(obs.get("role") or "cicd_runner")
+    region = str(obs.get("region") or "")
+    record = _build_instance_record(
+        instance_id=str(obs["instance_id"]),
+        name=str(obs["name"]),
+        role=role,
+        status=status,
+        region=region,
+        zone=str(obs.get("zone") or ""),
+        machine_type=str(obs.get("machine_type") or ""),
+        vcpu=int(obs.get("vcpu") or 0),
+        ram_gib=float(obs.get("ram_gib") or 0.0),
+        cpu_platform=str(obs.get("cpu_platform") or ""),
+        boot_disk_type=str(obs.get("boot_disk_type") or "pd-balanced"),
+        boot_disk_gb=int(obs.get("boot_disk_gb") or 0),
+        data_disk_type=str(obs.get("data_disk_type") or "pd-balanced"),
+        data_disk_gb=int(obs.get("data_disk_gb") or 0),
+        runners_count=int(obs.get("runners_count") or 0),
+        runner_vcpu=int(obs.get("runner_vcpu") or 0),
+        runner_ram_gib=float(obs.get("runner_ram_gib") or 0.0),
+        started_hours_ago=max(0.0, (now - started_epoch) / 3600.0),
+        deleted_hours_ago=None,
+        deletion_trigger="",
+        cloud_init_template_id="",
+        vm_template_id=None,
+        cpu_utilization_percent=0.0,
+        ram_utilization_percent=0.0,
+        project=project,
+        now_epoch=now,
+    )
+    if not any(r["region"] == region for r in REGIONS_CATALOG):
+        # Outside the catalog the record must not borrow another region's location.
+        record.update({"display_location": region, "continent": "", "lat": None, "lon": None,
+                       "map_x": None, "map_y": None})
+    stopped_epoch: float | None = None
+    if status == "RUNNING":
+        trigger = "Active — RUNNING in the live Compute Engine inventory"
+    elif status in GCE_STOPPED_STATUSES:
+        stop = obs.get("last_stop_epoch")
+        if isinstance(stop, (int, float)) and stop >= started_epoch:
+            stopped_epoch = float(stop)
+        elif previous is not None and isinstance(previous.get("stopped_epoch"), (int, float)):
+            stopped_epoch = float(previous["stopped_epoch"])
+        else:
+            stopped_epoch = now
+        trigger = (f"Stopped in Compute Engine ({status}): Spot preemption or a manual stop; "
+                   "the VM and its disks still exist")
+    else:
+        trigger = f"Compute Engine status {status}"
+    end = stopped_epoch if stopped_epoch is not None else now
+    runtime_hours = round(max(0.0, end - started_epoch) / 3600.0, 2)
+    record.update({
+        INSTANCE_SOURCE_KEY: INSTANCE_SOURCE_GCE,
+        "gce_status": status,
+        "spot": bool(obs.get("spot")),
+        "specs_known": bool(obs.get("specs_known", True)),
+        "started_epoch": started_epoch,
+        "started_at": _iso_epoch(started_epoch),
+        "stopped_epoch": stopped_epoch,
+        "stopped_at": _iso_epoch(stopped_epoch) if stopped_epoch is not None else None,
+        "deleted_epoch": None,
+        "deleted_at": None,
+        "runtime_hours": runtime_hours,
+        "total_cost_usd": round(runtime_hours * record["pricing"]["total_hourly_usd"], 2),
+        "total_cost_compute_only_usd": round(runtime_hours * record["pricing"]["compute_hourly_usd"], 2),
+        "deletion_trigger": trigger,
+        # Utilization is not part of the inventory listing.
+        "utilization_known": False,
+    })
+    if role == "cicd_runner":
+        count = int(obs.get("runners_count") or 0)
+        record["workload_summary"] = (
+            f"{count} GitHub runner(s) recorded at provisioning" if count
+            else "Runner host (runner count not recorded in instance metadata)"
+        )
+    return record
+
+
+def _mark_instance_deleted(record: dict[str, Any], now: float) -> dict[str, Any]:
+    """The record of a VM that is no longer in the Compute Engine inventory."""
+    out = dict(record)
+    started = float(out.get("started_epoch") or now)
+    end = _instance_end_epoch(out) or now
+    runtime_hours = round(max(0.0, end - started) / 3600.0, 2)
+    pricing = out.get("pricing") if isinstance(out.get("pricing"), dict) else {}
+    out.update({
+        "status": "DELETED",
+        "deleted_epoch": now,
+        "deleted_at": _iso_epoch(now),
+        "runtime_hours": runtime_hours,
+        "total_cost_usd": round(runtime_hours * float(pricing.get("total_hourly_usd", 0.0) or 0.0), 2),
+        "total_cost_compute_only_usd": round(runtime_hours * float(pricing.get("compute_hourly_usd", 0.0) or 0.0), 2),
+        "deletion_trigger": (f"No longer in the Compute Engine inventory (first missing at {_iso_epoch(now)}): "
+                             "deleted by Spot preemption, the autoscaler, or an operator"),
+        "cpu_utilization_percent": 0.0,
+        "ram_utilization_percent": 0.0,
+    })
+    return out
+
+
+def _instance_fingerprint(record: Any) -> tuple[Any, ...]:
+    """The fields whose change is a real fleet change (worth a new state version and a KV publish)."""
+    if not isinstance(record, dict):
+        return (repr(record),)
+    return tuple(record.get(key) for key in (
+        "instance_id", "name", "status", "zone", "machine_type", "vcpu", "ram_gib", "cpu_platform",
+        "boot_disk_type", "boot_disk_gb", "data_disk_type", "data_disk_gb", "runners_count",
+        "started_epoch", "stopped_epoch", "deleted_epoch", "spot", INSTANCE_SOURCE_KEY,
+    ))
+
+
+def reconcile_instance_records(
+    existing: list[Any],
+    observed: list[dict[str, Any]],
+    *,
+    project: str,
+    now: float,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Merge a complete Compute Engine fleet listing into the stored instance records.
+
+    Returns ``(records, changed)``. A VM in the listing gets its live status (RUNNING, TERMINATED, STOPPED, ...);
+    a stored record whose VM is missing becomes DELETED with the observation time as its deletion time; deleted
+    records older than the retention window, and records that did not come from the inventory, are dropped.
+    ``observed`` must be the complete listing: a partial one would mark the missing VMs deleted.
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    for obs in observed:
+        if isinstance(obs, dict) and obs.get("instance_id") and obs.get("name"):
+            by_id[str(obs["instance_id"])] = obs
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in existing:
+        if not is_live_instance_record(record):
+            continue
+        instance_id = str(record.get("instance_id", ""))
+        if instance_id in seen:
+            continue
+        obs = by_id.get(instance_id)
+        if obs is not None:
+            seen.add(instance_id)
+            records.append(_live_instance_record(obs, project=project, now=now, previous=record))
+        elif record.get("status") == "DELETED":
+            deleted = record.get("deleted_epoch")
+            if isinstance(deleted, (int, float)) and now - float(deleted) <= DELETED_INSTANCE_RETENTION_SECONDS:
+                records.append(record)
+        else:
+            records.append(_mark_instance_deleted(record, now))
+    for instance_id, obs in by_id.items():
+        if instance_id not in seen:
+            records.append(_live_instance_record(obs, project=project, now=now))
+    # Live VMs first (newest start first), then deleted history (newest deletion first), bounded in size.
+    live = sorted((r for r in records if r.get("status") != "DELETED"),
+                  key=lambda r: -float(r.get("started_epoch") or 0.0))
+    gone = sorted((r for r in records if r.get("status") == "DELETED"),
+                  key=lambda r: -float(r.get("deleted_epoch") or 0.0))
+    records = (live + gone)[:max(MAX_INSTANCE_RECORDS, len(live))]
+    changed = [_instance_fingerprint(r) for r in existing] != [_instance_fingerprint(r) for r in records]
+    return records, changed
+
+
 def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-tools") -> dict[str, Any]:
     """Construct the initial operational state for the Web UI Dashboard."""
     ref_now = time.time()
@@ -522,269 +736,9 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         },
     }
 
-    instances = [
-        # Active instance in South Africa (matches the user's exact world map example)
-        _build_instance_record(
-            instance_id="90481726351001",
-            name="oxidex-runners-za-jnb-01",
-            role="cicd_runner",
-            status="RUNNING",
-            region="africa-south1",
-            zone="africa-south1-a",
-            machine_type="n2-standard-16",
-            vcpu=16,
-            ram_gib=64,
-            cpu_platform="Intel Ice Lake",
-            boot_disk_type="pd-balanced",
-            boot_disk_gb=40,
-            data_disk_type="pd-ssd",
-            data_disk_gb=100,
-            runners_count=4,
-            runner_vcpu=4,
-            runner_ram_gib=8,
-            started_hours_ago=8.5,
-            deleted_hours_ago=None,
-            deletion_trigger="Active — Running (scheduled by minimum floor policy)",
-            cloud_init_template_id="ci-runner-default",
-            vm_template_id="tpl-runner-za-n2-16",
-            cpu_utilization_percent=64.0,
-            ram_utilization_percent=52.0,
-            project=project,
-            now_epoch=ref_now,
-        ),
-        # Active instance in Dallas, USA
-        _build_instance_record(
-            instance_id="90481726351002",
-            name="oxidex-runners-dallas-01",
-            role="cicd_runner",
-            status="RUNNING",
-            region="us-south1",
-            zone="us-south1-a",
-            machine_type="n4-standard-16",
-            vcpu=16,
-            ram_gib=64,
-            cpu_platform="Intel Emerald Rapids",
-            boot_disk_type="hyperdisk-balanced",
-            boot_disk_gb=40,
-            data_disk_type="hyperdisk-balanced",
-            data_disk_gb=100,
-            runners_count=4,
-            runner_vcpu=4,
-            runner_ram_gib=16,
-            started_hours_ago=14.0,
-            deleted_hours_ago=None,
-            deletion_trigger="Active — Running (queue & CPU demand)",
-            cloud_init_template_id="ci-runner-default",
-            vm_template_id="tpl-runner-n4-std16",
-            cpu_utilization_percent=72.0,
-            ram_utilization_percent=68.0,
-            project=project,
-            now_epoch=ref_now,
-        ),
-        # Active instance in Belgium, Europe
-        _build_instance_record(
-            instance_id="90481726351003",
-            name="oxidex-runners-eu-belgium-01",
-            role="cicd_runner",
-            status="RUNNING",
-            region="europe-west1",
-            zone="europe-west1-b",
-            machine_type="c4d-standard-8",
-            vcpu=8,
-            ram_gib=32,
-            cpu_platform="AMD Turin",
-            boot_disk_type="hyperdisk-balanced",
-            boot_disk_gb=40,
-            data_disk_type="hyperdisk-balanced",
-            data_disk_gb=100,
-            runners_count=2,
-            runner_vcpu=4,
-            runner_ram_gib=16,
-            started_hours_ago=5.2,
-            deleted_hours_ago=None,
-            deletion_trigger="Active — Running (strict pool member)",
-            cloud_init_template_id="ci-runner-strict-pool",
-            vm_template_id="tpl-runner-n4-std16",
-            cpu_utilization_percent=58.0,
-            ram_utilization_percent=61.0,
-            project=project,
-            now_epoch=ref_now,
-        ),
-        # Active Dedicated Rust Builder in Dallas
-        _build_instance_record(
-            instance_id="90481726351004",
-            name="builder-oxidex-turin-01",
-            role="rust_builder",
-            status="RUNNING",
-            region="us-south1",
-            zone="us-south1-b",
-            machine_type="c4d-highcpu-16",
-            vcpu=16,
-            ram_gib=32,
-            cpu_platform="AMD Turin",
-            boot_disk_type="hyperdisk-balanced",
-            boot_disk_gb=40,
-            data_disk_type="hyperdisk-balanced",
-            data_disk_gb=100,
-            runners_count=1,
-            runner_vcpu=16,
-            runner_ram_gib=28,
-            started_hours_ago=19.0,
-            deleted_hours_ago=None,
-            deletion_trigger="Active — Dedicated Rust 1.99 Builder",
-            cloud_init_template_id="ci-rust-builder-199",
-            vm_template_id="tpl-builder-c4d-16",
-            cpu_utilization_percent=78.0,
-            ram_utilization_percent=74.0,
-            project=project,
-            now_epoch=ref_now,
-        ),
-        # Active Dedicated Rust Builder in Eemshaven, Netherlands
-        _build_instance_record(
-            instance_id="90481726351005",
-            name="builder-oxidex-eu-01",
-            role="rust_builder",
-            status="RUNNING",
-            region="europe-west4",
-            zone="europe-west4-a",
-            machine_type="n4-highcpu-16",
-            vcpu=16,
-            ram_gib=32,
-            cpu_platform="Intel Emerald Rapids",
-            boot_disk_type="hyperdisk-balanced",
-            boot_disk_gb=40,
-            data_disk_type="hyperdisk-balanced",
-            data_disk_gb=100,
-            runners_count=1,
-            runner_vcpu=16,
-            runner_ram_gib=28,
-            started_hours_ago=11.0,
-            deleted_hours_ago=None,
-            deletion_trigger="Active — Dedicated Rust 1.99 Builder",
-            cloud_init_template_id="ci-rust-builder-199",
-            vm_template_id="tpl-builder-c4d-16",
-            cpu_utilization_percent=36.0,
-            ram_utilization_percent=48.0,
-            project=project,
-            now_epoch=ref_now,
-        ),
-        # Deleted instance in last 24h (ran for 6 hours, scaled down due to lack of runner demand)
-        _build_instance_record(
-            instance_id="80481726350901",
-            name="oxidex-runners-iowa-04",
-            role="cicd_runner",
-            status="DELETED",
-            region="us-central1",
-            zone="us-central1-a",
-            machine_type="n4-standard-16",
-            vcpu=16,
-            ram_gib=64,
-            cpu_platform="Intel Emerald Rapids",
-            boot_disk_type="hyperdisk-balanced",
-            boot_disk_gb=40,
-            data_disk_type="hyperdisk-balanced",
-            data_disk_gb=100,
-            runners_count=4,
-            runner_vcpu=4,
-            runner_ram_gib=16,
-            started_hours_ago=10.5,
-            deleted_hours_ago=4.5,
-            deletion_trigger="Scheduled scale-down: lack of GitHub runner demand (<= 5 jobs in past hour)",
-            cloud_init_template_id="ci-runner-default",
-            vm_template_id="tpl-runner-n4-std16",
-            cpu_utilization_percent=0.0,
-            ram_utilization_percent=0.0,
-            project=project,
-            now_epoch=ref_now,
-        ),
-        # Deleted instance in last 24h (high spec 32-vCPU host in Hong Kong)
-        _build_instance_record(
-            instance_id="80481726350902",
-            name="oxidex-runners-hk-bulky-02",
-            role="cicd_runner",
-            status="DELETED",
-            region="asia-east2",
-            zone="asia-east2-b",
-            machine_type="c4d-standard-32",
-            vcpu=32,
-            ram_gib=128,
-            cpu_platform="AMD Turin",
-            boot_disk_type="hyperdisk-balanced",
-            boot_disk_gb=40,
-            data_disk_type="hyperdisk-balanced",
-            data_disk_gb=200,
-            runners_count=8,
-            runner_vcpu=4,
-            runner_ram_gib=16,
-            started_hours_ago=22.0,
-            deleted_hours_ago=3.5,
-            deletion_trigger="Scheduled scale-down: lack of GitHub runner demand (idle queue cooldown)",
-            cloud_init_template_id="ci-runner-strict-pool",
-            vm_template_id="tpl-runner-n4-std16",
-            cpu_utilization_percent=0.0,
-            ram_utilization_percent=0.0,
-            project=project,
-            now_epoch=ref_now,
-        ),
-        # Deleted instance in last 50h (38 hours ago)
-        _build_instance_record(
-            instance_id="80481726350903",
-            name="oxidex-runners-finland-03",
-            role="cicd_runner",
-            status="DELETED",
-            region="europe-north1",
-            zone="europe-north1-b",
-            machine_type="n2d-standard-16",
-            vcpu=16,
-            ram_gib=64,
-            cpu_platform="AMD Milan",
-            boot_disk_type="pd-balanced",
-            boot_disk_gb=40,
-            data_disk_type="pd-ssd",
-            data_disk_gb=100,
-            runners_count=4,
-            runner_vcpu=4,
-            runner_ram_gib=16,
-            started_hours_ago=46.0,
-            deleted_hours_ago=29.0,
-            deletion_trigger="Spot preemption: GCP capacity reclamation in europe-north1-b",
-            cloud_init_template_id="ci-runner-default",
-            vm_template_id=None,
-            cpu_utilization_percent=0.0,
-            ram_utilization_percent=0.0,
-            project=project,
-            now_epoch=ref_now,
-        ),
-        # Deleted builder instance in last 30d (120 hours ago)
-        _build_instance_record(
-            instance_id="80481726350904",
-            name="builder-oxidex-saopaulo-01",
-            role="rust_builder",
-            status="DELETED",
-            region="southamerica-east1",
-            zone="southamerica-east1-a",
-            machine_type="n4-highcpu-16",
-            vcpu=16,
-            ram_gib=32,
-            cpu_platform="Intel Emerald Rapids",
-            boot_disk_type="hyperdisk-balanced",
-            boot_disk_gb=40,
-            data_disk_type="hyperdisk-balanced",
-            data_disk_gb=100,
-            runners_count=1,
-            runner_vcpu=16,
-            runner_ram_gib=28,
-            started_hours_ago=142.0,
-            deleted_hours_ago=118.0,
-            deletion_trigger="Price guard: Spot compute + Hyperdisk exceeded daily budget cap",
-            cloud_init_template_id="ci-rust-builder-199",
-            vm_template_id="tpl-builder-c4d-16",
-            cpu_utilization_percent=0.0,
-            ram_utilization_percent=0.0,
-            project=project,
-            now_epoch=ref_now,
-        ),
-    ]
+    # Instances come only from the live Compute Engine inventory (see fleet_inventory and
+    # DashboardStore.refresh_fleet_inventory); the dashboard never invents VM records.
+    instances: list[dict[str, Any]] = []
 
     scaling_telemetry = {
         "current_runners": 10,
@@ -1059,9 +1013,22 @@ class DashboardStore:
         kv: CloudflareKv | None = None,
         clock: Any = time.time,
         sleep: Any = time.sleep,
+        fleet_source: Any = None,
+        fleet_inventory_interval: float = FLEET_INVENTORY_INTERVAL_SECONDS,
     ) -> None:
         self._lock = threading.RLock()
         self.state_path = state_path
+        # Read-only live inventory (fleet_inventory.gce_fleet_source); None leaves the instance list empty.
+        self.fleet_source = fleet_source
+        self.fleet_inventory_interval = float(fleet_inventory_interval)
+        self._fleet_status: dict[str, Any] = {
+            "source": "gce" if fleet_source is not None else "none",
+            "last_attempt_at": None,
+            "last_success_at": None,
+            "last_change_at": None,
+            "observed_count": None,
+            "last_error": "",
+        }
         self.project = project
         self.org = org
         self.control_slot = validate_slot(control_slot) if control_slot else None
@@ -1418,6 +1385,16 @@ class DashboardStore:
             if key in loaded and isinstance(default_value, (list, dict)) and not isinstance(loaded[key], type(default_value)):
                 raise ValueError(f"dashboard state field {key!r} must be a JSON {type(default_value).__name__}")
         base.update(copy.deepcopy(loaded))
+        instances = base.get("instances")
+        if isinstance(instances, list):
+            # Malformed (non-object) entries stay so that validation below rejects the whole state.
+            kept = [r for r in instances if not isinstance(r, dict) or is_live_instance_record(r)]
+            if len(kept) != len(instances):
+                # Demo seed records and VMs fabricated by the old in-dashboard lifecycle actions never existed in
+                # Compute Engine; only inventory records survive a load.
+                LOG.warning("Dropped %d dashboard instance record(s) that did not come from the live inventory",
+                            len(instances) - len(kept))
+            base["instances"] = kept
         previous = getattr(self, "state", None)
         self.state = base
         try:
@@ -1434,13 +1411,106 @@ class DashboardStore:
         return version if isinstance(version, int) and not isinstance(version, bool) and version >= 0 else 0
 
     def start(self) -> None:
-        """Hydrate (in a background thread when KV is configured) and start KV write-behind."""
+        """Hydrate (in a background thread when KV is configured), start KV write-behind and the inventory loop."""
         if self.kv is None:
             self.hydrate()
-            return
-        thread = threading.Thread(target=self._background_main, name="dashboard-kv-sync", daemon=True)
-        self._threads.append(thread)
-        thread.start()
+        else:
+            thread = threading.Thread(target=self._background_main, name="dashboard-kv-sync", daemon=True)
+            self._threads.append(thread)
+            thread.start()
+        if self.fleet_source is not None:
+            inventory = threading.Thread(target=self._fleet_inventory_main, name="dashboard-fleet-inventory",
+                                         daemon=True)
+            self._threads.append(inventory)
+            inventory.start()
+
+    def _fleet_inventory_main(self) -> None:
+        while not self._stop_event.is_set():
+            if not self.hydrated:
+                self._stop_event.wait(min(5.0, self.fleet_inventory_interval))
+                continue
+            try:
+                self.refresh_fleet_inventory()
+            except Exception:  # noqa: BLE001 - the inventory loop must keep running
+                LOG.exception("Dashboard fleet inventory refresh failed")
+            self._stop_event.wait(self.fleet_inventory_interval)
+
+    def _consume_ooms_for_fleet_growth(self, previous: list[Any], current: list[dict[str, Any]]) -> None:
+        """Mark OOM events handled once the live fleet actually grew (runner slots, or builder VMs)."""
+
+        def running(records: list[Any], role: str) -> list[dict[str, Any]]:
+            return [r for r in records if isinstance(r, dict) and r.get("status") == "RUNNING" and r.get("role") == role]
+
+        previous_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(previous, "cicd_runner"))
+        current_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(current, "cicd_runner"))
+        if current_slots > previous_slots:
+            pol = self.state.get("scaling", {}).get("cicd_runner", {})
+            prof = self.state.get("profiles", {}).get("cicd_runner", {})
+            self._consume_active_oom_events(
+                role="cicd_runner",
+                previous_runners=previous_slots,
+                current_runners=current_slots,
+                step_runners=max(1, int(pol.get("scale_up_step_runners", 2))),
+                max_runners=max(int(prof.get("min_runners", 1)), int(pol.get("max_runners", 24))),
+            )
+        if len(running(current, "rust_builder")) > len(running(previous, "rust_builder")):
+            self._consume_active_oom_events(role="rust_builder")
+
+    def fleet_inventory_status(self) -> dict[str, Any]:
+        """Where the instance list comes from and how fresh it is (in memory; not part of the snapshot)."""
+        with self._lock:
+            return dict(self._fleet_status)
+
+    def refresh_fleet_inventory(self) -> bool:
+        """List the live fleet (read-only) and reconcile the stored instance records with it.
+
+        Returns True when the instance records changed (and were persisted as a new state version). Runs only
+        where changes are accepted (hydrated, not frozen, reconciled, the active slot): elsewhere the listing is
+        skipped and the stored records stay as the active slot last published them.
+        """
+        if self.fleet_source is None:
+            return False
+        now = self._clock()
+        with self._lock:
+            self._fleet_status["last_attempt_at"] = _iso_epoch(now)
+        try:
+            observed = list(self.fleet_source())
+        except Exception as exc:  # noqa: BLE001 - keep the last known records; report the failure
+            with self._lock:
+                self._fleet_status["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            LOG.warning("Dashboard fleet inventory listing failed: %s: %s", type(exc).__name__, exc)
+            return False
+
+        def apply() -> tuple[int, Any]:
+            records, changed = reconcile_instance_records(
+                self.state.get("instances", []), observed, project=self.project, now=self._clock())
+            if not changed:
+                return 200, {"changed": False}
+            previous_instances = self.state.get("instances", [])
+            previous_telemetry = copy.deepcopy(self.state.get("scaling_telemetry", {}))
+            self.state["instances"] = records
+            try:
+                self._consume_ooms_for_fleet_growth(previous_instances, records)
+                self._sync_fleet_telemetry()
+                self._persist()
+            except Exception:
+                self.state["instances"] = previous_instances
+                self.state["scaling_telemetry"] = previous_telemetry
+                raise
+            return 200, {"changed": True}
+
+        try:
+            _status, body, _replayed = self.run_request(None, "POST", "/internal/fleet-inventory", apply)
+        except DashboardFrozenError as exc:
+            with self._lock:
+                self._fleet_status["last_error"] = f"not applied: {exc}"
+            return False
+        with self._lock:
+            self._fleet_status.update({"last_success_at": _iso_epoch(now), "observed_count": len(observed),
+                                       "last_error": ""})
+            if body.get("changed"):
+                self._fleet_status["last_change_at"] = _iso_epoch(now)
+        return bool(body.get("changed"))
 
     def close(self, timeout: float = 5.0) -> None:
         self._stop_event.set()
@@ -2928,6 +2998,7 @@ class DashboardStore:
                 "vm_templates": self.state["vm_templates"],
                 "instances_view": instances_view,
                 "fleet_summary": fleet_summary,
+                "fleet_inventory": self.fleet_inventory_status(),
                 "rust_builds": self.get_rust_builds_summary(),
             }
 
@@ -2956,7 +3027,7 @@ class DashboardStore:
                 is_deleted = inst["status"] != "RUNNING"
                 if is_deleted and not include_deleted:
                     continue
-                deleted_ts = inst.get("deleted_epoch")
+                deleted_ts = _instance_end_epoch(inst)
                 started_ts = float(inst.get("started_epoch", now_ts - 3600.0))
                 end_ts = float(deleted_ts) if (is_deleted and deleted_ts is not None) else now_ts
 
@@ -3073,6 +3144,7 @@ class DashboardStore:
                 "active_daily_burn_usd": round(active_hourly_burn * 24.0, 2),
                 "active_monthly_burn_usd": round(active_hourly_burn * 24.0 * (365.0 / 12.0), 2),
                 "instances": rows,
+                "fleet_inventory": self.fleet_inventory_status(),
             }
 
     def update_budget(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -4112,53 +4184,49 @@ class DashboardStore:
             return {"status": "ok", "vm_template": new_tpl}
 
     def delete_instance(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Delete a running instance on demand and record its deletion trigger and final cost."""
+        """Plan only: the dashboard never deletes a VM, and never marks one deleted that still exists.
+
+        Returns the instance and how to retire it with the reviewed lifecycle tools; the record changes only when
+        the live inventory no longer lists the VM.
+        """
         with self._lock:
             instance_id = str(payload.get("instance_id", "")).strip()
             instance_name = str(payload.get("instance_name", "")).strip()
-            reason = str(
-                payload.get("reason")
-                or "Manual operator deletion from Web UI Dashboard"
-            ).strip()
             inst = next(
                 (
                     i
                     for i in self.state["instances"]
-                    if (instance_id and i["instance_id"] == instance_id)
-                    or (instance_name and i["name"] == instance_name)
+                    if (instance_id and i.get("instance_id") == instance_id)
+                    or (instance_name and i.get("name") == instance_name)
                 ),
                 None,
             )
             if inst is None:
                 raise ValueError("Instance not found")
-            if inst.get("status") != "RUNNING":
-                return {"status": "already_deleted", "instance": inst}
-            prev_instances = copy.deepcopy(self.state["instances"])
-            prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
-            try:
-                now_ts = time.time()
-                inst["status"] = "DELETED"
-                inst["deleted_epoch"] = now_ts
-                inst["deleted_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                inst["runtime_hours"] = round(max(0.1, (now_ts - float(inst["started_epoch"])) / 3600.0), 2)
-                inst["total_cost_usd"] = round(inst["runtime_hours"] * inst["pricing"]["total_hourly_usd"], 2)
-                inst["total_cost_compute_only_usd"] = round(
-                    inst["runtime_hours"] * inst["pricing"]["compute_hourly_usd"], 2
-                )
-                inst["deletion_trigger"] = reason
-                inst["cpu_utilization_percent"] = 0.0
-                inst["ram_utilization_percent"] = 0.0
-                self._sync_fleet_telemetry()
-                self._persist()
-            except Exception:
-                self.state["instances"] = prev_instances
-                self.state["scaling_telemetry"] = prev_telemetry
-                raise
-            return {"status": "ok", "instance": inst}
+            if inst.get("status") == "DELETED":
+                return {"status": "already_deleted", "applied": False, "instance": copy.deepcopy(inst)}
+            if inst.get("role") == "rust_builder":
+                next_step = ("Dedicated builders keep their cache disk (auto-delete=no); retire the VM only when no "
+                             "build or runtime update holds it, and delete the cache disk separately if intended.")
+            else:
+                next_step = ("Runner hosts are drained and retired by spot_runner_autoscaler.py so no job loses its "
+                             "runner; lower the runner floor or let the autoscaler scale in.")
+            return {
+                "status": "not_applied",
+                "applied": False,
+                "instance": copy.deepcopy(inst),
+                "message": LIFECYCLE_ACTIONS_DISABLED_MESSAGE,
+                "next_step": next_step,
+            }
 
     def scale_region_instances(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Scale the number of instances in a specific region/location on demand."""
+        """Plan only: validate a regional scale change and return what it would launch or retire.
+
+        The dashboard never launches or deletes a VM (see LIFECYCLE_ACTIONS_DISABLED_MESSAGE): the plan is
+        computed on a copy of the instance list and nothing in state changes.
+        """
         with self._lock:
+            instances = copy.deepcopy(self.state["instances"])
             region = str(payload.get("region", "africa-south1")).strip()
             raw_target = _finite_int(payload.get("target_instances", 1), "target_instances", min_val=0)
             target_count = raw_target
@@ -4176,12 +4244,12 @@ class DashboardStore:
             max_allowed = min(20, max(1, prof_max_instances))
             running_in_region = [
                 i
-                for i in self.state["instances"]
+                for i in instances
                 if i["region"] == region and i["status"] == "RUNNING" and i["role"] == role
             ]
             running_other_regions = sum(
                 1
-                for i in self.state["instances"]
+                for i in instances
                 if i["region"] != region and i["status"] == "RUNNING" and i["role"] == role
             )
             current_count = len(running_in_region)
@@ -4195,308 +4263,278 @@ class DashboardStore:
                     f"exceeds maximum allowed instances ({max_allowed}) for role '{role}'"
                 )
             now_ts = time.time()
-            prev_instances = copy.deepcopy(self.state["instances"])
-            prev_telemetry = copy.deepcopy(self.state["scaling_telemetry"])
-            try:
-                if target_count < current_count:
-                    to_remove = running_in_region[target_count:]
-                    for inst in to_remove:
-                        inst["status"] = "DELETED"
-                        inst["deleted_epoch"] = now_ts
-                        inst["deleted_at"] = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime(
-                            "%Y-%m-%dT%H:%M:%SZ"
-                        )
-                        inst["runtime_hours"] = round(
-                            max(0.1, (now_ts - float(inst["started_epoch"])) / 3600.0), 2
-                        )
-                        inst["total_cost_usd"] = round(
-                            inst["runtime_hours"] * inst["pricing"]["total_hourly_usd"], 2
-                        )
-                        inst["total_cost_compute_only_usd"] = round(
-                            inst["runtime_hours"] * inst["pricing"]["compute_hourly_usd"], 2
-                        )
-                        inst["deletion_trigger"] = (
-                            f"On-demand regional scale-down in {region} ({current_count} -> {target_count} instances)"
-                        )
-                        inst["cpu_utilization_percent"] = 0.0
-                        inst["ram_utilization_percent"] = 0.0
-                elif target_count > current_count:
-                    if not bool(self.state["regions_enabled"].get(region, True)):
-                        raise ValueError(f"Cannot scale up in disabled region '{region}'")
-                    vm_tpl = None
-                    if prof.get("use_vm_template") and prof.get("vm_template_id"):
-                        vm_tpl = next(
-                            (
-                                t
-                                for t in self.state.get("vm_templates", [])
-                                if t.get("id") == prof.get("vm_template_id")
-                                and t.get("role", role) == role
-                            ),
-                            None,
-                        )
-                        if vm_tpl is None:
-                            raise ValueError(
-                                f"Assigned VM template '{prof.get('vm_template_id')}' not found for role '{role}'"
-                            )
-                        self._validate_vm_template_compatibility(vm_tpl, prof, role)
-                        tpl_machine_type = str(vm_tpl.get("machine_type", ""))
-                        tpl_family = tpl_machine_type.split("-", 1)[0]
-                        if tpl_family not in reg_info.get("families", []):
-                            raise ValueError(
-                                f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' machine family '{tpl_family}' "
-                                f"({tpl_machine_type}) is not available in region '{region}' "
-                                f"(supported: {', '.join(reg_info.get('families', []))})"
-                            )
-                        tpl_cpu = str(vm_tpl.get("cpu_platform", ""))
-                        if tpl_cpu and tpl_cpu not in reg_info.get("cpu_platforms", []):
-                            raise ValueError(
-                                f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' CPU platform '{tpl_cpu}' "
-                                f"is not available in region '{region}' "
-                                f"(supported: {', '.join(reg_info.get('cpu_platforms', []))})"
-                            )
-                        tpl_boot_disk = str(vm_tpl.get("boot_disk_type", ""))
-                        if tpl_boot_disk and tpl_boot_disk not in reg_info.get("disk_types", []):
-                            raise ValueError(
-                                f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' boot disk type '{tpl_boot_disk}' "
-                                f"is not available in region '{region}' "
-                                f"(supported: {', '.join(reg_info.get('disk_types', []))})"
-                            )
-                        tpl_data_disk = str(vm_tpl.get("data_disk_type", ""))
-                        if tpl_data_disk and tpl_data_disk not in reg_info.get("disk_types", []):
-                            raise ValueError(
-                                f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' data disk type '{tpl_data_disk}' "
-                                f"is not available in region '{region}' "
-                                f"(supported: {', '.join(reg_info.get('disk_types', []))})"
-                            )
-                    source_spec: dict[str, Any] | None = vm_tpl
-                    if source_spec is None:
-                        existing_cand = running_in_region[0] if running_in_region else None
-                        if existing_cand is not None:
-                            try:
-                                self._validate_vm_template_compatibility(existing_cand, prof, role)
-                                if (
-                                    int(existing_cand.get("runner_vcpu", 0)) == int(prof["runner_vcpu"])
-                                    and float(existing_cand.get("runner_ram_gib", 0.0))
-                                    == float(prof["runner_ram_gib"])
-                                ):
-                                    source_spec = existing_cand
-                            except ValueError:
-                                # Existing instance no longer matches updated profile requirements; select a qualifying offer below.
-                                source_spec = None
-                        if source_spec is None:
-                            reg_qual = qualify_instances(
-                                prof,
-                                {r["region"]: (r["region"] == region) for r in REGIONS_CATALOG},
-                                self.project,
-                                region_latencies_ms=self.state.get("region_latencies_ms"),
-                            )
-                            best_offer = (
-                                reg_qual["spot_price_qualifying"]
-                                or reg_qual["hardware_qualifying"]
-                                or [None]
-                            )[0]
-                            if best_offer is None:
-                                raise ValueError(
-                                    f"No machine shape in region '{region}' satisfies the sizing and hardware "
-                                    f"requirements for role '{role}'"
-                                )
-                            source_spec = {
-                                "machine_type": best_offer["machine_type"],
-                                "vcpu": best_offer["vcpu"],
-                                "ram_gib": best_offer["ram_gib"],
-                                "cpu_platform": best_offer["cpu_platform"],
-                                "boot_disk_type": best_offer["boot_disk_type"],
-                                "boot_disk_gb": best_offer["boot_disk_gb"],
-                                "data_disk_type": best_offer["data_disk_type"],
-                                "data_disk_gb": best_offer["data_disk_gb"],
-                                "runner_vcpu": best_offer["unit_vcpu"],
-                                "runner_ram_gib": best_offer["unit_ram_gib"],
-                                "runners_count": best_offer["units_per_instance"],
-                                "cloud_init_template_id": prof.get(
-                                    "cloud_init_template_id", "ci-runner-default"
-                                ),
-                                "vm_template_id": None,
-                            }
-
-                    default_ci_id = "ci-runner-default" if role == "cicd_runner" else "ci-rust-builder-199"
-                    new_records: list[dict[str, Any]] = []
-                    for idx in range(current_count + 1, target_count + 1):
-                        zone = reg_info["zones"][(idx - 1) % len(reg_info["zones"])]
-                        machine_type = source_spec["machine_type"]
-                        vcpu = int(source_spec["vcpu"])
-                        ram_gib = float(source_spec["ram_gib"])
-                        cpu_platform = source_spec["cpu_platform"]
-                        boot_disk_type = source_spec["boot_disk_type"]
-                        boot_disk_gb = int(source_spec.get("boot_disk_gb", prof.get("boot_disk_gb", 40)))
-                        data_disk_type = source_spec["data_disk_type"]
-                        data_disk_gb = int(source_spec.get("data_disk_gb", prof.get("data_disk_gb", 100)))
-                        runner_vcpu = int(source_spec["runner_vcpu"])
-                        runner_ram = float(source_spec["runner_ram_gib"])
-                        runners_cnt = int(source_spec["runners_count"])
-                        cloud_init_id = (
-                            (vm_tpl.get("cloud_init_template_id") if vm_tpl else None)
-                            or prof.get("cloud_init_template_id")
-                            or source_spec.get("cloud_init_template_id")
-                            or default_ci_id
-                        )
-                        vm_tpl_id = (
-                            vm_tpl["id"]
-                            if vm_tpl
-                            else source_spec.get("vm_template_id")
-                        )
-                        prefix = "oxidex-runners" if role == "cicd_runner" else "builder-oxidex"
-                        new_name = f"{prefix}-{region}-{uuid.uuid4().hex[:4]}"
-                        prof_budget = prof.get("budget", {}) if isinstance(prof.get("budget"), dict) else {}
-                        override_tax = (
-                            float(prof_budget.get("tax_rate_percent", 0.0))
-                            if prof_budget.get("override_regional_tax")
-                            else None
-                        )
-                        created = _build_instance_record(
-                            instance_id=str(int(now_ts * 1000) + idx),
-                            name=new_name,
-                            role=role,
-                            status="RUNNING",
-                            region=region,
-                            zone=zone,
-                            machine_type=machine_type,
-                            vcpu=vcpu,
-                            ram_gib=ram_gib,
-                            cpu_platform=cpu_platform,
-                            boot_disk_type=boot_disk_type,
-                            boot_disk_gb=boot_disk_gb,
-                            data_disk_type=data_disk_type,
-                            data_disk_gb=data_disk_gb,
-                            runners_count=runners_cnt,
-                            runner_vcpu=runner_vcpu,
-                            runner_ram_gib=runner_ram,
-                            started_hours_ago=0.05,
-                            deleted_hours_ago=None,
-                            deletion_trigger=f"Active — Scaled up on demand in {region}",
-                            cloud_init_template_id=cloud_init_id,
-                            vm_template_id=vm_tpl_id,
-                            cpu_utilization_percent=35.0,
-                            ram_utilization_percent=40.0,
-                            project=self.project,
-                            now_epoch=now_ts,
-                            tax_rate_percent=override_tax,
-                        )
-                        new_records.append(created)
-
-                    budget = prof.get("budget", {})
-                    max_hourly_cap = float(
-                        pol.get("max_scale_up_hourly_usd", budget.get("max_hourly_usd", 5.0))
-                    )
-                    max_daily_cap = float(
-                        pol.get("max_scale_up_daily_usd", budget.get("max_daily_usd", 10.0))
-                    )
-                    max_monthly_cap = float(
-                        pol.get("max_scale_up_monthly_usd", budget.get("max_monthly_usd", 50.0))
-                    )
-                    include_disk = bool(
-                        pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
-                    )
-                    include_tax = bool(budget.get("include_taxes", False))
-                    effective_hourly_cap = min(
-                        max_hourly_cap,
-                        max_daily_cap / 24.0,
-                        max_monthly_cap / (24.0 * 365.0 / 12.0),
-                    )
-                    existing_running_role = [
-                        i
-                        for i in self.state["instances"]
-                        if i["status"] == "RUNNING" and i["role"] == role
-                    ]
-                    previous_runner_slots = sum(
-                        int(i.get("runners_count", 1)) for i in existing_running_role
-                    )
-                    projected_runner_slots = previous_runner_slots
-                    max_runners_cap = max(
-                        int(prof.get("min_runners", 1)),
-                        int(pol.get("max_runners", 24)),
-                    )
-                    if role == "cicd_runner":
-                        projected_runner_slots = sum(
-                            int(i.get("runners_count", 1)) for i in existing_running_role + new_records
-                        )
-                        if projected_runner_slots > max_runners_cap:
-                            raise ValueError(
-                                f"Scaling up in {region} to {target_count} instance(s) "
-                                f"(projected {projected_runner_slots} runner slots across {projected_total} VMs) "
-                                f"exceeds maximum allowed CI/CD runners ({max_runners_cap})"
-                            )
-                    other_role = "rust_builder" if role == "cicd_runner" else "cicd_runner"
-                    shared_global = bool(
-                        pol.get("shared_global_budget") or self.state.get("global_budget_enforced")
-                    )
-                    other_running = (
-                        [
-                            i
-                            for i in self.state["instances"]
-                            if i["status"] == "RUNNING" and i["role"] == other_role
-                        ]
-                        if shared_global
-                        else []
-                    )
-                    other_role_hourly = round(
-                        sum(
-                            self._instance_hourly_for_budget(
-                                i["pricing"], include_disk=include_disk, include_tax=include_tax
-                            )
-                            for i in other_running
+            would_retire: list[dict[str, Any]] = []
+            new_records: list[dict[str, Any]] = []
+            if target_count < current_count:
+                would_retire = running_in_region[target_count:]
+            elif target_count > current_count:
+                if not bool(self.state["regions_enabled"].get(region, True)):
+                    raise ValueError(f"Cannot scale up in disabled region '{region}'")
+                vm_tpl = None
+                if prof.get("use_vm_template") and prof.get("vm_template_id"):
+                    vm_tpl = next(
+                        (
+                            t
+                            for t in self.state.get("vm_templates", [])
+                            if t.get("id") == prof.get("vm_template_id")
+                            and t.get("role", role) == role
                         ),
-                        4,
+                        None,
                     )
-                    projected_fleet_hourly = round(
-                        other_role_hourly
-                        + sum(
-                            self._instance_hourly_for_budget(
-                                i["pricing"], include_disk=include_disk, include_tax=include_tax
-                            )
-                            for i in existing_running_role + new_records
-                        ),
-                        4,
-                    )
-                    if (
-                        effective_hourly_cap <= 0.0
-                        or projected_fleet_hourly > effective_hourly_cap + 1e-9
-                    ):
+                    if vm_tpl is None:
                         raise ValueError(
-                            f"Scaling up in {region} to {target_count} instance(s) (total fleet: {projected_total}, "
-                            f"projected ${projected_fleet_hourly:.4f}/hr) exceeds scale-up budget cap "
-                            f"(${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, ${max_monthly_cap:.2f}/mo) for role '{role}'"
+                            f"Assigned VM template '{prof.get('vm_template_id')}' not found for role '{role}'"
                         )
-                    for created in new_records:
-                        self.state["instances"].insert(0, created)
-                    if role == "cicd_runner":
-                        self._consume_active_oom_events(
-                            role=role,
-                            previous_runners=previous_runner_slots,
-                            current_runners=projected_runner_slots,
-                            step_runners=max(1, int(pol.get("scale_up_step_runners", 2))),
-                            max_runners=max_runners_cap,
+                    self._validate_vm_template_compatibility(vm_tpl, prof, role)
+                    tpl_machine_type = str(vm_tpl.get("machine_type", ""))
+                    tpl_family = tpl_machine_type.split("-", 1)[0]
+                    if tpl_family not in reg_info.get("families", []):
+                        raise ValueError(
+                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' machine family '{tpl_family}' "
+                            f"({tpl_machine_type}) is not available in region '{region}' "
+                            f"(supported: {', '.join(reg_info.get('families', []))})"
                         )
-                    else:
-                        self._consume_active_oom_events(role=role)
+                    tpl_cpu = str(vm_tpl.get("cpu_platform", ""))
+                    if tpl_cpu and tpl_cpu not in reg_info.get("cpu_platforms", []):
+                        raise ValueError(
+                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' CPU platform '{tpl_cpu}' "
+                            f"is not available in region '{region}' "
+                            f"(supported: {', '.join(reg_info.get('cpu_platforms', []))})"
+                        )
+                    tpl_boot_disk = str(vm_tpl.get("boot_disk_type", ""))
+                    if tpl_boot_disk and tpl_boot_disk not in reg_info.get("disk_types", []):
+                        raise ValueError(
+                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' boot disk type '{tpl_boot_disk}' "
+                            f"is not available in region '{region}' "
+                            f"(supported: {', '.join(reg_info.get('disk_types', []))})"
+                        )
+                    tpl_data_disk = str(vm_tpl.get("data_disk_type", ""))
+                    if tpl_data_disk and tpl_data_disk not in reg_info.get("disk_types", []):
+                        raise ValueError(
+                            f"VM template '{vm_tpl.get('name', vm_tpl['id'])}' data disk type '{tpl_data_disk}' "
+                            f"is not available in region '{region}' "
+                            f"(supported: {', '.join(reg_info.get('disk_types', []))})"
+                        )
+                source_spec: dict[str, Any] | None = vm_tpl
+                if source_spec is None:
+                    existing_cand = running_in_region[0] if running_in_region else None
+                    if existing_cand is not None:
+                        try:
+                            self._validate_vm_template_compatibility(existing_cand, prof, role)
+                            if (
+                                int(existing_cand.get("runner_vcpu", 0)) == int(prof["runner_vcpu"])
+                                and float(existing_cand.get("runner_ram_gib", 0.0))
+                                == float(prof["runner_ram_gib"])
+                            ):
+                                source_spec = existing_cand
+                        except ValueError:
+                            # Existing instance no longer matches updated profile requirements; select a qualifying offer below.
+                            source_spec = None
+                    if source_spec is None:
+                        reg_qual = qualify_instances(
+                            prof,
+                            {r["region"]: (r["region"] == region) for r in REGIONS_CATALOG},
+                            self.project,
+                            region_latencies_ms=self.state.get("region_latencies_ms"),
+                        )
+                        best_offer = (
+                            reg_qual["spot_price_qualifying"]
+                            or reg_qual["hardware_qualifying"]
+                            or [None]
+                        )[0]
+                        if best_offer is None:
+                            raise ValueError(
+                                f"No machine shape in region '{region}' satisfies the sizing and hardware "
+                                f"requirements for role '{role}'"
+                            )
+                        source_spec = {
+                            "machine_type": best_offer["machine_type"],
+                            "vcpu": best_offer["vcpu"],
+                            "ram_gib": best_offer["ram_gib"],
+                            "cpu_platform": best_offer["cpu_platform"],
+                            "boot_disk_type": best_offer["boot_disk_type"],
+                            "boot_disk_gb": best_offer["boot_disk_gb"],
+                            "data_disk_type": best_offer["data_disk_type"],
+                            "data_disk_gb": best_offer["data_disk_gb"],
+                            "runner_vcpu": best_offer["unit_vcpu"],
+                            "runner_ram_gib": best_offer["unit_ram_gib"],
+                            "runners_count": best_offer["units_per_instance"],
+                            "cloud_init_template_id": prof.get(
+                                "cloud_init_template_id", "ci-runner-default"
+                            ),
+                            "vm_template_id": None,
+                        }
 
-                self._sync_fleet_telemetry()
-                self._persist()
-            except Exception:
-                self.state["instances"] = prev_instances
-                self.state["scaling_telemetry"] = prev_telemetry
-                raise
-            updated_running = [
+                default_ci_id = "ci-runner-default" if role == "cicd_runner" else "ci-rust-builder-199"
+                for idx in range(current_count + 1, target_count + 1):
+                    zone = reg_info["zones"][(idx - 1) % len(reg_info["zones"])]
+                    machine_type = source_spec["machine_type"]
+                    vcpu = int(source_spec["vcpu"])
+                    ram_gib = float(source_spec["ram_gib"])
+                    cpu_platform = source_spec["cpu_platform"]
+                    boot_disk_type = source_spec["boot_disk_type"]
+                    boot_disk_gb = int(source_spec.get("boot_disk_gb", prof.get("boot_disk_gb", 40)))
+                    data_disk_type = source_spec["data_disk_type"]
+                    data_disk_gb = int(source_spec.get("data_disk_gb", prof.get("data_disk_gb", 100)))
+                    runner_vcpu = int(source_spec["runner_vcpu"])
+                    runner_ram = float(source_spec["runner_ram_gib"])
+                    runners_cnt = int(source_spec["runners_count"])
+                    cloud_init_id = (
+                        (vm_tpl.get("cloud_init_template_id") if vm_tpl else None)
+                        or prof.get("cloud_init_template_id")
+                        or source_spec.get("cloud_init_template_id")
+                        or default_ci_id
+                    )
+                    vm_tpl_id = (
+                        vm_tpl["id"]
+                        if vm_tpl
+                        else source_spec.get("vm_template_id")
+                    )
+                    prefix = "oxidex-runners" if role == "cicd_runner" else "builder-oxidex"
+                    new_name = f"{prefix}-{region}-{uuid.uuid4().hex[:4]}"
+                    prof_budget = prof.get("budget", {}) if isinstance(prof.get("budget"), dict) else {}
+                    override_tax = (
+                        float(prof_budget.get("tax_rate_percent", 0.0))
+                        if prof_budget.get("override_regional_tax")
+                        else None
+                    )
+                    created = _build_instance_record(
+                        instance_id=str(int(now_ts * 1000) + idx),
+                        name=new_name,
+                        role=role,
+                        status="RUNNING",
+                        region=region,
+                        zone=zone,
+                        machine_type=machine_type,
+                        vcpu=vcpu,
+                        ram_gib=ram_gib,
+                        cpu_platform=cpu_platform,
+                        boot_disk_type=boot_disk_type,
+                        boot_disk_gb=boot_disk_gb,
+                        data_disk_type=data_disk_type,
+                        data_disk_gb=data_disk_gb,
+                        runners_count=runners_cnt,
+                        runner_vcpu=runner_vcpu,
+                        runner_ram_gib=runner_ram,
+                        started_hours_ago=0.05,
+                        deleted_hours_ago=None,
+                        deletion_trigger=f"Active — Scaled up on demand in {region}",
+                        cloud_init_template_id=cloud_init_id,
+                        vm_template_id=vm_tpl_id,
+                        cpu_utilization_percent=35.0,
+                        ram_utilization_percent=40.0,
+                        project=self.project,
+                        now_epoch=now_ts,
+                        tax_rate_percent=override_tax,
+                    )
+                    new_records.append(created)
+
+                budget = prof.get("budget", {})
+                max_hourly_cap = float(
+                    pol.get("max_scale_up_hourly_usd", budget.get("max_hourly_usd", 5.0))
+                )
+                max_daily_cap = float(
+                    pol.get("max_scale_up_daily_usd", budget.get("max_daily_usd", 10.0))
+                )
+                max_monthly_cap = float(
+                    pol.get("max_scale_up_monthly_usd", budget.get("max_monthly_usd", 50.0))
+                )
+                include_disk = bool(
+                    pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
+                )
+                include_tax = bool(budget.get("include_taxes", False))
+                effective_hourly_cap = min(
+                    max_hourly_cap,
+                    max_daily_cap / 24.0,
+                    max_monthly_cap / (24.0 * 365.0 / 12.0),
+                )
+                existing_running_role = [
+                    i
+                    for i in instances
+                    if i["status"] == "RUNNING" and i["role"] == role
+                ]
+                previous_runner_slots = sum(
+                    int(i.get("runners_count", 1)) for i in existing_running_role
+                )
+                projected_runner_slots = previous_runner_slots
+                max_runners_cap = max(
+                    int(prof.get("min_runners", 1)),
+                    int(pol.get("max_runners", 24)),
+                )
+                if role == "cicd_runner":
+                    projected_runner_slots = sum(
+                        int(i.get("runners_count", 1)) for i in existing_running_role + new_records
+                    )
+                    if projected_runner_slots > max_runners_cap:
+                        raise ValueError(
+                            f"Scaling up in {region} to {target_count} instance(s) "
+                            f"(projected {projected_runner_slots} runner slots across {projected_total} VMs) "
+                            f"exceeds maximum allowed CI/CD runners ({max_runners_cap})"
+                        )
+                other_role = "rust_builder" if role == "cicd_runner" else "cicd_runner"
+                shared_global = bool(
+                    pol.get("shared_global_budget") or self.state.get("global_budget_enforced")
+                )
+                other_running = (
+                    [
+                        i
+                        for i in instances
+                        if i["status"] == "RUNNING" and i["role"] == other_role
+                    ]
+                    if shared_global
+                    else []
+                )
+                other_role_hourly = round(
+                    sum(
+                        self._instance_hourly_for_budget(
+                            i["pricing"], include_disk=include_disk, include_tax=include_tax
+                        )
+                        for i in other_running
+                    ),
+                    4,
+                )
+                projected_fleet_hourly = round(
+                    other_role_hourly
+                    + sum(
+                        self._instance_hourly_for_budget(
+                            i["pricing"], include_disk=include_disk, include_tax=include_tax
+                        )
+                        for i in existing_running_role + new_records
+                    ),
+                    4,
+                )
+                if (
+                    effective_hourly_cap <= 0.0
+                    or projected_fleet_hourly > effective_hourly_cap + 1e-9
+                ):
+                    raise ValueError(
+                        f"Scaling up in {region} to {target_count} instance(s) (total fleet: {projected_total}, "
+                        f"projected ${projected_fleet_hourly:.4f}/hr) exceeds scale-up budget cap "
+                        f"(${max_hourly_cap:.2f}/hr, ${max_daily_cap:.2f}/day, ${max_monthly_cap:.2f}/mo) for role '{role}'"
+                    )
+            planned_running = [
                 i
-                for i in self.state["instances"]
-                if i["region"] == region and i["status"] == "RUNNING" and i["role"] == role
+                for i in new_records + running_in_region
+                if not any(i is r for r in would_retire)
             ]
             return {
-                "status": "ok",
+                "status": "plan_only",
+                "applied": False,
                 "region": region,
                 "role": role,
                 "previous_count": current_count,
-                "current_count": len(updated_running),
-                "running_instances": updated_running,
+                "current_count": current_count,
+                "planned_count": len(planned_running),
+                "would_launch": [
+                    {k: rec.get(k) for k in ("zone", "machine_type", "vcpu", "ram_gib", "cpu_platform",
+                                             "boot_disk_type", "boot_disk_gb", "data_disk_type", "data_disk_gb",
+                                             "runners_count", "runner_vcpu", "runner_ram_gib", "pricing",
+                                             "vm_template_id", "cloud_init_template_id")}
+                    for rec in new_records
+                ],
+                "would_retire": [i.get("name") for i in would_retire],
+                "planned_instances": planned_running,
+                "message": LIFECYCLE_ACTIONS_DISABLED_MESSAGE,
             }
 
     def get_rust_builds_summary(self) -> dict[str, Any]:
@@ -6406,8 +6444,12 @@ def create_dashboard_server(
     config_repo: str | None = None,
     patch_console: PatchConsole | None = None,
     github_token_provider: Any = None,
+    fleet_source: Any = None,
 ) -> tuple[ThreadingHTTPServer, DashboardStore]:
     """Instantiate the ThreadingHTTPServer and DashboardStore, then start hydration.
+
+    ``fleet_source`` (else ``DASHBOARD_FLEET_INVENTORY=gce``) is the read-only live instance listing the
+    instance view mirrors; without one the instance list stays empty.
 
     ``oauth_manager`` enables GitHub OAuth login (additive to ``auth_token``); ``controlled_targets`` are
     static organization or ``owner/repo`` targets on which OAuth users must be administrators, in
@@ -6474,7 +6516,8 @@ def create_dashboard_server(
     )
     if oauth_manager is not None and config_targets_provider is None:
         config_targets_provider = ConfigRepoTargets(resolve_config_repo(config_repo, org=org))
-    store = DashboardStore(state_path=state_path, project=project, org=org, control_slot=control_slot, kv=kv)
+    store = DashboardStore(state_path=state_path, project=project, org=org, control_slot=control_slot, kv=kv,
+                           fleet_source=fleet_source if fleet_source is not None else fleet_source_from_env(project))
     handler = make_handler(
         store,
         auth_token=cleaned_token or None,

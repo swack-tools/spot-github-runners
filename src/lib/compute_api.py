@@ -322,15 +322,21 @@ async def list_regions(api: AsyncGoogleApi, project: str) -> list[dict]:
             return rows
 
 
-async def list_instances(api: AsyncGoogleApi, project: str) -> tuple[list[dict], list[str]]:
+INSTANCE_LIST_FIELDS = "name,zone,status,machineType,cpuPlatform,lastStartTimestamp,labels,metadata/items"
+# The dashboard's fleet inventory also needs identity, lifetime, Spot, and attached-disk fields.
+FLEET_INSTANCE_LIST_FIELDS = (INSTANCE_LIST_FIELDS + ",id,creationTimestamp,lastStopTimestamp,"
+                              "scheduling(provisioningModel,preemptible),disks(boot,diskSizeGb,source)")
+
+
+async def list_instances(api: AsyncGoogleApi, project: str, *,
+                         instance_fields: str = INSTANCE_LIST_FIELDS) -> tuple[list[dict], list[str]]:
     """List every VM instance (name, zone, status, machine type, labels, metadata items) with one aggregated
     stream. Callers keep only the metadata keys they need; startup scripts are never stored."""
     path = f"{API_ROOT}/projects/{quote(project, safe='')}/aggregated/instances"
     query = {
         "maxResults": "500",
         "returnPartialSuccess": "true",
-        "fields": ("nextPageToken,unreachables,"
-                   "items/*/instances(name,zone,status,machineType,cpuPlatform,lastStartTimestamp,labels,metadata/items)"),
+        "fields": f"nextPageToken,unreachables,items/*/instances({instance_fields})",
     }
     rows: list[dict] = []
     unreachables: list[str] = []
@@ -342,6 +348,27 @@ async def list_instances(api: AsyncGoogleApi, project: str) -> tuple[list[dict],
         token = data.get("nextPageToken")
         if not token:
             return rows, unreachables
+        query["pageToken"] = token
+
+
+async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, str]:
+    """``{disk selfLink: disk type name}`` for every persistent disk, from one aggregated listing."""
+    path = f"{API_ROOT}/projects/{quote(project, safe='')}/aggregated/disks"
+    query = {
+        "maxResults": "500",
+        "returnPartialSuccess": "true",
+        "fields": "nextPageToken,items/*/disks(selfLink,type)",
+    }
+    types: dict[str, str] = {}
+    while True:
+        data = await api.get_json(path, query)
+        for scoped in data.get("items", {}).values():
+            for disk in scoped.get("disks", []):
+                if isinstance(disk, dict) and disk.get("selfLink"):
+                    types[str(disk["selfLink"])] = str(disk.get("type", "")).rsplit("/", 1)[-1]
+        token = data.get("nextPageToken")
+        if not token:
+            return types
         query["pageToken"] = token
 
 

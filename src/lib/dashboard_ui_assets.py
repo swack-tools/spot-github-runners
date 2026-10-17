@@ -2077,8 +2077,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:9px; padding:14px; margin-bottom:12px;">
             <div style="color:var(--text-muted); margin-bottom:10px;">No running instances currently in <strong>${reg.display_name} (${reg.region})</strong>.</div>
             <div style="display:flex; gap:8px; flex-wrap:wrap;">
-              <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${reg.region}', 'cicd_runner', 1)">+ Launch 1 CI/CD Runner Host Here</button>
-              <button class="btn btn-sm btn-purple" onclick="scaleRegion('${reg.region}', 'rust_builder', 1)">+ Launch 1 Rust Builder Host Here</button>
+              <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', 1)">Plan 1 CI/CD Runner Host Here</button>
+              <button class="btn btn-sm btn-purple" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', 1)">Plan 1 Rust Builder Host Here</button>
             </div>
           </div>
         `;
@@ -2132,7 +2132,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
               <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
                 <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">🖥️ Create VM Template</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteInstanceNow('${esc(inst.instance_id)}', '${esc(inst.name)}')">🗑️ Delete Instance</button>
               </div>
             </div>
           `;
@@ -2150,13 +2149,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
 
         <div style="display:flex; flex-direction:column; gap:8px; background:var(--bg-card); border:1px solid var(--border); padding:10px 12px; border-radius:9px; margin-bottom:12px;">
+          <div style="font-size:11.5px; color:var(--text-muted);">Plan only: these controls check a scale change against budgets and caps and report what it would launch or retire. The dashboard never creates or deletes VMs; the autoscaler and the provisioning tools do.</div>
           <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
             <div style="font-size:12.5px; font-weight:600;">CI/CD Runner Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
             <div style="display:flex; align-items:center; gap:6px;">
               <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', Math.max(0, ${runnerCountInReg} - 1))">−1</button>
               <input type="number" id="map-scale-input-${esc(reg.region)}" value="${runnerCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
               <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', ${runnerCountInReg} + 1)">+1</button>
-              <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', parseInt(document.getElementById('map-scale-input-${esc(reg.region)}').value || '0', 10))">Apply Runner Scale</button>
+              <button class="btn btn-sm btn-emerald" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', parseInt(document.getElementById('map-scale-input-${esc(reg.region)}').value || '0', 10))">Plan Runner Scale</button>
             </div>
           </div>
           <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; border-top:1px solid var(--border); padding-top:8px;">
@@ -2165,7 +2165,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', Math.max(0, ${builderCountInReg} - 1))">−1</button>
               <input type="number" id="map-scale-builder-input-${esc(reg.region)}" value="${builderCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
               <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', ${builderCountInReg} + 1)">+1</button>
-              <button class="btn btn-sm btn-purple" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', parseInt(document.getElementById('map-scale-builder-input-${esc(reg.region)}').value || '0', 10))">Apply Builder Scale</button>
+              <button class="btn btn-sm btn-purple" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', parseInt(document.getElementById('map-scale-builder-input-${esc(reg.region)}').value || '0', 10))">Plan Builder Scale</button>
             </div>
           </div>
         </div>
@@ -2182,30 +2182,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       });
       const data = await res.json();
       if (!res.ok || data.error) {
-        showToast(`Error scaling ${region}: ${data.error || res.statusText}`);
+        showToast(`Plan for ${region} rejected: ${data.error || res.statusText}`);
         return;
       }
-      showToast(`Scaled ${region} (${role}) to ${data.current_count ?? targetCount} instance(s)`);
-      await loadOverview();
-    }
-
-    async function deleteInstanceNow(instanceId, name) {
-      const res = await fetch("/api/instances/delete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          instance_id: instanceId,
-          instance_name: name,
-          reason: "On-demand operator deletion from World Map / Instance Inspector"
-        })
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        showToast(`Error deleting ${name}: ${data.error || res.statusText}`);
-        return;
-      }
-      showToast(data.status === "already_deleted" ? `Instance ${name} was already deleted` : `Deleted instance ${name}`);
-      await loadOverview();
+      const launch = (data.would_launch || []).length;
+      const retire = (data.would_retire || []).length;
+      showToast(`Plan only, nothing changed: ${region} (${role}) ${data.current_count} → ${data.planned_count} instance(s); would launch ${launch}, retire ${retire}. ${data.message || ""}`);
     }
 
     async function makeTemplateFromInstance(instanceId, name) {
@@ -2269,7 +2251,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     function renderInstancesTableRows() {
       const iv = APP_STATE.instances_view;
       const summary = document.getElementById("inst-window-summary");
-      summary.innerHTML = `Showing <strong>${iv.instances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} deleted) · Total Window Spend: <strong class="mono" style="color:#34d399;">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
+      const fi = iv.fleet_inventory || APP_STATE.fleet_inventory || {};
+      const inventoryNote = fi.source === "gce"
+        ? `Source: live Compute Engine inventory${fi.last_success_at ? ", last listed " + esc(formatLocalTime(fi.last_success_at)) : ", not listed yet"}${fi.last_error ? ' · <span style="color:#fda4af;">' + esc(fi.last_error) + "</span>" : ""}`
+        : `Source: live Compute Engine inventory is not configured on this dashboard (set DASHBOARD_FLEET_INVENTORY=gce); no instances are shown`;
+      summary.innerHTML = `${inventoryNote}<br>Showing <strong>${iv.instances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} stopped or deleted) · Total Window Spend: <strong class="mono" style="color:#34d399;">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
 
       const tbody = document.getElementById("instances-table-body");
       tbody.innerHTML = iv.instances.map(inst => {
@@ -2312,7 +2298,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </td>
             <td style="font-size:11.5px;">
               <div><strong>Start:</strong> ${esc(formatLocalTime(inst.started_at))}</div>
-              <div><strong>End:</strong> ${inst.deleted_at ? esc(formatLocalTime(inst.deleted_at)) : '<span style="color:#34d399;">Present (Running)</span>'}</div>
+              <div><strong>End:</strong> ${inst.deleted_at ? esc(formatLocalTime(inst.deleted_at)) : inst.stopped_at ? 'Stopped ' + esc(formatLocalTime(inst.stopped_at)) : isRunning ? '<span style="color:#34d399;">Present (Running)</span>' : esc(inst.status)}</div>
             </td>
             <td style="max-width:260px; font-size:11.5px; color:${isRunning ? '#a7f3d0' : '#fda4af'};">
               ${esc(inst.deletion_trigger)}
@@ -2321,7 +2307,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <div style="display:flex; gap:5px; flex-wrap:wrap;">
                 <button class="btn btn-sm btn-secondary" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'SSH command')">📋 SSH</button>
                 <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">Template</button>
-                ${isRunning ? `<button class="btn btn-sm btn-danger" onclick="deleteInstanceNow('${esc(inst.instance_id)}', '${esc(inst.name)}')">Delete</button>` : ""}
               </div>
             </td>
           </tr>

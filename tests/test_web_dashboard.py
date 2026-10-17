@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 import urllib.request
@@ -29,12 +30,340 @@ from lib.dashboard_scaling import (
     evaluate_scaling_decision,
     parse_github_oom_deep_link,
 )
-from lib.dashboard_server import create_dashboard_server, main as dashboard_main
+from lib.dashboard_server import (
+    INSTANCE_SOURCE_GCE,
+    INSTANCE_SOURCE_KEY,
+    _build_instance_record,
+    create_dashboard_server,
+    main as dashboard_main,
+)
 from lib.rust_build_telemetry import (
     classify_ip_and_network,
     compute_cpu_points,
     enrich_rust_build_record,
 )
+
+
+def fleet_fixture_records(project: str = "homelab-424523", ref_now: float | None = None) -> list[dict]:
+    """Inventory-shaped instance records for tests (the dashboard itself no longer seeds any)."""
+    ref_now = time.time() if ref_now is None else ref_now
+    records = [
+        # Active instance in South Africa (matches the user's exact world map example)
+        _build_instance_record(
+            instance_id="790481726351001",
+            name="oxidex-runners-za-jnb-01",
+            role="cicd_runner",
+            status="RUNNING",
+            region="africa-south1",
+            zone="africa-south1-a",
+            machine_type="n2-standard-16",
+            vcpu=16,
+            ram_gib=64,
+            cpu_platform="Intel Ice Lake",
+            boot_disk_type="pd-balanced",
+            boot_disk_gb=40,
+            data_disk_type="pd-ssd",
+            data_disk_gb=100,
+            runners_count=4,
+            runner_vcpu=4,
+            runner_ram_gib=8,
+            started_hours_ago=8.5,
+            deleted_hours_ago=None,
+            deletion_trigger="Active — Running (scheduled by minimum floor policy)",
+            cloud_init_template_id="ci-runner-default",
+            vm_template_id="tpl-runner-za-n2-16",
+            cpu_utilization_percent=64.0,
+            ram_utilization_percent=52.0,
+            project=project,
+            now_epoch=ref_now,
+        ),
+        # Active instance in Dallas, USA
+        _build_instance_record(
+            instance_id="790481726351002",
+            name="oxidex-runners-dallas-01",
+            role="cicd_runner",
+            status="RUNNING",
+            region="us-south1",
+            zone="us-south1-a",
+            machine_type="n4-standard-16",
+            vcpu=16,
+            ram_gib=64,
+            cpu_platform="Intel Emerald Rapids",
+            boot_disk_type="hyperdisk-balanced",
+            boot_disk_gb=40,
+            data_disk_type="hyperdisk-balanced",
+            data_disk_gb=100,
+            runners_count=4,
+            runner_vcpu=4,
+            runner_ram_gib=16,
+            started_hours_ago=14.0,
+            deleted_hours_ago=None,
+            deletion_trigger="Active — Running (queue & CPU demand)",
+            cloud_init_template_id="ci-runner-default",
+            vm_template_id="tpl-runner-n4-std16",
+            cpu_utilization_percent=72.0,
+            ram_utilization_percent=68.0,
+            project=project,
+            now_epoch=ref_now,
+        ),
+        # Active instance in Belgium, Europe
+        _build_instance_record(
+            instance_id="790481726351003",
+            name="oxidex-runners-eu-belgium-01",
+            role="cicd_runner",
+            status="RUNNING",
+            region="europe-west1",
+            zone="europe-west1-b",
+            machine_type="c4d-standard-8",
+            vcpu=8,
+            ram_gib=32,
+            cpu_platform="AMD Turin",
+            boot_disk_type="hyperdisk-balanced",
+            boot_disk_gb=40,
+            data_disk_type="hyperdisk-balanced",
+            data_disk_gb=100,
+            runners_count=2,
+            runner_vcpu=4,
+            runner_ram_gib=16,
+            started_hours_ago=5.2,
+            deleted_hours_ago=None,
+            deletion_trigger="Active — Running (strict pool member)",
+            cloud_init_template_id="ci-runner-strict-pool",
+            vm_template_id="tpl-runner-n4-std16",
+            cpu_utilization_percent=58.0,
+            ram_utilization_percent=61.0,
+            project=project,
+            now_epoch=ref_now,
+        ),
+        # Active Dedicated Rust Builder in Dallas
+        _build_instance_record(
+            instance_id="790481726351004",
+            name="builder-oxidex-turin-01",
+            role="rust_builder",
+            status="RUNNING",
+            region="us-south1",
+            zone="us-south1-b",
+            machine_type="c4d-highcpu-16",
+            vcpu=16,
+            ram_gib=32,
+            cpu_platform="AMD Turin",
+            boot_disk_type="hyperdisk-balanced",
+            boot_disk_gb=40,
+            data_disk_type="hyperdisk-balanced",
+            data_disk_gb=100,
+            runners_count=1,
+            runner_vcpu=16,
+            runner_ram_gib=28,
+            started_hours_ago=19.0,
+            deleted_hours_ago=None,
+            deletion_trigger="Active — Dedicated Rust 1.99 Builder",
+            cloud_init_template_id="ci-rust-builder-199",
+            vm_template_id="tpl-builder-c4d-16",
+            cpu_utilization_percent=78.0,
+            ram_utilization_percent=74.0,
+            project=project,
+            now_epoch=ref_now,
+        ),
+        # Active Dedicated Rust Builder in Eemshaven, Netherlands
+        _build_instance_record(
+            instance_id="790481726351005",
+            name="builder-oxidex-eu-01",
+            role="rust_builder",
+            status="RUNNING",
+            region="europe-west4",
+            zone="europe-west4-a",
+            machine_type="n4-highcpu-16",
+            vcpu=16,
+            ram_gib=32,
+            cpu_platform="Intel Emerald Rapids",
+            boot_disk_type="hyperdisk-balanced",
+            boot_disk_gb=40,
+            data_disk_type="hyperdisk-balanced",
+            data_disk_gb=100,
+            runners_count=1,
+            runner_vcpu=16,
+            runner_ram_gib=28,
+            started_hours_ago=11.0,
+            deleted_hours_ago=None,
+            deletion_trigger="Active — Dedicated Rust 1.99 Builder",
+            cloud_init_template_id="ci-rust-builder-199",
+            vm_template_id="tpl-builder-c4d-16",
+            cpu_utilization_percent=36.0,
+            ram_utilization_percent=48.0,
+            project=project,
+            now_epoch=ref_now,
+        ),
+        # Deleted instance in last 24h (ran for 6 hours, scaled down due to lack of runner demand)
+        _build_instance_record(
+            instance_id="780481726350901",
+            name="oxidex-runners-iowa-04",
+            role="cicd_runner",
+            status="DELETED",
+            region="us-central1",
+            zone="us-central1-a",
+            machine_type="n4-standard-16",
+            vcpu=16,
+            ram_gib=64,
+            cpu_platform="Intel Emerald Rapids",
+            boot_disk_type="hyperdisk-balanced",
+            boot_disk_gb=40,
+            data_disk_type="hyperdisk-balanced",
+            data_disk_gb=100,
+            runners_count=4,
+            runner_vcpu=4,
+            runner_ram_gib=16,
+            started_hours_ago=10.5,
+            deleted_hours_ago=4.5,
+            deletion_trigger="Scheduled scale-down: lack of GitHub runner demand (<= 5 jobs in past hour)",
+            cloud_init_template_id="ci-runner-default",
+            vm_template_id="tpl-runner-n4-std16",
+            cpu_utilization_percent=0.0,
+            ram_utilization_percent=0.0,
+            project=project,
+            now_epoch=ref_now,
+        ),
+        # Deleted instance in last 24h (high spec 32-vCPU host in Hong Kong)
+        _build_instance_record(
+            instance_id="780481726350902",
+            name="oxidex-runners-hk-bulky-02",
+            role="cicd_runner",
+            status="DELETED",
+            region="asia-east2",
+            zone="asia-east2-b",
+            machine_type="c4d-standard-32",
+            vcpu=32,
+            ram_gib=128,
+            cpu_platform="AMD Turin",
+            boot_disk_type="hyperdisk-balanced",
+            boot_disk_gb=40,
+            data_disk_type="hyperdisk-balanced",
+            data_disk_gb=200,
+            runners_count=8,
+            runner_vcpu=4,
+            runner_ram_gib=16,
+            started_hours_ago=22.0,
+            deleted_hours_ago=3.5,
+            deletion_trigger="Scheduled scale-down: lack of GitHub runner demand (idle queue cooldown)",
+            cloud_init_template_id="ci-runner-strict-pool",
+            vm_template_id="tpl-runner-n4-std16",
+            cpu_utilization_percent=0.0,
+            ram_utilization_percent=0.0,
+            project=project,
+            now_epoch=ref_now,
+        ),
+        # Deleted instance in last 50h (38 hours ago)
+        _build_instance_record(
+            instance_id="780481726350903",
+            name="oxidex-runners-finland-03",
+            role="cicd_runner",
+            status="DELETED",
+            region="europe-north1",
+            zone="europe-north1-b",
+            machine_type="n2d-standard-16",
+            vcpu=16,
+            ram_gib=64,
+            cpu_platform="AMD Milan",
+            boot_disk_type="pd-balanced",
+            boot_disk_gb=40,
+            data_disk_type="pd-ssd",
+            data_disk_gb=100,
+            runners_count=4,
+            runner_vcpu=4,
+            runner_ram_gib=16,
+            started_hours_ago=46.0,
+            deleted_hours_ago=29.0,
+            deletion_trigger="Spot preemption: GCP capacity reclamation in europe-north1-b",
+            cloud_init_template_id="ci-runner-default",
+            vm_template_id=None,
+            cpu_utilization_percent=0.0,
+            ram_utilization_percent=0.0,
+            project=project,
+            now_epoch=ref_now,
+        ),
+        # Deleted builder instance in last 30d (120 hours ago)
+        _build_instance_record(
+            instance_id="780481726350904",
+            name="builder-oxidex-saopaulo-01",
+            role="rust_builder",
+            status="DELETED",
+            region="southamerica-east1",
+            zone="southamerica-east1-a",
+            machine_type="n4-highcpu-16",
+            vcpu=16,
+            ram_gib=32,
+            cpu_platform="Intel Emerald Rapids",
+            boot_disk_type="hyperdisk-balanced",
+            boot_disk_gb=40,
+            data_disk_type="hyperdisk-balanced",
+            data_disk_gb=100,
+            runners_count=1,
+            runner_vcpu=16,
+            runner_ram_gib=28,
+            started_hours_ago=142.0,
+            deleted_hours_ago=118.0,
+            deletion_trigger="Price guard: Spot compute + Hyperdisk exceeded daily budget cap",
+            cloud_init_template_id="ci-rust-builder-199",
+            vm_template_id="tpl-builder-c4d-16",
+            cpu_utilization_percent=0.0,
+            ram_utilization_percent=0.0,
+            project=project,
+            now_epoch=ref_now,
+        ),
+    ]
+    for record in records:
+        record[INSTANCE_SOURCE_KEY] = INSTANCE_SOURCE_GCE
+    return records
+
+
+def fleet_observation(
+    instance_id: str,
+    name: str,
+    zone: str,
+    *,
+    status: str = "RUNNING",
+    runners_count: int = 4,
+    machine_type: str = "n4-standard-16",
+    vcpu: int = 16,
+    ram_gib: float = 64.0,
+    started_hours_ago: float = 2.0,
+    stopped_hours_ago: float | None = None,
+    now: float | None = None,
+) -> dict:
+    """One observation as fleet_inventory.observe_fleet_items returns it."""
+    now = time.time() if now is None else now
+    role = "rust_builder" if name.startswith("builder-") else "cicd_runner"
+    return {
+        "instance_id": instance_id,
+        "name": name,
+        "role": role,
+        "status": status,
+        "zone": zone,
+        "region": zone.rsplit("-", 1)[0],
+        "machine_type": machine_type,
+        "cpu_platform": "Intel Emerald Rapids",
+        "vcpu": vcpu,
+        "ram_gib": ram_gib,
+        "specs_known": True,
+        "spot": True,
+        "boot_disk_type": "hyperdisk-balanced",
+        "boot_disk_gb": 40,
+        "data_disk_type": "hyperdisk-balanced",
+        "data_disk_gb": 100,
+        "runners_count": runners_count if role == "cicd_runner" else 1,
+        "runner_vcpu": 4,
+        "runner_ram_gib": 16.0,
+        "created_epoch": now - started_hours_ago * 3600.0 - 60.0,
+        "last_start_epoch": now - started_hours_ago * 3600.0,
+        "last_stop_epoch": now - stopped_hours_ago * 3600.0 if stopped_hours_ago is not None else None,
+    }
+
+
+def install_fleet_fixture(store) -> None:
+    """Load the fixture fleet into a store as if the live inventory had listed it."""
+    with store._lock:
+        store.state["instances"] = fleet_fixture_records(store.project)
+        store._sync_fleet_telemetry()
+        store._persist()
 
 
 class DashboardModelsTests(unittest.TestCase):
@@ -444,6 +773,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             port=0,
             state_path=self.state_file,
         )
+        install_fleet_fixture(self.store)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -550,11 +880,17 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             "/api/instances/scale-region",
             {"region": "us-south1", "role": "cicd_runner", "target_instances": 2},
         )
-        self.assertEqual(scale_res["current_count"], 2)
-        newest = next(i for i in scale_res["running_instances"] if i["name"] != "oxidex-runners-us-south1-03")
+        # Scale-region is a plan only: it validates and reports, and never adds an instance record.
+        before_names = [i["name"] for i in self.store.state["instances"]]
+        self.assertEqual(scale_res["status"], "plan_only")
+        self.assertFalse(scale_res["applied"])
+        self.assertEqual(scale_res["current_count"], 1)
+        self.assertEqual(scale_res["planned_count"], 2)
+        newest = scale_res["would_launch"][0]
         self.assertEqual(newest["machine_type"], "c4d-standard-32")
         self.assertEqual(newest["runners_count"], 8)
-        self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 18)
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 10)
+        self.assertEqual([i["name"] for i in self.store.state["instances"]], before_names)
 
         # Disabling a region blocks scale-up into that region
         self._post("/api/regions", {"regions_enabled": {"asia-east2": False}})
@@ -586,8 +922,15 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                 "reason": "Scheduled scale-down: lack of GitHub runner demand",
             },
         )
-        self.assertEqual(del_res["instance"]["status"], "DELETED")
-        self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 14)
+        # Delete is a plan only: the VM stays RUNNING until the live inventory stops listing it.
+        self.assertEqual(del_res["status"], "not_applied")
+        self.assertFalse(del_res["applied"])
+        self.assertEqual(del_res["instance"]["status"], "RUNNING")
+        self.assertIn("does not create, stop, or delete VMs", del_res["message"])
+        za_after = next(i for i in self.store.state["instances"] if i["name"] == "oxidex-runners-za-jnb-01")
+        self.assertEqual(za_after["status"], "RUNNING")
+        self.assertIsNone(za_after["deleted_at"])
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 10)
 
     def test_rust_builder_scaling_and_project_override_on_reload(self):
         sc_res = self._post(
@@ -966,8 +1309,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             "/api/instances/scale-region",
             {"region": "africa-south1", "role": "cicd_runner", "target_instances": 2},
         )
-        self.assertEqual(za_scale["current_count"], 2)
-        newest_za = next(i for i in za_scale["running_instances"] if i["name"] != "oxidex-runners-za-jnb-01")
+        self.assertEqual(za_scale["planned_count"], 2)
+        newest_za = za_scale["would_launch"][0]
         self.assertGreaterEqual(newest_za["vcpu"], 32)
         self.assertGreaterEqual(newest_za["ram_gib"], 100)
 
@@ -1085,7 +1428,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             "/api/instances/scale-region",
             {"region": "us-south1", "target_instances": 2, "role": "cicd_runner"},
         )
-        newest_vm = scaled_up["running_instances"][0]
+        newest_vm = scaled_up["would_launch"][0]
         self.assertEqual(newest_vm["cloud_init_template_id"], new_ci_id)
 
         # 4. Regional CI scaling enforces scaling.cicd_runner.max_runners (24 runners max)
@@ -1612,7 +1955,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertIn("curSc.max_scale_up_monthly_usd ?? 50", rendered_ui)
         self.assertNotIn('document.getElementById("runner-max-month").value || "300"', rendered_ui)
         self.assertNotIn('document.getElementById("sc-budget-mo").value || "300"', rendered_ui)
-        self.assertIn("scaleRegion('${reg.region}', 'rust_builder', 1)", rendered_ui)
+        self.assertIn("scaleRegion('${esc(reg.region)}', 'rust_builder', 1)", rendered_ui)
         self.assertIn("map-scale-builder-input-", rendered_ui)
         self.assertIn("saveAndEvaluateBuilderScaling()", rendered_ui)
 
@@ -1778,14 +2121,16 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             mock_skus.assert_called_once()
         set_live_spot_pricing_override(None)
 
-        # 4. scale_region_instances rolls back in-memory mutations when _persist fails
-        before_count = len(self.store.state["instances"])
-        with patch.object(self.store, "_persist", side_effect=OSError("disk full")):
-            with self.assertRaises(OSError):
-                self.store.scale_region_instances(
-                    {"region": "us-south1", "role": "cicd_runner", "delta": 2}
-                )
-        self.assertEqual(len(self.store.state["instances"]), before_count)
+        # 4. scale_region_instances is a plan only: it never persists or changes the instance list
+        before_instances = json.dumps(self.store.state["instances"], sort_keys=True)
+        with patch.object(self.store, "_persist", side_effect=OSError("disk full")) as persist:
+            plan = self.store.scale_region_instances(
+                {"region": "us-south1", "role": "cicd_runner", "target_instances": 0}
+            )
+        persist.assert_not_called()
+        self.assertFalse(plan["applied"])
+        self.assertEqual(plan["would_retire"], ["oxidex-runners-dallas-01"])
+        self.assertEqual(json.dumps(self.store.state["instances"], sort_keys=True), before_instances)
 
         # 5. /api/auth/login caps request body at MAX_LOGIN_BODY_BYTES (4096) with HTTP 413 before reading
         auth_srv, _ = create_dashboard_server(
@@ -2158,7 +2503,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         created_vm_tpl = self._post(
             "/api/vm-templates/from-instance",
             {
-                "instance_id": "90481726351002",
+                "instance_id": "790481726351002",
                 "template_name": "Preserved Source CI Template",
                 "assign_to_profile": True,
             },
@@ -2743,12 +3088,10 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(active_ci_tpl["parsed"]["env_vars"]["RUNNERS_COUNT"], "2")
 
-        # 3. Partial regional scale-up (+1 runner when step_runners=2) keeps OOM active until full step is reached
-        for reg_clear in ("africa-south1", "us-south1", "europe-west1"):
-            self._post(
-                "/api/instances/scale-region",
-                {"region": reg_clear, "role": "cicd_runner", "target_instances": 0},
-            )
+        # 3. Partial fleet growth (+1 runner when step_runners=2) keeps OOM active until the full step is observed
+        #    in the live inventory (the dashboard never launches VMs itself).
+        fleet = [fleet_observation("91700000000000000001", "oxidex-runners-oom-1", "us-south1-a", runners_count=1)]
+        self.store.fleet_source = lambda: list(fleet)
         self._post(
             "/api/profile/cicd_runner",
             {
@@ -2762,10 +3105,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                 "max_instances": 8,
             },
         )
-        self._post(
-            "/api/instances/scale-region",
-            {"region": "us-south1", "role": "cicd_runner", "target_instances": 1},
-        )
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 1)
         self._post(
             "/api/scaling",
             {
@@ -2804,10 +3145,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(oom_resp["evaluation"]["desired_runners"], 3)
 
         # Partial scale-up: +1 VM in us-south1 adds only +1 runner (total 2 runners < target 3)
-        self._post(
-            "/api/instances/scale-region",
-            {"region": "us-south1", "role": "cicd_runner", "target_instances": 2},
-        )
+        fleet.append(fleet_observation("91700000000000000002", "oxidex-runners-oom-2", "us-south1-b", runners_count=1))
+        self.assertTrue(self.store.refresh_fleet_inventory())
         ov_partial = self._get("/api/overview")
         oom_rec_partial = next(
             r for r in ov_partial["scaling_telemetry"]["github_oom_runs"] if r.get("run_id") == 99170001
@@ -2816,10 +3155,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(ov_partial["scaling_evaluation"]["desired_runners"], 3)
 
         # Completing the second +1 runner (total 3 runners >= baseline 1 + step 2) marks OOM handled
-        self._post(
-            "/api/instances/scale-region",
-            {"region": "us-south1", "role": "cicd_runner", "target_instances": 3},
-        )
+        fleet.append(fleet_observation("91700000000000000003", "oxidex-runners-oom-3", "us-south1-c", runners_count=1))
+        self.assertTrue(self.store.refresh_fleet_inventory())
         ov_complete = self._get("/api/overview")
         oom_rec_complete = next(
             r for r in ov_complete["scaling_telemetry"]["github_oom_runs"] if r.get("run_id") == 99170001
@@ -3661,6 +3998,241 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         # 11. CPU scope trims whitespace
         scope_ok, _ = evaluate_cpu_scope([85.0, 30.0, 20.0], 50.0, " any ")
         self.assertTrue(scope_ok)
+
+
+class FleetInventoryReconcileTests(unittest.TestCase):
+    """The instance list mirrors the read-only Compute Engine inventory; nothing is seeded or fabricated."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_file = Path(self.tmp.name) / "dashboard-state.json"
+        self.now = time.time()
+        self.fleet: list[dict] = []
+        from lib.dashboard_server import DashboardStore
+
+        self.store = DashboardStore(state_path=self.state_file, fleet_source=lambda: list(self.fleet))
+        self.store.start()
+        self.addCleanup(self.store.close)
+
+    def _record(self, name: str) -> dict:
+        return next(i for i in self.store.state["instances"] if i["name"] == name)
+
+    def test_default_state_has_no_instances(self):
+        from lib.dashboard_server import default_dashboard_state
+
+        self.assertEqual(default_dashboard_state()["instances"], [])
+        self.assertEqual(self.store.state["instances"], [])
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_instances"], 0)
+
+    def test_running_vm_is_listed_as_running(self):
+        self.fleet = [fleet_observation("1001", "oxidex-runners-us-south1-a-1", "us-south1-a", runners_count=4,
+                                        started_hours_ago=3.0, now=self.now)]
+        version_before = self.store.state_version()
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        rec = self._record("oxidex-runners-us-south1-a-1")
+        self.assertEqual(rec["status"], "RUNNING")
+        self.assertEqual(rec["inventory_source"], "gce")
+        self.assertEqual(rec["region"], "us-south1")
+        self.assertIsNone(rec["deleted_at"])
+        self.assertAlmostEqual(rec["started_epoch"], self.now - 3 * 3600.0, delta=1.0)
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 4)
+        self.assertEqual(self.store.state_version(), version_before + 1)
+        # The same listing again is not a change: no new state version (and no KV publish).
+        self.assertFalse(self.store.refresh_fleet_inventory())
+        self.assertEqual(self.store.state_version(), version_before + 1)
+        status = self.store.fleet_inventory_status()
+        self.assertEqual(status["source"], "gce")
+        self.assertEqual(status["observed_count"], 1)
+        self.assertEqual(status["last_error"], "")
+        view = self.store.query_instances(include_deleted=False)
+        self.assertEqual([r["name"] for r in view["instances"]], ["oxidex-runners-us-south1-a-1"])
+        self.assertEqual(view["fleet_inventory"]["source"], "gce")
+
+    def test_stopped_vm_shows_gce_status_and_stops_accruing(self):
+        self.fleet = [fleet_observation("1002", "builder-oxidex-eu-1", "europe-west4-a", started_hours_ago=5.0,
+                                        now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_builder_instances"], 1)
+        self.fleet = [fleet_observation("1002", "builder-oxidex-eu-1", "europe-west4-a", status="TERMINATED",
+                                        started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)]
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        rec = self._record("builder-oxidex-eu-1")
+        self.assertEqual(rec["status"], "TERMINATED")
+        self.assertIsNone(rec["deleted_at"])
+        self.assertAlmostEqual(rec["stopped_epoch"], self.now - 3600.0, delta=1.0)
+        self.assertAlmostEqual(rec["runtime_hours"], 4.0, delta=0.02)
+        self.assertIn("Stopped in Compute Engine (TERMINATED)", rec["deletion_trigger"])
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_builder_instances"], 0)
+        row = next(r for r in self.store.query_instances()["instances"] if r["name"] == "builder-oxidex-eu-1")
+        self.assertAlmostEqual(row["hours_in_window"], 4.0, delta=0.02)
+        self.assertEqual(self.store.query_instances(include_deleted=False)["instances"], [])
+        # Restarted: RUNNING again from the new start.
+        self.fleet = [fleet_observation("1002", "builder-oxidex-eu-1", "europe-west4-a", started_hours_ago=0.5,
+                                        stopped_hours_ago=1.0, now=self.now)]
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        rec = self._record("builder-oxidex-eu-1")
+        self.assertEqual(rec["status"], "RUNNING")
+        self.assertIsNone(rec["stopped_epoch"])
+
+    def test_vm_gone_from_gce_is_marked_deleted(self):
+        self.fleet = [
+            fleet_observation("1003", "oxidex-runners-africa-1", "africa-south1-a", now=self.now),
+            fleet_observation("1004", "oxidex-runners-dallas-1", "us-south1-a", now=self.now),
+        ]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [fleet_observation("1004", "oxidex-runners-dallas-1", "us-south1-a", now=self.now)]
+        clock_now = time.time()
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        gone = self._record("oxidex-runners-africa-1")
+        self.assertEqual(gone["status"], "DELETED")
+        self.assertIsNotNone(gone["deleted_at"])
+        self.assertAlmostEqual(gone["deleted_epoch"], clock_now, delta=5.0)
+        self.assertIn("No longer in the Compute Engine inventory", gone["deletion_trigger"])
+        self.assertEqual(self._record("oxidex-runners-dallas-1")["status"], "RUNNING")
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_instances"], 1)
+        overview = self.store.get_overview()
+        africa = next(r for r in overview["regions"] if r["region"] == "africa-south1")
+        self.assertEqual(africa["running_instances"], [])
+        # A later pass keeps the deletion time and does not count as a change.
+        self.assertFalse(self.store.refresh_fleet_inventory())
+        self.assertEqual(self._record("oxidex-runners-africa-1")["deleted_epoch"], gone["deleted_epoch"])
+
+    def test_recreated_vm_with_same_name_is_a_new_record(self):
+        self.fleet = [fleet_observation("1005", "builder-oxidex-turin-1", "us-south1-b", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [fleet_observation("2005", "builder-oxidex-turin-1", "us-south1-b", started_hours_ago=0.1,
+                                        now=self.now)]
+        self.store.refresh_fleet_inventory()
+        by_id = {r["instance_id"]: r for r in self.store.state["instances"]}
+        self.assertEqual(by_id["1005"]["status"], "DELETED")
+        self.assertEqual(by_id["2005"]["status"], "RUNNING")
+
+    def test_deleted_history_expires_after_retention(self):
+        from lib.dashboard_server import DELETED_INSTANCE_RETENTION_SECONDS, reconcile_instance_records
+
+        old = {"inventory_source": "gce", "instance_id": "9", "name": "oxidex-runners-old", "status": "DELETED",
+               "deleted_epoch": self.now - DELETED_INSTANCE_RETENTION_SECONDS - 60.0}
+        records, changed = reconcile_instance_records([old], [], project="p", now=self.now)
+        self.assertEqual(records, [])
+        self.assertTrue(changed)
+
+    def test_listing_failure_keeps_records_and_reports_error(self):
+        self.fleet = [fleet_observation("1006", "oxidex-runners-keep-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        version = self.store.state_version()
+
+        def failing():
+            raise RuntimeError("zones unreachable: us-south1-a")
+
+        self.store.fleet_source = failing
+        self.assertFalse(self.store.refresh_fleet_inventory())
+        self.assertEqual(self._record("oxidex-runners-keep-1")["status"], "RUNNING")
+        self.assertEqual(self.store.state_version(), version)
+        self.assertIn("zones unreachable", self.store.fleet_inventory_status()["last_error"])
+
+    def test_frozen_store_skips_reconcile(self):
+        self.fleet = [fleet_observation("1007", "oxidex-runners-frozen-1", "us-south1-a", now=self.now)]
+        self.store.frozen = True
+        self.assertFalse(self.store.refresh_fleet_inventory())
+        self.assertEqual(self.store.state["instances"], [])
+        self.assertIn("frozen", self.store.fleet_inventory_status()["last_error"])
+
+    def test_seed_and_fabricated_records_are_dropped_on_load(self):
+        from lib.dashboard_server import DashboardStore
+
+        seed = _build_instance_record(
+            instance_id="90481726351002", name="oxidex-runners-dallas-01", role="cicd_runner", status="RUNNING",
+            region="us-south1", zone="us-south1-a", machine_type="n4-standard-16", vcpu=16, ram_gib=64,
+            cpu_platform="Intel Emerald Rapids", boot_disk_type="hyperdisk-balanced", boot_disk_gb=40,
+            data_disk_type="hyperdisk-balanced", data_disk_gb=100, runners_count=4, runner_vcpu=4,
+            runner_ram_gib=16, started_hours_ago=14.0, deleted_hours_ago=None, deletion_trigger="seed",
+            cloud_init_template_id="ci-runner-default", vm_template_id=None,
+        )
+        fabricated = dict(seed, instance_id="1792345678001", name="oxidex-runners-us-south1-ab12")
+        self.fleet = [fleet_observation("1008", "oxidex-runners-real-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+        raw["instances"] = [seed, fabricated] + raw["instances"]
+        self.state_file.write_text(json.dumps(raw), encoding="utf-8")
+
+        reloaded = DashboardStore(state_path=self.state_file)
+        self.assertEqual([i["name"] for i in reloaded.state["instances"]], ["oxidex-runners-real-1"])
+        self.assertEqual(reloaded.state["scaling_telemetry"]["current_runners"], 4)
+        on_disk = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertEqual([i["name"] for i in on_disk["instances"]], ["oxidex-runners-real-1"])
+
+        # A snapshot from KV or a handover import is migrated the same way.
+        from lib.edge_state import build_snapshot
+
+        snapshot = build_snapshot(dict(raw, instances=[seed]), reloaded.state_version() + 1, "a")
+        reloaded.import_snapshot(snapshot)
+        self.assertEqual(reloaded.state["instances"], [])
+
+    def test_observe_fleet_items_normalizes_gce_listing(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        items = [
+            {"id": "11", "name": "oxidex-runners-asia-1", "zone": ".../zones/asia-northeast2-a", "status": "RUNNING",
+             "machineType": ".../machineTypes/c4d-standard-16", "cpuPlatform": "AMD Turin",
+             "creationTimestamp": "2026-10-18T01:00:00.000-07:00",
+             "lastStartTimestamp": "2026-10-18T01:01:00.000-07:00",
+             "scheduling": {"provisioningModel": "SPOT"},
+             "labels": {"spot-target": "swack-tools_oxidex"},
+             "metadata": {"items": [{"key": "spot-runner-count", "value": "4"},
+                                    {"key": "startup-script", "value": "#!/bin/bash secret"}]},
+             "disks": [{"boot": True, "diskSizeGb": "40", "source": "disk/boot-11"},
+                       {"boot": False, "diskSizeGb": "200", "source": "disk/data-11"}]},
+            {"id": "12", "name": "builder-oxidex-1", "zone": "zones/us-south1-b", "status": "TERMINATED",
+             "machineType": "machineTypes/n4-highcpu-16", "lastStopTimestamp": "2026-10-18T10:00:00Z"},
+            {"id": "13", "name": "spot-control-a", "zone": "zones/us-central1-a", "status": "RUNNING",
+             "machineType": "machineTypes/e2-micro"},
+            {"name": "oxidex-runners-no-id", "zone": "zones/us-south1-a", "status": "RUNNING"},
+        ]
+        observed = observe_fleet_items(
+            items,
+            disk_types={"disk/boot-11": "hyperdisk-balanced", "disk/data-11": "hyperdisk-throughput"},
+            shapes={("asia-northeast2-a", "c4d-standard-16"): {"vcpu": 16, "ram_gib": 62.0}},
+        )
+        self.assertEqual([o["name"] for o in observed], ["oxidex-runners-asia-1", "builder-oxidex-1"])
+        runner, builder = observed
+        self.assertEqual(runner["region"], "asia-northeast2")
+        self.assertEqual(runner["runners_count"], 4)
+        self.assertEqual((runner["vcpu"], runner["ram_gib"], runner["specs_known"]), (16, 62.0, True))
+        self.assertEqual((runner["boot_disk_type"], runner["boot_disk_gb"]), ("hyperdisk-balanced", 40))
+        self.assertEqual((runner["data_disk_type"], runner["data_disk_gb"]), ("hyperdisk-throughput", 200))
+        self.assertTrue(runner["spot"])
+        self.assertNotIn("startup-script", json.dumps(observed))
+        self.assertEqual(builder["role"], "rust_builder")
+        self.assertEqual(builder["status"], "TERMINATED")
+        self.assertEqual((builder["vcpu"], builder["specs_known"]), (16, False))
+        self.assertIsNotNone(builder["last_stop_epoch"])
+
+    def test_fleet_source_from_env(self):
+        from lib.fleet_inventory import fleet_source_from_env
+
+        self.assertIsNone(fleet_source_from_env("p", {}))
+        self.assertIsNone(fleet_source_from_env("p", {"DASHBOARD_FLEET_INVENTORY": "state"}))
+        self.assertTrue(callable(fleet_source_from_env("p", {"DASHBOARD_FLEET_INVENTORY": "gce"})))
+
+    def test_gce_fleet_source_refuses_partial_listing(self):
+        from lib import compute_api
+        from lib.fleet_inventory import gce_fleet_source
+
+        async def partial(api, project, *, instance_fields=compute_api.INSTANCE_LIST_FIELDS):
+            return [{"id": "1", "name": "oxidex-runners-x", "zone": "zones/us-south1-a"}], ["zones/us-east1-b"]
+
+        with unittest.mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("t", "p")), \
+                unittest.mock.patch.object(compute_api, "list_instances", partial):
+            with self.assertRaisesRegex(RuntimeError, "zones unreachable"):
+                gce_fleet_source("p")()
+
+    def test_lifecycle_endpoints_are_plan_only_in_the_ui(self):
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        self.assertNotIn("deleteInstanceNow(", DASHBOARD_HTML)
+        self.assertIn("Plan only", DASHBOARD_HTML)
+        self.assertIn("live Compute Engine inventory", DASHBOARD_HTML)
 
 
 class PublicOriginBehindWorkerTests(unittest.TestCase):

@@ -325,6 +325,40 @@ origin, and it never trusts `X-Forwarded-Host` for this check. The public origin
 `--public-origin`, then `DASHBOARD_PUBLIC_ORIGIN`, then the origin of `GITHUB_OAUTH_REDIRECT_URI`. The
 startup script writes `DASHBOARD_PUBLIC_ORIGIN` from the `dashboard-public-url` metadata value.
 
+## Instance data
+
+The instance list, the region map, and the fleet telemetry show only VMs that the live Compute Engine
+inventory lists. The dashboard doesn't ship demo or seed instances.
+
+- With `DASHBOARD_FLEET_INVENTORY=gce`, which the control VM sets, the dashboard lists the project's
+  instances every 2 minutes. The listing is one aggregated read-only call, plus one aggregated disk
+  listing and a cached machine type lookup for each shape. It keeps the VMs whose names start with
+  `oxidex-runners-` (runner hosts) or `builder-` (dedicated builders). Control VMs and other VMs aren't
+  listed. The control VM's service account needs `compute.instances.list` and
+  `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
+  they show `pd-balanced`.
+- A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
+  after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
+  `lastStopTimestamp`. Only `RUNNING` VMs count toward the runner and builder telemetry.
+- A VM that was listed before and is no longer in the inventory becomes `DELETED`. Its deletion time is
+  the time of the first listing that missed it. Deleted VMs stay in the history for 31 days. A VM that's
+  recreated with the same name gets a new record, because the record follows the instance ID.
+- A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
+  `fleet_inventory` field reports the last successful listing and the last error.
+- Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
+  inactive skips the listing and keeps the records the active slot last published. A listing that
+  changes nothing writes nothing, so a quiet fleet doesn't publish a new snapshot.
+- Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
+  empty and the instances tab says that the inventory isn't configured.
+- On load, from the state file, a KV snapshot, or a handover import, the dashboard drops every instance
+  record that didn't come from the inventory. These are the demo instances that earlier versions seeded,
+  such as `oxidex-runners-dallas-01`, and records that the old in-dashboard actions invented.
+- The delete and regional scale controls, `POST /api/instances/delete` and
+  `POST /api/instances/scale-region`, are plans only. They check the request against budgets and caps
+  and report what would launch or retire. They don't change the instance list or any VM. The autoscaler
+  (`src/spot_runner_autoscaler.py`) drains and retires runner hosts, `src/spot_runner_manager.py`
+  provisions them, and `src/render_builder_startup.py` renders a dedicated builder.
+
 ## State durability
 
 - The dashboard writes state atomically to `/var/lib/spot-dashboard/state.json` on the boot disk.
