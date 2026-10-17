@@ -1,8 +1,10 @@
 # Getting started
 
 This page takes you from a fresh checkout to your first read-only fleet inspection. Run the read-only commands
-first. Nothing on this page creates, changes, or deletes a cloud or GitHub resource until you add `--apply`
-to a manager command or run the autoscaler without `--dry-run`.
+first. Nothing on this page creates, changes, or deletes a VM, disk, or GitHub resource until you add `--apply`
+to a manager command or run the autoscaler without `--dry-run`. One exception: a tiered `--dry-run` connects
+with `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or to your OS Login
+profile, the first time it connects.
 
 ## Prerequisites
 

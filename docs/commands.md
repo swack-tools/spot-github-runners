@@ -16,10 +16,10 @@ The last column names the exact flag or action that makes it change something.
 | Command | Default effect | What makes it change something |
 | --- | --- | --- |
 | [`tools/spot_prices.py`](#spot-prices) | Reads prices and inventory | `--csv` writes a local file |
-| [`src/spot_finder.py`](#spot-finder) | Reads prices and inventory | Nothing |
+| [`src/spot_finder.py`](#spot-finder) | Reads prices and inventory | Nothing in the cloud. A quota error writes a local cooldown marker, `gcp-spot-finder-quota-<project>.timestamp`, in the temporary directory, and later runs wait out that cooldown |
 | [`src/runner_fleet.py`](#runner-fleet) | Reads runners and VMs | Nothing |
 | [`src/spot_runner_manager.py`](#spot-runner-manager) | Prints a plan after read-only checks | `--apply`, or `--patch-live` (which needs no `--apply`) |
-| [`src/spot_runner_autoscaler.py`](#spot-runner-autoscaler) | Manages the fleet | `--dry-run` makes it read-only; `--install-launch-agent` installs the macOS agent |
+| [`src/spot_runner_autoscaler.py`](#spot-runner-autoscaler) | Manages the fleet | `--dry-run` leaves VMs, disks, registrations, and controller state unchanged, but its `gcloud compute ssh` can add your SSH key; `--install-launch-agent` installs the macOS agent |
 | [`src/control_vm.py`](#control-vm) | `status` and `plan` read only | `ensure --apply`, `rotate --apply`; `render-startup` always writes its `--output` file |
 | [`src/web_dashboard.py`](#web-dashboard) | Serves HTTP | `--state-file` persists state; served POST routes can change state. With `SPOT_CONFIG_REPO` configured, `POST /api/patches/save` opens a pull request on the config repository, and with `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts |
 | [`src/render_builder_startup.py`](#render-builder-startup) | Writes a local directory | Running the rendered `launch-command.sh` creates a billable VM |
@@ -78,7 +78,8 @@ count and RAM, then prints a table with hourly, daily, monthly, and per-runner
 prices. It optionally prints an alert for offers that are at least 95 percent
 below the on-demand price.
 
-- **Effect.** Read-only. Results are candidates, not reservations.
+- **Effect.** Read-only in the cloud. Results are candidates, not reservations. A quota error writes the
+  local cooldown marker `gcp-spot-finder-quota-<project>.timestamp` in the temporary directory.
 - **Prices.** Compute only. Disk, network, operating system licensing, and
   capacity are excluded.
 - **Exit codes.** `0` on success, `1` on an authentication or API error, `2`
@@ -273,7 +274,7 @@ operation. See [Fleet and autoscaler](fleet-and-autoscaler.md) for the policies.
 | `--scaling-mode` | `tiered`, `resource`, `legacy` | `resource` | Scaling policy. `resource` uses CPU and memory over two 5-minute checks at the 75 percent threshold. `legacy` uses runner occupancy. `tiered` uses tier evidence. |
 | `--maximum-hosts` | Integer | `5` | Maximum number of Spot hosts. |
 | `--tier-job-memory-gib` | Positive finite number | `15` | Per-job memory cap and reservation. `15` is a verified compatible workload cap, not a measured peak. |
-| `--dry-run` | Flag | Off | Read-only tier decision. |
+| `--dry-run` | Flag | Off | Tier decision only; changes no VM, disk, registration, or controller state. Its `gcloud compute ssh` can add your SSH key. |
 | `--manage-control-vm` | Flag | Off | Also manage the control VM that hosts the dashboard. With `--dry-run`, print only its plan. |
 | `--migrate-oversized` | Flag | Off | Gradually replace existing oversized owned hosts. |
 | `--remote-builder`, `--no-remote-builder` | Flag pair | Enabled | Install the legacy shared-host Rust builder on new tiered hosts. |
