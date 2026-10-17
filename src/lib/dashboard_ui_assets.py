@@ -2283,7 +2283,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <td class="mono" style="font-weight:700; color:#38bdf8;">${inst.benchmark_score}</td>
             <td>
               <div style="font-weight:600;">${inst.role === 'cicd_runner' ? inst.runners_count + ' GitHub Runners' : '1 Rust Builder'}</div>
-              <div style="font-size:11px; color:var(--text-muted);">${inst.runner_vcpu} vCPU / ${inst.runner_ram_gib} GiB each</div>
+              <div style="font-size:11px; color:var(--text-muted);">${inst.runner_limits_known === false ? "per-runner limits not recorded" : `${inst.runner_vcpu} vCPU / ${inst.runner_ram_gib} GiB each`}</div>
             </td>
             <td class="mono">
               <div>${inst.runtime_hours}h total</div>

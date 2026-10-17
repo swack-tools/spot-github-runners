@@ -346,6 +346,11 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - A VM that was listed before and is no longer in the inventory becomes `DELETED`. Its deletion time is
   the time of the first listing that missed it. Deleted VMs stay in the history for 31 days. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
+- Spend covers each VM's attached disks while the VM exists. A dedicated builder's cache disk
+  (`auto-delete=no`) outlives its VM, and the dashboard doesn't count it after the VM is deleted.
+- Instance metadata records how many runners a host registered, but not the per-runner limits, which
+  depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
+  template can't copy them from such a host.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or

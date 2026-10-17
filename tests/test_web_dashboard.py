@@ -4131,6 +4131,54 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertAlmostEqual(usage["disk_hours_in_window"], 24.0, delta=0.01)
         self.assertAlmostEqual(usage["compute_hours_in_window"], 1.0, delta=0.01)
 
+    def test_lifetime_survives_pruned_runs(self):
+        # Ran 120 hours, stopped 35 days ago (past retention), started again an hour ago.
+        stop_ago = 35 * 24.0
+        self.fleet = [fleet_observation("1700", "oxidex-runners-old-1", "us-south1-a", status="TERMINATED",
+                                        started_hours_ago=stop_ago + 120.0, stopped_hours_ago=stop_ago, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [fleet_observation("1700", "oxidex-runners-old-1", "us-south1-a", started_hours_ago=1.0,
+                                        stopped_hours_ago=stop_ago, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("oxidex-runners-old-1")
+        self.assertEqual(rec["prior_runs"], [])
+        self.assertAlmostEqual(rec["pruned_compute_hours"], 120.0, delta=0.01)
+        self.assertAlmostEqual(rec["runtime_hours"], 121.0, delta=0.05)
+        row = next(r for r in self.store.query_instances(window_hours=24)["instances"]
+                   if r["name"] == "oxidex-runners-old-1")
+        self.assertAlmostEqual(row["runtime_hours"], 121.0, delta=0.05)
+        self.assertAlmostEqual(row["hours_in_window"], 1.0, delta=0.05)
+
+    def test_stopped_vm_disks_count_in_current_burn(self):
+        self.fleet = [fleet_observation("1800", "builder-oxidex-idle-1", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=5.0, stopped_hours_ago=2.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        view = self.store.query_instances()
+        pricing = view["instances"][0]["pricing"]
+        disk_all_in = pricing["disk_hourly_usd"] * (1 + pricing["tax_rate_percent"] / 100.0)
+        self.assertEqual(view["running_count"], 0)
+        self.assertGreater(view["active_hourly_burn_usd"], 0.0)
+        self.assertAlmostEqual(view["active_hourly_burn_usd"], disk_all_in, delta=0.0001)
+        self.assertEqual(self.store.query_instances(include_disk_and_tax=False)["active_hourly_burn_usd"], 0.0)
+
+    def test_runner_limits_are_unknown_not_guessed(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        obs = observe_fleet_items(
+            [{"id": "31", "name": "oxidex-runners-tier-1", "zone": "zones/us-south1-a", "status": "RUNNING",
+              "machineType": "machineTypes/n4-standard-4",
+              "metadata": {"items": [{"key": "spot-runner-count", "value": "8"}]}}],
+            shapes={("us-south1-a", "n4-standard-4"): {"vcpu": 4, "ram_gib": 16.0}},
+        )
+        self.assertEqual(obs[0]["runners_count"], 8)
+        self.assertEqual((obs[0]["runner_vcpu"], obs[0]["runner_ram_gib"]), (0, 0.0))
+        self.assertFalse(obs[0]["runner_limits_known"])
+        self.fleet = obs
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self._record("oxidex-runners-tier-1")["runner_limits_known"])
+        with self.assertRaisesRegex(ValueError, "not recorded"):
+            self.store.create_vm_template_from_instance({"instance_name": "oxidex-runners-tier-1"})
+
     def test_unchanged_shape_reuses_pricing(self):
         self.fleet = [fleet_observation("1010", "oxidex-runners-price-1", "us-south1-a", now=self.now)]
         self.store.refresh_fleet_inventory()

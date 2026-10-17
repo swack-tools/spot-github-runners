@@ -446,8 +446,10 @@ def instance_usage(record: dict[str, Any], now: float, window_start: float | Non
         disk_start = min(disk_start, float(created))
     disk_end = max(disk_start, disk_end)
     window = window_start if window_start is not None else float("-inf")
+    pruned = record.get("pruned_compute_hours")
+    pruned_hours = float(pruned) if isinstance(pruned, (int, float)) and not isinstance(pruned, bool) else 0.0
     return {
-        "compute_hours": sum(e - s for s, e in runs) / 3600.0,
+        "compute_hours": sum(e - s for s, e in runs) / 3600.0 + max(0.0, pruned_hours),
         "compute_hours_in_window": sum(_overlap_hours(s, e, window) for s, e in runs),
         "disk_hours": (disk_end - disk_start) / 3600.0,
         "disk_hours_in_window": _overlap_hours(disk_start, disk_end, window),
@@ -547,14 +549,18 @@ def _live_instance_record(
             stop = obs.get("last_stop_epoch")
             prev_end = stop if isinstance(stop, (int, float)) and previous_start <= stop <= started_epoch else started_epoch
         prior_runs.append((float(previous_start), min(float(prev_end), started_epoch)))
-    prior_runs = [run for run in prior_runs if now - run[1] <= DELETED_INSTANCE_RETENTION_SECONDS][-MAX_PRIOR_RUNS:]
+    pruned_hours = float(previous.get("pruned_compute_hours") or 0.0) if previous is not None else 0.0
+    kept_runs = [run for run in prior_runs if now - run[1] <= DELETED_INSTANCE_RETENTION_SECONDS][-MAX_PRIOR_RUNS:]
+    # Runs pruned from the detailed history still count toward lifetime runtime and cost.
+    pruned_hours += sum(e - s for s, e in prior_runs if (s, e) not in kept_runs) / 3600.0
+    prior_runs = kept_runs
     created = obs.get("created_epoch")
     if not isinstance(created, (int, float)) and previous is not None:
         created = previous.get("disk_start_epoch")
     disk_start = min(float(created), started_epoch) if isinstance(created, (int, float)) else started_epoch
     record.update({"started_epoch": started_epoch, "stopped_epoch": stopped_epoch, "deleted_epoch": None,
                    "status": status, "prior_runs": [list(run) for run in prior_runs],
-                   "disk_start_epoch": disk_start})
+                   "pruned_compute_hours": round(pruned_hours, 4), "disk_start_epoch": disk_start})
     usage = instance_usage(record, now)
     runtime_hours = round(usage["compute_hours"], 2)
     total_cost, compute_cost = instance_cost_usd(record["pricing"], usage["compute_hours"], usage["disk_hours"])
@@ -563,6 +569,7 @@ def _live_instance_record(
         "gce_status": status,
         "spot": bool(obs.get("spot")),
         "specs_known": bool(obs.get("specs_known", True)),
+        "runner_limits_known": bool(obs.get("runner_limits_known", True)),
         "started_epoch": started_epoch,
         "started_at": _iso_epoch(started_epoch),
         "stopped_epoch": stopped_epoch,
@@ -3236,8 +3243,19 @@ class DashboardStore:
             running_builder_rows = [r for r in running_rows if r.get("role") == "rust_builder"]
             running_runner_slots = sum(int(r.get("runners_count", 0)) for r in running_runner_rows)
             total_window_spend = round(sum(r["total_cost_in_window_usd"] for r in rows), 2)
+            # A stopped inventory VM still bills its attached disks (with tax) until it is deleted.
+            stopped_disk_burn = (
+                sum(
+                    float(r["pricing"].get("disk_hourly_usd", 0.0) or 0.0)
+                    * (1.0 + float(r["pricing"].get("tax_rate_percent", 0.0) or 0.0) / 100.0)
+                    for r in rows
+                    if is_live_instance_record(r) and r["status"] not in ("RUNNING", "DELETED")
+                )
+                if include_disk_and_tax
+                else 0.0
+            )
             active_hourly_burn = round(
-                sum(r["active_hourly_usd"] for r in running_rows), 4
+                sum(r["active_hourly_usd"] for r in running_rows) + stopped_disk_burn, 4
             )
 
             return {
@@ -4221,6 +4239,11 @@ class DashboardStore:
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
+            if inst.get("runner_limits_known") is False:
+                raise ValueError(
+                    f"Per-runner limits of {inst['name']} are not recorded in its instance metadata; "
+                    "set them on the profile instead of copying them from this host"
+                )
             role = inst["role"]
             prof = self.state["profiles"].get(role)
             explicit_ci_id = str(payload.get("cloud_init_template_id", "")).strip()
