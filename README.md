@@ -83,7 +83,9 @@ renewable `GH_TOKEN`. Git ignores the file. See
 
 - A request to edit code or documentation does not authorize changing live
   resources. Use read-only commands or previews (`--dry-run`, the `plan` and
-  `status` subcommands) unless you explicitly want a live operation.
+  `status` subcommands) unless you explicitly want a live operation. A tiered
+  `--dry-run` still connects with `gcloud compute ssh`, which can add your SSH key
+  to project or instance metadata, or to your OS Login profile.
 - Do not add `--install-launch-agent` to a preview: it writes and starts the macOS
   LaunchAgent before the dry-run check.
 - Never replay fresh-host bootstrap on an occupied runner or builder. Use the staged

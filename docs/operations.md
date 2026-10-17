@@ -14,7 +14,7 @@ or the macOS LaunchAgent, get explicit approval for that operation. Use the read
 | Command | What it does without a mutation flag |
 | --- | --- |
 | `src/spot_runner_manager.py` | Prints the deployment plan. It provisions only with `--apply`. The exception is `--patch-live`, which hot-patches a running host immediately with no preview. |
-| `src/spot_runner_autoscaler.py --dry-run` | Prints one read-only tier decision. It never launches, drains, or deletes, and never writes controller state. With `--manage-control-vm`, it also prints the control VM plan. |
+| `src/spot_runner_autoscaler.py --dry-run` | Prints one tier decision. It never launches, drains, or deletes, and never writes controller state. It reads host evidence with `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or to your OS Login profile, on the first connection. With `--manage-control-vm`, it also prints the control VM plan. |
 | `src/control_vm.py status` and `src/control_vm.py plan` | Show the control VMs, `origin:active`, health, and transition state, and the next lifecycle step. `ensure` and `rotate` change nothing without `--apply`. |
 | `src/lib/builder_runtime_update.py --plan` | Checks a reviewed runtime-update plan. It mutates only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed`. |
 | `src/runner_fleet.py` | Reads GitHub runner registrations and VM inventory. It never creates or deletes resources. |
