@@ -1,5 +1,7 @@
 """Watchdog deploy script: dry-run output, exact IAM roles, secrets as references, idempotent execution.
 
+The watchdog is a Cloud Run service invoked by Cloud Scheduler with an OIDC token.
+
 The runner is always a fake; nothing touches GCP or GitHub.
 """
 from __future__ import annotations
@@ -26,7 +28,7 @@ ENV = {
     "SPOT_DASHBOARD_IMAGE": "ghcr.io/swack-tools/spot-dashboard@sha256:" + "a" * 64,
     "SPOT_CONTROL_SERVICE_ACCOUNT": CONTROL_SA, "CLOUDFLARE_ACCOUNT_ID": "acct123",
     "CLOUDFLARE_KV_NAMESPACE_ID": "ns456", "DASHBOARD_CONTROLLED_TARGETS": "swack-tools,swack-tools/oxidex",
-    # Secrets in the operator's environment must never reach the job spec as values.
+    # Secrets in the operator's environment must never reach the service spec as values.
     "CLOUDFLARE_KV_API_TOKEN": SECRET_VALUES[0], "CF_ACCESS_CLIENT_SECRET": SECRET_VALUES[1],
     "DASHBOARD_CONTROL_SECRET": SECRET_VALUES[2], "CF_ACCESS_CLIENT_ID": SECRET_VALUES[3],
     "SPOT_DASHBOARD_IMAGE_TRACK_TOKEN": SECRET_VALUES[4],
@@ -97,7 +99,7 @@ class DryRunTests(unittest.TestCase):
         # The runtime account gets nothing at project level except the conditioned compute role.
         project_level = [c for c in self.commands if c[1:3] == ["projects", "add-iam-policy-binding"]]
         self.assertEqual(project_level, compute)
-        invoker = self.binding("run", "jobs")
+        invoker = self.binding("run", "services")
         self.assertEqual([(c[4], flag(c, "member"), flag(c, "role")) for c in invoker],
                          [("spot-control-watchdog", f"serviceAccount:spot-watchdog-invoker@{PROJECT}.iam."
                                                     "gserviceaccount.com", "roles/run.invoker")])
@@ -120,7 +122,7 @@ class DryRunTests(unittest.TestCase):
     def test_secrets_are_references_never_values(self):
         for value in SECRET_VALUES:
             self.assertNotIn(value, self.script)
-        job = next(c for c in self.commands if c[1:4] == ["run", "jobs", "deploy"])
+        job = next(c for c in self.commands if c[1:3] == ["run", "deploy"])
         refs = dict(item.split("=", 1) for item in flag(job, "set-secrets").split(","))
         self.assertEqual(refs, {
             "CF_ACCESS_CLIENT_ID": "spot-control-access-client-id:latest",
@@ -133,13 +135,29 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(env["SPOT_CONTROL_STATE_URI"], f"gs://{PROJECT}-spot-control-state/control-vm")
         self.assertEqual(env["SPOT_GCP_TOKEN_SOURCE"], "metadata")
         self.assertEqual(env["DASHBOARD_CONTROLLED_TARGETS"], "swack-tools,swack-tools/oxidex")  # commas survive
-        self.assertEqual(flag(job, "args"), f"ensure,--apply,--skip-if-idle,--skip-if-locked,--project={PROJECT}")
-        for setting in ("--max-retries=0", "--tasks=1", f"--image={IMAGE}", "--task-timeout=1800s"):
-            self.assertIn(setting, job)
+        self.assertEqual(env["WATCHDOG_PROJECT"], PROJECT)
+        self.assertEqual(env["WATCHDOG_AUDIENCE"], "https://spot-control-watchdog-N.us-central1.run.app")
+        self.assertEqual(env["WATCHDOG_INVOKER"], f"spot-watchdog-invoker@{PROJECT}.iam.gserviceaccount.com")
+        self.assertEqual(env["WATCHDOG_VERIFY_SIGNATURE"], "1")
+        self.assertEqual(env["SPOT_CONTROL_SERVICE_ACCOUNT"], CONTROL_SA)
+
+    def test_service_is_iam_only_one_tick_at_a_time_and_request_billed(self):
+        service = next(c for c in self.commands if c[1:3] == ["run", "deploy"])
+        for setting in ("--no-allow-unauthenticated", "--concurrency=1", "--max-instances=1", "--min-instances=0",
+                        "--cpu-throttling", "--no-cpu-boost", "--cpu=1", "--memory=512Mi", "--timeout=900",
+                        "--ingress=all", f"--image={IMAGE}"):
+            self.assertIn(setting, service)
+        self.assertNotIn("--allow-unauthenticated", service)
+        self.assertNotIn("--no-cpu-throttling", service)
+        self.assertNotIn("allUsers", self.script)
+        self.assertNotIn("allAuthenticatedUsers", self.script)
+        self.assertNotIn("run jobs", self.script)  # no Cloud Run job: jobs bill a minute per execution
+        self.assertGreater(deploy.REQUEST_TIMEOUT_SECONDS, __import__("lib.control_watchdog_server",
+                                                                       fromlist=["x"]).TICK_TIMEOUT_SECONDS)
 
     def test_tracking_adds_the_github_token_reference(self):
         _, script, _ = dry_run(f"--image={IMAGE}", env=dict(ENV, SPOT_DASHBOARD_IMAGE_TRACK="main"))
-        job = next(c for c in commands(script) if c[1:4] == ["run", "jobs", "deploy"])
+        job = next(c for c in commands(script) if c[1:3] == ["run", "deploy"])
         self.assertIn("SPOT_DASHBOARD_IMAGE_TRACK_TOKEN=spot-control-watchdog-github-token:latest",
                       flag(job, "set-secrets"))
         self.assertIn("SPOT_DASHBOARD_IMAGE_TRACK=main", flag(job, "set-env-vars"))
@@ -150,12 +168,14 @@ class DryRunTests(unittest.TestCase):
         for setting in ("--uniform-bucket-level-access", "--public-access-prevention", "--location=us-central1"):
             self.assertIn(setting, create)
         scheduler = next(c for c in self.commands if c[1:5] == ["scheduler", "jobs", "create", "http"])
-        self.assertEqual(flag(scheduler, "schedule"), "*/2 * * * *")
-        self.assertEqual(flag(scheduler, "oauth-service-account-email"),
+        self.assertEqual(flag(scheduler, "schedule"), "*/3 * * * *")
+        self.assertEqual(flag(scheduler, "oidc-service-account-email"),
                          f"spot-watchdog-invoker@{PROJECT}.iam.gserviceaccount.com")
-        self.assertEqual(flag(scheduler, "uri"), f"https://run.googleapis.com/v2/projects/{PROJECT}/locations/"
-                                                  "us-central1/jobs/spot-control-watchdog:run")
-        self.assertIsNone(flag(scheduler, "oidc-service-account-email"))
+        url = "https://spot-control-watchdog-N.us-central1.run.app"
+        self.assertEqual(flag(scheduler, "oidc-token-audience"), url)
+        self.assertEqual(flag(scheduler, "uri"), f"{url}/tick")
+        self.assertEqual(flag(scheduler, "http-method"), "POST")
+        self.assertIsNone(flag(scheduler, "oauth-service-account-email"))
         provider = next(c for c in self.commands if "create-oidc" in c)
         condition = flag(provider, "attribute-condition")
         for part in ("assertion.repository == 'swack-tools/spot-github-runners'", "assertion.ref == 'refs/heads/main'",
@@ -166,11 +186,11 @@ class DryRunTests(unittest.TestCase):
     def test_without_an_image_only_infrastructure(self):
         code, script, _ = dry_run()
         self.assertEqual(code, 0)
-        self.assertNotIn("run jobs deploy", script)
+        self.assertNotIn("gcloud run deploy", script)
         self.assertNotIn("scheduler jobs", script)
         self.assertIn("need --image", script)
         _, skipped, _ = dry_run(f"--image={IMAGE}", "--skip-scheduler")
-        self.assertIn("run jobs deploy", skipped)
+        self.assertIn("gcloud run deploy", skipped)
         self.assertNotIn("scheduler jobs", skipped)
 
 
@@ -197,9 +217,9 @@ class ValidationTests(unittest.TestCase):
 
     def test_secret_names_can_never_become_plain_env_vars(self):
         # Even a config that carries secret values in its env (config_from_args already drops them) never puts
-        # them in the job's plain env vars, and validate() refuses an overlap with the secret references.
+        # them in the service's plain env vars, and validate() refuses an overlap with the secret references.
         config = deploy.DeployConfig(project=PROJECT, control_vm_service_account=CONTROL_SA, env=dict(ENV))
-        env = config.job_env()
+        env = config.service_env()
         for name in [*deploy.SECRET_ENV, deploy.TRACK_SECRET_ENV[0]]:
             self.assertNotIn(name, env)
         for value in SECRET_VALUES:
@@ -207,6 +227,28 @@ class ValidationTests(unittest.TestCase):
         leaky = deploy.DeployConfig(project=PROJECT, control_vm_service_account=CONTROL_SA, env=dict(ENV),
                                     secrets={"SPOT_CONTROL_REGIONS": "x"})
         self.assertIn("must come from Secret Manager", " ".join(deploy.validate(leaky)))
+
+    def test_flag_supplied_control_vm_account_reaches_the_service(self):
+        env = {k: v for k, v in ENV.items() if k != "SPOT_CONTROL_SERVICE_ACCOUNT"}
+        code, script, err = dry_run(f"--image={IMAGE}", f"--control-vm-service-account={CONTROL_SA}", env=env)
+        self.assertEqual(code, 0, err)
+        service = next(c for c in commands(script) if c[1:3] == ["run", "deploy"])
+        self.assertIn(f"SPOT_CONTROL_SERVICE_ACCOUNT={CONTROL_SA}", flag(service, "set-env-vars"))
+
+    def test_tracking_mode_is_normalized_like_the_manager(self):
+        code, script, err = dry_run(f"--image={IMAGE}", env=dict(ENV, SPOT_DASHBOARD_IMAGE_TRACK=" Main "))
+        self.assertEqual(code, 0, err)
+        service = next(c for c in commands(script) if c[1:3] == ["run", "deploy"])
+        self.assertIn("SPOT_DASHBOARD_IMAGE_TRACK_TOKEN=spot-control-watchdog-github-token:latest",
+                      flag(service, "set-secrets"))
+        self.assertIn("SPOT_DASHBOARD_IMAGE_TRACK=main|", flag(service, "set-env-vars") + "|")
+        self.assertIn("gcloud secrets add-iam-policy-binding spot-control-watchdog-github-token", script)
+
+    def test_signature_check_can_be_relaxed_but_claims_stay(self):
+        _, script, _ = dry_run(f"--image={IMAGE}", "--no-verify-signature")
+        service = next(c for c in commands(script) if c[1:3] == ["run", "deploy"])
+        self.assertIn("WATCHDOG_VERIFY_SIGNATURE=0", flag(service, "set-env-vars"))
+        self.assertIn("WATCHDOG_INVOKER=", flag(service, "set-env-vars"))
 
     def test_secret_override(self):
         code, script, _ = dry_run(f"--image={IMAGE}", "--secret=CLOUDFLARE_KV_API_TOKEN=my-kv-token")
@@ -251,7 +293,8 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         verbs = [" ".join(c[1:4]) for c in calls]
         for created in ("storage buckets create", "iam service-accounts create", "artifacts repositories create",
-                        "iam workload-identity-pools create", "run jobs deploy", "scheduler jobs create"):
+                        "iam workload-identity-pools create", "run deploy spot-control-watchdog",
+                        "scheduler jobs create"):
             self.assertIn(created, verbs)
         self.assertNotIn("scheduler jobs update", verbs)
         self.assertEqual(files["condition"]["expression"], deploy.COMPUTE_CONDITION_EXPRESSION)
@@ -278,7 +321,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("has no enabled version", err)
         self.assertIn("--data-file=-", err)  # the hint reads the value from stdin, never from argv
-        self.assertFalse([c for c in calls if "add-iam-policy-binding" in c or "jobs" in c])
+        self.assertFalse([c for c in calls if "add-iam-policy-binding" in c or "deploy" in c or "jobs" in c])
 
     def test_failure_stops_at_that_step(self):
         run, calls, _ = self.runner(fail="deploy")
@@ -294,7 +337,7 @@ class ArtifactTests(unittest.TestCase):
         self.assertRegex(text, re.compile(r"^ARG BASE_IMAGE$", re.M))  # no default: the build must pin it
         self.assertRegex(text, re.compile(r"^FROM \$\{BASE_IMAGE\}$", re.M))
         self.assertIn("COPY cloud-init/control-vm-startup.sh /app/cloud-init/control-vm-startup.sh", text)
-        self.assertIn('ENTRYPOINT ["python3", "-B", "/app/src/control_vm.py"]', text)
+        self.assertIn('ENTRYPOINT ["python3", "-B", "/app/src/control_watchdog_server.py"]', text)
         self.assertRegex(text, re.compile(r"^USER 10001:10001$", re.M))
 
     def test_workflow_uses_federation_and_checks_the_base_pin(self):

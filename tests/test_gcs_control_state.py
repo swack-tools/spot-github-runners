@@ -423,7 +423,8 @@ class MigrationTests(unittest.TestCase):
         self.write_local(state)
         code, message = self.migrate(apply=False)
         self.assertEqual(code, 0)
-        self.assertIn("dry run, nothing changed: uploading", message)
+        self.assertIn("dry run, nothing changed: fencing", message)
+        self.assertIn("then uploading it to", message)
         self.assertEqual(self.w.server.writes(), [])
         code, message = self.migrate(apply=True)
         self.assertEqual(code, 0, message)
@@ -491,6 +492,74 @@ class MigrationTests(unittest.TestCase):
         self.assertIn("holds the Cloud Storage lease", message)
         self.assertNotIn(self.w.state_name, self.w.server.objects)
         self.assertEqual(json.loads(self.local.read_text()), {"control_vm": {}})
+
+    def test_the_local_fence_is_durable_before_the_remote_state_exists(self):
+        state = {"control_vm": {"transition": {"id": "t9", "step": "freeze"}}}
+        self.write_local(state)
+        seen = []
+
+        def before(method, name, query):
+            if method == "POST" and name == self.w.state_name:
+                kind, _ = gcs.read_local(self.local)
+                backups = list(self.dir.glob(f"{self.local.name}.migrated-*"))
+                seen.append((kind, [json.loads(b.read_text()) for b in backups]))
+        self.w.server.before = before
+        code, message = self.migrate(apply=True)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(seen, [("moved", [state])])
+
+    def test_an_upload_that_fails_after_the_fence_resumes_from_the_backup(self):
+        state = {"control_vm": {"transition": {"id": "t9"}}}
+        self.write_local(state)
+        real_put = self.w.client.put
+        calls = []
+
+        def put(name, data, *, if_generation_match):
+            calls.append(name)
+            if name == self.w.state_name and calls.count(name) == 1:
+                raise gcs.GcsError("HTTP 403")  # the first state upload fails definitively
+            return real_put(name, data, if_generation_match=if_generation_match)
+        self.w.client.put = put
+        code, message = self.migrate(apply=True)
+        self.assertEqual(code, 1)
+        self.assertIn("stays fenced", message)
+        self.assertNotIn(self.w.state_name, self.w.server.objects)
+        with self.assertRaises(cv.ControlStateConflict):  # no local controller can use it meanwhile
+            cv.ProjectControlState(self.local).load()
+        code, message = self.migrate(apply=False)
+        self.assertIn("uploading the fenced backup", message)
+        code, message = self.migrate(apply=True)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(self.w.server.json(self.w.state_name)["state"], state)
+
+    def test_a_failed_marker_install_leaves_the_original_in_place(self):
+        state = {"control_vm": {"transition": {"id": "t9"}}}
+        self.write_local(state)
+        with patch.object(gcs.os, "replace", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            self.migrate(apply=True)
+        self.assertEqual(json.loads(self.local.read_text()), state)  # never missing, never empty
+        self.assertNotIn(self.w.state_name, self.w.server.objects)
+        self.assertEqual(list(self.dir.glob(".*.moving")), [])
+        code, message = self.migrate(apply=True)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(self.w.server.json(self.w.state_name)["state"], state)
+
+    def test_a_missing_file_next_to_a_backup_is_never_empty_state(self):
+        (self.dir / f"{self.local.name}.migrated-20261018T000000Z").write_text("{}")
+        with self.assertRaisesRegex(cv.ControlStateConflict, "was migrated"):
+            cv.ProjectControlState(self.local).load()
+        with self.assertRaisesRegex(cv.ControlStateConflict, "was migrated"):
+            with cv.ProjectControlLock(PROJECT, self.dir):
+                pass
+
+    def test_a_missing_local_file_next_to_remote_state_gets_fenced(self):
+        self.w.init_state({"control_vm": {"transition": {"id": "remote"}}})
+        code, message = self.migrate(apply=True)
+        self.assertEqual(code, 0, message)
+        self.assertIn("fencing the local path", message)
+        with self.assertRaisesRegex(cv.ControlStateConflict, "moved to gs://"):
+            cv.ProjectControlState(self.local).load()
+        self.assertEqual(self.w.server.json(self.w.state_name)["state"]["control_vm"]["transition"]["id"], "remote")
 
     def test_marker_without_remote_state_refuses(self):
         self.local.write_text(json.dumps({cv.CONTROL_STATE_MOVED_KEY: URI}))

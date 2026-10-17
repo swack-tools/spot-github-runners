@@ -1,11 +1,11 @@
-# Control VM watchdog image: the Cloud Run job that runs one control VM lifecycle step per execution.
+# Control VM watchdog image: the Cloud Run service whose POST /tick runs one control VM lifecycle step.
 #
 # Built and pushed to Artifact Registry by .github/workflows/control-watchdog-image.yml. Build from the
 # repository root (the .dockerignore allowlist sends only src/, cloud-init/, and the other image inputs):
 #   docker build -f watchdog/Dockerfile --build-arg BASE_IMAGE=<google-cloud-cli slim image pinned by digest> .
 #
 # BASE_IMAGE has no default on purpose: the build fails unless it names an exact digest of
-# gcr.io/google.com/cloudsdktool/google-cloud-cli:<version>-slim, which supplies gcloud and Python 3. The workflow
+# gcr.io/google.com/cloudsdktool/google-cloud-cli:<version>-slim, which supplies gcloud. The workflow
 # reads it from the WATCHDOG_BASE_IMAGE repository variable and refuses anything not pinned by digest.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
@@ -37,10 +37,12 @@ RUN if ! command -v python3 >/dev/null 2>&1; then \
     && chmod -R u=rwX,go=rX /app \
     && groupadd --system --gid 10001 watchdog \
     && useradd --system --uid 10001 --gid 10001 --home-dir /home/watchdog --create-home --shell /usr/sbin/nologin watchdog \
-    && python3 -B -c "import lib.control_vm, lib.gcs_control_state, lib.image_tracking" \
+    && python3 -B -c "import lib.control_vm, lib.gcs_control_state, lib.image_tracking, lib.control_watchdog_server" \
     && gcloud --version >/dev/null
 
 USER 10001:10001
 
-ENTRYPOINT ["python3", "-B", "/app/src/control_vm.py"]
-CMD ["status"]
+# Listens on $PORT (Cloud Run sets it). For a one-off step: --entrypoint python3 <image> -B /app/src/control_vm.py ...
+ENV PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["python3", "-B", "/app/src/control_watchdog_server.py"]

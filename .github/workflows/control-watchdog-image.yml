@@ -71,9 +71,17 @@ jobs:
       - name: Smoke test
         run: |
           docker run --rm --entrypoint python3 "${IMAGE}:${GITHUB_SHA}" -B -c \
-            "import lib.control_vm, lib.gcs_control_state, lib.image_tracking; print('imports ok')"
-          docker run --rm "${IMAGE}:${GITHUB_SHA}" --help > /dev/null
-          docker run --rm "${IMAGE}:${GITHUB_SHA}" ensure --help | grep -q -- --skip-if-idle
+            "import lib.control_vm, lib.gcs_control_state, lib.image_tracking, lib.control_watchdog_server; print('imports ok')"
+          docker run --rm --entrypoint python3 "${IMAGE}:${GITHUB_SHA}" -B /app/src/control_vm.py ensure --help \
+            | grep -q -- --skip-if-idle
+          # The server answers /health, and refuses a tick without an identity token.
+          docker run -d --name watchdog-smoke -p 127.0.0.1:18080:8080 -e WATCHDOG_PROJECT=smoke \
+            -e WATCHDOG_AUDIENCE=https://smoke.invalid -e WATCHDOG_INVOKER=smoke@smoke.invalid "${IMAGE}:${GITHUB_SHA}"
+          trap 'docker rm -f watchdog-smoke >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/health >/dev/null 2>&1 && break; sleep 1; done
+          curl -fsS http://127.0.0.1:18080/health | grep -q '"ok"'
+          status="$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18080/tick)"
+          [[ "$status" == 403 ]] || { echo "::error::unauthenticated tick answered ${status}"; exit 1; }
 
       - name: Authenticate to Artifact Registry
         run: |

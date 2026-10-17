@@ -1,7 +1,7 @@
 """Durable control VM state and project lock in Google Cloud Storage.
 
 ``SPOT_CONTROL_STATE_URI=gs://<bucket>[/<prefix>]`` moves the project's control VM state and lock out of the
-local ``SPOT_CONTROL_STATE_DIR`` into two objects, so the serverless watchdog (a Cloud Run job) and an operator
+local ``SPOT_CONTROL_STATE_DIR`` into two objects, so the serverless watchdog (a Cloud Run service) and an operator
 workstation share one state and one lock:
 
 * ``<prefix>/control-vm-<project>.json``: the state, wrapped in an envelope (schema, project, writer, write id).
@@ -332,10 +332,10 @@ class GcsClient:
 # --------------------------------------------------------------------------------------------
 
 def default_owner() -> str:
-    """A readable owner: Cloud Run execution, or host and process."""
-    execution = os.environ.get("CLOUD_RUN_EXECUTION")
-    if execution:
-        return f"cloud-run:{os.environ.get('CLOUD_RUN_JOB', 'job')}/{execution}"
+    """A readable owner: the Cloud Run service revision, or the host; always with the process id."""
+    revision = os.environ.get("K_REVISION")
+    if revision:
+        return f"cloud-run:{revision}:{socket.gethostname()}:{os.getpid()}"
     return f"{socket.gethostname()}:{os.getpid()}"
 
 
@@ -680,31 +680,81 @@ def read_local(path: Path) -> tuple[str, Any]:
     return "state", data
 
 
-def write_moved_marker(path: Path, uri: str, now: float) -> Path:
-    """Keep the local file as ``<name>.migrated-<UTC>`` and leave a marker that makes the local backend refuse."""
+def _fsync_dir(directory: Path) -> None:
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def write_moved_marker(path: Path, uri: str, now: float) -> Path | None:
+    """Fence the local state file. Returns the backup path (None when there was no local file).
+
+    Crash-safe: the original is first copied to ``<name>.migrated-<UTC>`` and flushed, then a flushed marker is
+    renamed over the original in one atomic step. At every instant the path holds either the original state or
+    the marker, never nothing, and the backup exists before the original disappears.
+    """
+    import shutil
     import tempfile
 
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
-    backup = path.with_name(f"{path.name}.migrated-{stamp}")
-    existed = path.exists()
-    if existed:
-        os.replace(path, backup)
-    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as temp:
-        json.dump({MOVED_KEY: uri, "moved_at": now, "backup": backup.name if existed else None}, temp)
+    backup: Path | None = None
+    if path.exists():
+        backup = path.with_name(f"{path.name}.migrated-{stamp}")
+        shutil.copy2(path, backup)
+        with backup.open("rb") as handle:
+            os.fsync(handle.fileno())
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=f".{path.name}.", suffix=".moving", delete=False,
+                                     encoding="utf-8") as temp:
+        json.dump({MOVED_KEY: uri, "moved_at": now, "backup": backup.name if backup else None}, temp)
         temp.flush()
         os.fsync(temp.fileno())
-    Path(temp.name).replace(path)
+    try:
+        os.replace(temp.name, path)
+    except BaseException:
+        Path(temp.name).unlink(missing_ok=True)
+        raise
+    _fsync_dir(path.parent)
     return backup
+
+
+def _marker_backup(path: Path) -> tuple[bool, Any]:
+    """For a moved marker: (True, state) from the backup it names ({} when it names none), or (False, reason)."""
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return False, f"marker {path} is unreadable: {exc}"
+    if not isinstance(marker, dict) or "backup" not in marker:
+        return False, f"marker {path} doesn't say whether it kept a backup"
+    name = marker["backup"]
+    if name is None:
+        return True, {}  # write_moved_marker found no local file: the state was empty
+    if not isinstance(name, str) or "/" in name or not name.startswith(f"{path.name}.migrated-"):
+        return False, f"marker {path} names an invalid backup {name!r}"
+    kind, state = read_local(path.with_name(name))
+    if kind != "state":
+        return False, f"backup {name} next to {path} is {kind}"
+    return True, state
 
 
 def migrate_local_state(project: str, local_dir: Path | str | None, uri: str, *, apply: bool,
                         client: GcsClient | None = None, wall: Callable[[], float] = time.time) -> tuple[int, str]:
-    """Upload the local project state to Cloud Storage once. Returns (exit code, message).
+    """Move the local project state to Cloud Storage once. Returns (exit code, message).
 
-    * Local state and no Cloud Storage state: upload it (create-only, under both locks), then replace the local file
-      with a marker that makes the local backend refuse to run.
-    * Both exist and are equal: write the marker only.
-    * Both exist and differ: refuse (exit 1) and change nothing.
+    Under the local flock and the Cloud Storage lease, the local file is fenced (see write_moved_marker) BEFORE the
+    Cloud Storage object is created, so the remote state never exists while the local file could still be used:
+
+    * Local state, no remote state: fence the local file, then upload its backup (create-only).
+    * No local file, no remote state: fence (a marker without backup), then create an empty remote state.
+    * Remote state equal to the local state, or no local file: fence the local file only.
+    * Remote state that differs from the local state: refuse (exit 1) and change nothing.
+    * A marker whose remote state is missing (a run that stopped after fencing): upload the backup it names.
     Without ``apply`` nothing is written, and the message says what would happen.
     """
     import fcntl
@@ -716,20 +766,23 @@ def migrate_local_state(project: str, local_dir: Path | str | None, uri: str, *,
 
     def decide(kind: str, local: Any, remote_exists: bool, remote_state: Any) -> tuple[int, str, str]:
         if kind == "moved":
-            if not remote_exists:
-                return 1, "refuse", (f"{local_path} says the state moved to {local}, but {target} does not exist; "
-                                     "restore it from the .migrated-* backup by hand")
-            return 0, "none", f"already migrated: {local_path} points at {local}"
+            if remote_exists:
+                return 0, "none", f"already migrated: {local_path} points at {local}"
+            ok, backup = _marker_backup(local_path)
+            if not ok:
+                return 1, "refuse", (f"{local_path} is fenced but {target} does not exist, and {backup}; restore the "
+                                     "state from the .migrated-* backup by hand")
+            return 0, "resume", f"{local_path} is fenced but {target} does not exist; uploading the fenced backup"
         if kind == "absent":
             if remote_exists:
-                return 0, "none", f"no local state at {local_path}; {target} is the state"
-            return 0, "create", f"no local state at {local_path}; creating an empty {target}"
+                return 0, "fence", f"no local state at {local_path}; {target} is the state; fencing the local path"
+            return 0, "create", f"no local state at {local_path}; fencing it and creating an empty {target}"
         if remote_exists:
             if remote_state == local:
-                return 0, "mark", f"{target} already equals {local_path}; marking the local file as moved"
+                return 0, "fence", f"{target} already equals {local_path}; fencing the local file"
             return 1, "refuse", (f"both {local_path} and {target} exist and differ; refusing to choose. Compare "
                                  "them, keep the current one, and move the other aside by hand")
-        return 0, "upload", f"uploading {local_path} to {target}"
+        return 0, "upload", f"fencing {local_path}, then uploading it to {target}"
 
     if not apply:
         kind, local = read_local(local_path)
@@ -749,15 +802,18 @@ def migrate_local_state(project: str, local_dir: Path | str | None, uri: str, *,
                 return 1, f"{lock.describe_holder()} holds the Cloud Storage lease; run again later"
             kind, local = read_local(local_path)
             code, action, message = decide(kind, local, remote.exists, remote.state)
-            if action in ("upload", "create"):
-                remote.state = copy.deepcopy(local) if action == "upload" else {}
+            if action in ("upload", "create", "fence"):
+                write_moved_marker(local_path, uri, wall())  # the fence comes first, durably
+            if action in ("upload", "create", "resume"):
+                if action == "resume":
+                    _ok, upload = _marker_backup(local_path)
+                else:
+                    upload = local if action == "upload" else {}
+                remote.state = copy.deepcopy(upload)
                 try:
                     remote.save()  # create-only: the generation it loaded is 0
-                except ControlStateConflict as exc:
-                    return 1, f"upload refused: {exc}"
-                write_moved_marker(local_path, uri, wall())
-                return 0, message + "; done"
-            if action == "mark":
-                write_moved_marker(local_path, uri, wall())
-                return 0, message + "; done"
-            return code, message
+                except (ControlStateConflict, GcsError) as exc:
+                    return 1, f"upload failed: {exc}; the local file stays fenced, run migrate-state again"
+            if action == "none" or code != 0:
+                return code, message
+            return 0, message + "; done"

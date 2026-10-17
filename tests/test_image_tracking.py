@@ -448,6 +448,56 @@ class RolloutTests(unittest.TestCase):
         self.assertNotIn("image_rollout", h.transition)
         self.assertEqual(h.gcloud.create_image(), IMG_B)  # SPOT_DASHBOARD_IMAGE is IMG_A
 
+    def recover_from(self, h, image):
+        h.active(image=image)
+        h.registry.tags.update({"main": D_B, SHA_B: D_B})
+        h.tick()  # records a's image
+        self.assertEqual(h.image["active"]["image"], image)
+        h.gcloud.vms.pop("spot-control-a")
+        h.tick()
+        h.clock[0] += cv.START_GRACE_SECONDS
+        return h.tick()
+
+    def test_recovery_keeps_a_recorded_commit_tag_on_the_standard_vm(self):
+        h = TrackingHarness()
+        tag = f"{REPO}:{SHA_B}"
+        self.assertEqual(self.recover_from(h, tag).action, "recreate_other_slot")
+        self.assertEqual(h.transition["dashboard_image"], tag)
+        self.assertEqual(h.gcloud.create_image(), tag)  # never the configured IMG_A
+
+    def test_recovery_resolves_a_recorded_commit_tag_for_spot(self):
+        h = TrackingHarness(provisioning="spot", offers=tcv.OFFERS)
+        h.gcloud = WatchdogGcloud(h.events)
+        tag = f"{REPO}:{SHA_B}"
+        h.active = lambda image=IMG_A, slot="a": (h.gcloud.add(slot, provisioning="SPOT"),
+                                                  h.gcloud.images.__setitem__(f"spot-control-{slot}", image),
+                                                  h.kv.set_origin(slot), h.http.healthy(slot, version=7))
+        self.assertEqual(self.recover_from(h, tag).action, "recreate_other_slot")
+        self.assertEqual(h.transition["dashboard_image"], IMG_B)
+        self.assertEqual(h.image["active"]["resolved_image"], IMG_B)
+        self.assertEqual(h.gcloud.create_image(), IMG_B)
+
+    def test_unresolvable_commit_tag_on_spot_waits_instead_of_downgrading(self):
+        h = TrackingHarness(provisioning="spot", offers=tcv.OFFERS)
+        tag = f"{REPO}:{SHA_B}"
+        h.gcloud.add("a", provisioning="SPOT")
+        h.gcloud.images["spot-control-a"] = tag
+        h.kv.set_origin("a")
+        h.http.healthy("a", version=7)
+        h.state[cv.STATE_KEY] = {"image": {"active": {"slot": "a", "instance_id": "id-a", "image": tag}}}
+
+        def down(tag):
+            raise it.TrackingError("ghcr down")
+        h.registry.resolve = down
+        h.gcloud.vms.pop("spot-control-a")
+        h.tick()
+        h.clock[0] += cv.START_GRACE_SECONDS
+        h.tick()
+        # The transition keeps the commit tag, which a Spot create refuses: it waits, never creating IMG_A.
+        self.assertEqual(h.transition["dashboard_image"], tag)
+        self.assertIn("pinned by digest", h.transition["error"])
+        self.assertFalse([c for c in h.gcloud.calls if c[2:4] == ["instances", "create"]])
+
     def test_a_resumed_rollout_creates_its_pinned_image_on_any_controller(self):
         h = tcv.Harness(offers=tcv.STANDARD_OFFERS, provisioning="standard", regions=("us-central1",))
         h.gcloud.add("a", machine="e2-micro", provisioning="STANDARD")

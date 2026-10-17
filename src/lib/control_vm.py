@@ -1403,9 +1403,30 @@ class ControlVmManager:
     def _base_image(self) -> str:
         """Image for a new control VM that is not an image rollout while tracking: the active VM's recorded image
         (so a recovery never moves to another image), else the configured one."""
-        recorded = str(((self.cstate.get("image") or {}).get("active") or {}).get("image") or "")
-        if _DIGEST_RE.match(recorded) and image_tracking.parse_image(recorded, DEFAULT_DASHBOARD_IMAGE_REPO)[0]:
+        record = (self.cstate.get("image") or {}).get("active") or {}
+        recorded = str(record.get("image") or "")
+        digest, commit = image_tracking.parse_image(recorded, DEFAULT_DASHBOARD_IMAGE_REPO)
+        if digest:
             return recorded
+        if commit:
+            # A published commit tag (the standard VM accepts it) is kept as is, never replaced by an older
+            # configured image. Spot VMs take digests only, so resolve the tag's digest once and record it.
+            if self.config.standard:
+                return recorded
+            resolved = str(record.get("resolved_image") or "")
+            if not resolved:
+                registry = self._tracker().registry
+                try:
+                    resolved = image_tracking.digest_ref(DEFAULT_DASHBOARD_IMAGE_REPO, registry.resolve(commit)) \
+                        if registry is not None else ""
+                except image_tracking.TrackingError as exc:
+                    self._note("could not resolve %s to a digest: %s", recorded, exc, level=logging.WARNING)
+                    resolved = ""
+                if resolved:
+                    self.cstate.setdefault("image", {}).setdefault("active", {})["resolved_image"] = resolved
+            # Unresolved: the commit tag itself, which create_problems refuses on Spot, so the step waits instead of
+            # moving to another image.
+            return resolved or recorded
         return self.config.effective_dashboard_image
 
     def _image_rollout(self, obs: Observation, plan: Plan) -> Plan | None:
@@ -2613,6 +2634,11 @@ class ProjectControlState:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
+            backups = sorted(self.path.parent.glob(f"{self.path.name}.migrated-*"))
+            if backups:
+                # A migrated file whose marker is gone is never empty state: the state lives elsewhere.
+                raise ControlStateConflict(f"control VM state {self.path} is missing but {backups[-1].name} shows it "
+                                           f"was migrated; set {ENV_CONTROL_STATE_URI}, or restore the file by hand")
             data = {}
         if isinstance(data, dict) and CONTROL_STATE_MOVED_KEY in data:
             # Fail closed: this file was migrated, and acting on it would fork the state.
