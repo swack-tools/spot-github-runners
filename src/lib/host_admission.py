@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from contextlib import ExitStack
 
 BUILD_ROOT = Path('/mnt/runner-data/remote-build')
 LOCK_ROOT = Path('/run')
@@ -126,7 +127,11 @@ def builder_owner_kind(owner,config):
         return 'builder'
     actual=json.loads(Path('/etc/oxidex-remote-build.json').read_text())
     pin=actual.get('approved_image_id')
-    if ({k:v for k,v in actual.items() if k!='approved_image_id'}!={'role':'builder','cpus':16,'memory_gib':28,'image':'oxidex-remote-builder:1.99.0'}
+    if 'reservation_enrollment' in actual:
+        sys.path.insert(0, '/opt/oxidex-builder')
+        from qualification_trust.reservation import validate_enrollment
+        validate_enrollment(actual['reservation_enrollment'])
+    if ({k:v for k,v in actual.items() if k not in ('approved_image_id','reservation_enrollment')}!={'role':'builder','cpus':16,'memory_gib':28,'image':'oxidex-remote-builder:1.99.0'}
         or not isinstance(pin,str) or not re.fullmatch('sha256:[0-9a-f]{64}',pin)):
         raise ValueError('Actual builder launcher policy differs from reservation')
     return 'builder'
@@ -611,6 +616,17 @@ def release_build():
     request('release','builder')
 
 
+def hold_builder_reservation(custody, config, pid):
+    """Keep global SH until the authenticated admission transaction completes."""
+    if config.get('role') != 'builder':
+        return
+    global_lock = custody.enter_context(lock_file(LOCK_ROOT/'oxidex-build.lock'))
+    fcntl.flock(global_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    sys.path.insert(0, '/opt/oxidex-builder')
+    from qualification_trust.reservation import route_guard
+    route_guard(pid=pid)
+
+
 def serve():
     if os.geteuid() != 0:
         raise RuntimeError('Admission service must run as root')
@@ -629,7 +645,7 @@ def serve():
         measured_at=0
         while True:
             client,_ = server.accept()
-            with client:
+            with client, ExitStack() as custody:
                 try:
                     client.settimeout(5)
                     pid,uid,_ = struct.unpack('3i',client.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
@@ -649,6 +665,7 @@ def serve():
                     pool = LeasePool(ledger/'leases.json',config['work_gib'],alive=owner_alive,retain=retain,removal_fence=retain.finalize if retain is not None else None,heavy_builder_isolation=policy is not None)
                     if config.get('role')=='benchmark-builder':pool.refresh()
                     if message['action']=='acquire':
+                        hold_builder_reservation(custody, config, pid)
                         if config.get('role') in ('builder','benchmark-builder') or time.time()-measured_at>=60:
                             try:
                                 envelope=observed_envelope(config)

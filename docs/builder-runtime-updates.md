@@ -12,7 +12,10 @@ actual VM, boot, runtime files, and admission process; plans expire after
 120 seconds. It does not provision a VM or rebuild an image.
 
 The maintainer supplies a root-owned asset JSON file containing exactly the
-fifteen runtime targets and their reviewed bytes and hashes. Capture a fresh
+25 fixed runtime targets and their reviewed bytes and hashes. The SSH
+ForceCommand and sudoers entries are part of that set. Generate their bytes
+with `uploader_policy_bytes` from the existing root-owned uploader mapping;
+the updater rejects policy bytes that differ from that mapping. Capture a fresh
 plan after source review and builder handback:
 
 ```bash
@@ -30,12 +33,35 @@ python3 -I -B builder_runtime_update.py --plan plan.json \
   --plan-sha256 PLAN_FILE_SHA256 --apply
 ```
 
-Applying takes the existing build lock, refuses active builds and uploads,
+Applying takes the existing build lock, refuses any process carrying the
+enrolled uploader UID as well as active builds and uploads,
 creates an owned drain, backs up old files, and replaces only the fixed runtime
-file set. It restarts admission alone. It preserves the image, build limits,
+file set. It validates sshd, sudoers, and effective uploader access, then
+reloads SSH and restarts admission. It preserves the image, build limits,
 source worktrees, and caches. A partial failure retains the drain and backups
 for explicit recovery. Success verifies installed bytes and the new admission
 process while retaining the owned drain.
+
+For a partial apply that failed before `FILES_AND_SERVICE_VERIFIED`, select
+the original saved plan and its exact digest to restore only the two uploader
+policies from the private backup:
+
+```sh
+python3 -I -B builder_runtime_update.py --plan original-plan.json \
+  --plan-sha256 "$ORIGINAL_PLAN_SHA256" --recover-policy
+```
+
+This action requires the same provider VM, the retained pending marker and
+drain, an idle host, and policy files matching either the selected backup or
+the selected newly installed bytes. It validates sshd and sudoers, reloads SSH,
+records `POLICY_ROLLED_BACK_HELD`, and remains held. A crash after publication
+can repeat the same recovery command; a foreign policy file is preserved and
+refused. Runtime files and the launcher still need separately reviewed
+recovery. Policy rollback authenticates the saved plan, journal, and owned hold
+before loading either the unchanged historical helper or the exact reviewed
+helper already installed by that update. It retains that file identity and
+trust phase through policy and work-process checks; foreign helper bytes are
+refused. This command never reopens admission.
 
 Coordinate the exact OxiDex launcher pin before this update. The helper does not
 change clients or declare qualification ready. Run the reviewed Linux gate and
@@ -43,6 +69,16 @@ ordinary build checks before routing qualification work to the updated host. A s
 returns `INSTALLED_DRAINED`; it keeps the route off until an independently
 verified client-pin handoff authorizes removal of the exact owned drain. The
 updater never reopens the route automatically.
+
+An already enrolled host with a schema-1 `reservation_enrollment` containing
+`device` (a boot-local filesystem number) needs an explicit root-reviewed
+migration before the new reservation source can route work. Under the held
+maintenance fence, independently observe the mounted ext4 UUID, the approved
+`/dev/disk/by-id/google-...` mapping, and its hardware serial; publish schema 2
+with `uuid`, `by_id`, and `serial` only after those facts agree. Preserve the
+existing reservation and drain throughout. A missing/foreign mount or unknown
+legacy record must remain held; do not copy the old `device` value into the
+new identity or treat an old source-only CI result as a host migration receipt.
 
 The update also installs a fixed admission-service boot guard and a persistent
 pending marker. A private permit in `/run` allows only the current maintenance
