@@ -4049,6 +4049,63 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual([r["name"] for r in view["instances"]], ["oxidex-runners-us-south1-a-1"])
         self.assertEqual(view["fleet_inventory"]["source"], "gce")
 
+    def test_unknown_utilization_never_reads_as_idle(self):
+        self.fleet = [fleet_observation(f"12{i}", f"oxidex-runners-idle-{i}", "us-south1-a", runners_count=4,
+                                        now=self.now) for i in range(3)]
+        self.store.refresh_fleet_inventory()
+        telemetry = self.store.state["scaling_telemetry"]
+        self.assertEqual(telemetry["current_runners"], 12)
+        self.assertEqual(telemetry["instance_cpu_percentages"], [])
+        evaluation = self.store.get_overview()["scaling_evaluation"]
+        self.assertNotIn("idle_cpu", [r.get("trigger") for r in evaluation.get("scale_down_reasons", [])])
+
+    def test_restart_keeps_earlier_run_in_runtime_and_window(self):
+        # Ran 9 hours (from 10h ago to 1h ago), then started again 30 minutes ago.
+        self.fleet = [fleet_observation("1300", "oxidex-runners-restart-1", "us-south1-a", started_hours_ago=10.0,
+                                        now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [fleet_observation("1300", "oxidex-runners-restart-1", "us-south1-a", status="TERMINATED",
+                                        started_hours_ago=10.0, stopped_hours_ago=1.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [fleet_observation("1300", "oxidex-runners-restart-1", "us-south1-a", started_hours_ago=0.5,
+                                        stopped_hours_ago=1.0, now=self.now)]
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        rec = self._record("oxidex-runners-restart-1")
+        self.assertEqual(len(rec["prior_runs"]), 1)
+        self.assertAlmostEqual(rec["runtime_hours"], 9.5, delta=0.05)
+        row = next(r for r in self.store.query_instances(window_hours=24)["instances"]
+                   if r["name"] == "oxidex-runners-restart-1")
+        self.assertAlmostEqual(row["runtime_hours"], 9.5, delta=0.05)
+        self.assertAlmostEqual(row["hours_in_window"], 9.5, delta=0.05)
+        short = next(r for r in self.store.query_instances(window_hours=2)["instances"]
+                     if r["name"] == "oxidex-runners-restart-1")
+        self.assertAlmostEqual(short["hours_in_window"], 1.5, delta=0.05)
+        # The same listing again is stable.
+        self.assertFalse(self.store.refresh_fleet_inventory())
+
+    def test_stopped_vm_keeps_accruing_disk_cost(self):
+        self.fleet = [fleet_observation("1400", "builder-oxidex-disk-1", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=10.0, stopped_hours_ago=8.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        row = next(r for r in self.store.query_instances(window_hours=4)["instances"]
+                   if r["name"] == "builder-oxidex-disk-1")
+        pricing = row["pricing"]
+        disk_all_in = pricing["disk_hourly_usd"] * (1 + pricing["tax_rate_percent"] / 100.0)
+        self.assertGreater(disk_all_in, 0.0)
+        # Stopped 8 hours ago: no compute in the last 4 hours, but 4 hours of disk.
+        self.assertEqual(row["hours_in_window"], 0.0)
+        self.assertAlmostEqual(row["total_cost_in_window_usd"], round(4.0 * disk_all_in, 2), delta=0.011)
+        compute_only = next(r for r in self.store.query_instances(window_hours=4, include_disk_and_tax=False)
+                            ["instances"] if r["name"] == "builder-oxidex-disk-1")
+        self.assertEqual(compute_only["total_cost_in_window_usd"], 0.0)
+
+    def test_unchanged_shape_reuses_pricing(self):
+        self.fleet = [fleet_observation("1010", "oxidex-runners-price-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        with unittest.mock.patch("lib.dashboard_server.calculate_spot_pricing") as pricing:
+            self.assertFalse(self.store.refresh_fleet_inventory())
+        pricing.assert_not_called()
+
     def test_stopped_vm_shows_gce_status_and_stops_accruing(self):
         self.fleet = [fleet_observation("1002", "builder-oxidex-eu-1", "europe-west4-a", started_hours_ago=5.0,
                                         now=self.now)]

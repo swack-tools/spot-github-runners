@@ -269,6 +269,7 @@ def _build_instance_record(
     project: str = "homelab-424523",
     now_epoch: float | None = None,
     tax_rate_percent: float | None = None,
+    pricing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ref_now = now_epoch if now_epoch is not None else time.time()
     family = machine_type.split("-", 1)[0]
@@ -278,19 +279,20 @@ def _build_instance_record(
         if tax_rate_percent is not None
         else float(reg_info.get("tax_rate_default", 8.25))
     )
-    pricing = calculate_spot_pricing(
-        family=family,
-        vcpu=vcpu,
-        ram_gib=ram_gib,
-        region=region,
-        boot_disk_type=boot_disk_type,
-        boot_disk_gb=boot_disk_gb,
-        data_disk_type=data_disk_type,
-        data_disk_gb=data_disk_gb,
-        tax_rate_percent=tax_rate,
-        machine_type=machine_type,
-        project=project,
-    )
+    if pricing is None:
+        pricing = calculate_spot_pricing(
+            family=family,
+            vcpu=vcpu,
+            ram_gib=ram_gib,
+            region=region,
+            boot_disk_type=boot_disk_type,
+            boot_disk_gb=boot_disk_gb,
+            data_disk_type=data_disk_type,
+            data_disk_gb=data_disk_gb,
+            tax_rate_percent=tax_rate,
+            machine_type=machine_type,
+            project=project,
+        )
     benchmark = compute_cpu_benchmark_score(cpu_platform, vcpu, machine_type)
     started_epoch = ref_now - started_hours_ago * 3600.0
     deleted_epoch = (ref_now - deleted_hours_ago * 3600.0) if deleted_hours_ago is not None else None
@@ -405,6 +407,60 @@ def _instance_end_epoch(record: dict[str, Any]) -> float | None:
     return None
 
 
+MAX_PRIOR_RUNS = 50
+
+
+def _prior_runs(record: dict[str, Any]) -> list[tuple[float, float]]:
+    """Completed earlier running intervals ``(start, end)`` of a VM that was stopped and started again."""
+    runs: list[tuple[float, float]] = []
+    for item in record.get("prior_runs") or []:
+        if (isinstance(item, (list, tuple)) and len(item) == 2
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in item)
+                and item[1] >= item[0]):
+            runs.append((float(item[0]), float(item[1])))
+    return runs
+
+
+def _overlap_hours(start: float, end: float, window_start: float) -> float:
+    return max(0.0, end - max(start, window_start)) / 3600.0
+
+
+def instance_usage(record: dict[str, Any], now: float, window_start: float | None = None) -> dict[str, float]:
+    """Compute (VM running) and disk (VM exists) hours of a record, in total and inside the window.
+
+    Compute accrues over every running interval (earlier runs plus the current one, which ends at the stop or
+    deletion time). Attached disks keep billing while the VM is stopped, so disk hours run from the first start
+    until the VM is deleted (or now).
+    """
+    started = float(record.get("started_epoch") or now)
+    end = _instance_end_epoch(record)
+    if record.get("status") == "RUNNING" or end is None:
+        end = now
+    runs = _prior_runs(record) + [(started, max(started, end))]
+    deleted = record.get("deleted_epoch")
+    disk_end = float(deleted) if isinstance(deleted, (int, float)) and not isinstance(deleted, bool) else now
+    disk_start = min(s for s, _e in runs)
+    disk_end = max(disk_start, disk_end)
+    window = window_start if window_start is not None else float("-inf")
+    return {
+        "compute_hours": sum(e - s for s, e in runs) / 3600.0,
+        "compute_hours_in_window": sum(_overlap_hours(s, e, window) for s, e in runs),
+        "disk_hours": (disk_end - disk_start) / 3600.0,
+        "disk_hours_in_window": _overlap_hours(disk_start, disk_end, window),
+    }
+
+
+def instance_cost_usd(pricing: dict[str, Any], compute_hours: float, disk_hours: float) -> tuple[float, float]:
+    """(all-in cost with disks and tax, compute-only cost) for the given compute and disk hours."""
+    compute_hourly = float(pricing.get("compute_hourly_usd", 0.0) or 0.0)
+    total_hourly = float(pricing.get("total_hourly_usd", 0.0) or 0.0)
+    tax_fraction = float(pricing.get("tax_rate_percent", 0.0) or 0.0) / 100.0
+    disk_all_in = float(pricing.get("disk_hourly_usd", 0.0) or 0.0) * (1.0 + tax_fraction)
+    compute_all_in = max(0.0, total_hourly - disk_all_in)
+    return (round(compute_hours * compute_all_in + disk_hours * disk_all_in, 2),
+            round(compute_hours * compute_hourly, 2))
+
+
 def _live_instance_record(
     obs: dict[str, Any],
     *,
@@ -421,6 +477,14 @@ def _live_instance_record(
     started_epoch = min(started_epoch, now)
     role = str(obs.get("role") or "cicd_runner")
     region = str(obs.get("region") or "")
+    shape_keys = ("region", "machine_type", "vcpu", "ram_gib", "boot_disk_type", "boot_disk_gb",
+                  "data_disk_type", "data_disk_gb")
+    reuse_pricing = (
+        previous.get("pricing")
+        if previous is not None and isinstance(previous.get("pricing"), dict)
+        and all(previous.get(k) == obs.get(k) for k in shape_keys)
+        else None
+    )
     record = _build_instance_record(
         instance_id=str(obs["instance_id"]),
         name=str(obs["name"]),
@@ -448,6 +512,7 @@ def _live_instance_record(
         ram_utilization_percent=0.0,
         project=project,
         now_epoch=now,
+        pricing=copy.deepcopy(reuse_pricing) if reuse_pricing is not None else None,
     )
     if not any(r["region"] == region for r in REGIONS_CATALOG):
         # Outside the catalog the record must not borrow another region's location.
@@ -468,8 +533,22 @@ def _live_instance_record(
                    "the VM and its disks still exist")
     else:
         trigger = f"Compute Engine status {status}"
-    end = stopped_epoch if stopped_epoch is not None else now
-    runtime_hours = round(max(0.0, end - started_epoch) / 3600.0, 2)
+    prior_runs = _prior_runs(previous) if previous is not None else []
+    previous_start = previous.get("started_epoch") if previous is not None else None
+    if isinstance(previous_start, (int, float)) and started_epoch > float(previous_start):
+        # Started again: keep the earlier run (to its recorded stop, else to the stop GCE reports, else to the
+        # new start) so lifetime and window costs still include it.
+        prev_end = previous.get("stopped_epoch")
+        if not isinstance(prev_end, (int, float)):
+            stop = obs.get("last_stop_epoch")
+            prev_end = stop if isinstance(stop, (int, float)) and previous_start <= stop <= started_epoch else started_epoch
+        prior_runs.append((float(previous_start), min(float(prev_end), started_epoch)))
+    prior_runs = [run for run in prior_runs if now - run[1] <= DELETED_INSTANCE_RETENTION_SECONDS][-MAX_PRIOR_RUNS:]
+    record.update({"started_epoch": started_epoch, "stopped_epoch": stopped_epoch, "deleted_epoch": None,
+                   "status": status, "prior_runs": [list(run) for run in prior_runs]})
+    usage = instance_usage(record, now)
+    runtime_hours = round(usage["compute_hours"], 2)
+    total_cost, compute_cost = instance_cost_usd(record["pricing"], usage["compute_hours"], usage["disk_hours"])
     record.update({
         INSTANCE_SOURCE_KEY: INSTANCE_SOURCE_GCE,
         "gce_status": status,
@@ -482,8 +561,8 @@ def _live_instance_record(
         "deleted_epoch": None,
         "deleted_at": None,
         "runtime_hours": runtime_hours,
-        "total_cost_usd": round(runtime_hours * record["pricing"]["total_hourly_usd"], 2),
-        "total_cost_compute_only_usd": round(runtime_hours * record["pricing"]["compute_hourly_usd"], 2),
+        "total_cost_usd": total_cost,
+        "total_cost_compute_only_usd": compute_cost,
         "deletion_trigger": trigger,
         # Utilization is not part of the inventory listing.
         "utilization_known": False,
@@ -500,17 +579,20 @@ def _live_instance_record(
 def _mark_instance_deleted(record: dict[str, Any], now: float) -> dict[str, Any]:
     """The record of a VM that is no longer in the Compute Engine inventory."""
     out = dict(record)
-    started = float(out.get("started_epoch") or now)
-    end = _instance_end_epoch(out) or now
-    runtime_hours = round(max(0.0, end - started) / 3600.0, 2)
+    if out.get("status") == "RUNNING" or _instance_end_epoch(out) is None:
+        # It ran until it disappeared (between two listings; the observation time bounds it).
+        out["stopped_epoch"] = now
+    out.update({"status": "DELETED", "deleted_epoch": now})
+    usage = instance_usage(out, now)
     pricing = out.get("pricing") if isinstance(out.get("pricing"), dict) else {}
+    total_cost, compute_cost = instance_cost_usd(pricing, usage["compute_hours"], usage["disk_hours"])
     out.update({
         "status": "DELETED",
         "deleted_epoch": now,
         "deleted_at": _iso_epoch(now),
-        "runtime_hours": runtime_hours,
-        "total_cost_usd": round(runtime_hours * float(pricing.get("total_hourly_usd", 0.0) or 0.0), 2),
-        "total_cost_compute_only_usd": round(runtime_hours * float(pricing.get("compute_hourly_usd", 0.0) or 0.0), 2),
+        "runtime_hours": round(usage["compute_hours"], 2),
+        "total_cost_usd": total_cost,
+        "total_cost_compute_only_usd": compute_cost,
         "deletion_trigger": (f"No longer in the Compute Engine inventory (first missing at {_iso_epoch(now)}): "
                              "deleted by Spot preemption, the autoscaler, or an operator"),
         "cpu_utilization_percent": 0.0,
@@ -527,7 +609,7 @@ def _instance_fingerprint(record: Any) -> tuple[Any, ...]:
         "instance_id", "name", "status", "zone", "machine_type", "vcpu", "ram_gib", "cpu_platform",
         "boot_disk_type", "boot_disk_gb", "data_disk_type", "data_disk_gb", "runners_count",
         "started_epoch", "stopped_epoch", "deleted_epoch", "spot", INSTANCE_SOURCE_KEY,
-    ))
+    )) + (json.dumps(record.get("prior_runs") or []),)
 
 
 def reconcile_instance_records(
@@ -2556,13 +2638,16 @@ class DashboardStore:
         telem = self.state.setdefault("scaling_telemetry", {})
         telem["current_runners"] = sum(int(inst.get("runners_count", 0)) for inst in running_runners)
         telem["current_instances"] = len(running_runners)
+        # Inventory records carry no utilization: a made-up 0% would read as idle and recommend scale-in.
         telem["instance_cpu_percentages"] = [
             float(inst.get("cpu_utilization_percent", 0.0)) for inst in running_runners
+            if inst.get("utilization_known", True)
         ]
         telem["running_instance_hourly_rates"] = self._running_role_hourly_rates("cicd_runner")
         telem["current_builder_instances"] = len(running_builders)
         telem["builder_cpu_percentages"] = [
             float(inst.get("cpu_utilization_percent", 0.0)) for inst in running_builders
+            if inst.get("utilization_known", True)
         ]
         telem["builder_instance_hourly_rates"] = self._running_role_hourly_rates("rust_builder")
         raw_journal_ooms = telem.get("journal_oom_events", [])
@@ -3030,6 +3115,9 @@ class DashboardStore:
                 deleted_ts = _instance_end_epoch(inst)
                 started_ts = float(inst.get("started_epoch", now_ts - 3600.0))
                 end_ts = float(deleted_ts) if (is_deleted and deleted_ts is not None) else now_ts
+                if is_live_instance_record(inst) and inst["status"] != "DELETED":
+                    # A stopped VM still bills its disks, so it stays in every window until it is deleted.
+                    end_ts = now_ts
 
                 # Exclude deleted instances whose deletion occurred before the selected window
                 if is_deleted and end_ts < window_start_ts:
@@ -3069,6 +3157,18 @@ class DashboardStore:
                 live_total_cost_compute_only_usd = round(
                     live_runtime_hours * pricing["compute_hourly_usd"], 2
                 )
+                if is_live_instance_record(inst):
+                    # Inventory records: compute accrues over every running interval, disks while the VM exists.
+                    usage = instance_usage(inst, now_ts, window_start_ts)
+                    hours_in_window = round(usage["compute_hours_in_window"], 2)
+                    live_runtime_hours = round(usage["compute_hours"], 2)
+                    window_all_in, window_compute = instance_cost_usd(
+                        pricing, usage["compute_hours_in_window"], usage["disk_hours_in_window"])
+                    live_total_cost_usd, live_total_cost_compute_only_usd = instance_cost_usd(
+                        pricing, usage["compute_hours"], usage["disk_hours"])
+                    total_cost_in_window = window_all_in if include_disk_and_tax else window_compute
+                    lifetime_cost = (live_total_cost_usd if include_disk_and_tax
+                                     else live_total_cost_compute_only_usd)
 
                 row = {
                     **inst,

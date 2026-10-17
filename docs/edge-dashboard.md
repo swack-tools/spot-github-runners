@@ -339,7 +339,10 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   they show `pd-balanced`.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
-  `lastStopTimestamp`. Only `RUNNING` VMs count toward the runner and builder telemetry.
+  `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted. When a VM starts
+  again, its earlier running intervals stay in its runtime and window spend. Only `RUNNING` VMs count
+  toward the runner and builder telemetry. The listing carries no CPU utilization, so inventory VMs
+  never trigger a CPU-based scale-down recommendation.
 - A VM that was listed before and is no longer in the inventory becomes `DELETED`. Its deletion time is
   the time of the first listing that missed it. Deleted VMs stay in the history for 31 days. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
