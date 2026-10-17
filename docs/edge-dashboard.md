@@ -277,8 +277,9 @@ repository: `defaults.yaml` for the organization and `repos/<owner>/<repo>.yaml`
   host. A repeated request with the same `Idempotency-Key` returns the stored result without touching
   the hosts again. Like every change, it gets the wait response while the dashboard is frozen,
   unhydrated, or not the active slot.
-- The control VM can't reach runner hosts. Its image has no `gcloud` and no SSH access, so hot-patching
-  there answers HTTP 501 with `"code": "hot_patch_unavailable"`. Run
+- The control VM's image has no `gcloud` and no SSH credentials, so the shipped dashboard can't manage
+  runner hosts. That isn't a network boundary: on a shared VPC the VMs can still reach each other unless you
+  add firewall rules. Hot-patching there answers HTTP 501 with `"code": "hot_patch_unavailable"`. Run
   `src/spot_runner_manager.py --patch-repo OWNER/REPO --patch-live` from an operator workstation instead. A
   dashboard that runs where `gcloud` and operator credentials exist can set
   `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`. That path takes the zone, machine type, region, runner label,

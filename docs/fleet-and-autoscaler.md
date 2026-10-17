@@ -87,8 +87,10 @@ and only when the remaining hosts can carry current demand.
   check spent after sampling, so successive samples stay about five minutes
   apart.
 - CPU and memory metrics come from GCP monitoring. Runner provisioning in
-  `resource` and `tiered` modes installs the metrics-only Ops Agent. Without
-  complete metrics, tiered mode holds, and resource mode waits.
+  `resource` and `tiered` modes installs the metrics-only Ops Agent. The runner
+  VMs' service account needs `roles/monitoring.metricWriter` and the VMs need the
+  `monitoring.write` or `cloud-platform` scope, or the agent can't publish memory
+  metrics. Without complete metrics, tiered mode holds, and resource mode waits.
 
 ### Tiered mode
 

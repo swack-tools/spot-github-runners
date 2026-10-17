@@ -19,8 +19,11 @@ On the operator machine, install:
 Your accounts need these permissions:
 
 - **GCP**: access to Compute Engine, Billing Catalog prices, regional quotas, disks, instance metadata, and
-  the selected network. Resource monitoring also needs access to GCP monitoring. Enable the required APIs in
-  your project.
+  the selected network. Enable the required APIs in your project.
+- **Memory telemetry** (`resource` and `tiered` modes): the runner VMs' service account needs
+  `roles/monitoring.metricWriter`, and the VMs need the `monitoring.write` or `cloud-platform` access scope, so
+  the Ops Agent can publish `agent.googleapis.com/memory/percent_used`. The controller's identity needs
+  monitoring read access. Without complete metrics, tiered mode holds, and resource mode waits.
 - **GitHub**: organization runner-management access to deploy runners. Job recovery also needs Actions read and
   write access and Checks read access on each tracked repository.
 
