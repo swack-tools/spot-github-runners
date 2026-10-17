@@ -2113,7 +2113,8 @@ class DashboardStore:
                     return 422, {"error": "Idempotency-Key was already used for a different request"}, False
                 return int(existing.get("s", 200)), copy.deepcopy(existing.get("b")), True
             snapshot = copy.deepcopy(self.state)
-            self._defer = {"thread": threading.get_ident(), "dirty": False}
+            self._defer = {"thread": threading.get_ident(), "dirty": False, "after_commit": []}
+            defer = self._defer
             try:
                 status, body = fn()
             except BaseException:
@@ -2136,7 +2137,23 @@ class DashboardStore:
                 self.state = snapshot
                 LOG.exception("Failed to persist dashboard state for an idempotent request")
                 return 500, {"error": "Failed to persist dashboard state; retry the request"}, False
+            if status < 400:
+                for callback in defer["after_commit"]:
+                    callback()
             return status, body, False
+
+    def _after_commit(self, callback: Any) -> None:
+        """Run ``callback`` once the current change is durable.
+
+        Inside an idempotent request the write is deferred to :meth:`run_request`, so the callback waits for
+        that commit and is dropped when the request rolls back. Outside one, the change was already persisted
+        synchronously (a failure raised before reaching here), so it runs now.
+        """
+        defer = self._defer
+        if defer is not None and defer.get("thread") == threading.get_ident():
+            defer.setdefault("after_commit", []).append(callback)
+        else:
+            callback()
 
     def _mutation_preflight(self) -> None:
         """Gates every change shares (outside the lock): fresh ownership, writer sync, active slot."""
@@ -3823,7 +3840,7 @@ class DashboardStore:
                 {"at": at, "epoch": int(now), "action": "added", "login": clean_login, "uid": uid,
                  "actor": str(actor), "actor_uid": actor_uid},
             )
-            audit_admin_change("added", clean_login, uid, actor, actor_uid)
+            self._after_commit(lambda: audit_admin_change("added", clean_login, uid, actor, actor_uid))
             return dict(record)
 
     def remove_dashboard_admin(self, uid: Any, *, actor: str, actor_uid: int | None) -> dict[str, Any]:
@@ -3845,7 +3862,8 @@ class DashboardStore:
                 {"at": at, "epoch": int(now), "action": "removed", "login": removed["login"], "uid": uid,
                  "actor": str(actor), "actor_uid": actor_uid},
             )
-            audit_admin_change("removed", removed["login"], uid, actor, actor_uid)
+            removed_login = removed["login"]
+            self._after_commit(lambda: audit_admin_change("removed", removed_login, uid, actor, actor_uid))
             return {"login": removed["login"], "uid": uid}
 
     def peek_idempotent(self, key: str, method: str, path: str, fingerprint: str) -> tuple[int, Any, bool] | None:

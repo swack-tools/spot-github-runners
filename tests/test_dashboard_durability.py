@@ -1833,6 +1833,53 @@ class AddedAdminDurabilityTests(unittest.TestCase):
         # And the replacement keeps them across its own restart.
         self.assertEqual(self.store("b.json", "b").dashboard_admin_uids(), frozenset({4242}))
 
+    def test_admin_audit_lines_are_written_only_after_the_change_is_durable(self):
+        store = self.store("audit.json")
+        store.hydrate()
+        store.add_dashboard_admin("alice", 4242, actor="swackhamer", actor_uid=619624)
+        original_persist = store._persist
+
+        def failing_commit(bump=True):
+            if store._defer is not None:
+                return original_persist(bump)
+            raise OSError("simulated disk full at commit")
+
+        def remove():
+            return 200, store.remove_dashboard_admin(4242, actor="swackhamer", actor_uid=619624)
+
+        def add():
+            return 200, store.add_dashboard_admin("bob", 5151, actor="swackhamer", actor_uid=619624)
+
+        with mock.patch("lib.dashboard_server.audit_admin_change") as audit:
+            with mock.patch.object(store, "_persist", side_effect=failing_commit), \
+                    self.assertLogs("spot_dashboard", "ERROR"):
+                self.assertEqual(store.run_request("k-rm", "POST", "/api/admins/remove", remove,
+                                                   fingerprint="rm")[0], 500)
+                self.assertEqual(store.run_request("k-add", "POST", "/api/admins/add", add,
+                                                   fingerprint="add")[0], 500)
+            audit.assert_not_called()
+            self.assertEqual(store.dashboard_admin_uids(), frozenset({4242}))
+            status, _, replayed = store.run_request("k-rm2", "POST", "/api/admins/remove", remove, fingerprint="rm2")
+            self.assertEqual((status, replayed), (200, False))
+            audit.assert_called_once_with("removed", "alice", 4242, "swackhamer", 619624)
+            # An idempotent replay of the committed request writes no second audit line.
+            self.assertTrue(store.run_request("k-rm2", "POST", "/api/admins/remove", remove, fingerprint="rm2")[2])
+            audit.assert_called_once()
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+
+    def test_a_rolled_back_client_error_writes_no_admin_audit_line(self):
+        store = self.store("audit4xx.json")
+        store.hydrate()
+
+        def add_then_refuse():
+            store.add_dashboard_admin("bob", 5151, actor="swackhamer", actor_uid=619624)
+            return 409, {"error": "refused after the change"}
+
+        with mock.patch("lib.dashboard_server.audit_admin_change") as audit:
+            self.assertEqual(store.run_request("k", "POST", "/api/admins/add", add_then_refuse, fingerprint="f")[0], 409)
+            audit.assert_not_called()
+        self.assertEqual(store.dashboard_admin_uids(), frozenset())
+
     def test_fresh_vm_hydrates_admins_from_the_kv_snapshot(self):
         state = {"dashboard_admins": [{"login": "alice", "uid": 4242, "added_by": "swackhamer",
                                        "added_by_uid": 619624, "added_at": "2026-10-01T00:00:00Z"}]}
