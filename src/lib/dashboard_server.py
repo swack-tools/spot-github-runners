@@ -380,6 +380,7 @@ FLEET_INVENTORY_INTERVAL_SECONDS = 120.0
 FLEET_BASELINE_STATE_KEY = "fleet_inventory_baseline_at"
 # Deleted VMs stay in the history this long (the longest cost window the dashboard offers is 30 days).
 DELETED_INSTANCE_RETENTION_SECONDS = 31 * 86_400.0
+MAX_WINDOW_HOURS = DELETED_INSTANCE_RETENTION_SECONDS / 3600.0
 MAX_INSTANCE_RECORDS = 400
 # Compute Engine states in which the VM is stopped: compute billing ended at lastStopTimestamp.
 GCE_STOPPED_STATUSES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED"})
@@ -491,6 +492,7 @@ def _live_instance_record(
     started_epoch = min(started_epoch, now)
     role = str(obs.get("role") or "cicd_runner")
     region = str(obs.get("region") or "")
+    region_known = any(r["region"] == region for r in REGIONS_CATALOG)
     shape_keys = ("region", "machine_type", "vcpu", "ram_gib", "boot_disk_type", "boot_disk_gb",
                   "data_disk_type", "data_disk_gb")
     reuse_pricing = (
@@ -526,12 +528,14 @@ def _live_instance_record(
         ram_utilization_percent=0.0,
         project=project,
         now_epoch=now,
+        # Outside the catalog no regional tax default is known: never borrow another region's.
+        tax_rate_percent=None if region_known else 0.0,
         pricing=copy.deepcopy(reuse_pricing) if reuse_pricing is not None else None,
     )
-    if not any(r["region"] == region for r in REGIONS_CATALOG):
-        # Outside the catalog the record must not borrow another region's location.
+    if not region_known:
+        # Outside the catalog the record must not borrow another region's location or tax.
         record.update({"display_location": region, "continent": "", "lat": None, "lon": None,
-                       "map_x": None, "map_y": None})
+                       "map_x": None, "map_y": None, "tax_rate_known": False})
     stopped_epoch: float | None = None
     if status == "RUNNING":
         trigger = "Active — RUNNING in the live Compute Engine inventory"
@@ -578,6 +582,7 @@ def _live_instance_record(
         "spot": bool(obs.get("spot")),
         "specs_known": bool(obs.get("specs_known", True)),
         "runner_limits_known": bool(obs.get("runner_limits_known", True)),
+        "runners_count_known": bool(obs.get("runners_count_known", True)),
         "started_epoch": started_epoch,
         "started_at": _iso_epoch(started_epoch),
         "stopped_epoch": stopped_epoch,
@@ -1495,6 +1500,9 @@ class DashboardStore:
         if isinstance(instances, list):
             # Malformed (non-object) entries stay so that validation below rejects the whole state.
             kept = [r for r in instances if not isinstance(r, dict) or is_live_instance_record(r)]
+            if getattr(self, "fleet_source", None) is None:
+                # Without a live source nothing would ever update these records: showing them would be stale.
+                kept = [r for r in kept if not isinstance(r, dict)]
             if len(kept) != len(instances):
                 # Demo seed records and VMs fabricated by the old in-dashboard lifecycle actions never existed in
                 # Compute Engine; only inventory records survive a load.
@@ -2664,6 +2672,46 @@ class DashboardStore:
             for inst in running
         ]
 
+    def _hold_for_unknown_runner_counts(self, evaluation: dict[str, Any]) -> dict[str, Any]:
+        """Fail closed: with a running host of unknown runner count, recommend no runner change."""
+        unknown = self.state.get("scaling_telemetry", {}).get("unknown_runner_count_hosts") or []
+        if not unknown:
+            return evaluation
+        return {
+            **evaluation,
+            "direction": "hold",
+            "desired_runners": evaluation.get("current_runners"),
+            "desired_instances": evaluation.get("current_instances"),
+            "scale_up_reasons": [],
+            "scale_down_reasons": [],
+            "hold_reason": (f"Runner count not recorded on {len(unknown)} running host(s) "
+                            f"({', '.join(unknown[:5])}); slot totals are unknown"),
+        }
+
+    def _stopped_disk_burn(self, role: str) -> float:
+        """Hourly disk USD of the role's stopped inventory VMs, under the role's disk and tax budget flags."""
+        prof = self.state.get("profiles", {}).get(role, {})
+        pol = self.state.get("scaling", {}).get(role, {})
+        budget = prof.get("budget", {}) if isinstance(prof.get("budget"), dict) else {}
+        if not bool(pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))):
+            return 0.0
+        include_tax = bool(budget.get("include_taxes", False))
+        return round(sum(
+            _stopped_disk_hourly(inst.get("pricing") or {}, include_tax=include_tax)
+            for inst in self.state.get("instances", [])
+            if is_live_instance_record(inst) and inst.get("role") == role
+            and inst.get("status") not in ("RUNNING", "DELETED")
+        ), 4)
+
+    def _outside_burn(self, role: str, *, shared: bool, other_running_burn: float) -> float | None:
+        """Burn a role's scaling budget must leave room for: its stopped VMs' disks, plus (under a shared budget)
+        the other role's running fleet and stopped disks. None when there is none and the budget is not shared."""
+        other_role = "rust_builder" if role == "cicd_runner" else "cicd_runner"
+        own = self._stopped_disk_burn(role)
+        if not shared:
+            return own if own > 0.0 else None
+        return round(own + other_running_burn + self._stopped_disk_burn(other_role), 4)
+
     def _sync_fleet_telemetry(self) -> None:
         """Synchronize scaling telemetry counters, CPU percentages, and active fleet hourly rates with running instances."""
         running_runners = [
@@ -2678,6 +2726,10 @@ class DashboardStore:
         ]
         telem = self.state.setdefault("scaling_telemetry", {})
         telem["current_runners"] = sum(int(inst.get("runners_count", 0)) for inst in running_runners)
+        # Hosts whose runner count is not recorded: slot totals are unknown, so slot-based decisions hold.
+        telem["unknown_runner_count_hosts"] = [
+            str(inst.get("name")) for inst in running_runners if inst.get("runners_count_known") is False
+        ]
         telem["current_instances"] = len(running_runners)
         # Inventory records carry no utilization: a made-up 0% would read as idle and recommend scale-in.
         telem["instance_cpu_percentages"] = [
@@ -3035,7 +3087,7 @@ class DashboardStore:
                 self.state["scaling"]["rust_builder"].get("shared_global_budget")
                 or self.state.get("global_budget_enforced")
             )
-            scaling_eval = evaluate_scaling_decision(
+            scaling_eval = self._hold_for_unknown_runner_counts(evaluate_scaling_decision(
                 self.state["scaling"]["cicd_runner"],
                 self.state["scaling_telemetry"],
                 per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd(
@@ -3044,18 +3096,20 @@ class DashboardStore:
                 max_instances=int(
                     self.state["profiles"]["cicd_runner"].get("max_instances", 8)
                 ),
-                other_role_hourly_usd=sum(running_builder_rates) if ci_shared else None,
-            )
+                other_role_hourly_usd=self._outside_burn(
+                    "cicd_runner", shared=ci_shared, other_running_burn=sum(running_builder_rates)),
+            ))
             builder_scaling_eval = evaluate_builder_scaling_decision(
                 self.state["scaling"]["rust_builder"],
                 self.state["scaling_telemetry"],
                 per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd(
                     "rust_builder", builder_qual
                 ),
-                other_role_hourly_usd=(
-                    max(sum(running_runner_rates), float(scaling_eval.get("projected_hourly_usd", 0.0)))
-                    if builder_shared
-                    else None
+                other_role_hourly_usd=self._outside_burn(
+                    "rust_builder",
+                    shared=builder_shared,
+                    other_running_burn=max(sum(running_runner_rates),
+                                           float(scaling_eval.get("projected_hourly_usd", 0.0))),
                 ),
             )
             instances_view = self.query_instances(
@@ -3143,7 +3197,8 @@ class DashboardStore:
         with self._lock:
             self._refresh_instances_pricing()
             now_ts = time.time()
-            window_hours = max(0.5, _finite_float(window_hours, "window_hours", min_val=0.0))
+            # History (deleted VMs, earlier runs) is kept for the retention period, so no longer window is offered.
+            window_hours = min(MAX_WINDOW_HOURS, max(0.5, _finite_float(window_hours, "window_hours", min_val=0.0)))
             window_start_ts = now_ts - window_hours * 3600.0
             q = (search_filter or "").strip().lower()
             r_filter = (role_filter or "").strip().lower()
@@ -3151,7 +3206,9 @@ class DashboardStore:
             rows: list[dict[str, Any]] = []
             for inst in self.state["instances"]:
                 is_deleted = inst["status"] != "RUNNING"
-                if is_deleted and not include_deleted:
+                # A stopped inventory VM still exists (and bills its disks): only DELETED is "deleted" here.
+                hidden_as_deleted = inst["status"] == "DELETED" if is_live_instance_record(inst) else is_deleted
+                if hidden_as_deleted and not include_deleted:
                     continue
                 deleted_ts = _instance_end_epoch(inst)
                 started_ts = float(inst.get("started_epoch", now_ts - 3600.0))
@@ -3838,28 +3895,31 @@ class DashboardStore:
                     ),
                     4,
                 )
-                cicd_eval = evaluate_scaling_decision(
+                cicd_eval = self._hold_for_unknown_runner_counts(evaluate_scaling_decision(
                     self.state["scaling"]["cicd_runner"],
                     self.state["scaling_telemetry"],
                     per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("cicd_runner"),
                     max_instances=int(
                         self.state["profiles"]["cicd_runner"].get("max_instances", 8)
                     ),
-                    other_role_hourly_usd=(
-                        builder_burn_for_runner
-                        if (global_budget_shared or self.state["scaling"]["cicd_runner"].get("shared_global_budget"))
-                        else 0.0
-                    ),
-                )
+                    other_role_hourly_usd=self._outside_burn(
+                        "cicd_runner",
+                        shared=bool(global_budget_shared
+                                    or self.state["scaling"]["cicd_runner"].get("shared_global_budget")),
+                        other_running_burn=builder_burn_for_runner,
+                    ) or 0.0,
+                ))
                 builder_eval = evaluate_builder_scaling_decision(
                     self.state["scaling"]["rust_builder"],
                     self.state["scaling_telemetry"],
                     per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
-                    other_role_hourly_usd=(
-                        max(runner_burn_for_builder, float(cicd_eval.get("projected_hourly_usd", 0.0)))
-                        if (global_budget_shared or self.state["scaling"]["rust_builder"].get("shared_global_budget"))
-                        else 0.0
-                    ),
+                    other_role_hourly_usd=self._outside_burn(
+                        "rust_builder",
+                        shared=bool(global_budget_shared
+                                    or self.state["scaling"]["rust_builder"].get("shared_global_budget")),
+                        other_running_burn=max(runner_burn_for_builder,
+                                               float(cicd_eval.get("projected_hourly_usd", 0.0))),
+                    ) or 0.0,
                 )
                 self._persist()
             except Exception:
@@ -4617,6 +4677,13 @@ class DashboardStore:
                     int(i.get("runners_count", 1)) for i in existing_running_role
                 )
                 projected_runner_slots = previous_runner_slots
+                unknown_counts = [str(i.get("name")) for i in existing_running_role
+                                  if i.get("runners_count_known") is False]
+                if role == "cicd_runner" and unknown_counts:
+                    raise ValueError(
+                        f"Runner count is not recorded on running host(s) {', '.join(unknown_counts[:5])}; "
+                        "the runner total is unknown, so a scale-up cannot be checked against max_runners"
+                    )
                 max_runners_cap = max(
                     int(prof.get("min_runners", 1)),
                     int(pol.get("max_runners", 24)),
@@ -5111,6 +5178,7 @@ class DashboardStore:
                 self.state["scaling_telemetry"],
                 per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
                 now_epoch=now_ts,
+                other_role_hourly_usd=self._stopped_disk_burn("rust_builder") or None,
             )
             return {
                 "status": "ok",

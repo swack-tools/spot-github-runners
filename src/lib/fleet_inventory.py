@@ -124,6 +124,7 @@ def observe_fleet_items(
             # (listeners are not memory capacity), so they are unknown here rather than guessed.
             runners_count = int(deployment.get("runners_count", 0) or 0)
             runner_vcpu, runner_ram_gib, runner_limits_known = 0, 0.0, False
+        runners_count_known = role == "rust_builder" or "runners_count" in deployment
         observed.append({
             "instance_id": instance_id,
             "name": name,
@@ -145,6 +146,7 @@ def observe_fleet_items(
             "runner_vcpu": runner_vcpu,
             "runner_ram_gib": runner_ram_gib,
             "runner_limits_known": runner_limits_known,
+            "runners_count_known": runners_count_known,
             "runner_label": str(deployment.get("runner_label", "") or ""),
             "target_label": str((item.get("labels") or {}).get("spot-target", "")
                                 if isinstance(item.get("labels"), dict) else ""),
@@ -179,15 +181,16 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                     raise RuntimeError(f"zones unreachable: {', '.join(unreachables[:5])}")
                 fleet_items = [i for i in items if isinstance(i, dict)
                                and str(i.get("name", "")).startswith(FLEET_NAME_PREFIXES)]
+                disk_types: dict[str, str] = {}
                 try:
-                    disk_types = await compute_api.list_disk_types(api, auth.project) if fleet_items else {}
-                    disk_listing["ok_before"] = True
+                    if fleet_items:
+                        disk_types = await compute_api.list_disk_types(api, auth.project)
+                        disk_listing["ok_before"] = True
                 except Exception as exc:
                     if disk_listing["ok_before"]:
                         # Transient: fail the whole listing so known disk types are not replaced by defaults.
                         raise RuntimeError(f"disk listing failed: {type(exc).__name__}: {exc}") from exc
                     # Never worked (for example no compute.disks.list): disk types fall back to the default.
-                    disk_types = {}
                 wanted = {(str(i.get("zone", "")).rsplit("/", 1)[-1], str(i.get("machineType", "")).rsplit("/", 1)[-1])
                           for i in fleet_items}
                 for zone, machine_type in wanted - shape_cache.keys():
@@ -196,8 +199,12 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                     try:
                         shape_cache[(zone, machine_type)] = await compute_api.machine_type_capacity(
                             api, auth.project, zone, machine_type)
-                    except Exception:  # noqa: BLE001 - unknown capacity is reported as such, retried next time
+                    except Exception:  # noqa: BLE001 - reported below, retried next time
                         pass
+                missing = sorted(f"{mt} in {zone}" for zone, mt in wanted - shape_cache.keys() if zone and mt)
+                if missing:
+                    # Unknown RAM would price as free: fail the refresh (records stay as they were) instead.
+                    raise RuntimeError(f"machine type capacity unavailable: {', '.join(missing[:5])}")
                 return observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache)
             finally:
                 while not api.connections.empty():

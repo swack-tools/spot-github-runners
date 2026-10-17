@@ -336,38 +336,47 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `oxidex-runners-` (runner hosts) or `builder-` (dedicated builders). Control VMs and other VMs aren't
   listed. The control VM's service account needs `compute.instances.list` and
   `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
-  they show `pd-balanced`. Once a disk listing has succeeded, a failed one fails the whole refresh, so
-  known disk types are never replaced by the default.
+  they show `pd-balanced`. Once a disk listing has succeeded, a failed or partial one fails the whole
+  refresh, so known disk types are never replaced by the default. A machine type whose capacity can't
+  be read also fails the refresh, so no VM is priced without its memory.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
   `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted. When a VM starts
   again, its earlier running intervals stay in its runtime and window spend. Only `RUNNING` VMs count
-  toward the runner and builder telemetry. The listing carries no CPU utilization, so inventory VMs
-  never trigger a CPU-based scale-down recommendation.
+  toward the runner and builder telemetry, but the disks of stopped VMs count against the scaling
+  budgets. Hiding deleted instances doesn't hide stopped VMs, because they still exist. The listing
+  carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.
 - A VM that was listed before and is no longer in the inventory becomes `DELETED`. Its deletion time is
-  the time of the first listing that missed it. Deleted VMs stay in the history for 31 days. A VM that's
+  the time of the first listing that missed it. Deleted VMs and earlier runs stay in the history for 31
+  days, and cost windows are limited to 744 hours (31 days) to match. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
 - Spend covers each VM's attached disks while the VM exists. A dedicated builder's cache disk
   (`auto-delete=no`) outlives its VM, and the dashboard doesn't count it after the VM is deleted.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
-  template can't copy them from such a host.
+  template can't copy them from such a host. When a running host has no recorded runner count, the
+  runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
+  plans are refused.
+- A VM in a region outside the dashboard's region catalog is priced with no tax, marked
+  `tax_rate_known: false`, rather than with another region's default tax.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
   inactive makes no Compute Engine calls and keeps the records the active slot last published.
 - The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
   already existed, so they don't mark OOM events handled. Only later growth in runner slots or builder
-  VMs does. A listing that
-  changes nothing writes nothing, so a quiet fleet doesn't publish a new snapshot.
+  VMs does. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
+  snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
-  empty and the instances tab says that the inventory isn't configured.
+  empty and the instances tab says that the inventory isn't configured. Inventory records loaded from
+  a state file or snapshot are dropped too, since nothing would keep them current.
 - On load, from the state file, a KV snapshot, or a handover import, the dashboard drops every instance
   record that didn't come from the inventory. These are the demo instances that earlier versions seeded,
   such as `oxidex-runners-dallas-01`, and records that the old in-dashboard actions invented.
 - The delete and regional scale controls, `POST /api/instances/delete` and
   `POST /api/instances/scale-region`, are plans only. They check the request against budgets and caps
-  and report what would launch or retire. The budget projection includes the disks of stopped VMs. They don't change the instance list or any VM. The autoscaler
+  and report what would launch or retire. The budget projection includes the disks of stopped VMs.
+  They don't change the instance list or any VM. The autoscaler
   (`src/spot_runner_autoscaler.py`) drains and retires runner hosts, `src/spot_runner_manager.py`
   provisions them, and `src/render_builder_startup.py` renders a dedicated builder.
 

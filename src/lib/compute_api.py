@@ -357,11 +357,14 @@ async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, str]:
     query = {
         "maxResults": "500",
         "returnPartialSuccess": "true",
-        "fields": "nextPageToken,items/*/disks(selfLink,type)",
+        "fields": "nextPageToken,unreachables,items/*/disks(selfLink,type)",
     }
     types: dict[str, str] = {}
     while True:
         data = await api.get_json(path, query)
+        if data.get("unreachables"):
+            # A partial listing would silently drop those zones' disks (and their known types).
+            raise RuntimeError(f"disk listing zones unreachable: {', '.join(data['unreachables'][:5])}")
         for scoped in data.get("items", {}).values():
             for disk in scoped.get("disks", []):
                 if isinstance(disk, dict) and disk.get("selfLink"):
