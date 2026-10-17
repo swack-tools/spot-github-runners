@@ -33,6 +33,10 @@ python3 tools/spot_prices.py --min-cpu 4 --min-ram 8 \
   results.
 
 The tool prices M1 and M2 shapes, and the legacy N1 memory shapes, with the memory-optimized catalog rates.
+M2 on-demand and Spot prices apply only to an evaluation period, and long-running M2 use requires a
+resource-based commitment. Check the
+[M2 machine series requirements](https://docs.cloud.google.com/compute/docs/memory-optimized-machines#the_m2_machine_series)
+before you launch one.
 
 ## Find candidate offers
 

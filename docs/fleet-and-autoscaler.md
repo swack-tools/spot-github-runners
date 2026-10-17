@@ -20,7 +20,7 @@ Three entry points manage runner hosts. Run each from the repository root.
 | Entry point | Purpose | Changes resources? |
 | --- | --- | --- |
 | `src/runner_fleet.py` | Prints GitHub runner registrations, GCP VM counts, and the scale-out plan that restores a runner floor. | No |
-| `src/spot_runner_manager.py` | Previews or provisions one runner host, or a strict heavy-runner pool. | Only with `--apply` |
+| `src/spot_runner_manager.py` | Previews or provisions one runner host, or a strict heavy-runner pool. | With `--apply`, and with `--patch-live`, which changes a running VM and its runner containers at once without `--apply` |
 | `src/spot_runner_autoscaler.py` | Runs the control loop that launches, drains, rotates, and deletes hosts. | Yes (see the warning at the top of this page) |
 
 The autoscaler runs the same loop in every mode. Each check does the following:
