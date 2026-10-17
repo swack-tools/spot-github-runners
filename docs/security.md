@@ -186,9 +186,14 @@ These checks authenticate sources and process lifetimes. They don't certify an i
 
 The dashboard doesn't run on runner hosts or builders. Runner containers run workflow code, so a dashboard
 there would expose its session key and GitHub tokens to that code. The dashboard runs on a separate control
-VM instead, and the control VM can't reach runner hosts:
+VM instead. The dashboard image can't manage runner hosts, but that isn't a network boundary:
 
-- The dashboard image has no `gcloud` and no SSH credentials. The VM's service account and network still decide what the VM could reach in the project, so give the VM a dedicated service account that has only Secret Manager access, `compute.instances.list`, and `compute.machineTypes.get`, not a broad default account. Without `compute.machineTypes.get`, a host's vCPU and RAM stay unknown, and the patch preview classifies patches with hardware minimums as `unknown`. Runner hosts can reach the metadata server too.
+- The dashboard image has no `gcloud` and no SSH credentials, so the shipped dashboard can't manage hosts. That
+  doesn't stop network traffic. Runner hosts use the project's `default` network, the control VM doesn't pick an
+  isolated network, and this repository manages no firewall rules, so whether the control VM can reach runner
+  hosts depends on your VPC and firewall. Add the isolation yourself, for example a firewall rule that denies
+  ingress to runner hosts from the control VM's service account or network tag.
+- The VM's service account and network still decide what the VM could reach in the project, so give the VM a dedicated service account that has only Secret Manager access, `compute.instances.list`, and `compute.machineTypes.get`, not a broad default account. Without `compute.machineTypes.get`, a host's vCPU and RAM stay unknown, and the patch preview classifies patches with hardware minimums as `unknown`. Runner hosts can reach the metadata server too.
 - The dashboard's hot-patch action therefore answers HTTP 501 with `"code": "hot_patch_unavailable"` on the
   control VM. Hot-patch runner hosts from an operator workstation with the full `--patch-live` command,
   which needs every deployment value the host was provisioned with. See

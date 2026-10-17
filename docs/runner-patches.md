@@ -259,7 +259,15 @@ When the plan is correct, add `--apply` to the same command. The manager renders
 
 `--patch-live` applies a patch to a running VM and its runner containers. The command has no preview mode and doesn't need `--apply`: it acts as soon as the checks pass. Preview the effect first in the dashboard, which classifies every recorded host for a repository without changing anything. See [Preview and hot-patch](dashboard.md#the-patch-console).
 
-You must pass the same deployment values that the host was provisioned with, because the live patch derives the runner names, labels, and runner group from them. The values include `--instance-name`, `--instance-type`, `--region`, `--zone`, `--runner-prefix`, `--runner-count`, `--runner-label`, `--target`, and `--runner-group-id`. A mismatch with the observed VM, such as a different `--instance-type`, is refused.
+You must pass the same deployment values that the host was provisioned with, because the live patch derives the runner names, labels, and runner group from them. The values include `--instance-name`, `--instance-type`, `--region`, `--zone`, `--runner-prefix`, `--runner-count`, `--runner-label`, `--target`, and `--runner-group-id`.
+
+The manager also selects the host's sizing before it applies the patch, so replay the sizing mode the host was provisioned with, whichever applies:
+
+- For a tier host, pass `--tier`, and add `--tier-slots`, `--tier-job-memory-gib`, and `--host-overhead-gib` when you changed them from their defaults.
+- For fixed sizing, pass `--fixed-runner-sizing` with `--runner-cpu`, `--runner-memory-gb`, and `--runner-count`.
+- For a strict heavy pool, pass `--heavy-runner-pool` with the same pool size (`2` or `3`).
+
+A mismatch with the observed VM, such as a different `--instance-type`, is refused.
 
 ```bash
 PYTHONPATH=src python3 -B src/spot_runner_manager.py \
@@ -270,6 +278,8 @@ PYTHONPATH=src python3 -B src/spot_runner_manager.py \
   --target <org-or-owner/repo> --runner-group-id <group-id> \
   --patch-repo OWNER/REPO --patch-live
 ```
+
+The example doesn't include a sizing mode. Add the `--tier`, `--fixed-runner-sizing`, or `--heavy-runner-pool` flags that match your host. A strict heavy pool also replaces `--runner-count` and `--runner-label` with its own values.
 
 The command refuses, and changes nothing, in these cases:
 

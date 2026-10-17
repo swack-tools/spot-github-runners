@@ -50,7 +50,7 @@ Pages. You can also read the Markdown sources directly.
 | Render a dedicated builder launch | `src/render_builder_startup.py` | Writes local files; the generated launch command creates a VM |
 | Build on an explicitly selected legacy host | `src/remote_rust_build.py` | Transfers source and starts a remote build |
 | Install Cargo client commands | `src/install_remote_commands.py` | Writes local executable shims |
-| Run the Web UI control plane and telemetry dashboard | `src/web_dashboard.py` | Updates local dashboard state file |
+| Run the Web UI control plane and telemetry dashboard | `src/web_dashboard.py` | Updates the local dashboard state file. With `SPOT_CONFIG_REPO` configured, `POST /api/patches/save` creates a branch, commits, and opens a pull request on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts. |
 | Update an occupied dedicated builder in place | `src/lib/builder_runtime_update.py` | Only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed` |
 | Inspect, plan, or manage the Spot control VM that hosts the dashboard | `src/control_vm.py` | Only with `--apply`; `render-startup` writes a local file |
 

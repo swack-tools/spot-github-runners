@@ -212,7 +212,14 @@ def runner_count(offer: Offer, runners: int | None) -> float:
 
 
 def vcpu_per_runner(offer: Offer, runners: int | None) -> float:
-    return offer.vcpu / runner_count(offer, runners)
+    count = runner_count(offer, runners)
+    return offer.vcpu / count if count else 0.0
+
+
+def per_runner_usd(total_usd: float, offer: Offer, runners: int | None) -> float:
+    """Split a total price evenly across the runners on the host; zero runners yield zero."""
+    count = runner_count(offer, runners)
+    return total_usd / count if count else 0.0
 
 
 def print_offer(offer: Offer, prefix: str = "", runners: int | None = None) -> None:
@@ -223,8 +230,8 @@ def print_offer(offer: Offer, prefix: str = "", runners: int | None = None) -> N
           f"({count:g} runners, {vcpu_share:g} vCPU/runner; "
           f"${offer.hourly_usd * 24:.4f}/day, "
           f"${offer.hourly_usd * 730:.4f}/month at 730h, "
-          f"${offer.hourly_usd * 24 / vcpu_share:.4f}/runner/day, "
-          f"${offer.hourly_usd * 730 / vcpu_share:.4f}/runner/month)", flush=True)
+          f"${per_runner_usd(offer.hourly_usd * 24, offer, runners):.4f}/runner/day, "
+          f"${per_runner_usd(offer.hourly_usd * 730, offer, runners):.4f}/runner/month)", flush=True)
 
 
 def parse_ram(value: str) -> float:
@@ -243,8 +250,8 @@ def render_table(offers: list[Offer], runners: int) -> None:
              f"${o.hourly_usd:.6f}", f"${o.hourly_usd * 24:.4f}",
              f"${o.hourly_usd * 730:.4f}",
              f"{runner_count(o, runners):g}", f"{vcpu_per_runner(o, runners):g}",
-             f"${o.hourly_usd * 24 / vcpu_per_runner(o, runners):.4f}",
-             f"${o.hourly_usd * 730 / vcpu_per_runner(o, runners):.4f}") for o in offers]
+             f"${per_runner_usd(o.hourly_usd * 24, o, runners):.4f}",
+             f"${per_runner_usd(o.hourly_usd * 730, o, runners):.4f}") for o in offers]
     widths = [max([len(headers[i]), *(len(row[i]) for row in rows)]) for i in range(len(headers))]
     print(" | ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("-+-".join("-" * width for width in widths))

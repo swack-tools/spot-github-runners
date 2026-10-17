@@ -21,7 +21,7 @@ The last column names the exact flag or action that makes it change something.
 | [`src/spot_runner_manager.py`](#spot-runner-manager) | Prints a plan after read-only checks | `--apply`, or `--patch-live` (which needs no `--apply`) |
 | [`src/spot_runner_autoscaler.py`](#spot-runner-autoscaler) | Manages the fleet | `--dry-run` makes it read-only; `--install-launch-agent` installs the macOS agent |
 | [`src/control_vm.py`](#control-vm) | `status` and `plan` read only | `ensure --apply`, `rotate --apply`; `render-startup` always writes its `--output` file |
-| [`src/web_dashboard.py`](#web-dashboard) | Serves HTTP | `--state-file` persists state; served POST routes can change state |
+| [`src/web_dashboard.py`](#web-dashboard) | Serves HTTP | `--state-file` persists state; served POST routes can change state. With `SPOT_CONFIG_REPO` configured, `POST /api/patches/save` opens a pull request on the config repository, and with `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts |
 | [`src/render_builder_startup.py`](#render-builder-startup) | Writes a local directory | Running the rendered `launch-command.sh` creates a billable VM |
 | [`src/lib/builder_runtime_update.py`](#builder-runtime-update) | Captures and checks only | `--apply`, `--finish`, `--recover-committed`, `--recover-finish` |
 | [`src/remote_rust_build.py`](#remote-rust-build) | Uploads source and builds | Always changes the selected host |
@@ -82,7 +82,10 @@ below the on-demand price.
 - **Prices.** Compute only. Disk, network, operating system licensing, and
   capacity are excluded.
 - **Exit codes.** `0` on success, `1` on an authentication or API error, `2`
-  when no offer matches.
+  when no offer matches. If some regional price requests fail but offers
+  remain, the scan is partial: the command prints a warning and the first
+  five errors on stderr, still lists the remaining offers, and exits `0`. If every
+  request fails, no offer remains and the command exits `2`.
 - **Alerts.** The 95 percent alert needs either `--list-price` or a Billing
   Catalog API key from `--billing-api-key` or the `GOOGLE_CLOUD_API_KEY`
   environment variable. Without either, the command prints a notice that the
@@ -368,7 +371,10 @@ durability.
 - **Effect.** The server writes local state only when you pass `--state-file`.
   The server also exposes POST routes, such as `/api/instances/delete` and
   `/api/patches/hot-patch`, so treat a running dashboard as able to change
-  state.
+  state. With `SPOT_CONFIG_REPO` (or `--config-repo`) configured,
+  `POST /api/patches/save` creates a branch, commits, and opens a pull request
+  on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`,
+  `/api/patches/hot-patch` changes running hosts.
 - **Binding.** The default bind address is loopback. A non-loopback `--host`
   needs authentication (`--auth-token` or GitHub OAuth 2.0) and either TLS or
   `--allow-insecure-non-loopback` behind a trusted TLS-terminating proxy. The

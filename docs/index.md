@@ -66,7 +66,7 @@ persisted operation state, and changes one host at a time. The dashboard doesn't
 | Render a dedicated builder launch | `src/render_builder_startup.py` | Writes local files. The generated launch command creates a VM. |
 | Build on an explicitly selected legacy host | `src/remote_rust_build.py` | Transfers source and starts a remote build |
 | Install Cargo client commands | `src/install_remote_commands.py` | Writes local executable shims |
-| Run the web dashboard | `src/web_dashboard.py` | Updates the local dashboard state file |
+| Run the web dashboard | `src/web_dashboard.py` | Updates the local dashboard state file. With `SPOT_CONFIG_REPO` configured, `POST /api/patches/save` creates a branch, commits, and opens a pull request on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts. |
 | Inspect, plan, or manage the control VM that hosts the dashboard | `src/control_vm.py` | Only with `--apply`; `render-startup` writes a local file |
 | Update an occupied dedicated builder in place | `src/lib/builder_runtime_update.py` | Only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed` |
 

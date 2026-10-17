@@ -52,14 +52,18 @@ python3 src/spot_finder.py \
 
 - The defaults are `--min-vcpu 32`, `--min-ram 128`, and `--top 10`. `--min-ram` accepts a number with an
   optional `GB` or `GiB` suffix.
-- Each row shows the hourly, daily, and monthly price (730 hours) and the cost per runner. By default a host
-  gets one runner for every 4 vCPUs. Set `--runners` to change that count.
+- Each row shows the hourly, daily, and monthly price (730 hours), the runner count, the vCPUs per runner, and
+  the cost per runner. By default a host gets one runner for every 4 vCPUs, so a 32 vCPU host has 8 runners. Set
+  `--runners` to change that count. The cost per runner is the host's total price divided by the runner count,
+  so the daily figure for a 32 vCPU host is one eighth of its daily price by default.
 - The finder prints a discount alert for each offer that is at least 95 percent below the on-demand price. It
   compares against `--list-price` (an hourly on-demand baseline) or, when a Billing Catalog API key is set
   with `--billing-api-key` or `GOOGLE_CLOUD_API_KEY`, against the public on-demand rates. Without either, the
   alerts are turned off and the tool says so.
 - `--concurrency` limits parallel API requests (default 600). Repeat `-v` for more diagnostic detail.
 - The exit status is 2 when no matching Spot price data exists, and 1 for an authentication or inventory error.
+  A partial scan exits 0 and prints a warning on stderr. In a partial scan, some regional price requests fail but
+  offers remain. If every request fails, the status is 2.
 
 ## Treat results as candidates
 
