@@ -61,8 +61,9 @@ LOCK_SCHEMA = "spot-control-vm-lock-v1"
 # refuses to run, so a workstation that lost SPOT_CONTROL_STATE_URI fails closed instead of acting on old state.
 
 LEASE_TTL_SECONDS = 1200
-# Renew once less than this is left. It exceeds the longest single blocking call a tick makes (default_gcloud's
-# 600 s subprocess timeout) plus margin, so a call started inside the lease also ends inside it.
+# Renew once less than this is left; the guard never returns with less. It exceeds the longest single blocking call a
+# tick makes (control_vm.GCLOUD_TIMEOUT_SECONDS, 600 s) plus 60 s of slack, so a call started inside the lease also
+# ends inside it.
 LEASE_MIN_REMAINING_SECONDS = 660
 # Contenders break a lease only this long after its server-clock expiry.
 LEASE_STALE_GRACE_SECONDS = 60
@@ -554,13 +555,15 @@ class GcsLease:
         if not self.held:
             raise LeaseLost("the control VM lease is not held")
         now = self._now()
-        if self.remaining() < need or self._suspended(now):
-            self.renew()
-            if self.remaining() < need:
-                raise LeaseLost("the renewed control VM lease is shorter than the next call may take")
-            return
-        if self._elapsed(self._confirmed, now) >= LEASE_REVALIDATE_SECONDS:
-            self.revalidate()
+        if self.remaining() >= need and not self._suspended(now):
+            if self._elapsed(self._confirmed, now) >= LEASE_REVALIDATE_SECONDS:
+                self.revalidate()
+            # Checked again after the re-read, which can be slow or retried: on return at least ``need`` is left.
+            if self.remaining() >= need:
+                return
+        self.renew()
+        if self.remaining() < need:
+            raise LeaseLost("the renewed control VM lease is shorter than the next call may take")
 
     def release(self) -> None:
         """Delete the lock only if it is still our generation; a lost lease is left alone and logged."""

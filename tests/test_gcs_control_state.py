@@ -363,6 +363,34 @@ class SuspendAwareLeaseTests(unittest.TestCase):
             mac.ensure()
         self.assertEqual(len(self.w.server.writes()), writes, "a lost lease is detected by reading, not writing")
 
+    def test_a_slow_revalidation_that_eats_the_margin_renews_before_returning(self):
+        mac = self.lease("mac")
+        self.assertTrue(mac.acquire())
+        self.w.advance(gcs.LEASE_REVALIDATE_SECONDS)
+        self.mono[0] += gcs.LEASE_REVALIDATE_SECONDS
+        self.assertGreater(mac.remaining(), gcs.LEASE_MIN_REMAINING_SECONDS)  # enough before the re-read
+
+        def slow(method, name, query):
+            if method == "GET":  # each of the two re-reads takes 300 s (retries, a stalled connection)
+                self.w.advance(300)
+                self.mono[0] += 300
+        self.w.server.before = slow
+        writes = len(self.w.server.writes())
+        mac.ensure()
+        self.w.server.before = None
+        self.assertEqual(len(self.w.server.writes()), writes + 1, "the margin was gone after the re-read: renew")
+        self.assertGreaterEqual(mac.remaining(), gcs.LEASE_MIN_REMAINING_SECONDS)
+        # The same, but the renewal can't be proven: the guard fails instead of returning with too little left.
+        self.w.advance(gcs.LEASE_REVALIDATE_SECONDS)
+        self.mono[0] += gcs.LEASE_REVALIDATE_SECONDS
+        self.w.server.before = slow
+        self.w.server.faults.append(("POST", 403))
+        with self.assertRaises(gcs.LeaseLost):
+            mac.ensure()
+
+    def test_the_guard_margin_covers_the_longest_provider_call(self):
+        self.assertGreaterEqual(gcs.LEASE_MIN_REMAINING_SECONDS, cv.GCLOUD_TIMEOUT_SECONDS + 60)
+
     def test_a_wall_clock_stepped_back_keeps_monotonic_time(self):
         mac = self.lease("mac")
         self.assertTrue(mac.acquire())

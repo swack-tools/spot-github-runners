@@ -8,10 +8,16 @@ import base64
 import hashlib
 import http.client
 import json
+import os
 import random
+import signal
 import subprocess
+import sys
+import tempfile
 import threading
+import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from lib import control_watchdog_server as server
@@ -180,7 +186,140 @@ class IdentityTests(unittest.TestCase):
             fresh.verify({"Authorization": f"Bearer {token()}"})
 
 
+class FakeProcess:
+    pid = 4242
+
+    def __init__(self, fn, argv, kwargs):
+        self.fn, self.argv, self.kwargs = fn, argv, kwargs
+        self.returncode = None
+        self.calls = 0
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        if self.calls > 1:
+            return "", ""
+        result = self.fn(self.argv, dict(self.kwargs, timeout=timeout))
+        self.returncode = result.returncode
+        return result.stdout, result.stderr
+
+
+def fake_popen(fn, made=None):
+    def popen(argv, **kwargs):
+        process = FakeProcess(fn, argv, kwargs)
+        if made is not None:
+            made.append(process)
+        return process
+    return popen
+
+
+def fake_runner(fn, signals=None, **kw):
+    def killpg(pid, sig):
+        if signals is not None:
+            signals.append((pid, sig))
+        if sig == 0:
+            raise ProcessLookupError  # the group is gone
+    return server.TickRunner(["x"], popen=fake_popen(fn), killpg=killpg, **kw)
+
+
+GRANDCHILD = """
+import os, signal, subprocess, sys, time
+path = sys.argv[1]
+script = ("import os, signal, sys, time\\n"
+          "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"  # like a gcloud that ignores SIGTERM
+          "open(sys.argv[1], 'w').write(str(os.getpid()))\\n"
+          "time.sleep(120)\\n")
+subprocess.Popen([sys.executable, "-c", script, path])
+time.sleep(120)
+"""
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+class ProcessGroupTests(unittest.TestCase):
+    """Real processes: a tick whose gcloud-like grandchild ignores SIGTERM."""
+
+    def start(self, timeout):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.pidfile = Path(directory.name) / "grandchild.pid"
+        return server.TickRunner([sys.executable, "-c", GRANDCHILD, str(self.pidfile)], timeout=timeout,
+                                 term_grace=0.5)
+
+    def grandchild(self):
+        for _ in range(500):
+            if self.pidfile.exists() and self.pidfile.read_text():
+                return int(self.pidfile.read_text())
+            time.sleep(0.01)
+        self.fail("the grandchild never started")
+
+    def assert_gone(self, pid):
+        for _ in range(200):
+            if not alive(pid):
+                return
+            time.sleep(0.025)
+        os.kill(pid, signal.SIGKILL)
+        self.fail(f"grandchild {pid} survived the tick")
+
+    def test_timeout_kills_the_whole_process_group(self):
+        runner = self.start(timeout=2)
+        status, summary = runner.run()
+        self.assertEqual((status, summary["status"]), (500, "timeout"))
+        self.assert_gone(self.grandchild())
+
+    def test_server_sigterm_kills_the_running_tick_group(self):
+        runner = self.start(timeout=60)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(runner.run()))
+        worker.start()
+        pid = self.grandchild()
+        runner.terminate()
+        worker.join(10)
+        self.assertEqual((results[0][0], results[0][1]["status"]), (500, "terminated"))
+        self.assert_gone(pid)
+
+    def test_sigterm_handler_terminates_the_tick_and_exits(self):
+        calls = []
+        runner = SimpleNamespace(terminate=lambda: calls.append("terminate"))
+        previous = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        server.install_sigterm(None, runner)
+        handler = signal.getsignal(signal.SIGTERM)
+        with self.assertRaises(SystemExit):
+            handler(signal.SIGTERM, None)
+        self.assertEqual(calls, ["terminate"])
+
+
 class TickRunnerTests(unittest.TestCase):
+    def test_timing_leaves_the_lease_to_the_tick(self):
+        from lib import gcs_control_state as gcs
+        killed_by = server.TICK_TIMEOUT_SECONDS + server.TERM_GRACE_SECONDS + server.KILL_WAIT_SECONDS
+        breakable_after = gcs.LEASE_TTL_SECONDS + gcs.LEASE_STALE_GRACE_SECONDS
+        self.assertLess(killed_by + 300, breakable_after, "the group must be dead well before the lease can break")
+        self.assertLess(killed_by, 900, "and before the service's request timeout")
+
+    def test_timeout_signals_the_group_term_then_kill(self):
+        signals = []
+
+        def slow(argv, kw):
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        status, summary = fake_runner(slow, signals).run()
+        self.assertEqual((status, summary["status"]), (500, "timeout"))
+        self.assertEqual([s for _, s in signals][:2], [signal.SIGTERM, signal.SIGKILL])
+        self.assertTrue(all(pid == FakeProcess.pid for pid, _ in signals))
+
+    def test_ticks_start_in_their_own_session(self):
+        made = []
+        runner = server.TickRunner(["x"], popen=fake_popen(
+            lambda a, k: SimpleNamespace(returncode=0, stdout="", stderr=""), made), killpg=lambda p, s: None)
+        runner.run()
+        self.assertIs(made[0].kwargs["start_new_session"], True)
+
     def test_command_is_one_ensure_apply_step(self):
         command = server.tick_command("homelab-424523")
         self.assertEqual(command[1:2], ["-B"])
@@ -191,30 +330,25 @@ class TickRunnerTests(unittest.TestCase):
     def test_outcomes(self):
         calls = []
 
-        def ok(argv, **kw):
+        def ok(argv, kw):
             calls.append((argv, kw))
             return SimpleNamespace(returncode=0, stdout="Idle (no lock taken, nothing changed): noop\n", stderr="")
-        status, summary = server.TickRunner(["x"], runner=ok).run()
+        status, summary = fake_runner(ok).run()
         self.assertEqual((status, summary["status"], summary["exit_code"]), (200, "ok", 0))
         self.assertIn("Idle", summary["result"])
         self.assertEqual(calls[0][1]["timeout"], server.TICK_TIMEOUT_SECONDS)
         self.assertLess(server.TICK_TIMEOUT_SECONDS, 900)
-        failed = server.TickRunner(["x"], runner=lambda a, **k: SimpleNamespace(returncode=2, stdout="", stderr=""))
+        failed = fake_runner(lambda a, k: SimpleNamespace(returncode=2, stdout="", stderr=""))
         self.assertEqual(failed.run()[0], 500)
-
-        def slow(argv, **kw):
-            raise subprocess.TimeoutExpired(argv, kw["timeout"])
-        status, summary = server.TickRunner(["x"], runner=slow).run()
-        self.assertEqual((status, summary["status"]), (500, "timeout"))
 
     def test_one_tick_at_a_time(self):
         started, release = threading.Event(), threading.Event()
 
-        def blocking(argv, **kw):
+        def blocking(argv, kw):
             started.set()
             release.wait(5)
             return SimpleNamespace(returncode=0, stdout="done\n", stderr="")
-        runner = server.TickRunner(["x"], runner=blocking)
+        runner = fake_runner(blocking)
         results = []
         worker = threading.Thread(target=lambda: results.append(runner.run()))
         worker.start()
@@ -232,13 +366,13 @@ class HttpTests(unittest.TestCase):
         self.release = threading.Event()
         self.release.set()
 
-        def run(argv, **kw):
+        def run(argv, kw):
             self.ticks.append(argv)
             self.release.wait(5)
             return SimpleNamespace(returncode=0, stdout="Executed: noop\n", stderr="")
         v, _ = verifier()
-        self.httpd = server.build_server({}, host="127.0.0.1", port=0,
-                                         runner=server.TickRunner(["tick"], runner=run), verifier=v)
+        tick = server.TickRunner(["tick"], popen=fake_popen(run), killpg=lambda p, s: None)
+        self.httpd = server.build_server({}, host="127.0.0.1", port=0, runner=tick, verifier=v)
         thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(self.httpd.server_close)

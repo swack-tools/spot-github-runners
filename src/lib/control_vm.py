@@ -1076,11 +1076,14 @@ def created_instance_id(stdout: str | None, name: str) -> str:
                  if isinstance(row, dict) and row.get("name") == name and row.get("id")), "")
 
 
+GCLOUD_TIMEOUT_SECONDS = 600  # the longest single provider call; the lease guard leaves more than this
+
+
 def default_gcloud(argv: list[str]) -> Any:
     # Never accept partial Compute results (for example a zone that could not be listed): an omitted
     # VM would look missing and could be created again, giving two VMs the same slot identity.
     env = dict(os.environ, CLOUDSDK_COMPUTE_ALLOW_PARTIAL_ERROR="false") if argv[1:2] == ["compute"] else None
-    return subprocess.run(argv, check=False, text=True, capture_output=True, timeout=600, env=env)
+    return subprocess.run(argv, check=False, text=True, capture_output=True, timeout=GCLOUD_TIMEOUT_SECONDS, env=env)
 
 
 def default_offer_source(config: ControlConfig, gcloud: Callable[[list[str]], Any]) -> list[ControlOffer]:
@@ -1434,6 +1437,15 @@ class ControlVmManager:
         if plan.action != "noop" or self.cstate.get("transition") or obs.origin is None:
             return None
         active, other = obs.vm(obs.origin.slot), obs.vm(other_slot(obs.origin.slot))
+        if active is not None and not self._same_provisioning(active):
+            # A rollout creates the replacement in the configured mode, so it would switch modes implicitly; the
+            # switch between standard and Spot is always an explicit operator rotate (or the planner's own switch).
+            reason = (f"image rollout held: {active.name} is {active.provisioning_model or 'of unknown model'} but "
+                      f"{ENV_PROVISIONING}={self.config.provisioning}; an explicit rotate is required to change "
+                      f"modes")
+            self._note(reason, level=logging.WARNING)
+            return Plan(plan.action, f"{plan.reason}; {reason}", slot=plan.slot, target_slot=plan.target_slot,
+                        offer=plan.offer)
         ready = (active is not None and active.running and other is None
                  and (obs.health.get(obs.origin.slot) or HealthResult.unknown()).ok)
         now = self.clock()
@@ -1462,6 +1474,11 @@ class ControlVmManager:
         self._rollout = decision
         return Plan("rotate", f"image rollout: {decision.reason}", slot=active.slot,
                     target_slot=other_slot(active.slot), offer=best)
+
+    def _same_provisioning(self, vm: ControlVm) -> bool:
+        """The VM runs the configured mode: standard needs a VM the inventory reports standard; Spot accepts a Spot
+        VM or one whose model is unknown (VMs listed before the model was recorded were all Spot)."""
+        return vm.standard if self.config.standard else not vm.standard
 
     def _create_config(self, t: Mapping[str, Any]) -> ControlConfig:
         """The configuration a transition creates its VM with: its recorded image when it pinned one."""

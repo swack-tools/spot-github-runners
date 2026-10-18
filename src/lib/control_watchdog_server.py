@@ -24,6 +24,7 @@ import hmac
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -44,7 +45,14 @@ ENV_INVOKER = "WATCHDOG_INVOKER"
 ENV_VERIFY_SIGNATURE = "WATCHDOG_VERIFY_SIGNATURE"
 GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 GOOGLE_ISSUERS = ("https://accounts.google.com", "accounts.google.com")
-TICK_TIMEOUT_SECONDS = 840          # below the service's 900 s request timeout
+# Tick timing. The tick's child process takes the lease (LEASE_TTL_SECONDS = 1200) only after it starts, and a
+# contender may break the lease LEASE_STALE_GRACE_SECONDS = 60 after the last renewal sent by the child, so no
+# other controller can act earlier than 1260 s after the tick starts. A timed-out tick's whole process group is gone
+# by TICK_TIMEOUT_SECONDS + TERM_GRACE_SECONDS + KILL_WAIT_SECONDS = 840 + 10 + 5 = 855 s, 405 s before that, and
+# before the service's 900 s request timeout.
+TICK_TIMEOUT_SECONDS = 840
+TERM_GRACE_SECONDS = 10
+KILL_WAIT_SECONDS = 5
 CERTS_CACHE_SECONDS = 3600
 CLOCK_SKEW_SECONDS = 60
 MAX_BODY_BYTES = 4096
@@ -161,40 +169,117 @@ class IdentityVerifier:
 # --------------------------------------------------------------------------------------------
 
 class TickRunner:
-    """Runs one tick at a time; ``run`` returns None when another tick is running."""
+    """Runs one tick at a time in its own process group; ``run`` returns None when another tick is running.
+
+    The child runs ``gcloud`` as grandchildren, whose 600 s timeouts the child enforces. Killing only the child would
+    leave them running unsupervised, possibly after another controller took the lease, so a timeout (or the
+    server's own SIGTERM, see ``terminate``) signals the whole group: SIGTERM, a short grace, then SIGKILL.
+    """
 
     def __init__(self, command: Sequence[str], *, timeout: float = TICK_TIMEOUT_SECONDS,
-                 runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic) -> None:
+                 term_grace: float = TERM_GRACE_SECONDS, popen: Callable[..., Any] = subprocess.Popen,
+                 killpg: Callable[[int, int], None] = os.killpg, clock: Callable[[], float] = time.monotonic) -> None:
         self.command = list(command)
         self.timeout = timeout
-        self.runner = runner
+        self.term_grace = term_grace
+        self.popen = popen
+        self.killpg = killpg
         self.clock = clock
         self._lock = threading.Lock()
+        self._process: Any = None
+        self._terminated = False
+
+    def _signal_group(self, process: Any, sig: int) -> bool:
+        try:
+            self.killpg(process.pid, sig)  # pgid == pid: the child leads its own session
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
+    def _kill_group(self, process: Any) -> tuple[str, str]:
+        """SIGTERM the group, wait ``term_grace``, SIGKILL the group, and reap. Returns the remaining output."""
+        self._signal_group(process, signal.SIGTERM)
+        try:
+            out, err = process.communicate(timeout=self.term_grace)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        # Unconditionally: the child may have exited on SIGTERM while a grandchild ignored it.
+        self._signal_group(process, signal.SIGKILL)
+        try:
+            more_out, more_err = process.communicate(timeout=KILL_WAIT_SECONDS)
+            out, err = (out or "") + (more_out or ""), (err or "") + (more_err or "")
+        except (subprocess.TimeoutExpired, ValueError):
+            pass
+        reap_orphans()
+        deadline = self.clock() + KILL_WAIT_SECONDS
+        while self._signal_group(process, 0) and self.clock() < deadline:
+            time.sleep(0.05)
+            reap_orphans()
+        if self._signal_group(process, 0):
+            LOG.error("Watchdog tick process group %d still exists after SIGKILL", process.pid)
+        return out or "", err or ""
+
+    def terminate(self) -> None:
+        """Kill the running tick's process group (the server got SIGTERM)."""
+        process = self._process
+        if process is not None:
+            self._terminated = True
+            self._signal_group(process, signal.SIGTERM)
+            self._signal_group(process, signal.SIGKILL)
 
     def run(self) -> tuple[int, dict[str, Any]] | None:
         if not self._lock.acquire(blocking=False):
             return None
         try:
             started = self.clock()
+            self._terminated = False
             try:
-                result = self.runner(self.command, check=False, text=True, capture_output=True, timeout=self.timeout)
-            except subprocess.TimeoutExpired:
-                LOG.error("Watchdog tick timed out after %ss", self.timeout)
-                return 500, {"status": "timeout", "seconds": round(self.clock() - started, 1)}
+                process = self.popen(self.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     start_new_session=True)
             except OSError as exc:
                 LOG.error("Watchdog tick could not start: %s", exc)
                 return 500, {"status": "error", "error": type(exc).__name__}
+            self._process = process
+            try:
+                try:
+                    stdout, stderr = process.communicate(timeout=self.timeout)
+                except subprocess.TimeoutExpired:
+                    LOG.error("Watchdog tick timed out after %ss; killing its process group", self.timeout)
+                    _out, stderr = self._kill_group(process)
+                    _write_stderr(stderr)
+                    return 500, {"status": "timeout", "seconds": round(self.clock() - started, 1)}
+            finally:
+                self._process = None
             # The child's log lines (stderr) go to Cloud Logging; the response carries only the step summary.
-            if result.stderr:
-                sys.stderr.write(result.stderr if result.stderr.endswith("\n") else result.stderr + "\n")
-                sys.stderr.flush()
-            lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
-            summary = {"status": "ok" if result.returncode == 0 else "failed", "exit_code": result.returncode,
+            _write_stderr(stderr)
+            if self._terminated:
+                return 500, {"status": "terminated", "seconds": round(self.clock() - started, 1)}
+            returncode = process.returncode
+            lines = [line for line in (stdout or "").splitlines() if line.strip()]
+            summary = {"status": "ok" if returncode == 0 else "failed", "exit_code": returncode,
                        "result": (lines[-1] if lines else "")[:MAX_SUMMARY_CHARS],
                        "seconds": round(self.clock() - started, 1)}
-            return (200 if result.returncode == 0 else 500), summary
+            return (200 if returncode == 0 else 500), summary
         finally:
             self._lock.release()
+
+
+def _write_stderr(text: str | None) -> None:
+    if text:
+        sys.stderr.write(text if text.endswith("\n") else text + "\n")
+        sys.stderr.flush()
+
+
+def reap_orphans() -> None:
+    """Reap exited children without blocking. As PID 1 in the container this server inherits a killed tick's
+    orphaned grandchildren, which would otherwise stay zombies."""
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
 
 
 def make_handler(runner: TickRunner, verifier: IdentityVerifier) -> type[BaseHTTPRequestHandler]:
@@ -286,12 +371,26 @@ def main() -> int:
     from .log_format import configure_logging
 
     configure_logging()
-    server = build_server()
+    runner = TickRunner(tick_command(str(os.environ.get(ENV_PROJECT, "") or "").strip())) \
+        if str(os.environ.get(ENV_PROJECT, "") or "").strip() else None
+    server = build_server(runner=runner)
+    install_sigterm(server, runner)
     LOG.info("Control VM watchdog listening on port %d", server.server_address[1])
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         server.server_close()
     return 0
+
+
+def install_sigterm(server: ThreadingHTTPServer, runner: TickRunner | None) -> None:
+    """Cloud Run sends SIGTERM before it stops the instance: kill a running tick's whole process group first."""
+    def handle(signum: int, frame: Any) -> None:
+        LOG.warning("Watchdog got signal %d; killing any running tick's process group", signum)
+        if runner is not None:
+            runner.terminate()
+        reap_orphans()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, handle)

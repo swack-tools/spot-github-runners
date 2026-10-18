@@ -498,6 +498,50 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("pinned by digest", h.transition["error"])
         self.assertFalse([c for c in h.gcloud.calls if c[2:4] == ["instances", "create"]])
 
+    def test_no_rollout_from_a_standard_vm_when_spot_is_configured(self):
+        h = TrackingHarness(provisioning="spot", offers=tcv.OFFERS)
+        h.active()  # standard e2-micro serving; :main is newer
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "WARNING") as logs:
+            plan = h.tick()
+        self.assertEqual(plan.action, "noop")
+        self.assertIn("run rotate to move back to Spot", plan.reason)  # the planner's explicit-rotate reason stays
+        self.assertIn("image rollout held", plan.reason)
+        self.assertIn("an explicit rotate is required", "\n".join(logs.output))
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.registry.calls, [])
+        self.assertEqual(h.mutations(), [])
+
+    def test_no_rollout_from_a_spot_vm_when_standard_is_configured(self):
+        h = TrackingHarness()
+        h.gcloud.add("a", machine="e2-small", provisioning="SPOT")
+        h.gcloud.images["spot-control-a"] = IMG_A
+        h.kv.set_origin("a")
+        h.http.healthy("a", version=7)
+        h.state[cv.STATE_KEY] = {"last_transition_end_at": h.clock[0] - 10}  # inside the cooldown: a noop
+        plan = h.tick()
+        self.assertEqual(plan.action, "noop")
+        self.assertIn("image rollout held", plan.reason)
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.registry.calls, [])
+        # After the cooldown the planner's own mode switch runs, never an image rollout.
+        h.clock[0] += cv.ROTATION_COOLDOWN_SECONDS
+        plan = h.tick()
+        self.assertEqual(plan.action, "rotate")
+        self.assertIn("SPOT_CONTROL_PROVISIONING=standard", plan.reason)
+        self.assertNotIn("image_rollout", h.transition)
+        self.assertNotEqual(h.transition["dashboard_image"], IMG_B)
+
+    def test_unknown_model_holds_a_standard_rollout(self):
+        h = TrackingHarness()
+        h.gcloud.add("a", machine="e2-micro")  # no scheduling in the inventory row
+        h.gcloud.images["spot-control-a"] = IMG_A
+        h.kv.set_origin("a")
+        h.http.healthy("a", version=7)
+        plan = h.tick()
+        self.assertEqual(plan.action, "noop")
+        self.assertIn("image rollout held", plan.reason)
+        self.assertIsNone(h.transition)
+
     def test_a_resumed_rollout_creates_its_pinned_image_on_any_controller(self):
         h = tcv.Harness(offers=tcv.STANDARD_OFFERS, provisioning="standard", regions=("us-central1",))
         h.gcloud.add("a", machine="e2-micro", provisioning="STANDARD")

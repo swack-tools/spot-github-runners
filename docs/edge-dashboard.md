@@ -617,7 +617,15 @@ Cloud Run IAM authenticates every request: the service allows no unauthenticated
 app-level secret. It needs an RS256 signature by a key from Google's published certificates, a Google
 issuer, the service URL as audience, an unexpired token, and the verified email of the invoker account.
 `--no-verify-signature` keeps the claim checks but skips the signature, for the case where a request reaches
-the container with the signature removed. A tick that runs longer than 14 minutes is stopped and answers 500.
+the container with the signature removed.
+
+Each tick runs in its own process group. A tick that runs longer than 14 minutes answers 500, and the server
+stops the whole group, including `gcloud` processes that the tick started. It sends `SIGTERM`, waits 10
+seconds, then sends `SIGKILL`. The server does the same when Cloud Run sends it `SIGTERM` at shutdown. The group is gone within
+855 seconds of the tick's start. No other controller can take the lease earlier than 1,260 seconds after the
+start (its 20-minute time to live plus the 60-second grace), so nothing that the tick started still runs when
+another controller acts. The lease guard returns only while more than 11 minutes of the lease remain, even
+when its own re-read of the lease was slow, which covers the longest single `gcloud` call of 10 minutes.
 
 Each tick works in this order:
 
@@ -872,6 +880,11 @@ or written when a transition completes. It also records the digests that failed 
 `status` shows it. While tracking is on, a recovery recreates the recorded image, not `SPOT_DASHBOARD_IMAGE`,
 so a recovery never moves to an older image. Every transition records the image it creates, and a controller
 that resumes the transition creates that image whatever its own settings.
+
+A rollout never changes the provisioning mode. When the active VM's model differs from
+`SPOT_CONTROL_PROVISIONING`, the manager holds the rollout and logs why. For example, a standard VM while Spot
+is configured, or a Spot VM or one of unknown model while standard is configured. The planner's own reason, such
+as the explicit `rotate` needed to move back to Spot, stays in the plan.
 
 The manager reads the registry and GitHub only. A registry or GitHub failure never starts a rollout and never
 blocks recovery.
