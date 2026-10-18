@@ -135,6 +135,67 @@ class PricingHistoryTests(unittest.TestCase):
             {"complete": False, "disk_rate_unknown": ["unsupported-cache"]}, 0, 0, 0, 3600)
         self.assertFalse(recovered.get("unpriced_history_intervals"))
 
+    def test_retirement_keeps_unsupported_boot_history_when_cache_rate_is_complete(self):
+        obs = self.observation(boot_disk_type="unsupported-boot", boot_disk_gb=40)
+        boot = dict(obs["disks_detail"][0], source="z/boot", id="boot", type="unsupported-boot", gb=40,
+                    auto_delete=True, boot=True)
+        obs["disks_detail"] = [boot] + obs["disks_detail"]
+        record = _live_instance_record(obs, project="p", now=self.now)
+        self.assertFalse(record["pricing_complete"])
+        retired = _mark_instance_deleted(record, self.now + 3600, disks_pending=True, project="p")
+        self.assertTrue(retired["pricing_complete"])
+        self.assertFalse(retired["lifetime_cost_complete"])
+        self.assertEqual(retired["unpriced_history_intervals"]["fallback_storage"],
+                         [self.now - 7200, self.now + 3600])
+        self.assertNotIn("fallback_compute", retired["unpriced_history_intervals"])
+
+    def test_all_auto_deleted_disks_keep_recent_unknown_history_in_budget_holds(self):
+        obs = self.observation(boot_disk_type="unsupported-boot", boot_disk_gb=40,
+                               data_disk_gb=0, data_disks={})
+        obs["disks_detail"] = [dict(obs["disks_detail"][0], type="unsupported-boot", gb=40,
+                                    auto_delete=True, boot=True)]
+        record = _live_instance_record(obs, project="p", now=self.now)
+        retired = _mark_instance_deleted(record, self.now + 3600, disks_pending=True, project="p")
+        self.assertFalse(retired["disk_liability_pending"])
+        self.assertFalse(retired["lifetime_cost_complete"])
+        self.assertEqual(retired["unpriced_history_intervals"]["fallback_storage"][1], self.now + 3600)
+        store = self.store()
+        store.state["instances"] = [retired]
+        with patch("lib.dashboard_server.time.time", return_value=self.now + 7200):
+            self.assertIn(retired["name"], store._incomplete_cost_hosts("rust_builder"))
+            self.assertFalse(store.query_instances(window_hours=4)["window_cost_complete"])
+        with patch("lib.dashboard_server.time.time", return_value=self.now + 33 * 86400):
+            self.assertEqual(store._incomplete_cost_hosts("rust_builder"), [])
+        # A complete disk listing follows the ordinary deletion path rather than pending-liability pricing.
+        direct = _mark_instance_deleted(record, self.now + 3600, disks_pending=False, project="p")
+        self.assertEqual(direct["unpriced_history_intervals"], retired["unpriced_history_intervals"])
+
+    def test_retirement_bounds_unknown_compute_at_the_observed_stop(self):
+        obs = self.observation(machine_type="unknown-standard-16", status="TERMINATED",
+                               last_stop_epoch=self.now - 3600)
+        record = _live_instance_record(obs, project="p", now=self.now)
+        retired = _mark_instance_deleted(record, self.now + 3600, disks_pending=False, project="p")
+        self.assertEqual(retired["unpriced_history_intervals"]["fallback_compute"],
+                         [self.now - 7200, self.now - 3600])
+
+    def test_resolved_liability_keeps_uncertain_history_through_its_storage_end(self):
+        from lib.dashboard_server import reconcile_instance_records, instance_usage
+
+        obs = self.observation()
+        cache = dict(obs["disks_detail"][0], type="unsupported-cache")
+        obs.update(data_disk_type=cache["type"], data_disks={cache["type"]: 100}, disks_detail=[cache])
+        record = _live_instance_record(obs, project="p", now=self.now)
+        retired = _mark_instance_deleted(record, self.now + 3600, disks_pending=True, project="p")
+        end = self.now + 7200
+        expected_cost = instance_usage(retired, end)["cost_all_in"]
+        rows, _ = reconcile_instance_records([retired], [], project="p", now=end, disks_listed=True)
+        resolved = rows[0]
+        self.assertFalse(resolved["disk_liability_pending"])
+        self.assertEqual(resolved["disk_end_epoch"], end)
+        self.assertEqual(resolved["unpriced_history_intervals"]["fallback_storage"][1], end)
+        self.assertAlmostEqual(instance_usage(resolved, end)["cost_all_in"], expected_cost, places=6)
+        self.assertFalse(resolved["lifetime_cost_complete"])
+
     def test_failed_preserved_detached_repricing_does_not_mutate_nested_state(self):
         store = self.store()
         obs = self.observation(instance_id="disk-123", kind="disk", status="DETACHED", machine_type="", vcpu=0, ram_gib=0)
