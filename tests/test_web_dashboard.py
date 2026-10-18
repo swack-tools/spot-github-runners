@@ -7676,6 +7676,15 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
                 self.assertEqual(build["finished_at"], "2026-10-18T18:00:12.250000Z")
                 self.assertEqual(build["compile_duration_seconds"], 12.0)
 
+    def test_same_second_completion_keeps_order(self):
+        with unittest.mock.patch("lib.dashboard_server.time.time", return_value=_iso_to_epoch("2026-10-18T18:00:12.250Z")):
+            build = self.store.record_rust_build({"build_id": "rb-same-second", "status": "DELIVERED",
+                                                  "requested_at": "2026-10-18T18:00:00.010Z",
+                                                  "compile_duration_seconds": 12})["build"]
+        self.assertEqual(build["finished_at"], "2026-10-18T18:00:12.010000Z")
+        self.assertLessEqual(_iso_to_epoch(build["finished_at"]), _iso_to_epoch(build["delivered_at"]))
+        self.assertAlmostEqual(build["delivery_duration_seconds"], 0.24, delta=0.01)
+
     def test_failure_with_delivery_field_keeps_compile_time(self):
         build = self.store.record_rust_build({"build_id": "rb-del", "status": "OOM_KILLED",
                                               "compile_duration_seconds": 30, "delivery_duration_seconds": 5})["build"]

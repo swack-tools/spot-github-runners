@@ -7784,7 +7784,7 @@ class DashboardStore:
                     del_at = str(payload["delivered_at"])
                     del_epoch = _iso_to_epoch(del_at)
                 else:
-                    del_at = _iso_seconds_ago(0, max(now_ts, req_epoch + duration))
+                    del_at = _iso_at_epoch(max(now_ts, req_epoch + duration))
                     del_epoch = _iso_to_epoch(del_at)
                 if payload.get("finished_at"):
                     fin_at = str(payload["finished_at"])
@@ -7810,7 +7810,7 @@ class DashboardStore:
                     fin_epoch = _iso_to_epoch(fin_at)
                 elif delivery_sec is not None:
                     # Delivered when reported, so it finished the reported delivery time before that.
-                    fin_at = _iso_at_epoch(_iso_to_epoch(_iso_seconds_ago(0, now_ts)) - delivery_sec)
+                    fin_at = _iso_at_epoch(now_ts - delivery_sec)
                     fin_epoch = _iso_to_epoch(fin_at)
                 else:
                     fin_epoch = None
@@ -7828,9 +7828,9 @@ class DashboardStore:
                     elif delivery_sec is not None and fin_epoch is not None:
                         del_at = _iso_at_epoch(fin_epoch + delivery_sec)
                     else:
-                        del_at = _iso_seconds_ago(0, now_ts)  # delivered when reported
+                        del_at = _iso_at_epoch(now_ts)  # delivered when reported
             else:
-                del_at = payload.get("delivered_at") or _iso_seconds_ago(0, now_ts)
+                del_at = payload.get("delivered_at") or _iso_at_epoch(now_ts)
                 del_epoch = _iso_to_epoch(str(del_at))
                 if payload.get("finished_at"):
                     fin_at = payload["finished_at"]
