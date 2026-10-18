@@ -891,6 +891,18 @@ def _live_instance_record(
             obs = dict(obs, disks_detail=handed_off)
     prior_runs = _prior_runs(previous)
     disk_segments = _disk_segments(previous)
+    revived_at: float | None = None
+    if previous is not None and previous.get("status") == "DELETED":
+        # Back after it was gone (a cache disk detached again after a VM used it): its earlier standalone interval
+        # stays closed, and billing here restarts now; the time in between was billed by the VM's record.
+        ended = previous.get("deleted_epoch")
+        if _finite(ended) and isinstance(previous.get("pricing"), dict):
+            open_from = max([float(previous.get("disk_start_epoch") or ended)] + [e for _s, e, _r in disk_segments]
+                            + ([float(previous["disk_segment_start"])] if _finite(previous.get("disk_segment_start"))
+                               else []))
+            if ended > open_from:
+                disk_segments.append((open_from, float(ended), _pricing_rates(previous["pricing"])[2]))
+        revived_at = now
     initial_disk_segment_start: float | None = None
     if previous is None:
         # First sight of this VM: bill earlier disk time per disk from each disk's own creation, never a later-
@@ -903,7 +915,8 @@ def _live_instance_record(
             and float(previous.get("started_epoch") or 0.0) == started_epoch:
         # Same run: keep the boundary of an earlier rate change, or that time would be counted twice.
         compute_segment_start = max(started_epoch, float(previous["compute_segment_start"]))
-    disk_segment_start = (previous.get("disk_segment_start") if previous is not None
+    disk_segment_start = (revived_at if revived_at is not None
+                          else previous.get("disk_segment_start") if previous is not None
                           else initial_disk_segment_start)
     if previous is not None and isinstance(previous.get("pricing"), dict):
         prev_compute_all_in, prev_compute_only, prev_disk_all_in = _pricing_rates(previous["pricing"])
@@ -2261,7 +2274,9 @@ class DashboardStore:
                 self._fleet_status["fresh"] = False
             return False
         try:
-            observed = list(self.fleet_source())
+            listing = self.fleet_source()
+            disks_listed = bool(getattr(listing, "disks_listed", True))
+            observed = list(listing)
         except Exception as exc:  # noqa: BLE001 - keep the last known records; report the failure
             with self._lock:
                 self._fleet_status["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
@@ -2331,6 +2346,7 @@ class DashboardStore:
             return False
         with self._lock:
             self._fleet_status.update({"last_success_at": _iso_epoch(now), "last_success_epoch": now,
+                                       "disks_listed": disks_listed,
                                        "observed_count": len(observed),
                                        "fresh": True,
                                        "last_error": ""})
@@ -3426,6 +3442,11 @@ class DashboardStore:
             status = dict(self._fleet_status)
         last_success = status.get("last_success_epoch")
         max_age = FLEET_INVENTORY_MAX_AGE_INTERVALS * self.fleet_inventory_interval
+        if status.get("fresh") and status.get("disks_listed") is False:
+            # Without the disk listing, fleet disks that no VM uses (a builder cache disk after its VM is gone)
+            # still bill but cannot be seen.
+            return ("The disk listing is unavailable (compute.disks.list), so disks that outlive their VM cannot "
+                    "be counted")
         if status.get("fresh") and _finite(last_success) and self._clock() - float(last_success) <= max_age:
             return ""
         detail = status.get("last_error") or "no complete listing yet"

@@ -5331,6 +5331,41 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertFalse(rec["pricing_complete"])
         self.assertIn("no known rate for the zz9", rec["pricing_incomplete_reason"])
 
+    def test_detached_disk_returning_restarts_billing(self):
+        from lib.dashboard_server import instance_usage
+        from lib.fleet_inventory import observe_detached_disks
+
+        created = datetime.fromtimestamp(self.now - 5 * 86400.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        detail = {"z/disks/builder-oxidex-r-cache": {"id": "96", "name": "builder-oxidex-r-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced",
+                                                     "creationTimestamp": created}}
+        detached = observe_detached_disks(detail)
+        self.fleet = detached
+        self.store.refresh_fleet_inventory()
+        self.fleet = []  # Attached to a VM (billed there) for a while.
+        self.store.refresh_fleet_inventory()
+        first_end = self._record("builder-oxidex-r-cache")["deleted_epoch"]
+        self.fleet = detached  # Detached again.
+        back = time.time()
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-r-cache")
+        self.assertEqual(rec["status"], "DETACHED")
+        self.assertGreaterEqual(rec["disk_segment_start"], back - 1.0)
+        self.assertAlmostEqual(rec["disk_segments"][-1][1], first_end, delta=1.0)
+        total = instance_usage(rec, back + 3600.0)["disk_hours"]
+        first = instance_usage(dict(rec, disk_segments=[], disk_segment_start=None, deleted_epoch=first_end,
+                                    status="DELETED"), back)["disk_hours"]
+        self.assertAlmostEqual(total, first + 1.0, delta=0.05)
+
+    def test_unlisted_disks_hold_scaling(self):
+        from lib.fleet_inventory import FleetListing
+
+        listing = FleetListing([fleet_observation("8300", "oxidex-runners-nd-1", "us-south1-a", now=self.now)])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        self.assertIn("disk listing is unavailable", self.store._inventory_stale_reason())
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

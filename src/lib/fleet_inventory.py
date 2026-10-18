@@ -232,6 +232,12 @@ def _permission_denied(exc: BaseException) -> bool:
     return "HTTP 403" in str(exc)
 
 
+class FleetListing(list):
+    """Fleet observations plus whether the project's disks could be listed (detached disks are counted only then)."""
+
+    disks_listed: bool = True
+
+
 def observe_detached_disks(disk_details: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Observations for fleet-named persistent disks that no VM uses (status ``DETACHED``, storage only).
 
@@ -339,9 +345,11 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                 if missing:
                     # Unknown RAM would price as free: fail the refresh (records stay as they were) instead.
                     raise RuntimeError(f"machine type capacity unavailable: {', '.join(missing[:5])}")
-                return (observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache,
-                                            disk_types_known=types_known)
-                        + (observe_detached_disks(disk_types) if types_known else []))
+                result = FleetListing(observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache,
+                                                          disk_types_known=types_known)
+                                      + (observe_detached_disks(disk_types) if types_known else []))
+                result.disks_listed = types_known
+                return result
             finally:
                 while not api.connections.empty():
                     _reader, writer = api.connections.get_nowait()

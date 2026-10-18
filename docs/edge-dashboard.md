@@ -368,7 +368,11 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   as a dedicated builder's cache disk (`auto-delete=no`) after its VM is deleted, gets its own
   `DETACHED` record that bills storage until the disk is deleted. Disks are listed even when no fleet VM
   is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
-  is billed by the new record only from the handoff, never again from its creation.
+  is billed by the new record only from the handoff, never again from its creation. A disk that's
+  detached again keeps its earlier standalone interval and restarts billing at the new handoff.
+- Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
+  scale-up plans are refused even when the listing is otherwise current. Grant the permission for
+  scaling to work.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host. A VM with data disks of several types can't be a template
