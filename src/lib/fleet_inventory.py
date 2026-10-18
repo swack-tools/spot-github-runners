@@ -13,13 +13,16 @@ import os
 import re
 from typing import Any, Callable, Mapping
 
-from .runner_fleet import (gce_metadata_items, gce_timestamp, patch_record_from_gce_item,
-                           runner_deployment_from_gce_item)
+from .runner_fleet import (RUNNER_HOST_NAME_PREFIXES, gce_metadata_items, gce_timestamp,
+                           patch_record_from_gce_item, runner_deployment_from_gce_item)
 
 ENV_FLEET_INVENTORY = "DASHBOARD_FLEET_INVENTORY"
 # Runner hosts (runner_manager) and dedicated Rust builders (render_builder_startup). Control VMs
 # (``spot-control-*``) and anything else in the project are never part of the fleet view.
-FLEET_NAME_PREFIXES = ("oxidex-runners-", "builder-")
+FLEET_NAME_PREFIXES = RUNNER_HOST_NAME_PREFIXES + ("builder-",)
+# Status of an inventory record for a fleet disk that no VM uses (for example a dedicated builder's cache disk,
+# created with auto-delete=no, after its VM was deleted): it bills storage until it is deleted.
+DETACHED_DISK_STATUS = "DETACHED"
 # Dedicated builders run one build container capped at 16 vCPU / 28 GiB (see AGENTS.md).
 BUILDER_CONTAINER_VCPU = 16
 BUILDER_CONTAINER_RAM_GIB = 28.0
@@ -72,7 +75,7 @@ def fleet_role(name: str) -> str | None:
     """``cicd_runner`` or ``rust_builder`` for a fleet VM name, None for anything else."""
     if name.startswith("builder-"):
         return "rust_builder"
-    if name.startswith("oxidex-runners-"):
+    if name.startswith(RUNNER_HOST_NAME_PREFIXES):
         return "cicd_runner"
     return None
 
@@ -228,6 +231,62 @@ def _permission_denied(exc: BaseException) -> bool:
     return "HTTP 403" in str(exc)
 
 
+def observe_detached_disks(disk_details: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Observations for fleet-named persistent disks that no VM uses (status ``DETACHED``, storage only).
+
+    An attached disk is billed through its VM's record; once no VM uses it (a builder cache disk outlives its
+    VM), it gets its own record, which bills until the disk is gone from the listing.
+    """
+    observed = []
+    for link, raw in disk_details.items():
+        detail = raw if isinstance(raw, Mapping) else {}
+        name = str(detail.get("name", "") or "")
+        role = fleet_role(name)
+        if role is None or detail.get("users") or not detail.get("id"):
+            continue
+        zone = str(detail.get("zone", "")).rsplit("/", 1)[-1]
+        size_raw = str(detail.get("sizeGb", "") or "")
+        size = int(size_raw) if size_raw.isdigit() else 0
+        kind = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
+        created = gce_epoch(detail.get("creationTimestamp"))
+        observed.append({
+            "instance_id": f"disk-{detail['id']}",
+            "name": name,
+            "role": role,
+            "status": DETACHED_DISK_STATUS,
+            "kind": "disk",
+            "zone": zone,
+            "region": zone.rsplit("-", 1)[0] if "-" in zone else zone,
+            "machine_type": "",
+            "cpu_platform": "",
+            "vcpu": 0,
+            "ram_gib": 0.0,
+            "specs_known": True,
+            "spot": True,
+            "boot_disk_type": kind,
+            "boot_disk_gb": 0,
+            "data_disk_type": kind,
+            "data_disk_gb": size,
+            "data_disks": {kind: size},
+            "local_ssd_gb": 0,
+            "unpriced_disk_performance": _unpriced_performance(detail),
+            "regional_disks": bool(detail.get("regional")),
+            "disk_types_known": True,
+            "disks_detail": [{"type": kind, "gb": size, "created_epoch": created}],
+            "runners_count": 0,
+            "runners_count_known": True,
+            "runner_vcpu": 0,
+            "runner_ram_gib": 0.0,
+            "runner_limits_known": True,
+            "created_epoch": created,
+            "last_start_epoch": created,
+            "last_stop_epoch": created,
+            "last_suspended_epoch": None,
+            "source": str(link),
+        })
+    return observed
+
+
 def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
     """A callable that lists the live fleet from Compute Engine (gcloud credentials or the metadata server).
 
@@ -279,8 +338,9 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                 if missing:
                     # Unknown RAM would price as free: fail the refresh (records stay as they were) instead.
                     raise RuntimeError(f"machine type capacity unavailable: {', '.join(missing[:5])}")
-                return observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache,
-                                           disk_types_known=types_known)
+                return (observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache,
+                                            disk_types_known=types_known)
+                        + (observe_detached_disks(disk_types) if types_known else []))
             finally:
                 while not api.connections.empty():
                     _reader, writer = api.connections.get_nowait()

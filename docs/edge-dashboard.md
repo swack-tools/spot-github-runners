@@ -333,7 +333,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - With `DASHBOARD_FLEET_INVENTORY=gce`, which the control VM sets, the dashboard lists the project's
   instances every 2 minutes. The listing is one aggregated read-only call, plus one aggregated disk
   listing and a cached machine type lookup for each shape. It keeps the VMs whose names start with
-  `oxidex-runners-` (runner hosts) or `builder-` (dedicated builders). Control VMs and other VMs aren't
+  a runner host prefix (`oxidex-runners-`, or an earlier fleet's `newznab-spot-runners-`,
+  `spot-runners-`, or `oxidex-spot-runners-`) or `builder-` (dedicated builders). Control VMs and other VMs aren't
   listed. The control VM's service account needs `compute.instances.list` and
   `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
   (HTTP 403) a VM keeps the types stored from an earlier listing and a new VM shows `pd-balanced`,
@@ -363,8 +364,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   still don't fit is refused, and the inventory reads as stale. Window totals still include it to within an hour, though a search filter
   can't match folded records. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
-- Spend covers each VM's attached disks while the VM exists. A dedicated builder's cache disk
-  (`auto-delete=no`) outlives its VM, and the dashboard doesn't count it after the VM is deleted.
+- Spend covers each VM's attached disks while the VM exists. A fleet-named disk that no VM uses, such
+  as a dedicated builder's cache disk (`auto-delete=no`) after its VM is deleted, gets its own
+  `DETACHED` record that bills storage until the disk is deleted.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host. A VM with data disks of several types can't be a template
@@ -403,8 +405,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
   inactive makes no Compute Engine calls and keeps the records the active slot last published.
 - The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
-  already existed, so they don't mark OOM events handled. A runner OOM event keeps the ready runner slots
-  running when a listing first saw it (`baseline_runners`), and it's handled only when a runner host
+  already existed, so they don't mark OOM events handled. A runner OOM event that's active for scaling keeps
+  the ready runner slots running when it happened (`baseline_runners`; a late report excludes capacity
+  that started after it), and OOM state is reconciled on every listing, even one with no fleet change, and it's handled only when a runner host
   first listed after the baseline is `RUNNING` with its bootstrap confirmed and the ready slots reach
   the event's target. A restart of existing capacity, or a same-size replacement, handles nothing. New
   capacity stays pending through the OOM lookback, so an OOM reported late can still be answered by it.

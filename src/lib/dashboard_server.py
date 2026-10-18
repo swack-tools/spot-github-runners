@@ -390,7 +390,8 @@ FLEET_BASELINE_STATE_KEY = "fleet_inventory_baseline_at"
 DELETED_INSTANCE_RETENTION_SECONDS = 31 * 86_400.0
 MAX_WINDOW_HOURS = DELETED_INSTANCE_RETENTION_SECONDS / 3600.0
 # Compute Engine states in which the VM is stopped: compute billing ended at lastStopTimestamp.
-GCE_STOPPED_STATUSES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED"})
+# DETACHED is a fleet disk no VM uses (see fleet_inventory.observe_detached_disks): storage only, like a stopped VM.
+GCE_STOPPED_STATUSES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED", "DETACHED"})
 LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
     "The dashboard does not create, stop, or delete VMs: its instance list mirrors the live Compute Engine "
     "inventory. Run lifecycle changes with the reviewed tools instead (spot_runner_autoscaler.py drains and "
@@ -697,7 +698,8 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
     reasons = []
     pricing = record.get("pricing") or {}
     custom = "custom" in str(record.get("machine_type", "")) or str(record.get("machine_type", "")).endswith("-ext")
-    if pricing.get("complete") is False and not custom:
+    if pricing.get("complete") is False and not custom and pricing.get("provisioning") == "ondemand" \
+            and pricing.get("pricing_source") == "spot_baseline_for_on_demand_vm":
         reasons.append("no on-demand rate for this standard (non-Spot) VM")
     if record.get("status") == "SUSPENDED":
         reasons.append("suspended: Compute Engine also bills the preserved memory, which is not priced here")
@@ -856,6 +858,9 @@ def _live_instance_record(
     stopped_epoch: float | None = None
     if status == "RUNNING":
         trigger = "Active — RUNNING in the live Compute Engine inventory"
+    elif status == "DETACHED":
+        stopped_epoch = started_epoch  # A disk on its own never runs compute.
+        trigger = "Fleet disk that no VM uses (for example a builder cache disk); it bills storage until deleted"
     elif status in GCE_STOPPED_STATUSES:
         stop = obs.get("last_suspended_epoch") if status == "SUSPENDED" else obs.get("last_stop_epoch")
         if isinstance(stop, (int, float)) and stop >= started_epoch:
@@ -1006,6 +1011,7 @@ def _live_instance_record(
         "specs_known": bool(obs.get("specs_known", True)),
         "runner_limits_known": bool(obs.get("runner_limits_known", True)),
         "runners_count_known": bool(obs.get("runners_count_known", True)),
+        "kind": str(obs.get("kind") or "vm"),
         "started_epoch": started_epoch,
         "started_at": _iso_epoch(started_epoch),
         "stopped_epoch": stopped_epoch,
@@ -2123,9 +2129,36 @@ class DashboardStore:
         current_slots = ready_slots(current)
         # Each runner OOM event keeps the ready slots from when the reconcile first saw it, so capacity that only
         # comes back (a restart, or a replacement in this or a later listing) never reads as growth.
+        def event_epoch(evt: dict[str, Any]) -> float | None:
+            raw = evt.get("failed_at") or evt.get("observed_at") or evt.get("timestamp")
+            try:
+                parsed = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00")) if raw else None
+            except ValueError:
+                return None
+            if parsed is None:
+                return None
+            return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
+
+        pending_ready = [r for r in previous if isinstance(r, dict) and r.get("capacity_pending")
+                         and r.get("status") == "RUNNING" and r.get("role") == "cicd_runner"
+                         and r.get("runners_count_known") is not False]
+        cfg = {**default_scaling_config()["cicd_runner"], **(self.state.get("scaling", {}).get("cicd_runner") or {})}
+        lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60) or 60) * 60.0)
+        now = self._clock()
         for evt in self._runner_oom_events():
-            if not isinstance(evt.get("baseline_runners"), int):
-                evt["baseline_runners"] = previous_slots
+            # Only events active for scaling (unhandled, inside the lookback) need a capacity baseline.
+            if evt.get("baseline_source") == "inventory" or not _is_recent_unhandled_oom(evt, now, lookback_seconds):
+                continue
+            # The capacity running when the OOM happened: a late report must not count capacity that started after
+            # it (still pending) as part of its baseline. Lowers a baseline the scaling evaluation set from the
+            # already-grown count.
+            when = event_epoch(evt)
+            later = sum(int(r.get("runners_count", 0) or 0) for r in pending_ready
+                        if when is not None and float(r.get("started_epoch") or 0.0) > when)
+            computed = max(0, previous_slots - later)
+            existing = evt.get("baseline_runners")
+            evt["baseline_runners"] = min(int(existing), computed) if isinstance(existing, int) else computed
+            evt["baseline_source"] = "inventory"
         # Only VMs first seen after the baseline add capacity (capacity_pending), and only once ready: RUNNING with
         # a bootstrap confirmed in this boot. A restart of capacity that already existed adds none.
         new_ready = [r for r in current if isinstance(r, dict) and r.get("capacity_pending")
@@ -2233,16 +2266,27 @@ class DashboardStore:
             # The first successful listing (after an upgrade, a migration, or enabling the inventory) is the
             # baseline: the fleet it finds already existed, so it is not growth that handles an OOM event.
             baselined = bool(self.state.get(FLEET_BASELINE_STATE_KEY))
-            if not changed and baselined:
-                return 200, {"changed": False}
             previous_instances = self.state.get("instances", [])
             previous_telemetry = copy.deepcopy(self.state.get("scaling_telemetry", {}))
+            if baselined:
+                # OOM telemetry can arrive while the fleet is quiet: reconcile it on every listing, and save when
+                # it changed something (an event handled, a baseline recorded, a pending marker cleared).
+                try:
+                    self._consume_ooms_for_fleet_growth(previous_instances, records)
+                except Exception:
+                    self.state["scaling_telemetry"] = previous_telemetry
+                    raise
+                changed = (changed or self.state.get("scaling_telemetry") != previous_telemetry
+                           or [_instance_fingerprint(r) for r in previous_instances]
+                           != [_instance_fingerprint(r) for r in records])
+            if not changed and baselined:
+                return 200, {"changed": False}
             previous_compacted = self.state.get(COMPACTED_COSTS_STATE_KEY)
             self.state["instances"] = records
             self.state[COMPACTED_COSTS_STATE_KEY] = compacted
             try:
                 if baselined:
-                    self._consume_ooms_for_fleet_growth(previous_instances, records)
+                    pass  # OOM state was reconciled above.
                 else:
                     self.state[FLEET_BASELINE_STATE_KEY] = _iso_epoch(self._clock())
                     for record in records:
@@ -5523,8 +5567,8 @@ class DashboardStore:
                 if unpriced:
                     raise ValueError(
                         f"The planned {unpriced[0].get('machine_type')} VMs cannot be fully priced (custom or extended "
-                        "shape, or a standard VM without an on-demand rate); the scale-up cannot be checked against "
-                        "the budget"
+                        "shape, a standard VM without an on-demand rate, or a disk type that bills provisioned "
+                        "performance); the scale-up cannot be checked against the budget"
                     )
                 # Stopped inventory VMs bill no compute but keep billing their disks; transitional ones count fully.
                 stopped_disk_hourly = sum(

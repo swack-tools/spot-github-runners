@@ -4069,9 +4069,12 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertAlmostEqual(rec["started_epoch"], self.now - 3 * 3600.0, delta=1.0)
         self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 4)
         self.assertEqual(self.store.state_version(), version_before + 1)
+        # The default state's sample OOM event is recent, so the next listing records its baseline once.
+        self.store.refresh_fleet_inventory()
+        version = self.store.state_version()
         # The same listing again is not a change: no new state version (and no KV publish).
         self.assertFalse(self.store.refresh_fleet_inventory())
-        self.assertEqual(self.store.state_version(), version_before + 1)
+        self.assertEqual(self.store.state_version(), version)
         status = self.store.fleet_inventory_status()
         self.assertEqual(status["observed_count"], 1)
         self.assertEqual(status["last_error"], "")
@@ -4211,6 +4214,7 @@ class FleetInventoryReconcileTests(unittest.TestCase):
     def test_unchanged_rates_write_nothing(self):
         self.fleet = [fleet_observation("1010", "oxidex-runners-price-1", "us-south1-a", now=self.now)]
         self.store.refresh_fleet_inventory()
+        self.store.refresh_fleet_inventory()  # Records the sample OOM event's baseline once.
         version = self.store.state_version()
         self.assertFalse(self.store.refresh_fleet_inventory())
         self.assertEqual(self.store.state_version(), version)
@@ -4589,7 +4593,10 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             self.store.get_overview()
             self.assertAlmostEqual(self._record("builder-oxidex-mixed-1")["pricing"]["disk_hourly_usd"],
                                    reconciled, delta=0.0001)
+            self.store.refresh_fleet_inventory()  # May record baselines on existing OOM events once.
             self.assertFalse(self.store.refresh_fleet_inventory())
+            self.assertAlmostEqual(self._record("builder-oxidex-mixed-1")["pricing"]["disk_hourly_usd"],
+                                   reconciled, delta=0.0001)
 
     def test_stop_and_resize_in_one_listing_ends_run_at_stop(self):
         running = fleet_observation("3600", "builder-oxidex-stopgrow-1", "us-south1-b", started_hours_ago=10.0,
@@ -5202,6 +5209,65 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         rec = self._record("builder-oxidex-nobf-1")
         self.assertGreaterEqual(rec["disk_segment_start"], before - 1.0)
 
+    def test_delayed_oom_reconciled_on_unchanged_listing(self):
+        self.fleet = [self._runner("8000", "oxidex-runners-d-1")]
+        self.store.refresh_fleet_inventory()
+        new = self._runner("8001", "oxidex-runners-d-2", started_hours_ago=0.25)
+        self.fleet.append(new)
+        self.store.refresh_fleet_inventory()  # New capacity, no OOM yet: it stays pending (inside the lookback).
+        # The OOM is reported afterwards, timestamped before the new host started.
+        when = datetime.fromtimestamp(self.now - 1800.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-r20", "instance_name": "oxidex-runners-d-1", "role": "cicd_runner", "observed_at": when,
+                 "baseline_runners": 8}]  # As if the scaling evaluation had set it from the grown count.
+        self.assertTrue(self.store.refresh_fleet_inventory())  # Same listing: OOM state still reconciled.
+        event = self.store.state["scaling_telemetry"]["journal_oom_events"][0]
+        self.assertEqual(event["baseline_runners"], 4)
+        self.assertTrue(event.get("handled"))
+
+    def test_detached_fleet_disk_keeps_billing(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        created = "2026-10-10T00:00:00.000-07:00"
+        disks = observe_detached_disks({
+            "z/disks/builder-oxidex-x-cache": {"id": "91", "name": "builder-oxidex-x-cache", "zone": "z/us-south1-b",
+                                                "sizeGb": "100", "type": "hyperdisk-balanced",
+                                                "provisionedIops": "3000", "provisionedThroughput": "140",
+                                                "creationTimestamp": created},
+            "z/disks/builder-oxidex-y-cache": {"id": "92", "name": "builder-oxidex-y-cache", "zone": "z/us-south1-b",
+                                                "sizeGb": "100", "type": "hyperdisk-balanced", "users": ["vm"]},
+            "z/disks/other": {"id": "93", "name": "unrelated-disk", "zone": "z/us-south1-b", "sizeGb": "10"},
+        })
+        self.assertEqual([d["name"] for d in disks], ["builder-oxidex-x-cache"])
+        self.fleet = disks
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-x-cache")
+        self.assertEqual(rec["status"], "DETACHED")
+        self.assertEqual(rec["runtime_hours"], 0.0)
+        view = self.store.query_instances()
+        self.assertGreater(view["active_hourly_burn_usd"], 0.0)  # Storage still bills.
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_builder_instances"], 0)
+        self.fleet = []
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self._record("builder-oxidex-x-cache")["status"], "DELETED")
+
+    def test_legacy_runner_prefixes_are_listed(self):
+        from lib.fleet_inventory import FLEET_NAME_PREFIXES, fleet_role
+
+        for name in ("newznab-spot-runners-1", "spot-runners-2", "oxidex-spot-runners-3", "oxidex-runners-4"):
+            self.assertTrue(name.startswith(FLEET_NAME_PREFIXES))
+            self.assertEqual(fleet_role(name), "cicd_runner")
+        self.assertEqual(fleet_role("builder-oxidex-1"), "rust_builder")
+        self.assertIsNone(fleet_role("spot-control-a"))
+
+    def test_performance_billed_disk_candidates_are_incomplete(self):
+        common = dict(family="n2", vcpu=16, ram_gib=64.0, region="us-south1", boot_disk_type="pd-balanced",
+                      boot_disk_gb=40, data_disk_gb=500, machine_type="n2-standard-16", live_pricing={})
+        self.assertFalse(calculate_spot_pricing(**common, data_disk_type="hyperdisk-throughput")["complete"])
+        self.assertFalse(calculate_spot_pricing(**common, data_disk_type="pd-extreme")["complete"])
+        self.assertNotIn("complete", calculate_spot_pricing(**common, data_disk_type="pd-ssd"))
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]
@@ -5221,6 +5287,7 @@ class FleetInventoryReconcileTests(unittest.TestCase):
 
         self.store.refresh_fleet_inventory()
         self.assertTrue(self.store.state.get(FLEET_BASELINE_STATE_KEY))
+        self.store.refresh_fleet_inventory()  # May record baselines on existing OOM events once.
         version = self.store.state_version()
         self.store.refresh_fleet_inventory()
         self.assertEqual(self.store.state_version(), version)
