@@ -325,7 +325,7 @@ async def list_regions(api: AsyncGoogleApi, project: str) -> list[dict]:
 INSTANCE_LIST_FIELDS = "name,zone,status,machineType,cpuPlatform,lastStartTimestamp,labels,metadata/items"
 # The dashboard's fleet inventory also needs identity, lifetime, Spot, and attached-disk fields.
 FLEET_INSTANCE_LIST_FIELDS = (INSTANCE_LIST_FIELDS + ",id,creationTimestamp,lastStopTimestamp,"
-                              "scheduling(provisioningModel,preemptible),disks(boot,diskSizeGb,source)")
+                              "scheduling(provisioningModel,preemptible),disks(boot,diskSizeGb,source,type)")
 
 
 async def list_instances(api: AsyncGoogleApi, project: str, *,

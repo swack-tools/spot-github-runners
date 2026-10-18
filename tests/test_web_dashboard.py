@@ -4630,6 +4630,81 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                    if r["name"] == "oxidex-runners-fold-1")
         self.assertAlmostEqual(row["hours_in_window"], 12.0, delta=0.1)
 
+    def test_size_budget_compacts_until_records_fit(self):
+        from lib import dashboard_server
+        from lib.dashboard_server import _live_instance_record, _mark_instance_deleted, instance_usage
+
+        window_start = self.now - 24 * 3600.0
+        deleted = [_mark_instance_deleted(_live_instance_record(
+            fleet_observation(f"42{i:02d}", f"oxidex-runners-z{i}", "us-south1-a", started_hours_ago=3.0,
+                              now=self.now), project="p", now=self.now), self.now - i * 60.0) for i in range(30)]
+        expected = sum(instance_usage(r, self.now, window_start)["window_all_in"] for r in deleted)
+        compacted: dict = {}
+        with unittest.mock.patch.object(dashboard_server, "MAX_INSTANCE_STATE_BYTES", 20_000):
+            records, _changed = dashboard_server.reconcile_instance_records(
+                deleted, [], project="p", now=self.now, compacted=compacted)
+            self.assertLessEqual(dashboard_server._serialized_size([records, compacted]), 20_000)
+        self.assertLess(len(records), 30)
+        kept = sum(instance_usage(r, self.now, window_start)["window_all_in"] for r in records)
+        _h, folded, _c = dashboard_server._bucket_window_costs(compacted, window_start, self.now, "cicd_runner|")
+        self.assertAlmostEqual(kept + folded, expected, delta=0.001)
+
+    def test_size_budget_folds_live_detail(self):
+        from lib import dashboard_server
+        from lib.dashboard_server import _live_instance_record, instance_usage
+
+        rec = _live_instance_record(fleet_observation("4300", "oxidex-runners-busy-1", "us-south1-a",
+                                                      started_hours_ago=1.0, now=self.now), project="p", now=self.now)
+        rec["prior_runs"] = [[self.now - (100 - i) * 3600.0, self.now - (100 - i) * 3600.0 + 1800.0] for i in range(60)]
+        before = instance_usage(rec, self.now, self.now - 744 * 3600.0)
+        with unittest.mock.patch.object(dashboard_server, "MAX_INSTANCE_STATE_BYTES", 3_000):
+            live, _gone = dashboard_server._fit_size_budget([rec], [], {}, self.now)
+        self.assertLessEqual(len(live[0]["prior_runs"]), dashboard_server.MIN_DETAILED_SEGMENTS)
+        after = instance_usage(live[0], self.now, self.now - 744 * 3600.0)
+        self.assertAlmostEqual(after["compute_hours"], before["compute_hours"], delta=0.01)
+        self.assertAlmostEqual(after["window_all_in"], before["window_all_in"], delta=0.001)
+
+    def test_stale_inventory_holds_scaling(self):
+        self.fleet = [fleet_observation("4400", "oxidex-runners-stale-2", "us-south1-a", now=self.now)]
+        self.store.update_budget({"target": "cicd_runner", "max_hourly_usd": 50.0, "max_daily_usd": 1000.0,
+                                  "max_monthly_usd": 30000.0})
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self.store._fail_closed_evaluation({"direction": "scale_up"}, "cicd_runner")["direction"],
+                         "scale_up")
+
+        def failing():
+            raise RuntimeError("Google API HTTP 403: permission denied")
+
+        working = self.store.fleet_source
+        self.store.fleet_source = failing
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self._record("oxidex-runners-stale-2")["status"], "RUNNING")  # Rows stay for display.
+        held = self.store._fail_closed_evaluation({"direction": "scale_down"}, "rust_builder")
+        self.assertIn("not current", held["hold_reason"])
+        with self.assertRaisesRegex(ValueError, "not current"):
+            self.store.scale_region_instances({"region": "us-south1", "role": "cicd_runner", "target_instances": 2})
+        self.store.fleet_source = working
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self.store._inventory_stale_reason(), "")
+
+    def test_local_ssd_is_not_priced_as_persistent_disk(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        obs = observe_fleet_items(
+            [{"id": "4500", "name": "oxidex-runners-lssd-1", "zone": "zones/us-south1-a", "status": "RUNNING",
+              "machineType": "machineTypes/n4-standard-16",
+              "metadata": {"items": [{"key": "spot-runner-count", "value": "4"}]},
+              "disks": [{"boot": True, "diskSizeGb": "40", "source": "d/boot"},
+                        {"boot": False, "diskSizeGb": "375", "type": "SCRATCH"}]}],
+            disk_types={"d/boot": "pd-balanced"},
+            shapes={("us-south1-a", "n4-standard-16"): {"vcpu": 16, "ram_gib": 64.0}})
+        self.assertEqual((obs[0]["local_ssd_gb"], obs[0]["data_disk_gb"], obs[0]["data_disks"]), (375, 0, {}))
+        self.fleet = obs
+        self.store.refresh_fleet_inventory()
+        rec = self._record("oxidex-runners-lssd-1")
+        self.assertFalse(rec["pricing_complete"])
+        self.assertIn("Local SSD", rec["pricing_incomplete_reason"])
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

@@ -457,6 +457,11 @@ def _overlap_hours(start: float, end: float, window_start: float) -> float:
 # the oldest detail is folded into per-hour cost buckets, which still answer every window (to within an hour).
 MAX_DETAILED_INSTANCE_RECORDS = 2000
 MAX_DETAILED_SEGMENTS = 200
+# Serialized budget for the instance records and compacted costs together, well below the 25 MiB KV value limit
+# (the rest of the state shares that value). Past it, records are compacted until they fit.
+MAX_INSTANCE_STATE_BYTES = 6 * 1024 * 1024
+# Segments a live VM keeps in detail when the size budget forces compaction of live records.
+MIN_DETAILED_SEGMENTS = 10
 COMPACTED_COSTS_STATE_KEY = "compacted_instance_costs"
 # Hour buckets: windows are answered to within an hour at their start.
 _BUCKET_SECONDS = 3600.0
@@ -653,6 +658,8 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
         reasons.append("no on-demand rate for this standard (non-Spot) VM")
     if record.get("status") == "SUSPENDED":
         reasons.append("suspended: Compute Engine also bills the preserved memory, which is not priced here")
+    if int(record.get("local_ssd_gb") or 0) > 0:
+        reasons.append(f"{int(record['local_ssd_gb'])} GiB of Local SSD, which is not priced here")
     record["pricing_complete"] = not reasons
     record["pricing_incomplete_reason"] = "; ".join(reasons)
 
@@ -693,7 +700,7 @@ def _live_instance_record(
     region_known = any(r["region"] == region for r in REGIONS_CATALOG)
     provisioning = "spot" if obs.get("spot", True) else "ondemand"
     shape_keys = ("spot", "region", "machine_type", "vcpu", "ram_gib", "boot_disk_type", "boot_disk_gb",
-                  "data_disk_type", "data_disk_gb", "data_disks")
+                  "data_disk_type", "data_disk_gb", "data_disks", "local_ssd_gb")
     reuse_pricing = (
         previous.get("pricing")
         if previous is not None and isinstance(previous.get("pricing"), dict)
@@ -737,6 +744,7 @@ def _live_instance_record(
         record["pricing"] = _with_secondary_disks(record["pricing"], obs, region=region,
                                                   family=record["family"], project=project)
     record["data_disks"] = obs.get("data_disks") or {}
+    record["local_ssd_gb"] = int(obs.get("local_ssd_gb") or 0)
     # The record shows the total data-disk size (pricing already covers each type).
     record["data_disk_gb"] = int(obs.get("data_disk_gb") or 0)
     if not region_known:
@@ -946,6 +954,49 @@ def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[floa
             bucket[i] += float(value[i])
 
 
+def _serialized_size(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), allow_nan=False))
+
+
+def _fold_record_detail(record: dict[str, Any], keep: int) -> dict[str, Any]:
+    """A live record with all but its newest ``keep`` runs and disk segments folded into its hour buckets."""
+    out = dict(record)
+    pricing = out.get("pricing") if isinstance(out.get("pricing"), dict) else {}
+    cur_all_in, cur_compute, _disk = _pricing_rates(pricing)
+    folded = copy.deepcopy(out.get("folded_cost_buckets") or {})
+    runs = sorted(_prior_runs(out), key=lambda run: run[0])
+    for s0, e0, ca, co in runs[:-keep] if len(runs) > keep else []:
+        _add_to_buckets(folded, "", s0, e0, ca if ca is not None else cur_all_in,
+                        co if co is not None else cur_compute, compute=True)
+    disks = sorted(_disk_segments(out), key=lambda seg: seg[0])
+    for s0, e0, r0 in disks[:-keep] if len(disks) > keep else []:
+        _add_to_buckets(folded, "", s0, e0, r0, 0.0, compute=False)
+    out["prior_runs"] = [[s0, e0] if ca is None else [s0, e0, ca, co] for s0, e0, ca, co in runs[-keep:]]
+    out["disk_segments"] = [list(seg) for seg in disks[-keep:]]
+    out["folded_cost_buckets"] = folded
+    return out
+
+
+def _fit_size_budget(live: list[dict[str, Any]], gone: list[dict[str, Any]], compacted: dict[str, list[float]],
+                     now: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Compact until the records and compacted costs serialize within MAX_INSTANCE_STATE_BYTES: first the oldest
+    deleted records (into ``compacted``), then the detailed history of live records. Window totals keep every
+    compacted cost (to within an hour)."""
+    size = _serialized_size([live, gone, compacted])
+    while size > MAX_INSTANCE_STATE_BYTES and gone:
+        batch = max(1, len(gone) // 10)
+        for record in gone[-batch:]:
+            _compact_deleted_record(record, compacted, now)
+        gone = gone[:-batch]
+        size = _serialized_size([live, gone, compacted])
+    if size > MAX_INSTANCE_STATE_BYTES:
+        live = [_fold_record_detail(r, MIN_DETAILED_SEGMENTS) for r in live]
+        size = _serialized_size([live, gone, compacted])
+    if size > MAX_INSTANCE_STATE_BYTES:
+        LOG.error("Dashboard instance state is %d bytes after compaction (budget %d)", size, MAX_INSTANCE_STATE_BYTES)
+    return live, gone
+
+
 def reconcile_instance_records(
     existing: list[Any],
     observed: list[dict[str, Any]],
@@ -1001,6 +1052,7 @@ def reconcile_instance_records(
         gone = gone[:keep]
     if compacted is not None:
         _prune_buckets(compacted, now - DELETED_INSTANCE_RETENTION_SECONDS)
+        live, gone = _fit_size_budget(live, gone, compacted, now)
     records = live + gone
     changed = [_instance_fingerprint(r) for r in existing] != [_instance_fingerprint(r) for r in records]
     return records, changed
@@ -1455,6 +1507,8 @@ class DashboardStore:
             "last_change_at": None,
             "observed_count": None,
             "last_error": "",
+            # True only while the most recent attempt listed the complete fleet; scaling holds otherwise.
+            "fresh": False,
         }
         self.project = project
         self.org = org
@@ -1914,12 +1968,14 @@ class DashboardStore:
         except DashboardFrozenError as exc:
             with self._lock:
                 self._fleet_status["last_error"] = f"skipped: {exc}"
+                self._fleet_status["fresh"] = False
             return False
         try:
             observed = list(self.fleet_source())
         except Exception as exc:  # noqa: BLE001 - keep the last known records; report the failure
             with self._lock:
                 self._fleet_status["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+                self._fleet_status["fresh"] = False
             LOG.warning("Dashboard fleet inventory listing failed: %s: %s", type(exc).__name__, exc)
             return False
 
@@ -1960,9 +2016,11 @@ class DashboardStore:
         except DashboardFrozenError as exc:
             with self._lock:
                 self._fleet_status["last_error"] = f"not applied: {exc}"
+                self._fleet_status["fresh"] = False
             return False
         with self._lock:
             self._fleet_status.update({"last_success_at": _iso_epoch(now), "observed_count": len(observed),
+                                       "fresh": True,
                                        "last_error": ""})
             if body.get("changed"):
                 self._fleet_status["last_change_at"] = _iso_epoch(now)
@@ -3028,9 +3086,23 @@ class DashboardStore:
             "hold_reason": reason,
         }
 
+    def _inventory_stale_reason(self) -> str:
+        """Why the live inventory cannot be trusted right now (empty when it can, or when none is configured)."""
+        if self.fleet_source is None:
+            return ""
+        with self._lock:
+            status = dict(self._fleet_status)
+        if status.get("fresh"):
+            return ""
+        detail = status.get("last_error") or "no complete listing yet"
+        return f"The live inventory is not current ({detail}); fleet counts and burn may be out of date"
+
     def _fail_closed_evaluation(self, evaluation: dict[str, Any], role: str) -> dict[str, Any]:
-        """Hold recommendations that cannot be checked: unknown runner totals (any change), or an understated
-        fleet cost (scale-ups, whose budget check would pass on the low figure)."""
+        """Hold recommendations that cannot be checked: a stale inventory or unknown runner totals (any change),
+        or an understated fleet cost (scale-ups, whose budget check would pass on the low figure)."""
+        stale = self._inventory_stale_reason()
+        if stale:
+            return self._held(evaluation, stale)
         if role == "cicd_runner":
             unknown = self.state.get("scaling_telemetry", {}).get("unknown_runner_count_hosts") or []
             if unknown:
@@ -5080,6 +5152,9 @@ class DashboardStore:
                         f"Runner count is not recorded on running host(s) {', '.join(unknown_counts[:5])}; "
                         "the runner total is unknown, so a scale-up cannot be checked against max_runners"
                     )
+                stale_reason = self._inventory_stale_reason()
+                if stale_reason:
+                    raise ValueError(f"{stale_reason}; plan the scale-up after the next complete listing")
                 pending_hosts = self._transitional_hosts(role)
                 if pending_hosts:
                     raise ValueError(

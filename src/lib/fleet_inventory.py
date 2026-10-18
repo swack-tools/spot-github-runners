@@ -99,11 +99,16 @@ def observe_fleet_items(
         boot_disk_type, boot_disk_gb = DEFAULT_DISK_TYPE, 0
         data_disk_type, data_disk_gb = DEFAULT_DISK_TYPE, 0
         data_disks: dict[str, int] = {}
+        local_ssd_gb = 0
         for disk in item.get("disks", []) if isinstance(item.get("disks"), list) else []:
             if not isinstance(disk, dict):
                 continue
             size_raw = str(disk.get("diskSizeGb", "") or "")
             size = int(size_raw) if size_raw.isdigit() else 0
+            if str(disk.get("type", "")).upper() == "SCRATCH":
+                # Local SSD: no persistent disk behind it, billed (and lost on stop) differently.
+                local_ssd_gb += size
+                continue
             dtype = disk_types.get(str(disk.get("source", "")), "") or DEFAULT_DISK_TYPE
             if disk.get("boot"):
                 boot_disk_type, boot_disk_gb = dtype, size
@@ -146,6 +151,7 @@ def observe_fleet_items(
             "data_disk_type": data_disk_type,
             "data_disk_gb": data_disk_gb,
             "data_disks": data_disks,
+            "local_ssd_gb": local_ssd_gb,
             "runners_count": runners_count,
             "runner_vcpu": runner_vcpu,
             "runner_ram_gib": runner_ram_gib,
