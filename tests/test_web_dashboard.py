@@ -6976,6 +6976,41 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
             self.store.record_rust_build({"build_id": "rb-bad", "status": "QUEUED", "cache_hits": 9,
                                           "total_crates": 8})
 
+    def test_partial_crate_update_keeps_stored_counts(self):
+        base = {"build_id": "rb-crates", "status": "DELIVERED", "total_duration_seconds": 30.0}
+        self.store.record_rust_build({**base, "cache_hits": 8, "cache_misses": 2, "total_crates": 12})
+        kept = self.store.record_rust_build({"build_id": "rb-crates", "cache_hits": 9})["build"]
+        self.assertEqual((kept["cache_hits"], kept["cache_misses"], kept["total_crates"]), (9, 2, 12))
+        # Stored misses that no longer fit the new hits and the stored total are re-derived, not kept.
+        rederived = self.store.record_rust_build({"build_id": "rb-crates", "cache_hits": 12})["build"]
+        self.assertEqual((rederived["cache_hits"], rederived["cache_misses"], rederived["total_crates"]),
+                         (12, 0, 12))
+
+    def test_reported_compile_time_places_the_finish(self):
+        build = self.store.record_rust_build({
+            "build_id": "rb-compile", "status": "DELIVERED", "requested_at": "2026-10-15T00:00:00Z",
+            "delivered_at": "2026-10-15T00:01:00Z", "compile_duration_seconds": 52.0,
+        })["build"]
+        self.assertEqual(build["finished_at"], "2026-10-15T00:00:52Z")
+        self.assertEqual((build["compile_duration_seconds"], build["delivery_duration_seconds"]), (52.0, 8.0))
+
+    def test_reported_delivery_time_places_the_finish(self):
+        requested = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+        build = self.store.record_rust_build({"build_id": "rb-delivery", "status": "DELIVERED",
+                                              "requested_at": requested, "delivery_duration_seconds": 5.0})["build"]
+        self.assertIsNotNone(build["finished_at"])
+        self.assertEqual(build["delivery_duration_seconds"], 5.0)
+        self.assertAlmostEqual(build["compile_duration_seconds"], 55.0, delta=2.0)
+
+    def test_summary_counts_hits_without_crate_totals(self):
+        self.store.record_rust_build({"build_id": "rb-h", "status": "DELIVERED", "total_duration_seconds": 60.0,
+                                      "cache_hits": 5})
+        self.store.record_rust_build({"build_id": "rb-ht", "status": "DELIVERED", "total_duration_seconds": 60.0,
+                                      "cache_hits": 3, "total_crates": 4})
+        summary = self.store.get_rust_builds_summary()
+        self.assertEqual(summary["total_cache_hits"], 8)
+        self.assertEqual(summary["overall_cache_hit_rate_percent"], 75.0)
+
     def test_no_invented_build_defaults_remain(self):
         import inspect
 

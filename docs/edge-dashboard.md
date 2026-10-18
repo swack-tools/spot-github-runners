@@ -533,10 +533,12 @@ machine type, commit, origin IP, crate count, memory peak, CPU time, or duration
   when the report arrives. The request time comes from `requested_at`, from `total_duration_seconds`, or
   from both `compile_duration_seconds` and `delivery_duration_seconds`. Without one of these the request
   fails with HTTP 400.
-- When no report gives a finish time, `finished_at` and the compile and delivery durations stay `null`.
-  The dashboard doesn't split the total between compiling and delivery.
+- The finish time comes from `finished_at`, from the delivery time minus `delivery_duration_seconds`, or
+  from `requested_at` plus `compile_duration_seconds`. Without any of these, `finished_at` and the compile
+  and delivery durations stay `null`. The dashboard doesn't split the total between compiling and delivery.
 - `cache_hits`, `cache_misses`, and `total_crates` are stored as reported. A missing count is derived only
-  when the other two are present.
+  when the other two are present. An update keeps the stored counts it omits, unless one contradicts the
+  counts it reports. That stored count is then derived again from the others.
 - The benchmark score needs `cpu_platform`, `vcpu`, and `machine_type`, or an explicit
   `instance_benchmark_score`. CPU points need the benchmark score and `cpu_time_seconds`.
 - Without `origin_ip` the build has no network classification and shows the origin as not reported.

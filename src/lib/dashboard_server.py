@@ -6184,11 +6184,12 @@ class DashboardStore:
                 else 0.0
             )
             # Aggregates cover only the builds that reported each figure (unreported figures are None).
+            total_hits = sum(b["cache_hits"] for b in completed_builds if b.get("cache_hits") is not None)
             with_crates = [b for b in completed_builds
                            if b.get("cache_hits") is not None and b.get("total_crates") is not None]
-            total_hits = sum(b["cache_hits"] for b in with_crates)
+            rate_hits = sum(b["cache_hits"] for b in with_crates)
             total_crates = sum(b["total_crates"] for b in with_crates)
-            overall_hit_rate = round((total_hits / total_crates * 100.0) if total_crates else 0.0, 1)
+            overall_hit_rate = round((rate_hits / total_crates * 100.0) if total_crates else 0.0, 1)
             max_peak_ram = max((b["peak_ram_gib"] for b in completed_builds if b.get("peak_ram_gib") is not None),
                                default=0.0)
             total_cpu_time = round(sum(b["cpu_time_seconds"] for b in completed_builds
@@ -6359,11 +6360,7 @@ class DashboardStore:
                 else (duration - delivery_sec if duration is not None and delivery_sec is not None else None)
             )
 
-            # Crate counts come from this report when it carries any, else from the stored build; a count nobody
-            # reported stays None (derived only from the other two).
-            crate_keys = ("cache_hits", "cache_misses", "total_crates")
-            crate_source = payload if any(payload.get(k) is not None for k in crate_keys) else existing_build
-            cache_hits, cache_misses, total_crates = _crate_counts(*(crate_source.get(k) for k in crate_keys))
+            cache_hits, cache_misses, total_crates = _merged_crate_counts(payload, existing_build)
 
             if is_non_delivered:
                 req_at = (
@@ -6421,6 +6418,10 @@ class DashboardStore:
                 elif known_compile is not None:
                     fin_epoch = req_epoch + max(0.0, known_compile)
                     fin_at = _iso_seconds_ago(0, fin_epoch)
+                elif delivery_sec is not None:
+                    # Delivered when reported, so it finished the reported delivery time before that.
+                    fin_epoch = now_ts - delivery_sec
+                    fin_at = _iso_seconds_ago(0, fin_epoch)
                 else:
                     fin_epoch = None
                     fin_at = None  # not reported: the compile/delivery split stays unknown
@@ -6446,6 +6447,9 @@ class DashboardStore:
                     fin_at = payload["finished_at"]
                 elif delivery_sec is not None:
                     fin_at = _iso_seconds_ago(delivery_sec, del_epoch)
+                elif known_compile is not None and payload.get("requested_at"):
+                    fin_at = _iso_seconds_ago(
+                        0, _iso_to_epoch(str(payload["requested_at"])) + max(0.0, known_compile))
                 else:
                     fin_at = None  # not reported: the compile/delivery split stays unknown
                 fin_epoch = _iso_to_epoch(str(fin_at)) if fin_at else None
@@ -6455,6 +6459,8 @@ class DashboardStore:
                     req_at = _iso_seconds_ago(max(0.0, known_compile), fin_epoch)
                 elif duration is not None:
                     req_at = _iso_seconds_ago(max(0.0, duration), del_epoch)
+                elif existing_build.get("requested_at"):
+                    req_at = existing_build["requested_at"]
                 else:
                     raise ValueError(UNKNOWN_BUILD_TIMING_MESSAGE)
 
@@ -6557,6 +6563,36 @@ class DashboardStore:
                 "build": enriched,
                 "builder_scaling_evaluation": builder_eval,
             }
+
+
+CRATE_COUNT_KEYS = ("cache_hits", "cache_misses", "total_crates")
+
+
+def _merged_crate_counts(payload: dict[str, Any], stored: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+    """Crate counts of a build update: this report's counts over the stored ones, field by field.
+
+    A stored count that contradicts the new report (for example, misses that no longer fit the new hits and the
+    stored total) is dropped and re-derived from the others; reported counts always win. A count nobody
+    reported stays None.
+    """
+    reported = {k: payload[k] for k in CRATE_COUNT_KEYS if payload.get(k) is not None}
+    kept = {k: stored[k] for k in CRATE_COUNT_KEYS if k not in reported and stored.get(k) is not None}
+
+    def counts(values: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+        return _crate_counts(*(values.get(k) for k in CRATE_COUNT_KEYS))
+
+    try:
+        return counts({**kept, **reported})
+    except ValueError:
+        if not kept:
+            raise
+    for dropped in ("cache_misses", "cache_hits", "total_crates"):
+        if dropped in kept:
+            try:
+                return counts({**{k: v for k, v in kept.items() if k != dropped}, **reported})
+            except ValueError:
+                continue
+    return counts(reported)
 
 
 def _is_loopback_host(host: str) -> bool:
