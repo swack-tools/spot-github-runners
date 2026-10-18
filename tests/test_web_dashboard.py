@@ -6503,11 +6503,38 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
     def test_seed_ids_from_older_versions_are_dropped(self):
         from lib.dashboard_server import drop_seeded_demo_telemetry
 
-        state = {"rust_builds": [], "scaling_telemetry": {"github_oom_runs": [
-            {"id": "gh-oom-38601924810", "run_id": 38601924810, "job_id": 116012948102},
-            {"id": "gh-oom-38596411473", "run_id": 38596411473, "job_id": 115964282184},
-        ]}}
-        self.assertEqual(drop_seeded_demo_telemetry(state), 2)
+        legacy_runs = [{'id': 'gh-oom-38601924810',
+          'repository': 'swack-tools/oxidex',
+          'workflow_name': 'Rust 1.99 Qualification Matrix',
+          'run_id': 38601924810,
+          'job_id': 116012948102,
+          'job_name': 'cargo-nextest-heavy',
+          'runner_name': 'oxidex-za-jnb-01-3',
+          'step_number': 4,
+          'line_number': 118,
+          'failed_at': '2027-01-15T07:51:00Z',
+          'error_excerpt': 'LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)',
+          'failure_classification': 'OOM',
+          'is_oom': True,
+          'is_self_hosted_runner': True,
+          'badge_text': 'OOM Killed (Exit 137 · Self-Hosted Spot Runner)',
+          'deep_link': 'https://github.com/swack-tools/oxidex/actions/runs/38601924810/job/116012948102#step:4:118'},
+         {'id': 'gh-oom-38596411473',
+          'repository': 'Appz4Fun/nzbget',
+          'workflow_name': 'CI Build & Integration Suite',
+          'run_id': 38596411473,
+          'job_id': 115964282184,
+          'job_name': 'linux-x64-release-build',
+          'runner_name': 'oxidex-dallas-01-2',
+          'step_number': 2,
+          'line_number': 50,
+          'failed_at': '2027-01-15T07:37:00Z',
+          'error_excerpt': "error: could not compile `nzbget-core`: process didn't exit successfully (signal: 9, "
+                           'SIGKILL: kill) — container memory.max (16 GiB) exhausted',
+          'deep_link': 'https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50'}]
+        state = seeded_demo_telemetry(ref_now=1800000000)
+        state["scaling_telemetry"] = {"github_oom_runs": legacy_runs}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 7)
         self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [])
 
     def test_seed_ids_with_other_fields_are_real_reports(self):
@@ -6523,6 +6550,26 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         self.assertEqual(state["rust_builds"], [build])
         self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [run])
         self.assertEqual(state["scaling_telemetry"]["journal_oom_events"], [event])
+
+    def test_reported_event_corrections_survive_legacy_cleanup(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        seeds = seeded_demo_telemetry()["scaling_telemetry"]
+        for key, updates in (
+            ("github_oom_runs", ({"error_excerpt": "corrected log evidence"},
+                                 {"failed_at": "2026-10-17T10:00:00Z"},
+                                 {"deep_link": "https://github.com/o/r/actions/runs/123/job/456"})),
+            ("journal_oom_events", ({"journal_line": "corrected kernel evidence"},
+                                    {"process": "python3"}, {"zone": "europe-west1-b"},
+                                    {"observed_at": "2026-10-17T10:00:00Z"})),
+        ):
+            for update in updates:
+                with self.subTest(key=key, update=update):
+                    record = dict(seeds[key][0], **update)
+                    state = {"rust_builds": copy.deepcopy(seeded_demo_telemetry()["rust_builds"]),
+                             "scaling_telemetry": {key: [record]}}
+                    self.assertEqual(drop_seeded_demo_telemetry(state), 5)
+                    self.assertEqual(state["scaling_telemetry"][key], [record])
 
     def test_partial_real_updates_to_a_seeded_build_are_kept(self):
         from lib.dashboard_server import drop_seeded_demo_telemetry

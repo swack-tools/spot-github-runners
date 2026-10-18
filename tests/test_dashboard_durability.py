@@ -1053,8 +1053,23 @@ class FreshOwnershipTests(unittest.TestCase):
 class DemoTelemetryMigrationCommitTests(unittest.TestCase):
     """A load that drops seeded demo telemetry is committed as a new state_version, only by the active slot."""
 
-    SEEDED_RUN = {"id": "gh-oom-37192994059", "run_id": 37192994059, "job_id": 111409747367,
-                  "error_excerpt": "##[error]Process completed with exit code 137."}
+    SEEDED_RUN = {'id': 'gh-oom-37192994059',
+     'repository': 'swack-tools/oxidex',
+     'workflow_name': 'CI',
+     'run_id': 37192994059,
+     'job_id': 111409747367,
+     'job_name': 'Verify Generated Tables / tools 5/8',
+     'runner_name': 'gha-oxidex-runners-asianortheast2-a-1791098074-5',
+     'step_number': 7,
+     'line_number': 77,
+     'failed_at': '2026-10-04T10:01:39Z',
+     'error_excerpt': 'test_committed_rules_and_ledger_equal_fresh_native_generation ... ##[error]Process '
+                      'completed with exit code 137.',
+     'failure_classification': 'OOM',
+     'is_oom': True,
+     'is_self_hosted_runner': True,
+     'badge_text': 'OOM Killed (Exit 137 · Self-Hosted Spot Runner)',
+     'deep_link': 'https://github.com/swack-tools/oxidex/actions/runs/37192994059/job/111409747367#step:7:77'}
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

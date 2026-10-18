@@ -467,17 +467,107 @@ SEEDED_RUST_BUILD_GAPS = {
     "rb-20261015-004": (145, 14),
     "rb-20261015-005": (190, 14),
 }
-# id -> (run_id, job_id)
-SEEDED_GITHUB_CI_RUNS = {
-    "gh-oom-37192272062": (37192272062, 111407847874),
-    "gh-oom-37192994059": (37192994059, 111409747367),
-    "gh-timeout-38596411473": (38596411473, 115964282184),
-    # The same seeds in older versions, before they were rewritten on load.
-    "gh-oom-38596411473": (38596411473, 115964282184),
-    "gh-oom-38601924810": (38601924810, 116012948102),
+# Match source event content too: reports can replace seeded rows while retaining the same identity.
+# RELATIVE timestamps in the earliest versions are checked against the unchanged build timestamps.
+SEEDED_GITHUB_CI_RUNS = [
+    {
+        "id": "gh-oom-37192272062",
+        "repository": "swack-tools/oxidex",
+        "workflow_name": "CI",
+        "run_id": 37192272062,
+        "job_id": 111407847874,
+        "job_name": "Verify Generated Tables / catalog join",
+        "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-2",
+        "step_number": 8,
+        "line_number": 106,
+        "failed_at": "2026-10-04T09:39:54Z",
+        "error_excerpt": "line 14: 15780 Killed python3 tools/exiftool-tables — ##[error]Process completed with exit code 137.",
+        "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/37192272062/job/111407847874#step:8:106"
+    },
+    {
+        "id": "gh-oom-37192994059",
+        "repository": "swack-tools/oxidex",
+        "workflow_name": "CI",
+        "run_id": 37192994059,
+        "job_id": 111409747367,
+        "job_name": "Verify Generated Tables / tools 5/8",
+        "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-5",
+        "step_number": 7,
+        "line_number": 77,
+        "failed_at": "2026-10-04T10:01:39Z",
+        "error_excerpt": "test_committed_rules_and_ledger_equal_fresh_native_generation ... ##[error]Process completed with exit code 137.",
+        "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/37192994059/job/111409747367#step:7:77"
+    },
+    {
+        "id": "gh-timeout-38596411473",
+        "repository": "Appz4Fun/nzbget",
+        "workflow_name": "docs",
+        "run_id": 38596411473,
+        "job_id": 115964282184,
+        "job_name": "deploy (Deploy to GitHub Pages)",
+        "runner_name": "GitHub Actions 1000014245",
+        "step_number": 2,
+        "line_number": 50,
+        "failed_at": "2026-10-14T16:25:26Z",
+        "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
+        "deep_link": "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50"
+    },
+    {
+        "id": "gh-oom-38601924810",
+        "repository": "swack-tools/oxidex",
+        "workflow_name": "Rust 1.99 Qualification Matrix",
+        "run_id": 38601924810,
+        "job_id": 116012948102,
+        "job_name": "cargo-nextest-heavy",
+        "runner_name": "oxidex-za-jnb-01-3",
+        "step_number": 4,
+        "line_number": 118,
+        "failed_at": "RELATIVE",
+        "error_excerpt": "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)",
+        "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/38601924810/job/116012948102#step:4:118"
+    },
+    {
+        "id": "gh-timeout-38596411473",
+        "repository": "Appz4Fun/nzbget",
+        "workflow_name": "docs",
+        "run_id": 38596411473,
+        "job_id": 115964282184,
+        "job_name": "deploy (Deploy to GitHub Pages)",
+        "runner_name": "GitHub Actions 1000014245",
+        "step_number": 2,
+        "line_number": 50,
+        "failed_at": "RELATIVE",
+        "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
+        "deep_link": "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50"
+    },
+    {
+        "id": "gh-oom-38596411473",
+        "repository": "Appz4Fun/nzbget",
+        "workflow_name": "CI Build & Integration Suite",
+        "run_id": 38596411473,
+        "job_id": 115964282184,
+        "job_name": "linux-x64-release-build",
+        "runner_name": "oxidex-dallas-01-2",
+        "step_number": 2,
+        "line_number": 50,
+        "failed_at": "RELATIVE",
+        "error_excerpt": "error: could not compile `nzbget-core`: process didn't exit successfully (signal: 9, SIGKILL: kill) — container memory.max (16 GiB) exhausted",
+        "deep_link": "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50"
+    }
+]
+SEEDED_JOURNAL_OOM_EVENT = {
+    "id": "oom-journal-01", "instance_name": "oxidex-runners-dallas-01", "zone": "us-south1-a",
+    "pid": 18492, "process": "rustc", "constraint": "CONSTRAINT_MEMCG",
+    "journal_line": (
+        "kernel: oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),"
+        "cpuset=docker-8f4a21.scope,mems_allowed=0,oom_memcg=/system.slice/docker-8f4a21.scope,"
+        "task_memcg=/system.slice/docker-8f4a21.scope,task=rustc,pid=18492,uid=1001"
+    ),
 }
-# id -> (instance_name, pid)
-SEEDED_JOURNAL_OOM_EVENTS = {"oom-journal-01": ("oxidex-runners-dallas-01", 18492)}
+SEEDED_BUILD_REQUEST_OFFSETS = {
+    "rb-20261015-001": 920, "rb-20261015-002": 2450, "rb-20261015-003": 4800,
+    "rb-20261015-004": 7600, "rb-20261015-005": 11200,
+}
 SEEDED_JOB_COUNTERS = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
 
 
@@ -502,21 +592,43 @@ def _is_seeded_build(record: dict[str, Any]) -> bool:
     return (round(finished - requested), round(delivered - finished)) == SEEDED_RUST_BUILD_GAPS[build_id]
 
 
-def _is_seeded_ci_run(record: dict[str, Any]) -> bool:
-    fingerprint = SEEDED_GITHUB_CI_RUNS.get(record.get("id"))
-    return fingerprint is not None and (record.get("run_id"), record.get("job_id")) == fingerprint
+def _seed_fields_match(record: dict[str, Any], fingerprint: dict[str, Any]) -> bool:
+    return all(record.get(k) == v and type(record.get(k)) is type(v) for k, v in fingerprint.items())
 
 
-def _is_seeded_journal_oom(record: dict[str, Any]) -> bool:
-    fingerprint = SEEDED_JOURNAL_OOM_EVENTS.get(record.get("id"))
-    return fingerprint is not None and (record.get("instance_name"), record.get("pid")) == fingerprint
+def _is_seeded_ci_run(record: dict[str, Any], reference: float | None) -> bool:
+    for fingerprint in SEEDED_GITHUB_CI_RUNS:
+        if fingerprint["failed_at"] != "RELATIVE":
+            if _seed_fields_match(record, fingerprint):
+                return True
+        elif reference is not None:
+            expected = dict(fingerprint, failed_at=_iso_epoch(reference - (
+                540 if fingerprint["id"] == "gh-oom-38601924810" else 1380)))
+            if _seed_fields_match(record, expected):
+                return True
+    return False
+
+
+def _is_seeded_journal_oom(record: dict[str, Any], reference: float | None) -> bool:
+    # Its timestamp was generated at startup. Without an unchanged build to recover that startup time,
+    # the record cannot be distinguished from a later report with the same static fields; keep it.
+    if reference is None:
+        return False
+    expected = dict(SEEDED_JOURNAL_OOM_EVENT, observed_at=_iso_epoch(reference - 420))
+    return _seed_fields_match(record, expected)
 
 
 def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
     """Remove seeded demo telemetry from ``state`` in place; returns how many records or counters it dropped."""
     dropped = 0
+    reference = None
     builds = state.get("rust_builds")
     if isinstance(builds, list):
+        for build in builds:
+            if isinstance(build, dict) and _is_seeded_build(build):
+                reference = (_iso_to_epoch(build["requested_at"])
+                             + SEEDED_BUILD_REQUEST_OFFSETS[build["build_id"]])
+                break
         kept = [b for b in builds if not (isinstance(b, dict) and _is_seeded_build(b))]
         dropped += len(builds) - len(kept)
         state["rust_builds"] = kept
@@ -530,7 +642,7 @@ def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
     ):
         records = telem.get(key)
         if isinstance(records, list):
-            kept = [r for r in records if not (isinstance(r, dict) and is_seed(r))]
+            kept = [r for r in records if not (isinstance(r, dict) and is_seed(r, reference))]
             dropped += len(records) - len(kept)
             telem[key] = kept
     if all(telem.get(k) == v and type(telem.get(k)) is int for k, v in SEEDED_JOB_COUNTERS.items()):
