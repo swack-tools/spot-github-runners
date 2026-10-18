@@ -6795,7 +6795,10 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         resumed = time.time()
         self.store.refresh_fleet_inventory()
         detached = self._record("builder-oxidex-so-cache")
-        self.assertLess(instance_usage(detached, resumed + 3600.0)["disk_hours"], 1.1)  # Handoff, not creation.
+        # The first denied listing billed no fabricated rate. Recovery now supplies the previously unpaid
+        # creation-to-observation interval, exactly once, on the physical disk's new billing record.
+        self.assertAlmostEqual(instance_usage(detached, resumed + 3600.0)["disk_hours"],
+                               (resumed + 3600.0 - created) / 3600.0, delta=0.05)
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
@@ -6909,6 +6912,31 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(builder["status"], "TERMINATED")
         self.assertEqual((builder["vcpu"], builder["specs_known"]), (16, False))
         self.assertIsNotNone(builder["last_stop_epoch"])
+
+    def test_builder_capacity_requires_verified_fixed_host_shape(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        for machine, vcpu, ram, verified in (("n4-highcpu-8", 8, 16.0, True),
+                ("n4-highcpu-16", 16, 28.0, True), ("n4-highcpu-16", 8, 32.0, True),
+                ("n4-highcpu-16", 16, 32.0, False),
+                ("n4-highcpu-16", 16, 32.0, True)):
+            valid = machine == "n4-highcpu-16" and vcpu == 16 and ram == 32.0 and verified
+            with self.subTest(machine=machine, ram=ram, verified=verified):
+                item = {"id": "shape-check", "name": "builder-shape-check", "zone": "zones/us-south1-b",
+                        "status": "RUNNING", "machineType": "types/" + machine}
+                shapes = {("us-south1-b", machine): {"vcpu": vcpu, "ram_gib": ram}} if verified else {}
+                observation = observe_fleet_items([item], shapes=shapes)[0]
+                self.assertEqual(observation["runner_limits_known"], valid)
+                self.assertEqual(observation["runners_count_known"], valid)
+                self.assertEqual((observation["runners_count"], observation["runner_vcpu"],
+                                  observation["runner_ram_gib"]), (1, 16, 28.0) if valid else (0, 0, 0.0))
+                self.fleet = [observation]
+                self.store.refresh_fleet_inventory()
+                self.assertEqual(self.store.state["scaling_telemetry"]["current_builder_instances"], int(valid))
+                if not valid:
+                    with self.assertRaisesRegex(ValueError, "Per-runner limits"):
+                        self.store.create_vm_template_from_instance({"instance_id": "shape-check",
+                                                                    "assign_to_profile": False})
 
     def test_custom_machine_type_vcpu_fallback(self):
         from lib.fleet_inventory import observe_fleet_items
@@ -7133,7 +7161,7 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in telem["github_oom_runs"]], ["gh-ci-real0001"])
         self.assertEqual([(e["id"], e["instance_name"]) for e in telem["journal_oom_events"]],
                          [("oom-journal-01", "oxidex-runners-real-1")])
-        self.assertEqual((telem["jobs_ran_past_hour"], telem["provisioned_jobs"], telem["queued_jobs"]), (0, 0, 0))
+        self.assertEqual((telem["jobs_ran_past_hour"], telem["provisioned_jobs"], telem["queued_jobs"]), (14, 7, 3))
 
     def test_legacy_template_sources_do_not_block_telemetry_cleanup(self):
         from lib.dashboard_server import DashboardStore
@@ -7291,7 +7319,7 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
                 for key in ("requested_at", "finished_at", "delivered_at"):
                     stamp = datetime.fromisoformat(build[key].replace("Z", "+00:00")).timestamp()
                     build[key] = datetime.fromtimestamp(stamp + shift, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                self.assertEqual(drop_seeded_demo_telemetry(state), 11)
+                self.assertEqual(drop_seeded_demo_telemetry(state), 8)
                 self.assertEqual(state["rust_builds"], [build])
                 self.assertEqual(state["scaling_telemetry"]["journal_oom_events"], [])
 
@@ -7326,13 +7354,29 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         self.assertEqual(len(self.store.state["rust_builds"]), 5)
         self.assertEqual(self.store.state["scaling_telemetry"]["queued_jobs"], 3)
 
+    def test_fresh_partial_counter_report_survives_even_with_old_seed_events(self):
+        from lib.dashboard_server import DashboardStore
+
+        # Simulate the old deployment: its report path wrote no migration marker and left omitted event lists.
+        self.store.state = self._seeded_raw_state()
+        counters = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
+        self.store.update_scaling({"telemetry": counters})
+        before = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("demo_telemetry_migration", before)
+        self.assertEqual(len(before["scaling_telemetry"]["github_oom_runs"]), 4)
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        self.assertEqual(len(reloaded.state["scaling_telemetry"]["github_oom_runs"]), 1)
+        self.assertEqual({key: reloaded.state["scaling_telemetry"][key] for key in counters}, counters)
+
     def test_extra_event_evidence_survives_legacy_cleanup(self):
         from lib.dashboard_server import drop_seeded_demo_telemetry
 
         state = seeded_demo_telemetry()
         state["scaling_telemetry"]["github_oom_runs"][0]["log_sha256"] = "evidence-sha256"
         state["scaling_telemetry"]["journal_oom_events"][0]["cgroup_path"] = "/jobs/actual-job"
-        self.assertEqual(drop_seeded_demo_telemetry(state), 10)  # 5 builds, 2 CI runs, 3 counters
+        self.assertEqual(drop_seeded_demo_telemetry(state), 7)  # 5 builds, 2 CI runs
         self.assertEqual(len(state["scaling_telemetry"]["github_oom_runs"]), 1)
         self.assertEqual(len(state["scaling_telemetry"]["journal_oom_events"]), 1)
 

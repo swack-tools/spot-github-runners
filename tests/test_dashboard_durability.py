@@ -1093,7 +1093,7 @@ class DemoTelemetryMigrationCommitTests(unittest.TestCase):
 
     def assert_migrated(self, state: dict) -> None:
         self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [])
-        self.assertEqual(state["scaling_telemetry"]["queued_jobs"], 0)
+        self.assertEqual(state["scaling_telemetry"]["queued_jobs"], 3)
         self.assertEqual(state["controlled_targets"], ["o/kept"])
         self.assertEqual(state["demo_telemetry_migration"], 1)
 

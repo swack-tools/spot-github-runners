@@ -399,6 +399,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   missing before its unresolved history can expire. Once that confirmed absence is outside the 31-day
   window, it no longer holds current budgets; `lifetime_cost_complete` stays false if the old amount
   couldn't be recovered. A newer disk with the same source name cannot resolve the old uncertainty.
+- A builder name identifies the host's role, but its fixed build capacity is counted only after the
+  machine inventory verifies `n4-highcpu-16`, 16 vCPUs, and 32 GiB of host RAM. Other shapes and unknown
+  capacities have no known container limits and can't be copied into a VM template.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host; the dashboard hides the template action for such records.
@@ -507,9 +510,10 @@ GitHub CI failure runs, journal OOM events, or job counters.
     by the unchanged saved presets. If that time cannot be recovered, these events stay rather than risking a
     reported correction. Additional source evidence, such as a log hash or cgroup path, also keeps the
     event; only known classification and handling fields may be added to an unchanged seed.
-- The migration resets the job counters to 0 only when it also removes a confirmed seeded record and all
-  three counters still hold the seeded values, 14 jobs in the past hour, 7 provisioned, and 3 queued. Counter
-  values alone don't prove demo provenance, so the tuple stays as reported when no seed record is removed.
+- The migration preserves all saved job counters, including the old demo tuple of 14 jobs in the past
+  hour, 7 provisioned, and 3 queued. Earlier versions stored no provenance for counters: a fresh partial
+  report could produce that tuple while leaving old demo events untouched. There is no way to prove the
+  saved counters are still demo data. New states start at 0; later reports replace the saved counters.
 - The drop keeps the loaded `state_version` and sets `demo_telemetry_migration_pending` in the saved
   state, so a restart doesn't lose it. The active slot then commits the migrated state as the next
   `state_version` through the same checks as any change, and publishes it to KV. Any new version clears
