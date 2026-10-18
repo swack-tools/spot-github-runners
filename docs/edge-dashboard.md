@@ -353,7 +353,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   days, and cost windows are limited to 744 hours (31 days) to match. To keep the state and its KV
   snapshot small, history past 2,000 records, or past 200 runs or disk segments of one VM, is folded
   into hourly cost totals. If the instance data still exceeds 6 MiB serialized, the oldest deleted
-  records are folded next, then all but the newest 10 runs and disk segments of each live VM. Window totals still include it to within an hour, though a search filter
+  records are folded next, then all but the newest 10 runs and disk segments of each live VM, then all
+  of them, and then each live VM's folded totals are merged into daily totals. A listing whose records
+  still don't fit is refused, and the inventory reads as stale. Window totals still include it to within an hour, though a search filter
   can't match folded records. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
 - Spend covers each VM's attached disks while the VM exists. A dedicated builder's cache disk
@@ -362,16 +364,19 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host. A VM with data disks of several types can't be a template
   source or the shape of a scale plan, since those hold one data-disk type. Neither can a VM with
-  Local SSD, which templates don't describe. When a running host has no recorded runner count, the
-  runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
+  Local SSD, which templates don't describe. When a running host has no recorded runner count, or
+  hasn't confirmed its bootstrap in its current boot (an applied patch record for this boot with
+  nothing pending), the runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
   plans are refused.
 - A VM in a region outside the dashboard's region catalog is priced with no tax, marked
   `tax_rate_known: false`, rather than with another region's default tax. Each inventory refresh,
   not a page read, reprices the listed VMs, stopped ones included, so a tax override also applies to
   their disks, and the rate change is saved with the state.
 - A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, for a
-  `SUSPENDED` VM, whose preserved memory Compute Engine also bills, and for a VM with Local SSD (counted
-  as `local_ssd_gb`, not as a persistent data disk), the record is marked
+  `SUSPENDED` VM, whose preserved memory Compute Engine also bills, for a VM with Local SSD (counted
+  as `local_ssd_gb`, not as a persistent data disk), and for a VM whose Hyperdisk bills provisioned IOPS
+  or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
+  no reported performance), the record is marked
   `pricing_complete: false`. While the role's fleet (both roles under a shared budget) has such a VM,
   scale-up recommendations hold and scale-up plans are refused, because their budget check would pass
   on a cost that's too low.
@@ -381,12 +386,13 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error. Until the next
   complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false: the rows
-  stay visible, but scaling recommendations hold and scale-up plans are refused.
+  stay visible, but scaling recommendations hold and scale-up plans are refused. A listing that can't be
+  saved, for example on a full disk, also leaves the inventory stale.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
   inactive makes no Compute Engine calls and keeps the records the active slot last published.
 - The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
-  already existed, so they don't mark OOM events handled. Only later growth in runner slots or builder
-  VMs does. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
+  already existed, so they don't mark OOM events handled. Only later growth beyond the capacity that
+  already existed, running or stopped, does: a stopped VM that starts again adds none. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
   snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
   empty and the instances tab says that the inventory isn't configured. Inventory records loaded from

@@ -4690,6 +4690,7 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         before = instance_usage(rec, self.now, self.now - 744 * 3600.0)
         with unittest.mock.patch.object(dashboard_server, "MAX_INSTANCE_STATE_BYTES", 3_000):
             live, _gone = dashboard_server._fit_size_budget([rec], [], {}, self.now)
+            self.assertLessEqual(dashboard_server._serialized_size([live, [], {}]), 3_000)
         self.assertLessEqual(len(live[0]["prior_runs"]), dashboard_server.MIN_DETAILED_SEGMENTS)
         after = instance_usage(live[0], self.now, self.now - 744 * 3600.0)
         self.assertAlmostEqual(after["compute_hours"], before["compute_hours"], delta=0.01)
@@ -4781,6 +4782,42 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.store.refresh_fleet_inventory()
         with self.assertRaisesRegex(ValueError, "Local SSD"):
             self.store.create_vm_template_from_instance({"instance_name": "builder-oxidex-lssd-2"})
+
+    def test_state_that_cannot_fit_is_rejected_and_stale(self):
+        from lib import dashboard_server
+
+        self.fleet = [fleet_observation("4900", "oxidex-runners-huge-1", "us-south1-a", now=self.now)]
+        with unittest.mock.patch.object(dashboard_server, "MAX_INSTANCE_STATE_BYTES", 100):
+            self.assertFalse(self.store.refresh_fleet_inventory())
+        self.assertEqual(self.store.state["instances"], [])
+        self.assertIn("InventoryTooLargeError", self.store.fleet_inventory_status()["last_error"])
+        self.assertTrue(self.store._inventory_stale_reason())
+
+    def test_failed_persist_marks_inventory_stale(self):
+        self.fleet = [fleet_observation("5000", "oxidex-runners-disk-full-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self.store._inventory_stale_reason(), "")
+        self.fleet.append(fleet_observation("5001", "oxidex-runners-disk-full-2", "us-south1-a", now=self.now))
+        with unittest.mock.patch.object(self.store, "_persist", side_effect=OSError("No space left on device")):
+            self.assertFalse(self.store.refresh_fleet_inventory())
+        self.assertEqual(len(self.store.state["instances"]), 1)  # Rolled back.
+        self.assertIn("No space left", self.store._inventory_stale_reason())
+
+    def test_builder_restart_does_not_consume_oom(self):
+        builder = fleet_observation("5100", "builder-oxidex-oom-1", "us-south1-b", started_hours_ago=5.0, now=self.now)
+        self.fleet = [builder]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [dict(builder, status="TERMINATED", last_stop_epoch=self.now - 3600.0)]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-b2", "instance_name": "builder-oxidex-oom-1", "role": "rust_builder"}]
+        self.fleet = [dict(builder, last_start_epoch=self.now - 60.0)]  # Same VM started again.
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
+        self.fleet.append(fleet_observation("5101", "builder-oxidex-oom-2", "us-south1-b", now=self.now))
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
@@ -4917,6 +4954,49 @@ class FleetInventoryReconcileTests(unittest.TestCase):
              "machineType": "machineTypes/n2-custom-32-112640"},
         ])
         self.assertEqual((observed[0]["vcpu"], observed[0]["specs_known"]), (32, False))
+
+    def test_runner_count_needs_bootstrap_confirmation(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        start = "2026-10-18T01:00:00.000-07:00"
+        base = {"id": "61", "name": "oxidex-runners-boot-1", "zone": "zones/us-south1-a", "status": "RUNNING",
+                "machineType": "machineTypes/n4-standard-16", "lastStartTimestamp": start}
+        provisioned = {"items": [{"key": "spot-runner-count", "value": "4"},
+                                 {"key": "spot-runner-patch-pending-sha256", "value": "none"}]}
+        confirmed = {"items": [{"key": "spot-runner-count", "value": "4"},
+                               {"key": "spot-runner-patch-sha256", "value": "none"},
+                               {"key": "spot-runner-patch-boot", "value": start}]}
+        stale_boot = {"items": [{"key": "spot-runner-count", "value": "4"},
+                                {"key": "spot-runner-patch-sha256", "value": "none"},
+                                {"key": "spot-runner-patch-boot", "value": "2026-10-01T00:00:00.000-07:00"}]}
+        shapes = {("us-south1-a", "n4-standard-16"): {"vcpu": 16, "ram_gib": 64.0}}
+        known = [observe_fleet_items([dict(base, metadata=m)], shapes=shapes)[0]["runners_count_known"]
+                 for m in (provisioned, confirmed, stale_boot)]
+        self.assertEqual(known, [False, True, False])
+
+    def test_provisioned_hyperdisk_performance_marks_pricing_incomplete(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        def observe(detail):
+            return observe_fleet_items(
+                [{"id": "62", "name": "builder-oxidex-hd-1", "zone": "zones/us-south1-b", "status": "RUNNING",
+                  "machineType": "machineTypes/n4-highcpu-16",
+                  "disks": [{"boot": True, "diskSizeGb": "40", "source": "d/boot"},
+                            {"boot": False, "diskSizeGb": "500", "source": "d/data"}]}],
+                disk_types={"d/boot": {"type": "pd-balanced"}, "d/data": detail},
+                shapes={("us-south1-b", "n4-highcpu-16"): {"vcpu": 16, "ram_gib": 32.0}})[0]
+
+        included = {"type": "hyperdisk-balanced", "provisionedIops": "3000", "provisionedThroughput": "140"}
+        self.assertFalse(observe(included)["unpriced_disk_performance"])
+        self.assertTrue(observe(dict(included, provisionedIops="8000"))["unpriced_disk_performance"])
+        self.assertTrue(observe({"type": "hyperdisk-balanced"})["unpriced_disk_performance"])
+        throughput = observe({"type": "hyperdisk-throughput", "provisionedThroughput": "200"})
+        self.assertTrue(throughput["unpriced_disk_performance"])
+        self.fleet = [throughput]
+        self.store.refresh_fleet_inventory()
+        rec = next(i for i in self.store.state["instances"] if i["name"] == "builder-oxidex-hd-1")
+        self.assertFalse(rec["pricing_complete"])
+        self.assertIn("provisioned IOPS or throughput", rec["pricing_incomplete_reason"])
 
     def test_fleet_source_from_env(self):
         from lib.fleet_inventory import fleet_source_from_env

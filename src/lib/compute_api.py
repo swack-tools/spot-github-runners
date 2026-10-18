@@ -351,15 +351,16 @@ async def list_instances(api: AsyncGoogleApi, project: str, *,
         query["pageToken"] = token
 
 
-async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, str]:
-    """``{disk selfLink: disk type name}`` for every persistent disk, from one aggregated listing."""
+async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, dict]:
+    """``{disk selfLink: {"type", "provisionedIops", "provisionedThroughput"}}`` for every persistent disk, from one
+    aggregated listing (the performance keys only where Compute Engine reports them)."""
     path = f"{API_ROOT}/projects/{quote(project, safe='')}/aggregated/disks"
     query = {
         "maxResults": "500",
         "returnPartialSuccess": "true",
-        "fields": "nextPageToken,unreachables,items/*/disks(selfLink,type)",
+        "fields": "nextPageToken,unreachables,items/*/disks(selfLink,type,provisionedIops,provisionedThroughput)",
     }
-    types: dict[str, str] = {}
+    types: dict[str, dict] = {}
     while True:
         data = await api.get_json(path, query)
         if data.get("unreachables"):
@@ -368,7 +369,10 @@ async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, str]:
         for scoped in data.get("items", {}).values():
             for disk in scoped.get("disks", []):
                 if isinstance(disk, dict) and disk.get("selfLink"):
-                    types[str(disk["selfLink"])] = str(disk.get("type", "")).rsplit("/", 1)[-1]
+                    types[str(disk["selfLink"])] = {
+                        "type": str(disk.get("type", "")).rsplit("/", 1)[-1],
+                        **{k: disk[k] for k in ("provisionedIops", "provisionedThroughput") if k in disk},
+                    }
         token = data.get("nextPageToken")
         if not token:
             return types

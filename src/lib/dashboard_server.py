@@ -469,12 +469,13 @@ _BUCKET_SECONDS = 3600.0
 
 
 def _add_to_buckets(buckets: dict[str, list[float]], prefix: str, start: float, end: float,
-                        all_in_rate: float, compute_rate: float, *, compute: bool) -> None:
+                        all_in_rate: float, compute_rate: float, *, compute: bool,
+                        span: float = _BUCKET_SECONDS) -> None:
     """Spread one interval's cost over hour buckets ``{prefix + hour_epoch: [compute_hours, all_in, compute]}``."""
     cursor = start
     while cursor < end:
-        hour = math.floor(cursor / _BUCKET_SECONDS) * _BUCKET_SECONDS
-        chunk_end = min(end, hour + _BUCKET_SECONDS)
+        hour = math.floor(cursor / span) * span
+        chunk_end = min(end, hour + span)
         hours = (chunk_end - cursor) / 3600.0
         bucket = buckets.setdefault(f"{prefix}{int(hour)}", [0.0, 0.0, 0.0])
         if compute:
@@ -484,7 +485,8 @@ def _add_to_buckets(buckets: dict[str, list[float]], prefix: str, start: float, 
         cursor = chunk_end
 
 
-def _bucket_window_costs(buckets: Any, window_start: float, now: float, prefix: str = "") -> tuple[float, float, float]:
+def _bucket_window_costs(buckets: Any, window_start: float, now: float, prefix: str = "",
+                         span: float = _BUCKET_SECONDS) -> tuple[float, float, float]:
     """(compute hours, all-in cost, compute cost) of buckets inside the window, pro rata for a partial hour."""
     hours = all_in = compute = 0.0
     for key, value in (buckets or {}).items() if isinstance(buckets, dict) else []:
@@ -494,7 +496,7 @@ def _bucket_window_costs(buckets: Any, window_start: float, now: float, prefix: 
             hour = float(str(key)[len(prefix):])
         except ValueError:
             continue
-        span_end = min(hour + _BUCKET_SECONDS, now)
+        span_end = min(hour + span, now)
         if span_end <= hour:
             continue
         fraction = max(0.0, span_end - max(hour, window_start)) / (span_end - hour)
@@ -504,13 +506,44 @@ def _bucket_window_costs(buckets: Any, window_start: float, now: float, prefix: 
     return hours, all_in, compute
 
 
-def _prune_buckets(buckets: dict[str, list[float]], cutoff: float) -> None:
+COARSE_BUCKET_SECONDS = 86_400.0
+
+
+def _record_bucket_span(record: dict[str, Any] | None) -> float:
+    span = (record or {}).get("folded_bucket_seconds")
+    return float(span) if _finite(span) and span > 0 else _BUCKET_SECONDS
+
+
+def _rebucket(buckets: dict[str, list[float]], prefix: str, from_span: float, to_span: float) -> dict[str, list[float]]:
+    """Buckets re-keyed to ``to_span``: merged when coarser, spread evenly when finer."""
+    out: dict[str, list[float]] = {}
+    for key, value in buckets.items():
+        if not str(key).startswith(prefix):
+            continue
+        try:
+            start = float(str(key)[len(prefix):])
+        except ValueError:
+            continue
+        if to_span >= from_span:
+            target = out.setdefault(f"{prefix}{int(math.floor(start / to_span) * to_span)}", [0.0, 0.0, 0.0])
+            for i in range(3):
+                target[i] += float(value[i])
+        else:
+            parts = max(1, int(round(from_span / to_span)))
+            for n in range(parts):
+                target = out.setdefault(f"{prefix}{int(start + n * to_span)}", [0.0, 0.0, 0.0])
+                for i in range(3):
+                    target[i] += float(value[i]) / parts
+    return out
+
+
+def _prune_buckets(buckets: dict[str, list[float]], cutoff: float, span: float = _BUCKET_SECONDS) -> None:
     for key in list(buckets):
         try:
             hour = float(key.rsplit("|", 1)[-1])
         except ValueError:
             continue
-        if hour + _BUCKET_SECONDS < cutoff:
+        if hour + span < cutoff:
             del buckets[key]
 
 
@@ -559,8 +592,9 @@ def instance_usage(record: dict[str, Any], now: float, window_start: float | Non
         else (0.0, 0.0)
     )
     folded = record.get("folded_cost_buckets") if isinstance(record.get("folded_cost_buckets"), dict) else {}
-    folded_total = _bucket_window_costs(folded, float("-inf"), now)
-    folded_window = _bucket_window_costs(folded, window, now)
+    span = _record_bucket_span(record)
+    folded_total = _bucket_window_costs(folded, float("-inf"), now, span=span)
+    folded_window = _bucket_window_costs(folded, window, now, span=span)
     return {
         "compute_hours": sum(e - s for s, e, _a, _c in runs) / 3600.0 + (float(pruned) if _finite(pruned) else 0.0)
         + folded_total[0],
@@ -659,6 +693,8 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
         reasons.append("no on-demand rate for this standard (non-Spot) VM")
     if record.get("status") == "SUSPENDED":
         reasons.append("suspended: Compute Engine also bills the preserved memory, which is not priced here")
+    if record.get("unpriced_disk_performance"):
+        reasons.append("Hyperdisk provisioned IOPS or throughput above the included baseline, not priced here")
     if int(record.get("local_ssd_gb") or 0) > 0:
         reasons.append(f"{int(record['local_ssd_gb'])} GiB of Local SSD, which is not priced here")
     record["pricing_complete"] = not reasons
@@ -701,7 +737,7 @@ def _live_instance_record(
     region_known = any(r["region"] == region for r in REGIONS_CATALOG)
     provisioning = "spot" if obs.get("spot", True) else "ondemand"
     shape_keys = ("spot", "region", "machine_type", "vcpu", "ram_gib", "boot_disk_type", "boot_disk_gb",
-                  "data_disk_type", "data_disk_gb", "data_disks", "local_ssd_gb")
+                  "data_disk_type", "data_disk_gb", "data_disks", "local_ssd_gb", "unpriced_disk_performance")
     reuse_pricing = (
         previous.get("pricing")
         if previous is not None and isinstance(previous.get("pricing"), dict)
@@ -746,6 +782,7 @@ def _live_instance_record(
                                                   family=record["family"], project=project)
     record["data_disks"] = obs.get("data_disks") or {}
     record["local_ssd_gb"] = int(obs.get("local_ssd_gb") or 0)
+    record["unpriced_disk_performance"] = bool(obs.get("unpriced_disk_performance"))
     # The record shows the total data-disk size (pricing already covers each type).
     record["data_disk_gb"] = int(obs.get("data_disk_gb") or 0)
     if not region_known:
@@ -847,24 +884,26 @@ def _live_instance_record(
         else:
             kept_disks.append((s0, e0, r0))
     folded = copy.deepcopy((previous or {}).get("folded_cost_buckets") or {})
+    folded_span = _record_bucket_span(previous)
     if len(kept_runs) > MAX_DETAILED_SEGMENTS:
         kept_runs.sort(key=lambda run: run[0])
         for s0, e0, ca, co in kept_runs[:-MAX_DETAILED_SEGMENTS]:
             _add_to_buckets(folded, "", s0, e0, ca if ca is not None else cur_compute_all_in,
-                                co if co is not None else cur_compute_only, compute=True)
+                                co if co is not None else cur_compute_only, compute=True, span=folded_span)
         kept_runs = kept_runs[-MAX_DETAILED_SEGMENTS:]
     if len(kept_disks) > MAX_DETAILED_SEGMENTS:
         kept_disks.sort(key=lambda seg: seg[0])
         for s0, e0, r0 in kept_disks[:-MAX_DETAILED_SEGMENTS]:
-            _add_to_buckets(folded, "", s0, e0, r0, 0.0, compute=False)
+            _add_to_buckets(folded, "", s0, e0, r0, 0.0, compute=False, span=folded_span)
         kept_disks = kept_disks[-MAX_DETAILED_SEGMENTS:]
     expired_hours, expired_all_in, expired_compute = _bucket_window_costs(
-        {k: v for k, v in folded.items() if float(k) + _BUCKET_SECONDS < cutoff}, float("-inf"), now)
+        {k: v for k, v in folded.items() if float(k) + folded_span < cutoff}, float("-inf"), now, span=folded_span)
     pruned_hours += expired_hours
     pruned_all_in += expired_all_in
     pruned_compute += expired_compute
-    _prune_buckets(folded, cutoff)
+    _prune_buckets(folded, cutoff, folded_span)
     record["folded_cost_buckets"] = folded
+    record["folded_bucket_seconds"] = folded_span
     record.update({
         "started_epoch": started_epoch, "stopped_epoch": stopped_epoch, "deleted_epoch": None, "status": status,
         "prior_runs": [[s0, e0] if ca is None else [s0, e0, ca, co] for s0, e0, ca, co in kept_runs],
@@ -966,7 +1005,8 @@ def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[floa
         _add_to_buckets(buckets, prefix, s0, e0, r0, 0.0, compute=False)
     if usage_end > disk_open:
         _add_to_buckets(buckets, prefix, disk_open, usage_end, cur_disk, 0.0, compute=False)
-    for key, value in (record.get("folded_cost_buckets") or {}).items():
+    own = _rebucket(record.get("folded_cost_buckets") or {}, "", _record_bucket_span(record), _BUCKET_SECONDS)
+    for key, value in own.items():
         bucket = buckets.setdefault(f"{prefix}{key}", [0.0, 0.0, 0.0])
         for i in range(3):
             bucket[i] += float(value[i])
@@ -991,6 +1031,10 @@ def _close_open_segments(record: dict[str, Any], old_pricing: dict[str, Any], no
     record["disk_segment_start"] = now
 
 
+class InventoryTooLargeError(RuntimeError):
+    """The live inventory cannot be compacted into the state size budget."""
+
+
 def _serialized_size(value: Any) -> int:
     return len(json.dumps(value, separators=(",", ":"), allow_nan=False))
 
@@ -1000,17 +1044,29 @@ def _fold_record_detail(record: dict[str, Any], keep: int) -> dict[str, Any]:
     out = dict(record)
     pricing = out.get("pricing") if isinstance(out.get("pricing"), dict) else {}
     cur_all_in, cur_compute, _disk = _pricing_rates(pricing)
+    span = _record_bucket_span(out)
     folded = copy.deepcopy(out.get("folded_cost_buckets") or {})
     runs = sorted(_prior_runs(out), key=lambda run: run[0])
-    for s0, e0, ca, co in runs[:-keep] if len(runs) > keep else []:
+    fold_runs, keep_runs = (runs[:-keep], runs[-keep:]) if keep else (runs, [])
+    for s0, e0, ca, co in fold_runs:
         _add_to_buckets(folded, "", s0, e0, ca if ca is not None else cur_all_in,
-                        co if co is not None else cur_compute, compute=True)
+                        co if co is not None else cur_compute, compute=True, span=span)
     disks = sorted(_disk_segments(out), key=lambda seg: seg[0])
-    for s0, e0, r0 in disks[:-keep] if len(disks) > keep else []:
-        _add_to_buckets(folded, "", s0, e0, r0, 0.0, compute=False)
-    out["prior_runs"] = [[s0, e0] if ca is None else [s0, e0, ca, co] for s0, e0, ca, co in runs[-keep:]]
-    out["disk_segments"] = [list(seg) for seg in disks[-keep:]]
+    fold_disks, keep_disks = (disks[:-keep], disks[-keep:]) if keep else (disks, [])
+    for s0, e0, r0 in fold_disks:
+        _add_to_buckets(folded, "", s0, e0, r0, 0.0, compute=False, span=span)
+    out["prior_runs"] = [[s0, e0] if ca is None else [s0, e0, ca, co] for s0, e0, ca, co in keep_runs]
+    out["disk_segments"] = [list(seg) for seg in keep_disks]
     out["folded_cost_buckets"] = folded
+    return out
+
+
+def _coarsen_record_buckets(record: dict[str, Any]) -> dict[str, Any]:
+    """A live record whose folded buckets are merged into day buckets (windows then resolve to within a day)."""
+    out = dict(record)
+    out["folded_cost_buckets"] = _rebucket(out.get("folded_cost_buckets") or {}, "", _record_bucket_span(out),
+                                           COARSE_BUCKET_SECONDS)
+    out["folded_bucket_seconds"] = COARSE_BUCKET_SECONDS
     return out
 
 
@@ -1026,11 +1082,18 @@ def _fit_size_budget(live: list[dict[str, Any]], gone: list[dict[str, Any]], com
             _compact_deleted_record(record, compacted, now)
         gone = gone[:-batch]
         size = _serialized_size([live, gone, compacted])
-    if size > MAX_INSTANCE_STATE_BYTES:
-        live = [_fold_record_detail(r, MIN_DETAILED_SEGMENTS) for r in live]
+    for keep in (MIN_DETAILED_SEGMENTS, 0):
+        if size <= MAX_INSTANCE_STATE_BYTES:
+            break
+        live = [_fold_record_detail(r, keep) for r in live]
         size = _serialized_size([live, gone, compacted])
     if size > MAX_INSTANCE_STATE_BYTES:
-        LOG.error("Dashboard instance state is %d bytes after compaction (budget %d)", size, MAX_INSTANCE_STATE_BYTES)
+        live = [_coarsen_record_buckets(r) for r in live]
+        size = _serialized_size([live, gone, compacted])
+    if size > MAX_INSTANCE_STATE_BYTES:
+        # Never save (or publish) state that may not fit in KV: the refresh fails and the inventory reads as stale.
+        raise InventoryTooLargeError(
+            f"instance records are {size} bytes after compaction (budget {MAX_INSTANCE_STATE_BYTES})")
     return live, gone
 
 
@@ -1965,7 +2028,11 @@ class DashboardStore:
         def running(records: list[Any], role: str) -> list[dict[str, Any]]:
             return [r for r in records if isinstance(r, dict) and r.get("status") == "RUNNING" and r.get("role") == role]
 
-        previous_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(previous, "cicd_runner"))
+        def existing(records: list[Any], role: str) -> list[dict[str, Any]]:
+            # Capacity that already existed, running or stopped: a restart brings it back, it adds none.
+            return [r for r in records if isinstance(r, dict) and r.get("status") != "DELETED" and r.get("role") == role]
+
+        previous_slots = sum(int(r.get("runners_count", 0) or 0) for r in existing(previous, "cicd_runner"))
         current_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(current, "cicd_runner"))
         if current_slots > previous_slots:
             pol = self.state.get("scaling", {}).get("cicd_runner", {})
@@ -1977,7 +2044,7 @@ class DashboardStore:
                 step_runners=max(1, int(pol.get("scale_up_step_runners", 2))),
                 max_runners=max(int(prof.get("min_runners", 1)), int(pol.get("max_runners", 24))),
             )
-        if len(running(current, "rust_builder")) > len(running(previous, "rust_builder")):
+        if len(running(current, "rust_builder")) > len(existing(previous, "rust_builder")):
             self._consume_active_oom_events(role="rust_builder")
 
     def fleet_inventory_status(self) -> dict[str, Any]:
@@ -2056,6 +2123,12 @@ class DashboardStore:
             with self._lock:
                 self._fleet_status["last_error"] = f"not applied: {exc}"
                 self._fleet_status["fresh"] = False
+            return False
+        except Exception as exc:  # noqa: BLE001 - for example a full disk: the stored records are not current
+            with self._lock:
+                self._fleet_status["last_error"] = f"not applied: {type(exc).__name__}: {exc}"[:500]
+                self._fleet_status["fresh"] = False
+            LOG.warning("Dashboard fleet inventory could not be applied: %s: %s", type(exc).__name__, exc)
             return False
         with self._lock:
             self._fleet_status.update({"last_success_at": _iso_epoch(now), "observed_count": len(observed),

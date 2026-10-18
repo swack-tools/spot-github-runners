@@ -13,7 +13,8 @@ import os
 import re
 from typing import Any, Callable, Mapping
 
-from .runner_fleet import gce_metadata_items, runner_deployment_from_gce_item
+from .runner_fleet import (gce_metadata_items, gce_timestamp, patch_record_from_gce_item,
+                           runner_deployment_from_gce_item)
 
 ENV_FLEET_INVENTORY = "DASHBOARD_FLEET_INVENTORY"
 # Runner hosts (runner_manager) and dedicated Rust builders (render_builder_startup). Control VMs
@@ -23,6 +24,30 @@ FLEET_NAME_PREFIXES = ("oxidex-runners-", "builder-")
 BUILDER_CONTAINER_VCPU = 16
 BUILDER_CONTAINER_RAM_GIB = 28.0
 DEFAULT_DISK_TYPE = "pd-balanced"
+# Performance included in a Hyperdisk Balanced disk's capacity price; above it IOPS and throughput bill separately.
+HYPERDISK_BALANCED_INCLUDED_IOPS = 3000
+HYPERDISK_BALANCED_INCLUDED_THROUGHPUT = 140
+
+
+def _disk_detail(disk_types: Mapping[str, Any], source: str) -> dict[str, Any]:
+    detail = disk_types.get(source)
+    if isinstance(detail, str):
+        return {"type": detail}
+    return dict(detail) if isinstance(detail, Mapping) else {}
+
+
+def _unpriced_performance(detail: Mapping[str, Any]) -> bool:
+    """True when a disk bills provisioned performance the dashboard does not price (or reports none to check)."""
+    kind = str(detail.get("type", ""))
+    if kind == "hyperdisk-throughput":
+        return True  # Provisioned throughput is always billed separately.
+    if kind.startswith("hyperdisk-"):
+        try:
+            return (int(detail["provisionedIops"]) > HYPERDISK_BALANCED_INCLUDED_IOPS
+                    or int(detail["provisionedThroughput"]) > HYPERDISK_BALANCED_INCLUDED_THROUGHPUT)
+        except (KeyError, TypeError, ValueError):
+            return True  # Unknown provisioned performance: never assume it is free.
+    return False
 
 _MACHINE_VCPU_RE = re.compile(r"-(\d+)$")
 
@@ -100,6 +125,7 @@ def observe_fleet_items(
         data_disk_type, data_disk_gb = DEFAULT_DISK_TYPE, 0
         data_disks: dict[str, int] = {}
         local_ssd_gb = 0
+        unpriced_performance = False
         for disk in item.get("disks", []) if isinstance(item.get("disks"), list) else []:
             if not isinstance(disk, dict):
                 continue
@@ -109,7 +135,9 @@ def observe_fleet_items(
                 # Local SSD: no persistent disk behind it, billed (and lost on stop) differently.
                 local_ssd_gb += size
                 continue
-            dtype = disk_types.get(str(disk.get("source", "")), "") or DEFAULT_DISK_TYPE
+            detail = _disk_detail(disk_types, str(disk.get("source", "")))
+            dtype = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
+            unpriced_performance = unpriced_performance or (bool(detail) and _unpriced_performance(detail))
             if disk.get("boot"):
                 boot_disk_type, boot_disk_gb = dtype, size
             else:
@@ -132,7 +160,14 @@ def observe_fleet_items(
             # (listeners are not memory capacity), so they are unknown here rather than guessed.
             runners_count = int(deployment.get("runners_count", 0) or 0)
             runner_vcpu, runner_ram_gib, runner_limits_known = 0, 0.0, False
-        runners_count_known = role == "rust_builder" or "runners_count" in deployment
+        # The recorded count is what provisioning asked for; it counts as current runners only once the host
+        # confirmed its bootstrap in this boot (applied patch record, nothing pending; see runner_fleet).
+        patch = patch_record_from_gce_item(item)
+        bootstrap_confirmed = bool(
+            patch["patch_sha256"] and not patch["patch_pending_sha256"]
+            and patch["patch_boot"] and patch["patch_boot"] == gce_timestamp(item.get("lastStartTimestamp"))
+        )
+        runners_count_known = role == "rust_builder" or ("runners_count" in deployment and bootstrap_confirmed)
         observed.append({
             "instance_id": instance_id,
             "name": name,
@@ -152,6 +187,7 @@ def observe_fleet_items(
             "data_disk_gb": data_disk_gb,
             "data_disks": data_disks,
             "local_ssd_gb": local_ssd_gb,
+            "unpriced_disk_performance": unpriced_performance,
             "runners_count": runners_count,
             "runner_vcpu": runner_vcpu,
             "runner_ram_gib": runner_ram_gib,
