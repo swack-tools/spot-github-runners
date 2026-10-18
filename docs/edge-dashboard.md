@@ -342,7 +342,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
   `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
-  that disk-only rate. When a VM starts again, its earlier running intervals stay in its runtime and
+  that disk-only rate, and a deleted VM's row shows no current rate. When a VM starts again, its earlier running intervals stay in its runtime and
   window spend. When its machine type or disks change, the time before the change keeps the earlier
   rates. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
   toward the runner and builder telemetry, but the disks of stopped VMs count against the scaling
@@ -350,13 +350,17 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.
 - A VM that was listed before and is no longer in the inventory becomes `DELETED`. Its deletion time is
   the time of the first listing that missed it. Deleted VMs and earlier runs stay in the history for 31
-  days, however many there are, and cost windows are limited to 744 hours (31 days) to match. A VM that's
+  days, and cost windows are limited to 744 hours (31 days) to match. To keep the state and its KV
+  snapshot small, history past 2,000 records, or past 200 runs or disk segments of one VM, is folded
+  into hourly cost totals. Window totals still include it to within an hour, though a search filter
+  can't match folded records. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
 - Spend covers each VM's attached disks while the VM exists. A dedicated builder's cache disk
   (`auto-delete=no`) outlives its VM, and the dashboard doesn't count it after the VM is deleted.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
-  template can't copy them from such a host. When a running host has no recorded runner count, the
+  template can't copy them from such a host. A VM with data disks of several types can't be a template
+  source or the shape of a scale plan, since those hold one data-disk type. When a running host has no recorded runner count, the
   runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
   plans are refused.
 - A VM in a region outside the dashboard's region catalog is priced with no tax, marked

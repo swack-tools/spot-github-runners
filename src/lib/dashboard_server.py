@@ -453,6 +453,61 @@ def _overlap_hours(start: float, end: float, window_start: float) -> float:
     return max(0.0, end - max(start, window_start)) / 3600.0
 
 
+# Size bounds that keep the state (and its KV snapshot, at most 25 MiB) small however busy the fleet is. Past them
+# the oldest detail is folded into per-hour cost buckets, which still answer every window (to within an hour).
+MAX_DETAILED_INSTANCE_RECORDS = 2000
+MAX_DETAILED_SEGMENTS = 200
+COMPACTED_COSTS_STATE_KEY = "compacted_instance_costs"
+# Hour buckets: windows are answered to within an hour at their start.
+_BUCKET_SECONDS = 3600.0
+
+
+def _add_to_buckets(buckets: dict[str, list[float]], prefix: str, start: float, end: float,
+                        all_in_rate: float, compute_rate: float, *, compute: bool) -> None:
+    """Spread one interval's cost over hour buckets ``{prefix + hour_epoch: [compute_hours, all_in, compute]}``."""
+    cursor = start
+    while cursor < end:
+        hour = math.floor(cursor / _BUCKET_SECONDS) * _BUCKET_SECONDS
+        chunk_end = min(end, hour + _BUCKET_SECONDS)
+        hours = (chunk_end - cursor) / 3600.0
+        bucket = buckets.setdefault(f"{prefix}{int(hour)}", [0.0, 0.0, 0.0])
+        if compute:
+            bucket[0] += hours
+            bucket[2] += hours * compute_rate
+        bucket[1] += hours * all_in_rate
+        cursor = chunk_end
+
+
+def _bucket_window_costs(buckets: Any, window_start: float, now: float, prefix: str = "") -> tuple[float, float, float]:
+    """(compute hours, all-in cost, compute cost) of buckets inside the window, pro rata for a partial hour."""
+    hours = all_in = compute = 0.0
+    for key, value in (buckets or {}).items() if isinstance(buckets, dict) else []:
+        if not str(key).startswith(prefix) or not isinstance(value, list) or len(value) != 3:
+            continue
+        try:
+            hour = float(str(key)[len(prefix):])
+        except ValueError:
+            continue
+        span_end = min(hour + _BUCKET_SECONDS, now)
+        if span_end <= hour:
+            continue
+        fraction = max(0.0, span_end - max(hour, window_start)) / (span_end - hour)
+        hours += float(value[0]) * fraction
+        all_in += float(value[1]) * fraction
+        compute += float(value[2]) * fraction
+    return hours, all_in, compute
+
+
+def _prune_buckets(buckets: dict[str, list[float]], cutoff: float) -> None:
+    for key in list(buckets):
+        try:
+            hour = float(key.rsplit("|", 1)[-1])
+        except ValueError:
+            continue
+        if hour + _BUCKET_SECONDS < cutoff:
+            del buckets[key]
+
+
 def _current_run_end(record: dict[str, Any], now: float) -> float:
     end = _instance_end_epoch(record)
     return now if record.get("status") == "RUNNING" or end is None else end
@@ -497,17 +552,21 @@ def instance_usage(record: dict[str, Any], now: float, window_start: float | Non
         if isinstance(pruned_cost, (list, tuple)) and len(pruned_cost) == 2 and all(_finite(v) for v in pruned_cost)
         else (0.0, 0.0)
     )
+    folded = record.get("folded_cost_buckets") if isinstance(record.get("folded_cost_buckets"), dict) else {}
+    folded_total = _bucket_window_costs(folded, float("-inf"), now)
+    folded_window = _bucket_window_costs(folded, window, now)
     return {
-        "compute_hours": sum(e - s for s, e, _a, _c in runs) / 3600.0 + (float(pruned) if _finite(pruned) else 0.0),
-        "compute_hours_in_window": sum(_overlap_hours(s, e, window) for s, e, _a, _c in runs),
+        "compute_hours": sum(e - s for s, e, _a, _c in runs) / 3600.0 + (float(pruned) if _finite(pruned) else 0.0)
+        + folded_total[0],
+        "compute_hours_in_window": sum(_overlap_hours(s, e, window) for s, e, _a, _c in runs) + folded_window[0],
         "disk_hours": sum(e - s for s, e, _r in disks) / 3600.0,
         "disk_hours_in_window": sum(_overlap_hours(s, e, window) for s, e, _r in disks),
-        "cost_all_in": pruned_all_in + sum((e - s) / 3600.0 * a for s, e, a, _c in runs)
+        "cost_all_in": pruned_all_in + folded_total[1] + sum((e - s) / 3600.0 * a for s, e, a, _c in runs)
         + sum((e - s) / 3600.0 * r for s, e, r in disks),
-        "cost_compute": pruned_compute + sum((e - s) / 3600.0 * c for s, e, _a, c in runs),
-        "window_all_in": sum(_overlap_hours(s, e, window) * a for s, e, a, _c in runs)
+        "cost_compute": pruned_compute + folded_total[2] + sum((e - s) / 3600.0 * c for s, e, _a, c in runs),
+        "window_all_in": folded_window[1] + sum(_overlap_hours(s, e, window) * a for s, e, a, _c in runs)
         + sum(_overlap_hours(s, e, window) * r for s, e, r in disks),
-        "window_compute": sum(_overlap_hours(s, e, window) * c for s, e, _a, c in runs),
+        "window_compute": folded_window[2] + sum(_overlap_hours(s, e, window) * c for s, e, _a, c in runs),
     }
 
 
@@ -706,6 +765,10 @@ def _live_instance_record(
     prior_runs = _prior_runs(previous)
     disk_segments = _disk_segments(previous)
     compute_segment_start = started_epoch
+    if previous is not None and _finite(previous.get("compute_segment_start")) \
+            and float(previous.get("started_epoch") or 0.0) == started_epoch:
+        # Same run: keep the boundary of an earlier rate change, or that time would be counted twice.
+        compute_segment_start = max(started_epoch, float(previous["compute_segment_start"]))
     disk_segment_start = previous.get("disk_segment_start") if previous is not None else None
     if previous is not None and isinstance(previous.get("pricing"), dict):
         prev_compute_all_in, prev_compute_only, prev_disk_all_in = _pricing_rates(previous["pricing"])
@@ -762,6 +825,20 @@ def _live_instance_record(
             pruned_all_in += (e0 - s0) / 3600.0 * r0
         else:
             kept_disks.append((s0, e0, r0))
+    folded = copy.deepcopy((previous or {}).get("folded_cost_buckets") or {})
+    if len(kept_runs) > MAX_DETAILED_SEGMENTS:
+        kept_runs.sort(key=lambda run: run[0])
+        for s0, e0, ca, co in kept_runs[:-MAX_DETAILED_SEGMENTS]:
+            _add_to_buckets(folded, "", s0, e0, ca if ca is not None else cur_compute_all_in,
+                                co if co is not None else cur_compute_only, compute=True)
+        kept_runs = kept_runs[-MAX_DETAILED_SEGMENTS:]
+    if len(kept_disks) > MAX_DETAILED_SEGMENTS:
+        kept_disks.sort(key=lambda seg: seg[0])
+        for s0, e0, r0 in kept_disks[:-MAX_DETAILED_SEGMENTS]:
+            _add_to_buckets(folded, "", s0, e0, r0, 0.0, compute=False)
+        kept_disks = kept_disks[-MAX_DETAILED_SEGMENTS:]
+    _prune_buckets(folded, cutoff)
+    record["folded_cost_buckets"] = folded
     record.update({
         "started_epoch": started_epoch, "stopped_epoch": stopped_epoch, "deleted_epoch": None, "status": status,
         "prior_runs": [[s0, e0] if ca is None else [s0, e0, ca, co] for s0, e0, ca, co in kept_runs],
@@ -838,7 +915,35 @@ def _instance_fingerprint(record: Any) -> tuple[Any, ...]:
         "boot_disk_type", "boot_disk_gb", "data_disk_type", "data_disk_gb", "runners_count",
         "started_epoch", "stopped_epoch", "deleted_epoch", "spot", INSTANCE_SOURCE_KEY,
     )) + (json.dumps([record.get("prior_runs") or [], record.get("disk_segments") or [],
-                      record.get("data_disks") or {}], sort_keys=True),)
+                      record.get("data_disks") or {}, record.get("folded_cost_buckets") or {}], sort_keys=True),)
+
+
+def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[float]], now: float) -> None:
+    """Fold a deleted record's whole cost history into role-scoped hour buckets ``"<role>|<day>"``."""
+    prefix = f"{record.get('role', 'cicd_runner')}|"
+    pricing = record.get("pricing") if isinstance(record.get("pricing"), dict) else {}
+    cur_all_in, cur_compute, cur_disk = _pricing_rates(pricing)
+    usage_end = float(record.get("deleted_epoch") or now)
+    started = float(record.get("started_epoch") or usage_end)
+    seg = record.get("compute_segment_start")
+    open_start = max(started, float(seg)) if _finite(seg) else started
+    for s0, e0, ca, co in _prior_runs(record):
+        _add_to_buckets(buckets, prefix, s0, e0, ca if ca is not None else cur_all_in,
+                            co if co is not None else cur_compute, compute=True)
+    run_end = _current_run_end(record, usage_end)
+    if run_end > open_start:
+        _add_to_buckets(buckets, prefix, open_start, run_end, cur_all_in, cur_compute, compute=True)
+    disks = _disk_segments(record)
+    disk_open = max([float(record.get("disk_start_epoch") or started)] + [e for _s, e, _r in disks]
+                    + ([float(record["disk_segment_start"])] if _finite(record.get("disk_segment_start")) else []))
+    for s0, e0, r0 in disks:
+        _add_to_buckets(buckets, prefix, s0, e0, r0, 0.0, compute=False)
+    if usage_end > disk_open:
+        _add_to_buckets(buckets, prefix, disk_open, usage_end, cur_disk, 0.0, compute=False)
+    for key, value in (record.get("folded_cost_buckets") or {}).items():
+        bucket = buckets.setdefault(f"{prefix}{key}", [0.0, 0.0, 0.0])
+        for i in range(3):
+            bucket[i] += float(value[i])
 
 
 def reconcile_instance_records(
@@ -847,6 +952,7 @@ def reconcile_instance_records(
     *,
     project: str,
     now: float,
+    compacted: dict[str, list[float]] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Merge a complete Compute Engine fleet listing into the stored instance records.
 
@@ -885,8 +991,16 @@ def reconcile_instance_records(
                   key=lambda r: -float(r.get("started_epoch") or 0.0))
     gone = sorted((r for r in records if r.get("status") == "DELETED"),
                   key=lambda r: -float(r.get("deleted_epoch") or 0.0))
-    # Bounded by time only: every record inside the retention period is kept, so every accepted cost window
-    # (at most MAX_WINDOW_HOURS) sees its full spend.
+    # Every record inside the retention period counts in every accepted window (at most MAX_WINDOW_HOURS). Past
+    # MAX_DETAILED_INSTANCE_RECORDS the oldest deleted ones are folded into ``compacted`` hour buckets, so the
+    # state stays far below the KV value limit while window totals keep their cost.
+    keep = max(0, MAX_DETAILED_INSTANCE_RECORDS - len(live))
+    if compacted is not None and len(gone) > keep:
+        for record in gone[keep:]:
+            _compact_deleted_record(record, compacted, now)
+        gone = gone[:keep]
+    if compacted is not None:
+        _prune_buckets(compacted, now - DELETED_INSTANCE_RETENTION_SECONDS)
     records = live + gone
     changed = [_instance_fingerprint(r) for r in existing] != [_instance_fingerprint(r) for r in records]
     return records, changed
@@ -1707,6 +1821,7 @@ class DashboardStore:
                 kept = [r for r in kept if not isinstance(r, dict)]
                 # The baseline belonged to the dropped records; a later re-enabled inventory starts a new one.
                 base.pop(FLEET_BASELINE_STATE_KEY, None)
+                base.pop(COMPACTED_COSTS_STATE_KEY, None)
             if len(kept) != len(instances):
                 # Demo seed records and VMs fabricated by the old in-dashboard lifecycle actions never existed in
                 # Compute Engine; only inventory records survive a load.
@@ -1809,8 +1924,11 @@ class DashboardStore:
             return False
 
         def apply() -> tuple[int, Any]:
+            compacted = copy.deepcopy(self.state.get(COMPACTED_COSTS_STATE_KEY) or {})
             records, changed = reconcile_instance_records(
-                self.state.get("instances", []), observed, project=self.project, now=self._clock())
+                self.state.get("instances", []), observed, project=self.project, now=self._clock(),
+                compacted=compacted)
+            changed = changed or compacted != (self.state.get(COMPACTED_COSTS_STATE_KEY) or {})
             # The first successful listing (after an upgrade, a migration, or enabling the inventory) is the
             # baseline: the fleet it finds already existed, so it is not growth that handles an OOM event.
             baselined = bool(self.state.get(FLEET_BASELINE_STATE_KEY))
@@ -1818,7 +1936,9 @@ class DashboardStore:
                 return 200, {"changed": False}
             previous_instances = self.state.get("instances", [])
             previous_telemetry = copy.deepcopy(self.state.get("scaling_telemetry", {}))
+            previous_compacted = self.state.get(COMPACTED_COSTS_STATE_KEY)
             self.state["instances"] = records
+            self.state[COMPACTED_COSTS_STATE_KEY] = compacted
             try:
                 if baselined:
                     self._consume_ooms_for_fleet_growth(previous_instances, records)
@@ -1829,6 +1949,7 @@ class DashboardStore:
             except Exception:
                 self.state["instances"] = previous_instances
                 self.state["scaling_telemetry"] = previous_telemetry
+                self.state[COMPACTED_COSTS_STATE_KEY] = previous_compacted
                 if not baselined:
                     self.state.pop(FLEET_BASELINE_STATE_KEY, None)
                 raise
@@ -3523,7 +3644,10 @@ class DashboardStore:
                     live_total_cost_compute_only_usd = round(usage["cost_compute"], 2)
                     lifetime_cost = (live_total_cost_usd if include_disk_and_tax
                                      else live_total_cost_compute_only_usd)
-                    if inst["status"] in GCE_STOPPED_STATUSES:
+                    if inst["status"] == "DELETED":
+                        # Gone with its disks: no current rate (its history keeps its costs).
+                        hourly_rate, daily_rate, monthly_rate = 0.0, 0.0, 0.0
+                    elif inst["status"] in GCE_STOPPED_STATUSES:
                         # A stopped VM bills only its disks now (nothing when disk costs are excluded).
                         hourly_rate = round(_stopped_disk_hourly(pricing) if include_disk_and_tax else 0.0, 4)
                         daily_rate = round(hourly_rate * 24.0, 2)
@@ -3584,6 +3708,14 @@ class DashboardStore:
             running_runner_rows = [r for r in running_rows if r.get("role") == "cicd_runner"]
             running_builder_rows = [r for r in running_rows if r.get("role") == "rust_builder"]
             running_runner_slots = sum(int(r.get("runners_count", 0)) for r in running_runner_rows)
+            if include_deleted and not q:
+                # Deleted VMs compacted into hour buckets (see MAX_DETAILED_INSTANCE_RECORDS) still count.
+                compacted_prefixes = ([f"{r_filter}|"] if r_filter and r_filter != "all"
+                                      else ["cicd_runner|", "rust_builder|"])
+                for prefix in compacted_prefixes:
+                    _h, c_all_in, c_compute = _bucket_window_costs(
+                        self.state.get(COMPACTED_COSTS_STATE_KEY), window_start_ts, now_ts, prefix)
+                    exact_window_costs.append(c_all_in if include_disk_and_tax else c_compute)
             total_window_spend = round(sum(exact_window_costs), 2)
             # A stopped inventory VM still bills its attached disks (with tax) until it is deleted; a transitional
             # one (provisioning, stopping, repairing, ...) counts at its full rate.
@@ -4580,6 +4712,11 @@ class DashboardStore:
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
+            if len(inst.get("data_disks") or {}) > 1:
+                raise ValueError(
+                    f"{inst['name']} has data disks of several types ({', '.join(sorted(inst['data_disks']))}); "
+                    "a VM template holds one data-disk type, so create it from the profile instead"
+                )
             if inst.get("runner_limits_known") is False:
                 raise ValueError(
                     f"Per-runner limits of {inst['name']} are not recorded in its instance metadata; "
@@ -4794,7 +4931,9 @@ class DashboardStore:
                         )
                 source_spec: dict[str, Any] | None = vm_tpl
                 if source_spec is None:
-                    existing_cand = running_in_region[0] if running_in_region else None
+                    existing_cand = next(
+                        # A host with several data-disk types cannot be described by one type and size.
+                        (i for i in running_in_region if len(i.get("data_disks") or {}) <= 1), None)
                     if existing_cand is not None:
                         try:
                             self._validate_vm_template_compatibility(existing_cand, prof, role)

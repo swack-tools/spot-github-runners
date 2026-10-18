@@ -4559,6 +4559,77 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertAlmostEqual(rec["prior_runs"][0][1], self.now - 5 * 3600.0, delta=1.0)
         self.assertAlmostEqual(rec["runtime_hours"], 5.0, delta=0.02)
 
+    def test_resize_then_stop_does_not_double_count(self):
+        running = fleet_observation("3700", "builder-oxidex-rs-1", "us-south1-b", started_hours_ago=10.0, now=self.now)
+        self.fleet = [running]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [dict(running, data_disk_gb=2000)]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [dict(running, data_disk_gb=2000)]
+        self.assertFalse(self.store.refresh_fleet_inventory())
+        stopped = dict(running, status="TERMINATED", data_disk_gb=2000, last_stop_epoch=time.time() + 60.0)
+        self.fleet = [stopped]
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        self.assertAlmostEqual(self._record("builder-oxidex-rs-1")["runtime_hours"], 10.0, delta=0.05)
+
+    def test_deleted_row_has_no_active_rate(self):
+        self.fleet = [fleet_observation("3800", "oxidex-runners-gone-2", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.fleet = []
+        self.store.refresh_fleet_inventory()
+        row = self.store.query_instances()["instances"][0]
+        self.assertEqual(row["status"], "DELETED")
+        self.assertEqual((row["active_hourly_usd"], row["active_daily_usd"], row["active_monthly_usd"]), (0.0, 0.0, 0.0))
+        self.assertGreater(row["total_cost_usd"], 0.0)
+
+    def test_mixed_disk_host_is_not_a_template_source(self):
+        obs = fleet_observation("3900", "builder-oxidex-mix-2", "us-south1-b", now=self.now)
+        obs.update({"data_disk_type": "pd-ssd", "data_disk_gb": 600, "data_disks": {"pd-ssd": 100, "pd-standard": 500}})
+        self.fleet = [obs]
+        self.store.refresh_fleet_inventory()
+        with self.assertRaisesRegex(ValueError, "several types"):
+            self.store.create_vm_template_from_instance({"instance_name": "builder-oxidex-mix-2"})
+
+    def test_compacted_history_keeps_window_cost(self):
+        from lib import dashboard_server
+        from lib.dashboard_server import _live_instance_record, _mark_instance_deleted, instance_usage
+
+        deleted = [_mark_instance_deleted(_live_instance_record(
+            fleet_observation(f"40{i}", f"oxidex-runners-c{i}", "us-south1-a", started_hours_ago=3.0, now=self.now),
+            project="p", now=self.now), self.now - i * 600.0) for i in range(4)]
+        expected = sum(instance_usage(r, self.now, self.now - 24 * 3600.0)["window_all_in"] for r in deleted)
+        compacted: dict = {}
+        with unittest.mock.patch.object(dashboard_server, "MAX_DETAILED_INSTANCE_RECORDS", 2):
+            records, changed = dashboard_server.reconcile_instance_records(
+                deleted, [], project="p", now=self.now, compacted=compacted)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(compacted)
+        kept = sum(instance_usage(r, self.now, self.now - 24 * 3600.0)["window_all_in"] for r in records)
+        _h, folded, _c = dashboard_server._bucket_window_costs(compacted, self.now - 24 * 3600.0, self.now,
+                                                               "cicd_runner|")
+        self.assertAlmostEqual(kept + folded, expected, delta=0.001)
+
+    def test_many_segments_fold_into_hour_buckets(self):
+        from lib import dashboard_server
+
+        with unittest.mock.patch.object(dashboard_server, "MAX_DETAILED_SEGMENTS", 3):
+            for i in range(6):
+                start_ago = 100.0 - 10.0 * i
+                self.fleet = [fleet_observation("4100", "oxidex-runners-fold-1", "us-south1-a",
+                                                started_hours_ago=start_ago, now=self.now)]
+                self.store.refresh_fleet_inventory()
+                self.fleet = [fleet_observation("4100", "oxidex-runners-fold-1", "us-south1-a", status="TERMINATED",
+                                                started_hours_ago=start_ago, stopped_hours_ago=start_ago - 2.0,
+                                                now=self.now)]
+                self.store.refresh_fleet_inventory()
+        rec = self._record("oxidex-runners-fold-1")
+        self.assertEqual(len(rec["prior_runs"]), 3)
+        self.assertTrue(rec["folded_cost_buckets"])
+        self.assertAlmostEqual(rec["runtime_hours"], 12.0, delta=0.05)
+        row = next(r for r in self.store.query_instances(window_hours=744)["instances"]
+                   if r["name"] == "oxidex-runners-fold-1")
+        self.assertAlmostEqual(row["hours_in_window"], 12.0, delta=0.1)
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]
