@@ -39,8 +39,9 @@ flowchart LR
     local["Local ARM64 runners"] <-->|"listeners"| github
 ```
 
-The autoscaler is the only long-running component that changes the fleet. It reads GitHub and GCP state, keeps its own
-persisted operation state, and changes one host at a time. The dashboard doesn't run on runner hosts, and the control
+The autoscaler is the long-running component that changes runner hosts. It reads GitHub and GCP state, keeps its own
+persisted operation state, and changes one host at a time. The control VM watchdog changes only the dashboard's control
+VMs, and a dashboard run with `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud` can hot-patch runner hosts. The dashboard doesn't run on runner hosts, and the control
 VM dashboard has no `gcloud` or SSH path to them. A dashboard that an operator runs with
 `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud` can reach them over `gcloud compute ssh`. See the [security model](security.md).
 
