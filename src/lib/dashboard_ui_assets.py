@@ -735,7 +735,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <button class="btn btn-sm btn-secondary" onclick="setInstanceWindowHours(168)">Last 7d</button>
             <button class="btn btn-sm btn-secondary" onclick="setInstanceWindowHours(720)">Last 30d</button>
             <div style="display:inline-flex; align-items:center; gap:5px; margin-left:4px;">
-              <input type="number" id="inst-custom-window-val" value="24" min="1" max="8760" style="width:72px;" onchange="applyCustomWindow()" />
+              <input type="number" id="inst-custom-window-val" value="24" min="1" max="744" style="width:72px;" onchange="applyCustomWindow()" />
               <select id="inst-custom-window-unit" onchange="applyCustomWindow()">
                 <option value="hours" selected>Hours</option>
                 <option value="days">Days</option>

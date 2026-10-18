@@ -13,7 +13,8 @@ import os
 import re
 from typing import Any, Callable, Mapping
 
-from .runner_fleet import gce_metadata_items, runner_deployment_from_gce_item
+from .runner_fleet import (gce_metadata_items, gce_timestamp, patch_record_from_gce_item,
+                           runner_deployment_from_gce_item)
 
 ENV_FLEET_INVENTORY = "DASHBOARD_FLEET_INVENTORY"
 # Runner hosts (runner_manager) and dedicated Rust builders (render_builder_startup). Control VMs
@@ -23,6 +24,30 @@ FLEET_NAME_PREFIXES = ("oxidex-runners-", "builder-")
 BUILDER_CONTAINER_VCPU = 16
 BUILDER_CONTAINER_RAM_GIB = 28.0
 DEFAULT_DISK_TYPE = "pd-balanced"
+# Performance included in a Hyperdisk Balanced disk's capacity price; above it IOPS and throughput bill separately.
+HYPERDISK_BALANCED_INCLUDED_IOPS = 3000
+HYPERDISK_BALANCED_INCLUDED_THROUGHPUT = 140
+
+
+def _disk_detail(disk_types: Mapping[str, Any], source: str) -> dict[str, Any]:
+    detail = disk_types.get(source)
+    if isinstance(detail, str):
+        return {"type": detail}
+    return dict(detail) if isinstance(detail, Mapping) else {}
+
+
+def _unpriced_performance(detail: Mapping[str, Any]) -> bool:
+    """True when a disk bills provisioned performance the dashboard does not price (or reports none to check)."""
+    kind = str(detail.get("type", ""))
+    if kind == "hyperdisk-throughput":
+        return True  # Provisioned throughput is always billed separately.
+    if kind.startswith("hyperdisk-"):
+        try:
+            return (int(detail["provisionedIops"]) > HYPERDISK_BALANCED_INCLUDED_IOPS
+                    or int(detail["provisionedThroughput"]) > HYPERDISK_BALANCED_INCLUDED_THROUGHPUT)
+        except (KeyError, TypeError, ValueError):
+            return True  # Unknown provisioned performance: never assume it is free.
+    return False
 
 _MACHINE_VCPU_RE = re.compile(r"-(\d+)$")
 
@@ -65,8 +90,9 @@ def _vcpu_from_machine_type(machine_type: str) -> int:
 def observe_fleet_items(
     items: list[dict],
     *,
-    disk_types: Mapping[str, str] | None = None,
+    disk_types: Mapping[str, Any] | None = None,
     shapes: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+    disk_types_known: bool = True,
 ) -> list[dict[str, Any]]:
     """Normalize a Compute Engine aggregated instance listing into fleet observations.
 
@@ -98,19 +124,32 @@ def observe_fleet_items(
             vcpu, ram_gib = _vcpu_from_machine_type(machine_type), 0.0
         boot_disk_type, boot_disk_gb = DEFAULT_DISK_TYPE, 0
         data_disk_type, data_disk_gb = DEFAULT_DISK_TYPE, 0
+        data_disks: dict[str, int] = {}
+        local_ssd_gb = 0
+        unpriced_performance = False
+        regional_disks = False
         for disk in item.get("disks", []) if isinstance(item.get("disks"), list) else []:
             if not isinstance(disk, dict):
                 continue
             size_raw = str(disk.get("diskSizeGb", "") or "")
             size = int(size_raw) if size_raw.isdigit() else 0
-            dtype = disk_types.get(str(disk.get("source", "")), "") or DEFAULT_DISK_TYPE
+            if str(disk.get("type", "")).upper() == "SCRATCH":
+                # Local SSD: no persistent disk behind it, billed (and lost on stop) differently.
+                local_ssd_gb += size
+                continue
+            detail = _disk_detail(disk_types, str(disk.get("source", "")))
+            regional_disks = regional_disks or bool(detail.get("regional")) or "/regions/" in str(disk.get("source", ""))
+            dtype = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
+            unpriced_performance = unpriced_performance or (bool(detail) and _unpriced_performance(detail))
             if disk.get("boot"):
                 boot_disk_type, boot_disk_gb = dtype, size
             else:
-                # Several data disks: report the type of the first and their total size.
+                # Several data disks: report the first one's type and the total size; data_disks keeps the size of
+                # each type so each is priced at its own rate.
                 if data_disk_gb == 0:
                     data_disk_type = dtype
                 data_disk_gb += size
+                data_disks[dtype] = data_disks.get(dtype, 0) + size
         scheduling = item.get("scheduling") if isinstance(item.get("scheduling"), dict) else {}
         spot = (str(scheduling.get("provisioningModel", "")).upper() == "SPOT"
                 or bool(scheduling.get("preemptible", False)))
@@ -124,6 +163,14 @@ def observe_fleet_items(
             # (listeners are not memory capacity), so they are unknown here rather than guessed.
             runners_count = int(deployment.get("runners_count", 0) or 0)
             runner_vcpu, runner_ram_gib, runner_limits_known = 0, 0.0, False
+        # The recorded count is what provisioning asked for; it counts as current runners only once the host
+        # confirmed its bootstrap in this boot (applied patch record, nothing pending; see runner_fleet).
+        patch = patch_record_from_gce_item(item)
+        bootstrap_confirmed = bool(
+            patch["patch_sha256"] and not patch["patch_pending_sha256"]
+            and patch["patch_boot"] and patch["patch_boot"] == gce_timestamp(item.get("lastStartTimestamp"))
+        )
+        runners_count_known = role == "rust_builder" or ("runners_count" in deployment and bootstrap_confirmed)
         observed.append({
             "instance_id": instance_id,
             "name": name,
@@ -141,10 +188,17 @@ def observe_fleet_items(
             "boot_disk_gb": boot_disk_gb,
             "data_disk_type": data_disk_type,
             "data_disk_gb": data_disk_gb,
+            "data_disks": data_disks,
+            "local_ssd_gb": local_ssd_gb,
+            "unpriced_disk_performance": unpriced_performance,
+            "regional_disks": regional_disks,
+            # False when disk types fell back to the default (no compute.disks.list): the record keeps known types.
+            "disk_types_known": disk_types_known,
             "runners_count": runners_count,
             "runner_vcpu": runner_vcpu,
             "runner_ram_gib": runner_ram_gib,
             "runner_limits_known": runner_limits_known,
+            "runners_count_known": runners_count_known,
             "runner_label": str(deployment.get("runner_label", "") or ""),
             "target_label": str((item.get("labels") or {}).get("spot-target", "")
                                 if isinstance(item.get("labels"), dict) else ""),
@@ -154,6 +208,11 @@ def observe_fleet_items(
             "patch_target": metadata.get("spot-runner-patch-target", ""),
         })
     return observed
+
+
+def _permission_denied(exc: BaseException) -> bool:
+    """True for a Compute Engine HTTP 403 (the service account lacks the permission)."""
+    return "HTTP 403" in str(exc)
 
 
 def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
@@ -179,15 +238,20 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                     raise RuntimeError(f"zones unreachable: {', '.join(unreachables[:5])}")
                 fleet_items = [i for i in items if isinstance(i, dict)
                                and str(i.get("name", "")).startswith(FLEET_NAME_PREFIXES)]
+                disk_types: dict[str, Any] = {}
+                types_known = True
                 try:
-                    disk_types = await compute_api.list_disk_types(api, auth.project) if fleet_items else {}
-                    disk_listing["ok_before"] = True
+                    if fleet_items:
+                        disk_types = await compute_api.list_disk_types(api, auth.project)
+                        disk_listing["ok_before"] = True
                 except Exception as exc:
-                    if disk_listing["ok_before"]:
-                        # Transient: fail the whole listing so known disk types are not replaced by defaults.
+                    if disk_listing["ok_before"] or not _permission_denied(exc):
+                        # Transient (or after a restart, when this process has not listed disks yet but stored
+                        # records may hold real types): fail the whole listing so known types are not replaced.
                         raise RuntimeError(f"disk listing failed: {type(exc).__name__}: {exc}") from exc
-                    # Never worked (for example no compute.disks.list): disk types fall back to the default.
-                    disk_types = {}
+                    # No compute.disks.list (HTTP 403): disk types fall back to the default, flagged as unknown so
+                    # stored types are kept and new records are not priced as complete.
+                    types_known = False
                 wanted = {(str(i.get("zone", "")).rsplit("/", 1)[-1], str(i.get("machineType", "")).rsplit("/", 1)[-1])
                           for i in fleet_items}
                 for zone, machine_type in wanted - shape_cache.keys():
@@ -196,9 +260,14 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                     try:
                         shape_cache[(zone, machine_type)] = await compute_api.machine_type_capacity(
                             api, auth.project, zone, machine_type)
-                    except Exception:  # noqa: BLE001 - unknown capacity is reported as such, retried next time
+                    except Exception:  # noqa: BLE001 - reported below, retried next time
                         pass
-                return observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache)
+                missing = sorted(f"{mt} in {zone}" for zone, mt in wanted - shape_cache.keys() if zone and mt)
+                if missing:
+                    # Unknown RAM would price as free: fail the refresh (records stay as they were) instead.
+                    raise RuntimeError(f"machine type capacity unavailable: {', '.join(missing[:5])}")
+                return observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache,
+                                           disk_types_known=types_known)
             finally:
                 while not api.connections.empty():
                     _reader, writer = api.connections.get_nowait()

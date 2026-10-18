@@ -336,38 +336,89 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `oxidex-runners-` (runner hosts) or `builder-` (dedicated builders). Control VMs and other VMs aren't
   listed. The control VM's service account needs `compute.instances.list` and
   `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
-  they show `pd-balanced`. Once a disk listing has succeeded, a failed one fails the whole refresh, so
-  known disk types are never replaced by the default.
+  (HTTP 403) a VM keeps the types stored from an earlier listing, and a new VM shows `pd-balanced`
+  with its pricing marked incomplete. Any other failed or partial disk listing fails the whole refresh,
+  so known disk types are never replaced by the default. A machine type whose capacity can't
+  be read also fails the refresh, so no VM is priced without its memory.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
-  `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted. When a VM starts
-  again, its earlier running intervals stay in its runtime and window spend. Only `RUNNING` VMs count
-  toward the runner and builder telemetry. The listing carries no CPU utilization, so inventory VMs
-  never trigger a CPU-based scale-down recommendation.
+  `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
+  that disk-only rate, and a deleted VM's row shows no current rate. When a VM starts again, its earlier running intervals stay in its runtime and
+  window spend. When its machine type or disks change, or its prices change, the time before the change
+  keeps the earlier rates. A stop that's reported late ends the run at the reported stop time. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
+  toward the runner and builder telemetry, but the disks of stopped VMs count against the scaling
+  budgets. Hiding deleted instances doesn't hide stopped VMs, because they still exist. The listing
+  carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.
 - A VM that was listed before and is no longer in the inventory becomes `DELETED`. Its deletion time is
-  the time of the first listing that missed it. Deleted VMs stay in the history for 31 days. A VM that's
+  the time of the first listing that missed it. Deleted VMs and earlier runs stay in the history for 31
+  days, and cost windows are limited to 744 hours (31 days) to match. To keep the state and its KV
+  snapshot small, history past 2,000 records, or past 200 runs or disk segments of one VM, is folded
+  into hourly cost totals. If the instance data still exceeds 6 MiB serialized, the oldest deleted
+  records are folded next, then all but the newest 10 runs and disk segments of each live VM, then all
+  of them, and then each live VM's folded totals are merged into daily totals. A listing whose records
+  still don't fit is refused, and the inventory reads as stale. Window totals still include it to within an hour, though a search filter
+  can't match folded records. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
 - Spend covers each VM's attached disks while the VM exists. A dedicated builder's cache disk
   (`auto-delete=no`) outlives its VM, and the dashboard doesn't count it after the VM is deleted.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
-  template can't copy them from such a host.
+  template can't copy them from such a host. A VM with data disks of several types can't be a template
+  source or the shape of a scale plan, since those hold one data-disk type. Neither can a VM with
+  Local SSD, regional disks, or provisioned Hyperdisk performance, which templates don't describe. A
+  scale-up plan whose new VMs can't be fully priced is refused. When a running host has no recorded runner count, or
+  hasn't confirmed its bootstrap in its current boot (an applied patch record for this boot with
+  nothing pending), the runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
+  plans are refused.
+- A VM in a region outside the dashboard's region catalog is priced with no tax, marked
+  `tax_rate_known: false`, rather than with another region's default tax. When the budget being
+  checked or the VM's own budget includes taxes, without a tax override on the VM's profile, that
+  unknown tax holds scale-ups like other unpriced costs. Each inventory refresh,
+  and each budget or profile change, reprices the listed VMs, stopped ones included, but a page read
+  doesn't, so a tax override also applies to
+  their disks, and the rate change is saved with the state.
+- A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, for a
+  `SUSPENDED` VM, whose preserved memory Compute Engine also bills, for a VM with Local SSD (counted
+  as `local_ssd_gb`, not as a persistent data disk), for a VM with a regional (replicated) persistent
+  disk, for a custom or extended machine shape, which predefined rates don't price, and for a VM whose
+  Hyperdisk bills provisioned IOPS or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
+  no reported performance), the record is marked
+  `pricing_complete: false`. While the role's fleet (both roles under a shared budget) has such a VM,
+  scale-up recommendations hold and scale-up plans are refused, because their budget check would pass
+  on a cost that's too low.
+- A VM in a transitional state, such as `PROVISIONING`, `STAGING`, `STOPPING`, or `REPAIRING`, counts
+  at its full rate in burn and budgets. While the role has one, scale-up recommendations hold and
+  scale-up plans are refused, because its capacity hasn't settled.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
-  `fleet_inventory` field reports the last successful listing and the last error.
+  `fleet_inventory` field reports the last successful listing and the last error. Until the next
+  complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false: the rows
+  stay visible, but scaling recommendations hold and scale-up plans are refused. A listing that can't be
+  saved, for example on a full disk, also leaves the inventory stale.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
   inactive makes no Compute Engine calls and keeps the records the active slot last published.
 - The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
-  already existed, so they don't mark OOM events handled. Only later growth in runner slots or builder
-  VMs does. A listing that
-  changes nothing writes nothing, so a quiet fleet doesn't publish a new snapshot.
+  already existed, so they don't mark OOM events handled. Only later growth beyond the capacity that
+  already existed does: a VM first listed after the baseline adds capacity once, when it's `RUNNING`
+  and, for a runner host, has confirmed its bootstrap. A stopped VM that starts again adds none. The
+  OOM target is then checked against the ready runner slots actually running after the listing, so
+  replacing a host with one of the same size handles nothing. A new builder handles builder OOM events
+  only when the number of running builders grew. A held recommendation projects the cost
+  of the fleet it keeps. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
+  snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
-  empty and the instances tab says that the inventory isn't configured.
+  empty, the instances tab says that the inventory isn't configured, and scaling recommendations hold
+  and scale-up plans are refused, because the real fleet is unknown. Inventory records loaded from
+  a state file or snapshot are dropped too, since nothing would keep them current, and so is the
+  baseline: a later re-enabled inventory starts a new one.
 - On load, from the state file, a KV snapshot, or a handover import, the dashboard drops every instance
   record that didn't come from the inventory. These are the demo instances that earlier versions seeded,
   such as `oxidex-runners-dallas-01`, and records that the old in-dashboard actions invented.
 - The delete and regional scale controls, `POST /api/instances/delete` and
   `POST /api/instances/scale-region`, are plans only. They check the request against budgets and caps
-  and report what would launch or retire. The budget projection includes the disks of stopped VMs. They don't change the instance list or any VM. The autoscaler
+  and report what would launch or retire. The budget projection includes the disks of stopped VMs.
+  They don't change the instance list or any VM, and they run like reads: each request is computed
+  from the current state, an `Idempotency-Key` stores nothing, and a frozen or unreconciled slot still
+  answers them. The autoscaler
   (`src/spot_runner_autoscaler.py`) drains and retires runner hosts, `src/spot_runner_manager.py`
   provisions them, and `src/render_builder_startup.py` renders a dedicated builder.
 
@@ -382,15 +433,29 @@ GitHub CI failure runs, journal OOM events, or job counters.
 - When the dashboard loads a state that an earlier version wrote, from the state file, a KV snapshot, or
   a handover import, it drops the demo records that version seeded and logs how many it dropped. It
   then marks the state with `demo_telemetry_migration`, so this runs once and later loads keep every
-  reported record and counter. It matches the exact seeded IDs:
+  reported record and counter. A state with a marker of 1 or higher, including one a later version
+  wrote, is left as it is.
+- A record is dropped only when its ID and the fields that every seeded version gave it all match, so a
+  real report merged into a seeded row stays:
   - The Rust builds `rb-20261015-001` through `rb-20261015-005`, on `builder-oxidex-turin-01` and
-    `builder-oxidex-eu-01`.
+    `builder-oxidex-eu-01`. `POST /api/rust-builds` merges a partial update into an existing build, so
+    these match only when every field the seed set is unchanged, including the seeded gaps between the
+    requested, finished, and delivered times.
   - The GitHub CI runs `gh-oom-37192272062`, `gh-oom-37192994059`, and `gh-timeout-38596411473`, and
-    the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`.
-  - The journal OOM event `oom-journal-01` on `oxidex-runners-dallas-01`.
-- The migration also resets the job counters to 0 when all three still hold the seeded values, 14 jobs in the
-  past hour, 7 provisioned, and 3 queued. Any other combination stays as reported.
-- A reported record that only shares a run ID with a seed stays as reported.
+    the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`, matched with their
+    run and job IDs.
+  - The journal OOM event `oom-journal-01`, matched with `oxidex-runners-dallas-01` and its process ID.
+- The migration also resets the job counters to 0 when all three still hold the seeded values, 14 jobs in
+  the past hour, 7 provisioned, and 3 queued. Any other combination stays as reported.
+- The drop keeps the loaded `state_version` and sets `demo_telemetry_migration_pending` in the saved
+  state, so a restart doesn't lose it. The active slot then commits the migrated state as the next
+  `state_version` through the same checks as any change, and publishes it to KV. Any new version clears
+  the flag. A standby slot waits, so its copy never shadows the active slot's next change. A rollback then
+  sees the migrated version as newer than the old slot's copy and carries it back.
+- A handover import keeps the snapshot's `state_version`, because the control plane records the version
+  that an import reports as the floor for any later re-import. The replacement commits the migration once
+  it confirms that it's the active slot, within one writer check (30 seconds) of cutover. A rollback inside
+  that window leaves the old slot's demo telemetry in place until the next rotation migrates it again.
 
 ### Reporting a GitHub CI failure run
 
