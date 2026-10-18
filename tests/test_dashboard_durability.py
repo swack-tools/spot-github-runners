@@ -1121,6 +1121,38 @@ class DemoTelemetryMigrationCommitTests(unittest.TestCase):
         self.assertEqual([c for c in self.fake.calls if c == ("PUT", KV_STATE_KEY)], [])
         self.assertFalse(store.commit_demo_telemetry_migration())
 
+    def test_pending_commit_survives_a_restart_before_it_runs(self):
+        path = Path(self.tmp.name) / "a.json"
+        path.write_text(json.dumps(self.seeded(5)), encoding="utf-8")
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=1).to_json()
+        first = self.store("a.json")  # loads, drops the seeds, and writes them back at state_version 5
+        first.close()
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["state_version"], 5)
+        self.assert_migrated(on_disk)
+        self.assertIs(on_disk["demo_telemetry_migration_pending"], True)
+
+        self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=5).to_json()
+        restarted = self.store("a.json")
+        restarted.hydrate()
+        self.tick_until_published(restarted)
+        published = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual(published["state_version"], 6)
+        self.assert_migrated(published["state"])
+        self.assertNotIn("demo_telemetry_migration_pending", published["state"])
+        self.assertNotIn("demo_telemetry_migration_pending", json.loads(path.read_text(encoding="utf-8")))
+
+    def test_any_new_version_completes_the_pending_commit(self):
+        path = Path(self.tmp.name) / "local.json"
+        path.write_text(json.dumps(self.seeded(5)), encoding="utf-8")
+        store = self.store("local.json", slot=None)
+        store.hydrate()
+        store.set_controlled_targets(["o/kept", "o/new"])
+        self.assertEqual(store.state_version(), 6)
+        self.assertNotIn("demo_telemetry_migration_pending", store.state)
+        self.assertFalse(store.commit_demo_telemetry_migration())
+        self.assertEqual(store.state_version(), 6)
+
     def test_handover_import_commits_once_the_target_is_active(self):
         self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("a", now=1).to_json()
         snapshot = build_snapshot(self.seeded(5), 5, "a", now=1)

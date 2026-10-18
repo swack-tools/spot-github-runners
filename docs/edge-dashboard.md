@@ -435,10 +435,11 @@ GitHub CI failure runs, journal OOM events, or job counters.
   - The journal OOM event `oom-journal-01`, matched with `oxidex-runners-dallas-01` and its process ID.
 - The migration also resets the job counters to 0 when all three still hold the seeded values, 14 jobs in
   the past hour, 7 provisioned, and 3 queued. Any other combination stays as reported.
-- The drop keeps the loaded `state_version`. The active slot then commits the migrated state as the next
-  `state_version` through the same checks as any change, and publishes it to KV. A standby slot waits, so
-  its copy never shadows the active slot's next change. A rollback then sees the migrated version as newer
-  than the old slot's copy and carries it back.
+- The drop keeps the loaded `state_version` and sets `demo_telemetry_migration_pending` in the saved
+  state, so a restart doesn't lose it. The active slot then commits the migrated state as the next
+  `state_version` through the same checks as any change, and publishes it to KV. Any new version clears
+  the flag. A standby slot waits, so its copy never shadows the active slot's next change. A rollback then
+  sees the migrated version as newer than the old slot's copy and carries it back.
 
 ## State durability
 

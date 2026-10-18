@@ -407,6 +407,8 @@ LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
 # migrated state as a new state_version (DashboardStore.commit_demo_telemetry_migration).
 DEMO_TELEMETRY_MIGRATION_KEY = "demo_telemetry_migration"
 DEMO_TELEMETRY_MIGRATION_VERSION = 1
+# True while the drop is saved only at the loaded state_version (it survives a restart); any new version clears it.
+DEMO_TELEMETRY_MIGRATION_PENDING_KEY = "demo_telemetry_migration_pending"
 # build_id -> (commit_sha, instance_name, origin_ip)
 SEEDED_RUST_BUILDS = {
     "rb-20261015-001": ("af7c14f8cb2c", "builder-oxidex-turin-01", "185.159.157.42"),
@@ -1555,8 +1557,6 @@ class DashboardStore:
             self.frozen = True
             LOG.warning("Dashboard starts frozen: freeze marker %s is present", self.freeze_marker_path)
         self.loaded_from_file = False
-        # Set by _apply_loaded_state when a load dropped seeded demo telemetry (see commit_demo_telemetry_migration).
-        self._demo_migration_uncommitted = False
         self.controlled_targets_error = ""
         # Set when the state file was unreadable: the store must recover from a verified snapshot first.
         self.recovery_pending = False
@@ -1873,6 +1873,10 @@ class DashboardStore:
             # A state written before the migration: drop its seeds once (a newer marker is kept as it is).
             dropped_seeds = drop_seeded_demo_telemetry(base)
             base[DEMO_TELEMETRY_MIGRATION_KEY] = DEMO_TELEMETRY_MIGRATION_VERSION
+            if dropped_seeds:
+                base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
+        if base.get(DEMO_TELEMETRY_MIGRATION_PENDING_KEY) is not True:
+            base.pop(DEMO_TELEMETRY_MIGRATION_PENDING_KEY, None)
         previous = getattr(self, "state", None)
         self.state = base
         try:
@@ -1883,9 +1887,6 @@ class DashboardStore:
             if previous is not None:
                 self.state = previous
             raise ValueError(f"invalid dashboard state: {type(exc).__name__}: {exc}") from exc
-        # The loaded state_version now names content without the seeds; commit_demo_telemetry_migration publishes
-        # it as a new version once this slot accepts changes.
-        self._demo_migration_uncommitted = dropped_seeds > 0
         if dropped_seeds:
             LOG.warning("Dropped %d seeded demo telemetry record(s) and counter(s) from the dashboard state",
                         dropped_seeds)
@@ -1897,16 +1898,16 @@ class DashboardStore:
         look caught up (to a rollback, or to KV, which never takes different content at an equal version). The
         commit goes through the same gates as every change, so only the active, hydrated, reconciled, unfrozen
         slot advances the version; elsewhere it waits (a standby that bumped could shadow the active slot's next
-        change), and a handover import replaces the state, and this flag with it, anyway.
+        change), and a handover import replaces the state anyway. The pending flag is part of the state, so it
+        survives a restart between the load (whose write-back keeps the loaded version) and the commit.
         """
-        if not self._demo_migration_uncommitted:
+        if self.state.get(DEMO_TELEMETRY_MIGRATION_PENDING_KEY) is not True:
             return False
 
         def apply() -> tuple[int, Any]:
-            if not self._demo_migration_uncommitted:
+            if self.state.get(DEMO_TELEMETRY_MIGRATION_PENDING_KEY) is not True:
                 return 200, {"changed": False}
-            self._persist()
-            self._demo_migration_uncommitted = False
+            self._persist()  # a new version clears the pending flag
             return 200, {"changed": True}
 
         try:
@@ -3411,6 +3412,9 @@ class DashboardStore:
             raise OSError(f"Refusing to overwrite the unreadable dashboard state file: {self.controlled_targets_error}")
         new_version = self.state_version() + (1 if bump else 0)
         candidate_state = {**self.state, "updated_at": new_updated_at, "state_version": new_version}
+        if bump:
+            # Every new version carries the content without the seeds, which is all the pending commit waited for.
+            candidate_state.pop(DEMO_TELEMETRY_MIGRATION_PENDING_KEY, None)
         serialized = json.dumps(candidate_state, indent=2, allow_nan=False)
         if self.state_path:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3447,6 +3451,7 @@ class DashboardStore:
         self.state["updated_at"] = new_updated_at
         self.state["state_version"] = new_version
         if bump:
+            self.state.pop(DEMO_TELEMETRY_MIGRATION_PENDING_KEY, None)
             self._mark_kv_dirty()
 
     def _refresh_instances_pricing(self, records: list[Any] | None = None, *, live: bool = False) -> bool:
