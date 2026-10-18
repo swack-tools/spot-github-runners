@@ -252,9 +252,16 @@ def runner_inventory_stale(state):
                                      or not 0<=time.time()-observed<=120)
 
 
+# While this controller holds its target's runner floor lease (SPOT_RUNNER_FLOOR_STATE_URI set), the lease's guard:
+# every fleet mutation first proves the lease still held, so the floor keeper and this controller never both act.
+_FLOOR_LEASE_GUARD = None
+
+
 def guard_inventory_fresh(state):
     if runner_inventory_stale(state):
         raise RuntimeError('Fleet mutation held: runner inventory expired')
+    if _FLOOR_LEASE_GUARD is not None:
+        _FLOOR_LEASE_GUARD()
 
 
 def guard_fleet_mutation(state, vm=None, is_rotation=False):
@@ -3111,7 +3118,56 @@ def run_controller(args: argparse.Namespace) -> int:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError(f"Another controller owns state {state_path}") from exc
-        return _run_controller(args)
+        holder = None if getattr(args, 'dry_run', False) else acquire_floor_lease(args)
+        if holder is False:
+            return 0
+        try:
+            return _run_controller(args)
+        finally:
+            if holder:
+                release_floor_lease(holder)
+
+
+def acquire_floor_lease(args: argparse.Namespace):
+    """With SPOT_RUNNER_FLOOR_STATE_URI set, hold this target's runner floor lease while the controller runs.
+
+    Returns None when the variable is unset (no floor coordination), False with --once while another controller
+    (the floor keeper, or a replacement command) holds the lease, else the held lease. Without --once it waits.
+    """
+    global _FLOOR_LEASE_GUARD
+    from .runner_floor import ENV_STATE_URI, AutoscalerTargetLease
+
+    uri = str(os.environ.get(ENV_STATE_URI, '') or '').strip()
+    if not uri:
+        return None
+    target = _active_target(args)
+    holder = AutoscalerTargetLease.for_target(args.project, target, uri)
+    while True:
+        if holder.acquire():
+            pending = holder.pending_operation()
+            if not pending:
+                break
+            # The keeper must finish its own launch (and remove its one-use registration token) first.
+            holder.release()
+            LOG.warning('Runner floor keeper has a %s of %s in progress on %s; this controller waits for it',
+                        pending.get('kind'), pending.get('name'), target)
+        else:
+            LOG.warning('Runner floor lease of %s is held by %s; this controller waits before it manages the target',
+                        target, holder.holder())
+        if args.once:
+            return False
+        time.sleep(args.interval_seconds)
+    holder.start()
+    _FLOOR_LEASE_GUARD = holder.guard
+    LOG.info('Holding the runner floor lease of %s; the floor keeper skips this target while this controller runs',
+             target)
+    return holder
+
+
+def release_floor_lease(holder) -> None:
+    global _FLOOR_LEASE_GUARD
+    _FLOOR_LEASE_GUARD = None
+    holder.release()
 
 
 def bind_state_to_target(state: dict, args: Any) -> bool:
@@ -3156,6 +3212,12 @@ def _run_controller(args: argparse.Namespace) -> int:
                        tracked_job_repositories(args))
     args.cpu_platforms_by_zone = None
     while True:
+        if _FLOOR_LEASE_GUARD is not None:
+            try:
+                _FLOOR_LEASE_GUARD()
+            except RuntimeError as exc:
+                LOG.error('%s; stopping so that a restart takes the lease again before it acts', exc)
+                return 75
         clear_catalog_cache()
         if args.cpu_platforms_by_zone is None:
             try:
