@@ -286,13 +286,16 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
     for link, raw in disk_details.items():
         detail = raw if isinstance(raw, Mapping) else {}
         name = str(detail.get("name", "") or "")
-        role = fleet_role(name) or (tracked_roles or {}).get("id:" + str(detail.get("id", "")))
+        users = [str(u).rstrip("/").rsplit("/", 1)[-1] for u in (detail.get("users") or [])]
+        user_roles = sorted({fleet_role(user) for user in users if fleet_role(user) is not None})
+        named_role = ("cicd_runner" if name == "runner-data" or name.startswith("runner-data-") else fleet_role(name))
+        role = (named_role if named_role in user_roles else user_roles[0]) if user_roles else (
+            named_role or (tracked_roles or {}).get("id:" + str(detail.get("id", ""))))
         if role is None or not detail.get("id"):
             continue
         # Users from the later disk listing cannot prove the earlier instance snapshot contained this
         # attachment, even when the user VM was already present. Only attached_sources proves billing ownership.
-        users = [str(u).rstrip("/").rsplit("/", 1)[-1] for u in (detail.get("users") or [])]
-        if users and all(fleet_role(name) is None for name in users):
+        if users and not user_roles:
             # A disk with only external users is outside fleet billing. Mixed users still include fleet storage.
             continue
         # Keep fleet-used disks here until an instance snapshot actually includes their attachment.

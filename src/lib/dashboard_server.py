@@ -96,6 +96,7 @@ from .dashboard_models import (
 from .dashboard_scaling import (
     _assert_finite_json_tree,
     _is_recent_unhandled_oom,
+    _is_eligible_github_oom,
     build_github_oom_deep_link,
     classify_github_ci_failure,
     default_scaling_config,
@@ -570,6 +571,8 @@ def _prune_buckets(buckets: dict[str, list[float]], cutoff: float, span: float =
 
 
 def _current_run_end(record: dict[str, Any], now: float) -> float:
+    if record.get("compute_start_known") is False:
+        return float(record.get("started_epoch") or now)
     end = _instance_end_epoch(record)
     return now if record.get("status") == "RUNNING" or end is None else end
 
@@ -786,6 +789,8 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
     if record.get("deferred_disk_sources") or record.get("unpaid_disk_details"):
         reasons.append("new disk metadata unavailable")
     pricing = record.get("pricing") or {}
+    if record.get("status") == "RUNNING" and record.get("compute_start_known") is False:
+        reasons.append("the first compute start timestamp is not reported yet")
     custom = "custom" in str(record.get("machine_type", "")) or str(record.get("machine_type", "")).endswith("-ext")
     if pricing.get("complete") is False and not custom and pricing.get("provisioning") == "ondemand" \
             and pricing.get("pricing_source") == "spot_baseline_for_on_demand_vm":
@@ -1064,9 +1069,11 @@ def _live_instance_record(
         obs = dict(obs, disks_detail=details)
     obs = dict(obs, deferred_disk_sources=sorted(deferred_disks))
     status = str(obs.get("status") or "UNKNOWN").upper()
-    started = obs.get("last_start_epoch") or obs.get("created_epoch")
-    if not isinstance(started, (int, float)) and previous is not None:
-        started = previous.get("started_epoch")
+    previous_start_known = bool(previous is not None and previous.get("compute_start_known",
+        previous.get("status") not in ("PROVISIONING", "STAGING") or bool(_prior_runs(previous))))
+    start_known = _finite(obs.get("last_start_epoch")) or previous_start_known
+    started = (obs.get("last_start_epoch") if _finite(obs.get("last_start_epoch")) else
+               previous.get("started_epoch") if previous_start_known else obs.get("created_epoch"))
     started_epoch = float(started) if isinstance(started, (int, float)) else now
     started_epoch = min(started_epoch, now)
     role = str(obs.get("role") or "cicd_runner")
@@ -1122,6 +1129,7 @@ def _live_instance_record(
         # Data disks of other types than the first are priced at their own rates.
         record["pricing"] = _with_secondary_disks(record["pricing"], obs, region=region,
                                                   family=record["family"], project=project)
+    record["compute_start_known"] = start_known
     record["boot_disk_gb"] = int(obs.get("boot_disk_gb") or 0)
     if "boot_disk_billed_gb" in obs:
         record["boot_disk_billed_gb"] = obs["boot_disk_billed_gb"]
@@ -1282,7 +1290,11 @@ def _live_instance_record(
         prev_start = float(previous.get("started_epoch") or started_epoch)
         prev_seg = previous.get("compute_segment_start")
         prev_open = max(prev_start, float(prev_seg)) if _finite(prev_seg) else prev_start
-        if started_epoch > prev_start:
+        if started_epoch > prev_start and not previous_start_known:
+            # Creation was only a placeholder before the first lastStartTimestamp. It never represented a run;
+            # discard any provisional closed intervals rather than preserving pre-start compute charges.
+            prior_runs = [(s0, e0, ca, co) for s0, e0, ca, co in prior_runs if e0 <= prev_start]
+        elif started_epoch > prev_start:
             # Started again: close the earlier run (to its recorded stop, else the stop GCE reports, else the new
             # start) at the rates that applied to it.
             prev_end = previous.get("stopped_epoch")
@@ -3079,7 +3091,8 @@ class DashboardStore:
     def _runner_oom_events(self) -> list[dict[str, Any]]:
         """Unhandled runner OOM events (GitHub OOM runs and journal events on runner hosts)."""
         telem = self.state.get("scaling_telemetry", {})
-        events = [evt for evt in (telem.get("github_oom_runs") or []) if isinstance(evt, dict)]
+        events = [evt for evt in (telem.get("github_oom_runs") or [])
+                  if isinstance(evt, dict) and _is_eligible_github_oom(evt)]
         events += [evt for evt in (telem.get("journal_oom_events") or []) if isinstance(evt, dict)
                    and str(evt.get("role", "")).strip().lower() != "rust_builder"
                    and not str(evt.get("instance_name", "")).strip().lower().startswith("builder-")]
@@ -3099,7 +3112,8 @@ class DashboardStore:
 
         events: list[Any] = list(telem.get("journal_oom_events") or [])
         if role == "cicd_runner":
-            events += list(telem.get("github_oom_runs") or [])
+            events += [evt for evt in telem.get("github_oom_runs") or []
+                       if isinstance(evt, dict) and _is_eligible_github_oom(evt)]
         else:
             events += list(telem.get("builder_journal_oom_events") or [])
         return any(
@@ -5449,7 +5463,7 @@ class DashboardStore:
 
         if role in (None, "cicd_runner"):
             for run in telem.get("github_oom_runs", []):
-                if not isinstance(run, dict):
+                if not isinstance(run, dict) or not _is_eligible_github_oom(run):
                     continue
                 if event_id and str(run.get("id", "")) != event_id and str(run.get("run_id", "")) != event_id:
                     continue
