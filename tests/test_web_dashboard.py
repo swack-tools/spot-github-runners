@@ -1033,8 +1033,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             {
                 "min_instances": 2,
                 "max_instances": 5,
-                "runner_vcpu": 24,
-                "runner_ram_gib": 48,
+                "runner_vcpu": 8,
+                "runner_ram_gib": 16,
                 "use_vm_template": False,
                 "budget": {
                     "max_hourly_usd": 2.25,
@@ -1050,10 +1050,10 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(b_sc["max_scale_up_daily_usd"], 18.00)
         self.assertEqual(b_sc["max_scale_up_monthly_usd"], 120.00)
         self.assertFalse(b_sc["include_disk_in_scale_budget"])
-        self.assertEqual(b_sc["container_vcpu"], 24)
-        self.assertEqual(b_sc["builder_vcpu"], 24)
-        self.assertEqual(b_sc["container_ram_gib"], 48.0)
-        self.assertEqual(b_sc["builder_ram_gib"], 48.0)
+        self.assertEqual(b_sc["container_vcpu"], 8)
+        self.assertEqual(b_sc["builder_vcpu"], 8)
+        self.assertEqual(b_sc["container_ram_gib"], 16.0)
+        self.assertEqual(b_sc["builder_ram_gib"], 16.0)
 
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._post(
@@ -5617,8 +5617,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             self.assertEqual(self.store._inventory_stale_reason(), "")
 
     def test_added_disk_billed_from_its_creation(self):
-        from lib.dashboard_server import instance_usage
-
         created = self.now - 10 * 86400.0
         boot = {"type": "pd-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-ad", "id": "1"}
         vm = fleet_observation("9900", "builder-oxidex-add-1", "us-south1-b", started_hours_ago=240.0, now=self.now)
@@ -6366,7 +6364,7 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(observed, observe_fleet_items(list(reversed(items)), **args))
 
     def test_compaction_keeps_resolved_liability_interval(self):
-        from lib.dashboard_server import _bucket_window_costs, _compact_deleted_record, _live_instance_record
+        from lib.dashboard_server import _compact_deleted_record, _live_instance_record
 
         rec = _live_instance_record(fleet_observation("9960", "builder-oxidex-cl", "us-south1-b", started_hours_ago=10.0,
                                                       now=self.now), project="p", now=self.now - 6 * 3600.0)
