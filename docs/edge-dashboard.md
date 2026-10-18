@@ -346,7 +346,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   be read also fails the refresh, so no VM is priced without its memory.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A suspended VM's compute ends at its
-  `lastSuspendedTimestamp`. A stopped VM stops adding compute cost at its
+  `lastSuspendedTimestamp`, also when it resumed between two listings. A stopped VM stops adding compute cost at its
   `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
   that disk-only rate, and a deleted VM's row shows no current rate. When a VM starts again, its earlier running intervals stay in its runtime and
   window spend. When its machine type or disks change, or its prices change, the time before the change
@@ -368,7 +368,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   as a dedicated builder's cache disk (`auto-delete=no`) after its VM is deleted, gets its own
   `DETACHED` record that bills storage until the disk is deleted. Disks are listed even when no fleet VM
   is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
-  is billed by the new record only from the handoff, never again from its creation. A disk that's
+  is billed by the new record only from the handoff, never again from its creation. Disks are matched
+  by their immutable disk ID, so a new disk that reuses a name is billed from its own creation. While
+  disks can't be listed, existing `DETACHED` records are kept, not marked deleted. A disk that's
   detached again keeps its earlier standalone interval and restarts billing at the new handoff.
 - Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
   scale-up plans are refused even when the listing is otherwise current. Grant the permission for
@@ -398,7 +400,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   without a known rate (when no live price was found), and for a VM whose
   Hyperdisk bills provisioned IOPS or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
   no reported performance), the record is marked
-  `pricing_complete: false`. While the role's fleet (both roles under a shared budget) has such a VM,
+  `pricing_complete: false`. Under a shared budget, the other role's VMs and disks are priced with the
+  disk and tax settings of the budget being checked. While the role's fleet (both roles under a shared
+  budget) has such a VM,
   scale-up recommendations hold and scale-up plans are refused, because their budget check would pass
   on a cost that's too low.
 - A VM in a transitional state, such as `PROVISIONING`, `STAGING`, `STOPPING`, or `REPAIRING`, counts
@@ -420,7 +424,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   first listed after the baseline is `RUNNING` with its bootstrap confirmed and the ready slots reach
   the event's target. A restart of existing capacity, or a same-size replacement, handles nothing. New
   capacity stays pending through the OOM lookback, so an OOM reported late can still be answered by it.
-  Builder OOM events are never handled from the inventory: a builder has no service account, so its
+  Hosts first listed together with an OOM that were already running before it count toward its baseline,
+  and only ready runner slots count as current runners. Builder OOM events are never handled from the
+  inventory, including by the builder scaling evaluation: a builder has no service account, so its
   instance record can't show that its build container started. Acknowledge them with `POST /api/scaling`
   and `acknowledge_oom_id` (or `acknowledge_all_ooms`).
   A held recommendation projects the cost of the fleet it keeps, including the storage its stopped VMs

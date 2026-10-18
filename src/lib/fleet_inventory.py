@@ -155,7 +155,7 @@ def observe_fleet_items(
             dtype = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
             unpriced_performance = unpriced_performance or (bool(detail) and _unpriced_performance(detail))
             disks_detail.append({"type": dtype, "gb": size, "created_epoch": gce_epoch(detail.get("creationTimestamp")),
-                                 "source": str(disk.get("source", "") or "")})
+                                 "source": str(disk.get("source", "") or ""), "id": str(detail.get("id", "") or "")})
             if disk.get("boot"):
                 boot_disk_type, boot_disk_gb = dtype, size
             else:
@@ -279,7 +279,8 @@ def observe_detached_disks(disk_details: Mapping[str, Any]) -> list[dict[str, An
             "unpriced_disk_performance": _unpriced_performance(detail),
             "regional_disks": bool(detail.get("regional")),
             "disk_types_known": True,
-            "disks_detail": [{"type": kind, "gb": size, "created_epoch": created, "source": str(link)}],
+            "disks_detail": [{"type": kind, "gb": size, "created_epoch": created, "source": str(link),
+                              "id": str(detail["id"])}],
             "runners_count": 0,
             "runners_count_known": True,
             "runner_vcpu": 0,
