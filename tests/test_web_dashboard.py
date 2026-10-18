@@ -4402,6 +4402,40 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertIn("preserved memory", rec["pricing_incomplete_reason"])
         self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), ["builder-oxidex-susp-1"])
 
+    def test_disabling_inventory_clears_baseline(self):
+        from lib.dashboard_server import FLEET_BASELINE_STATE_KEY, DashboardStore
+
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state.get(FLEET_BASELINE_STATE_KEY))
+        disabled = DashboardStore(state_path=self.state_file)
+        self.assertNotIn(FLEET_BASELINE_STATE_KEY, disabled.state)
+
+    def test_transitional_vm_counts_fully_and_holds_scale_up(self):
+        from lib.dashboard_server import DashboardStore
+
+        self.fleet = [fleet_observation("2900", "builder-oxidex-prov-1", "us-south1-b", status="PROVISIONING",
+                                        started_hours_ago=0.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-prov-1")
+        budget = self.store.state["profiles"]["rust_builder"]["budget"]
+        full = DashboardStore._instance_hourly_for_budget(
+            rec["pricing"], include_disk=bool(budget.get("include_disk_costs", True)),
+            include_tax=bool(budget.get("include_taxes", False)))
+        self.assertAlmostEqual(self.store._stopped_disk_burn("rust_builder"), full, delta=0.0002)
+        self.assertGreater(self.store.query_instances()["active_hourly_burn_usd"], 0.0)
+        held = self.store._fail_closed_evaluation({"direction": "scale_up"}, "rust_builder")
+        self.assertIn("capacity is not settled", held["hold_reason"])
+        with self.assertRaisesRegex(ValueError, "starting, stopping, or repairing"):
+            self.store.scale_region_instances({"region": "us-south1", "role": "rust_builder", "target_instances": 1})
+
+    def test_deleted_history_is_bounded_by_time_not_count(self):
+        from lib.dashboard_server import reconcile_instance_records
+
+        deleted = [{"inventory_source": "gce", "instance_id": str(i), "name": f"oxidex-runners-d{i}",
+                    "status": "DELETED", "deleted_epoch": self.now - i * 60.0} for i in range(1, 451)]
+        records, _changed = reconcile_instance_records(deleted, [], project="p", now=self.now)
+        self.assertEqual(len(records), 450)
+
     def test_inventory_status_reports_source(self):
         from lib.dashboard_server import DashboardStore
 
@@ -4614,6 +4648,28 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                           "machineType": "machineTypes/c4d-highcpu-16"})
             with self.assertRaisesRegex(RuntimeError, "machine type capacity unavailable"):
                 source()
+
+    def test_first_disk_listing_failure_other_than_403_fails_refresh(self):
+        from lib import compute_api
+        from lib.fleet_inventory import gce_fleet_source
+
+        async def listing(api, project, *, instance_fields=compute_api.INSTANCE_LIST_FIELDS):
+            return [{"id": "1", "name": "builder-oxidex-x", "zone": "zones/us-south1-a", "status": "RUNNING",
+                     "machineType": "machineTypes/n4-highcpu-16"}], []
+
+        async def capacity(api, project, zone, machine_type):
+            return {"vcpu": 16, "ram_gib": 32.0}
+
+        async def disks(api, project):
+            raise RuntimeError("Google API HTTP 503: backend error")
+
+        with unittest.mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("t", "p")), \
+                unittest.mock.patch.object(compute_api, "list_instances", listing), \
+                unittest.mock.patch.object(compute_api, "machine_type_capacity", capacity), \
+                unittest.mock.patch.object(compute_api, "list_disk_types", disks):
+            # A fresh process (for example after a restart) must not replace stored disk types on a 503.
+            with self.assertRaisesRegex(RuntimeError, "disk listing failed"):
+                gce_fleet_source("p")()
 
     def test_disk_listing_rejects_unreachable_zones(self):
         import asyncio

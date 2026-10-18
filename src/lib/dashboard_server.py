@@ -383,7 +383,6 @@ FLEET_BASELINE_STATE_KEY = "fleet_inventory_baseline_at"
 # Deleted VMs stay in the history this long (the longest cost window the dashboard offers is 30 days).
 DELETED_INSTANCE_RETENTION_SECONDS = 31 * 86_400.0
 MAX_WINDOW_HOURS = DELETED_INSTANCE_RETENTION_SECONDS / 3600.0
-MAX_INSTANCE_RECORDS = 400
 # Compute Engine states in which the VM is stopped: compute billing ended at lastStopTimestamp.
 GCE_STOPPED_STATUSES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED"})
 LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
@@ -487,6 +486,23 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
         reasons.append("suspended: Compute Engine also bills the preserved memory, which is not priced here")
     record["pricing_complete"] = not reasons
     record["pricing_incomplete_reason"] = "; ".join(reasons)
+
+
+def _nonrunning_hourly(inst: dict[str, Any], *, include_disk: bool, include_tax: bool) -> float:
+    """Hourly USD a live inventory VM that is neither RUNNING nor DELETED bills.
+
+    A stopped VM (TERMINATED, STOPPED, SUSPENDED) bills only its disks. A VM in a transitional state
+    (PROVISIONING, STAGING, STOPPING, REPAIRING, ...) is about to run or still is, so it counts at its full rate.
+    """
+    pricing = inst.get("pricing") or {}
+    if inst.get("status") in GCE_STOPPED_STATUSES:
+        return _stopped_disk_hourly(pricing, include_tax=include_tax) if include_disk else 0.0
+    return DashboardStore._instance_hourly_for_budget(pricing, include_disk=include_disk, include_tax=include_tax)
+
+
+def _is_transitional(inst: Any) -> bool:
+    return (is_live_instance_record(inst) and inst.get("status") not in GCE_STOPPED_STATUSES
+            and inst.get("status") not in ("RUNNING", "DELETED"))
 
 
 def _live_instance_record(
@@ -701,7 +717,9 @@ def reconcile_instance_records(
                   key=lambda r: -float(r.get("started_epoch") or 0.0))
     gone = sorted((r for r in records if r.get("status") == "DELETED"),
                   key=lambda r: -float(r.get("deleted_epoch") or 0.0))
-    records = (live + gone)[:max(MAX_INSTANCE_RECORDS, len(live))]
+    # Bounded by time only: every record inside the retention period is kept, so every accepted cost window
+    # (at most MAX_WINDOW_HOURS) sees its full spend.
+    records = live + gone
     changed = [_instance_fingerprint(r) for r in existing] != [_instance_fingerprint(r) for r in records]
     return records, changed
 
@@ -1519,6 +1537,8 @@ class DashboardStore:
             if getattr(self, "fleet_source", None) is None:
                 # Without a live source nothing would ever update these records: showing them would be stale.
                 kept = [r for r in kept if not isinstance(r, dict)]
+                # The baseline belonged to the dropped records; a later re-enabled inventory starts a new one.
+                base.pop(FLEET_BASELINE_STATE_KEY, None)
             if len(kept) != len(instances):
                 # Demo seed records and VMs fabricated by the old in-dashboard lifecycle actions never existed in
                 # Compute Engine; only inventory records survive a load.
@@ -2702,6 +2722,11 @@ class DashboardStore:
             and inst.get("status") != "DELETED" and inst.get("pricing_complete") is False
         ]
 
+    def _transitional_hosts(self, role: str) -> list[str]:
+        """The role's inventory VMs in a transitional GCE state (their capacity is about to change)."""
+        return [str(inst.get("name")) for inst in self.state.get("instances", [])
+                if _is_transitional(inst) and inst.get("role") == role]
+
     @staticmethod
     def _held(evaluation: dict[str, Any], reason: str) -> dict[str, Any]:
         return {
@@ -2722,6 +2747,10 @@ class DashboardStore:
             if unknown:
                 return self._held(evaluation, f"Runner count not recorded on {len(unknown)} running host(s) "
                                               f"({', '.join(unknown[:5])}); slot totals are unknown")
+        pending = self._transitional_hosts(role)
+        if pending and evaluation.get("direction") == "scale_up":
+            return self._held(evaluation, f"{len(pending)} VM(s) ({', '.join(pending[:5])}) are starting, stopping, "
+                                          "or repairing; their capacity is not settled yet")
         incomplete = self._incomplete_cost_hosts(role)
         if incomplete and evaluation.get("direction") == "scale_up":
             return self._held(evaluation, f"Cost of {len(incomplete)} VM(s) ({', '.join(incomplete[:5])}) is not fully "
@@ -2729,15 +2758,15 @@ class DashboardStore:
         return evaluation
 
     def _stopped_disk_burn(self, role: str) -> float:
-        """Hourly disk USD of the role's stopped inventory VMs, under the role's disk and tax budget flags."""
+        """Hourly USD of the role's not-running inventory VMs (disks of stopped ones, full rate of transitional
+        ones), under the role's disk and tax budget flags."""
         prof = self.state.get("profiles", {}).get(role, {})
         pol = self.state.get("scaling", {}).get(role, {})
         budget = prof.get("budget", {}) if isinstance(prof.get("budget"), dict) else {}
-        if not bool(pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))):
-            return 0.0
+        include_disk = bool(pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True)))
         include_tax = bool(budget.get("include_taxes", False))
         return round(sum(
-            _stopped_disk_hourly(inst.get("pricing") or {}, include_tax=include_tax)
+            _nonrunning_hourly(inst, include_disk=include_disk, include_tax=include_tax)
             for inst in self.state.get("instances", [])
             if is_live_instance_record(inst) and inst.get("role") == role
             and inst.get("status") not in ("RUNNING", "DELETED")
@@ -3373,15 +3402,12 @@ class DashboardStore:
             running_builder_rows = [r for r in running_rows if r.get("role") == "rust_builder"]
             running_runner_slots = sum(int(r.get("runners_count", 0)) for r in running_runner_rows)
             total_window_spend = round(sum(r["total_cost_in_window_usd"] for r in rows), 2)
-            # A stopped inventory VM still bills its attached disks (with tax) until it is deleted.
-            stopped_disk_burn = (
-                sum(
-                    _stopped_disk_hourly(r["pricing"])
-                    for r in rows
-                    if is_live_instance_record(r) and r["status"] not in ("RUNNING", "DELETED")
-                )
-                if include_disk_and_tax
-                else 0.0
+            # A stopped inventory VM still bills its attached disks (with tax) until it is deleted; a transitional
+            # one (provisioning, stopping, repairing, ...) counts at its full rate.
+            stopped_disk_burn = sum(
+                _nonrunning_hourly(r, include_disk=include_disk_and_tax, include_tax=include_disk_and_tax)
+                for r in rows
+                if is_live_instance_record(r) and r["status"] not in ("RUNNING", "DELETED")
             )
             active_hourly_burn = round(
                 sum(r["active_hourly_usd"] for r in running_rows) + stopped_disk_burn, 4
@@ -4732,6 +4758,12 @@ class DashboardStore:
                         f"Runner count is not recorded on running host(s) {', '.join(unknown_counts[:5])}; "
                         "the runner total is unknown, so a scale-up cannot be checked against max_runners"
                     )
+                pending_hosts = self._transitional_hosts(role)
+                if pending_hosts:
+                    raise ValueError(
+                        f"VM(s) {', '.join(pending_hosts[:5])} are starting, stopping, or repairing; plan the "
+                        "scale-up once their capacity has settled"
+                    )
                 incomplete_costs = self._incomplete_cost_hosts(role)
                 if incomplete_costs:
                     raise ValueError(
@@ -4774,17 +4806,13 @@ class DashboardStore:
                     ),
                     4,
                 )
-                # Stopped inventory VMs bill no compute but keep billing their disks.
-                stopped_disk_hourly = (
-                    sum(
-                        _stopped_disk_hourly(i["pricing"], include_tax=include_tax)
-                        for i in instances
-                        if is_live_instance_record(i)
-                        and i["status"] not in ("RUNNING", "DELETED")
-                        and (i["role"] == role or (shared_global and i["role"] == other_role))
-                    )
-                    if include_disk
-                    else 0.0
+                # Stopped inventory VMs bill no compute but keep billing their disks; transitional ones count fully.
+                stopped_disk_hourly = sum(
+                    _nonrunning_hourly(i, include_disk=include_disk, include_tax=include_tax)
+                    for i in instances
+                    if is_live_instance_record(i)
+                    and i["status"] not in ("RUNNING", "DELETED")
+                    and (i["role"] == role or (shared_global and i["role"] == other_role))
                 )
                 projected_fleet_hourly = round(
                     other_role_hourly

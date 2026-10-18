@@ -336,8 +336,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `oxidex-runners-` (runner hosts) or `builder-` (dedicated builders). Control VMs and other VMs aren't
   listed. The control VM's service account needs `compute.instances.list` and
   `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
-  they show `pd-balanced`. Once a disk listing has succeeded, a failed or partial one fails the whole
-  refresh, so known disk types are never replaced by the default. A machine type whose capacity can't
+  (HTTP 403) they show `pd-balanced`. Any other failed or partial disk listing fails the whole refresh,
+  so known disk types are never replaced by the default. A machine type whose capacity can't
   be read also fails the refresh, so no VM is priced without its memory.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
@@ -348,7 +348,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.
 - A VM that was listed before and is no longer in the inventory becomes `DELETED`. Its deletion time is
   the time of the first listing that missed it. Deleted VMs and earlier runs stay in the history for 31
-  days, and cost windows are limited to 744 hours (31 days) to match. A VM that's
+  days, however many there are, and cost windows are limited to 744 hours (31 days) to match. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
 - Spend covers each VM's attached disks while the VM exists. A dedicated builder's cache disk
   (`auto-delete=no`) outlives its VM, and the dashboard doesn't count it after the VM is deleted.
@@ -365,6 +365,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `pricing_complete: false`. While the role's fleet (both roles under a shared budget) has such a VM,
   scale-up recommendations hold and scale-up plans are refused, because their budget check would pass
   on a cost that's too low.
+- A VM in a transitional state, such as `PROVISIONING`, `STAGING`, `STOPPING`, or `REPAIRING`, counts
+  at its full rate in burn and budgets. While the role has one, scale-up recommendations hold and
+  scale-up plans are refused, because its capacity hasn't settled.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
@@ -375,7 +378,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
   empty and the instances tab says that the inventory isn't configured. Inventory records loaded from
-  a state file or snapshot are dropped too, since nothing would keep them current.
+  a state file or snapshot are dropped too, since nothing would keep them current, and so is the
+  baseline: a later re-enabled inventory starts a new one.
 - On load, from the state file, a KV snapshot, or a handover import, the dashboard drops every instance
   record that didn't come from the inventory. These are the demo instances that earlier versions seeded,
   such as `oxidex-runners-dallas-01`, and records that the old in-dashboard actions invented.

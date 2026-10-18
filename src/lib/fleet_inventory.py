@@ -158,6 +158,11 @@ def observe_fleet_items(
     return observed
 
 
+def _permission_denied(exc: BaseException) -> bool:
+    """True for a Compute Engine HTTP 403 (the service account lacks the permission)."""
+    return "HTTP 403" in str(exc)
+
+
 def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
     """A callable that lists the live fleet from Compute Engine (gcloud credentials or the metadata server).
 
@@ -187,10 +192,11 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                         disk_types = await compute_api.list_disk_types(api, auth.project)
                         disk_listing["ok_before"] = True
                 except Exception as exc:
-                    if disk_listing["ok_before"]:
-                        # Transient: fail the whole listing so known disk types are not replaced by defaults.
+                    if disk_listing["ok_before"] or not _permission_denied(exc):
+                        # Transient (or after a restart, when this process has not listed disks yet but stored
+                        # records may hold real types): fail the whole listing so known types are not replaced.
                         raise RuntimeError(f"disk listing failed: {type(exc).__name__}: {exc}") from exc
-                    # Never worked (for example no compute.disks.list): disk types fall back to the default.
+                    # No compute.disks.list (HTTP 403): disk types fall back to the default.
                 wanted = {(str(i.get("zone", "")).rsplit("/", 1)[-1], str(i.get("machineType", "")).rsplit("/", 1)[-1])
                           for i in fleet_items}
                 for zone, machine_type in wanted - shape_cache.keys():
