@@ -39,6 +39,8 @@ def _disk_detail(disk_types: Mapping[str, Any], source: str) -> dict[str, Any]:
 def _unpriced_performance(detail: Mapping[str, Any]) -> bool:
     """True when a disk bills provisioned performance the dashboard does not price (or reports none to check)."""
     kind = str(detail.get("type", ""))
+    if kind == "pd-extreme":
+        return True  # Extreme PD bills its provisioned IOPS separately.
     if kind == "hyperdisk-throughput":
         return True  # Provisioned throughput is always billed separately.
     if kind.startswith("hyperdisk-"):
@@ -205,6 +207,7 @@ def observe_fleet_items(
             "created_epoch": gce_epoch(item.get("creationTimestamp")),
             "last_start_epoch": gce_epoch(item.get("lastStartTimestamp")),
             "last_stop_epoch": gce_epoch(item.get("lastStopTimestamp")),
+            "last_suspended_epoch": gce_epoch(item.get("lastSuspendedTimestamp")),
             "patch_target": metadata.get("spot-runner-patch-target", ""),
         })
     return observed

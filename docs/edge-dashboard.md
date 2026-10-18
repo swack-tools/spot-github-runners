@@ -336,12 +336,13 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `oxidex-runners-` (runner hosts) or `builder-` (dedicated builders). Control VMs and other VMs aren't
   listed. The control VM's service account needs `compute.instances.list` and
   `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
-  (HTTP 403) a VM keeps the types stored from an earlier listing, and a new VM shows `pd-balanced`
-  with its pricing marked incomplete. Any other failed or partial disk listing fails the whole refresh,
+  (HTTP 403) a VM keeps the types stored from an earlier listing and a new VM shows `pd-balanced`,
+  but both are marked unverified and incompletely priced, and neither can be a template source. Any other failed or partial disk listing fails the whole refresh,
   so known disk types are never replaced by the default. A machine type whose capacity can't
   be read also fails the refresh, so no VM is priced without its memory.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
-  after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
+  after a Spot preemption or a manual stop. A suspended VM's compute ends at its
+  `lastSuspendedTimestamp`. A stopped VM stops adding compute cost at its
   `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
   that disk-only rate, and a deleted VM's row shows no current rate. When a VM starts again, its earlier running intervals stay in its runtime and
   window spend. When its machine type or disks change, or its prices change, the time before the change
@@ -371,7 +372,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   nothing pending), the runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
   plans are refused.
 - A VM in a region outside the dashboard's region catalog is priced with no tax, marked
-  `tax_rate_known: false`, rather than with another region's default tax. When the budget being
+  `tax_rate_known: false`, rather than with another region's default tax, and its pricing is marked
+  incomplete, since the catalog has no trusted compute or disk rates for that region either. When the budget being
   checked or the VM's own budget includes taxes, without a tax override on the VM's profile, that
   unknown tax holds scale-ups like other unpriced costs. Each inventory refresh,
   and each budget or profile change, reprices the listed VMs, stopped ones included, but a page read
@@ -380,7 +382,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, for a
   `SUSPENDED` VM, whose preserved memory Compute Engine also bills, for a VM with Local SSD (counted
   as `local_ssd_gb`, not as a persistent data disk), for a VM with a regional (replicated) persistent
-  disk, for a custom or extended machine shape, which predefined rates don't price, and for a VM whose
+  disk or an Extreme Persistent Disk (`pd-extreme`, whose provisioned IOPS bill separately), for a custom or extended machine shape, which predefined rates don't price, and for a VM whose
   Hyperdisk bills provisioned IOPS or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
   no reported performance), the record is marked
   `pricing_complete: false`. While the role's fleet (both roles under a shared budget) has such a VM,
@@ -402,7 +404,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   and, for a runner host, has confirmed its bootstrap. A stopped VM that starts again adds none. The
   OOM target is then checked against the ready runner slots actually running after the listing, so
   replacing a host with one of the same size handles nothing. A new builder handles builder OOM events
-  only when the number of running builders grew. A held recommendation projects the cost
+  only when the number of running builders grew. New capacity stays pending while an active OOM event
+  it could still satisfy remains, so a later net increase still handles it. A held recommendation projects the cost
   of the fleet it keeps. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
   snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays

@@ -95,6 +95,7 @@ from .dashboard_models import (
 )
 from .dashboard_scaling import (
     _assert_finite_json_tree,
+    _is_recent_unhandled_oom,
     build_github_oom_deep_link,
     classify_github_ci_failure,
     default_scaling_config,
@@ -698,6 +699,8 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
         reasons.append("no on-demand rate for this standard (non-Spot) VM")
     if record.get("status") == "SUSPENDED":
         reasons.append("suspended: Compute Engine also bills the preserved memory, which is not priced here")
+    if record.get("tax_rate_known") is False:
+        reasons.append("region outside the dashboard's catalog: no trusted regional compute, disk, or tax rates")
     if record.get("regional_disks"):
         reasons.append("regional (replicated) persistent disk, priced here only at the zonal rate")
     if record.get("disk_types_known") is False:
@@ -748,8 +751,7 @@ def _live_instance_record(
                 obs["data_disks"] = previous.get("data_disks") or obs.get("data_disks")
                 obs["unpriced_disk_performance"] = bool(previous.get("unpriced_disk_performance"))
                 obs["regional_disks"] = bool(previous.get("regional_disks"))
-                if int(previous.get("boot_disk_gb") or 0) == int(obs.get("boot_disk_gb") or 0):
-                    obs["disk_types_known"] = True
+            # Still unverified: a same-size disk may have been replaced by another type, so pricing stays incomplete.
     status = str(obs.get("status") or "UNKNOWN").upper()
     started = obs.get("last_start_epoch") or obs.get("created_epoch")
     if not isinstance(started, (int, float)) and previous is not None:
@@ -822,7 +824,7 @@ def _live_instance_record(
     if status == "RUNNING":
         trigger = "Active — RUNNING in the live Compute Engine inventory"
     elif status in GCE_STOPPED_STATUSES:
-        stop = obs.get("last_stop_epoch")
+        stop = obs.get("last_suspended_epoch") if status == "SUSPENDED" else obs.get("last_stop_epoch")
         if isinstance(stop, (int, float)) and stop >= started_epoch:
             stopped_epoch = float(stop)
         elif previous is not None and isinstance(previous.get("stopped_epoch"), (int, float)):
@@ -2097,8 +2099,35 @@ class DashboardStore:
         # (a replacement for a builder that stopped in the same listing adds nothing).
         if new_builders and len(running(current, "rust_builder")) > len(running(previous, "rust_builder")):
             self._consume_active_oom_events(role="rust_builder")
-        for record in new_running("cicd_runner") + new_builders:
-            record["capacity_pending"] = False
+        # New capacity stays pending while an OOM it could still satisfy is active (for example after a replacement
+        # with no net growth, until a later restart makes it net growth); with none active it is just capacity.
+        for role, records in (("cicd_runner", new_running("cicd_runner")), ("rust_builder", new_builders)):
+            if not self._active_oom_events(role):
+                for record in records:
+                    record["capacity_pending"] = False
+
+    def _active_oom_events(self, role: str) -> bool:
+        """True while an OOM event of the role is active for scaling: unhandled and inside the policy's lookback
+        window (the same test the scaling evaluation applies)."""
+        telem = self.state.get("scaling_telemetry", {})
+        cfg = {**default_scaling_config()[role], **(self.state.get("scaling", {}).get(role) or {})}
+        lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60) or 60) * 60.0)
+        now = self._clock()
+
+        def builder_event(evt: dict[str, Any]) -> bool:
+            return (str(evt.get("role", "")).strip().lower() == "rust_builder"
+                    or str(evt.get("instance_name", "")).strip().lower().startswith("builder-"))
+
+        events: list[Any] = list(telem.get("journal_oom_events") or [])
+        if role == "cicd_runner":
+            events += list(telem.get("github_oom_runs") or [])
+        else:
+            events += list(telem.get("builder_journal_oom_events") or [])
+        return any(
+            isinstance(evt, dict) and _is_recent_unhandled_oom(evt, now, lookback_seconds)
+            and (builder_event(evt) if role == "rust_builder" else not builder_event(evt))
+            for evt in events
+        )
 
     def fleet_inventory_status(self) -> dict[str, Any]:
         """Where the instance list comes from and how fresh it is (in memory; not part of the snapshot)."""
@@ -4981,14 +5010,19 @@ class DashboardStore:
                 (
                     i
                     for i in self.state["instances"]
-                    if (instance_id and i["instance_id"] == instance_id)
-                    or (instance_name and i["name"] == instance_name)
+                    # An instance ID is exact; names can repeat across zones and over time.
+                    if (i["instance_id"] == instance_id if instance_id else (instance_name and i["name"] == instance_name))
                 ),
                 None,
             )
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
+            if inst.get("disk_types_known") is False:
+                raise ValueError(
+                    f"The disk types of {inst['name']} are not verified (no compute.disks.list), so a VM template "
+                    "cannot describe them; create the template from the profile instead"
+                )
             if inst.get("regional_disks") or inst.get("unpriced_disk_performance"):
                 raise ValueError(
                     f"{inst['name']} has regional disks or provisioned Hyperdisk performance, which a VM template "
@@ -5096,8 +5130,9 @@ class DashboardStore:
                 (
                     i
                     for i in self.state["instances"]
-                    if (instance_id and i.get("instance_id") == instance_id)
-                    or (instance_name and i.get("name") == instance_name)
+                    # An instance ID is exact; names can repeat across zones and over time.
+                    if (i.get("instance_id") == instance_id if instance_id
+                        else (instance_name and i.get("name") == instance_name))
                 ),
                 None,
             )
@@ -5222,7 +5257,8 @@ class DashboardStore:
                         # A host with several data-disk types cannot be described by one type and size.
                         (i for i in running_in_region
                          if len(i.get("data_disks") or {}) <= 1 and not int(i.get("local_ssd_gb") or 0)
-                         and not i.get("regional_disks") and not i.get("unpriced_disk_performance")), None)
+                         and not i.get("regional_disks") and not i.get("unpriced_disk_performance")
+                         and i.get("disk_types_known") is not False), None)
                     if existing_cand is not None:
                         try:
                             self._validate_vm_template_compatibility(existing_cand, prof, role)
