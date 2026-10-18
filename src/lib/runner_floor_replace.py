@@ -75,6 +75,19 @@ class Preflight:
     steps: list[str] = field(default_factory=list)
 
 
+def associated_runner_names(vm_name: str, machine_type: str, region: str,
+                            runners: Sequence[GitHubRunner]) -> list[str]:
+    """Every registration attributed to the old VM, independent of what the operator named: a name that contains the
+    VM name, or custom labels that name the VM's machine type and region. Managed floor runners never count.
+
+    The attribution is deliberately broad: a runner it wrongly includes only blocks the deletion, while a runner it
+    missed could still be running a job when the VM is deleted.
+    """
+    shape = {machine_type, region} - {""}
+    return sorted(r.name for r in runners if not r.name.startswith(f"{rf.RUNNER_PREFIX}-{rf.HOST_PREFIX}")
+                  and ((vm_name and vm_name in r.name) or (len(shape) == 2 and shape <= rf.custom_labels(r))))
+
+
 def preflight(target: rf.FloorTarget, old: rf.Host | None, old_names: Sequence[str], runners: Sequence[GitHubRunner],
               hosts: Sequence[rf.Host], record: dict, *, accept_dropped: bool, instance: str = "") -> Preflight:
     """Every check that must pass before the replacement changes anything (pure; the preview prints it)."""
@@ -90,12 +103,15 @@ def preflight(target: rf.FloorTarget, old: rf.Host | None, old_names: Sequence[s
         if old.target_label and old.target_label != target.key:
             out.problems.append(f"{old.name} carries the spot-target label of another target")
     by_name = {r.name: r for r in runners}
-    out.candidates = sorted(r.name for r in runners if not r.name.startswith(f"{rf.RUNNER_PREFIX}-{rf.HOST_PREFIX}")
-                            and ((name and name in r.name) or (old and {old.machine_type, old.region} <=
-                                                                set(rf.custom_labels(r)))))
+    out.candidates = associated_runner_names(name, old.machine_type if old else "", old.region if old else "", runners)
     if not old_names:
         out.problems.append("name the old host's runners with --old-runner (candidates: "
                             + (", ".join(out.candidates) or "none found") + ")")
+    unnamed = sorted(set(out.candidates) - set(old_names))
+    if old_names and unnamed:
+        # Every runner of the VM is drained and must be gone before the VM is deleted, never a subset.
+        out.problems.append(f"--old-runner must name every runner attributed to {name}; also name "
+                            f"{', '.join(unnamed)} (or remove those registrations first if they aren't its runners)")
     for runner_name in dict.fromkeys(old_names):
         runner = by_name.get(runner_name)
         if runner is None:
@@ -140,7 +156,8 @@ def preflight(target: rf.FloorTarget, old: rf.Host | None, old_names: Sequence[s
             "7. verify the VM is gone",
         ]
     recorded = record.get("replacement") or {}
-    if recorded and (recorded.get("old") or {}).get("name") != name and recorded.get("phase") not in ("done", "aborted", "held"):
+    if recorded and (recorded.get("old") or {}).get("name") != name and \
+            recorded.get("phase") not in ("done", "aborted", "held"):
         out.problems.append("another replacement is recorded for this target: "
                             f"{(recorded.get('old') or {}).get('name')} ({recorded.get('phase')})")
     return out
@@ -212,10 +229,45 @@ def label_strip_step(rep: dict, old_runners: Sequence[GitHubRunner], github: rf.
             rep["idle_since"] = None
             save()
             return False
-        rep.setdefault("deregistered", []).append(runner.name)
+        # Pending until the delete returns: a crash in between leaves it to reconcile_pending, never to a rollback.
+        rep["deregistering"] = runner.name
         save()
         github.delete_runner(target.target, runner.runner_id)
+        rep.setdefault("deregistered", []).append(runner.name)
+        rep.pop("deregistering", None)
+        save()
     return False  # a fresh inventory must prove them gone
+
+
+def irreversible(rep: dict) -> bool:
+    """Whether any old runner was (or may have been) deregistered: then the old host can't be put back."""
+    drain = rep.get("drain") or {}
+    return bool(rep.get("deregistered") or rep.get("deregistering") or drain.get("deregistered_runner_ids")
+                or drain.get("deregistering_runner_id") is not None)
+
+
+def reconcile_pending(rep: dict, runners: Sequence[GitHubRunner]) -> str | None:
+    """Settle a deregistration whose outcome was never saved, from a fresh GitHub inventory.
+
+    Gone: it happened, so it is recorded as deregistered (irreversible). Still registered: the delete never took
+    effect, so the pending mark is dropped and the runner counts as present. Returns what changed, or None.
+    """
+    drain = rep.get("drain") or {}
+    pending_id = drain.get("deregistering_runner_id")
+    if pending_id is not None:
+        drain.pop("deregistering_runner_id")
+        if pending_id in {r.runner_id for r in runners}:
+            return f"runner {pending_id} is still registered; its interrupted deregistration never took effect"
+        drain["deregistered_runner_ids"] = sorted(set(drain.get("deregistered_runner_ids") or []) | {pending_id})
+        return f"runner {pending_id} is gone; its interrupted deregistration is recorded"
+    pending_name = rep.get("deregistering")
+    if pending_name:
+        rep.pop("deregistering")
+        if pending_name in {r.name for r in runners}:
+            return f"runner {pending_name} is still registered; its interrupted deregistration never took effect"
+        rep["deregistered"] = sorted(set(rep.get("deregistered") or []) | {pending_name})
+        return f"runner {pending_name} is gone; its interrupted deregistration is recorded"
+    return None
 
 
 class Replacement:
@@ -258,6 +310,20 @@ class Replacement:
         names = set(self.rep["old_runner_names"])
         return [r for r in runners if r.name in names]
 
+    def _unaccounted(self, runners: Sequence[GitHubRunner]) -> list[str]:
+        """Runners attributed to the old VM that this replacement never drained (they registered later, or the
+        record predates the complete-set check)."""
+        old = self.rep["old"]
+        associated = associated_runner_names(old["name"], old.get("machine_type", ""),
+                                             old.get("zone", "").rsplit("-", 1)[0] if old.get("machine_type") else "",
+                                             runners)
+        return sorted(set(associated) - set(self.rep["old_runner_names"]))
+
+    def _refuse_delete(self, names: Sequence[str]) -> int:
+        self.say(f"refusing to delete {self.rep['old']['name']}: runner(s) {', '.join(names)} attributed to it are "
+                 "still registered and this replacement didn't drain them; drain or remove them, then rerun")
+        return 1
+
     def _abort(self, why: str, runners: Sequence[GitHubRunner], old: rf.Host | None) -> int | None:
         """Release the cordon, then restore the old runners' labels; only before any old runner was deregistered.
 
@@ -268,8 +334,8 @@ class Replacement:
         if rep.get("phase") != "aborting":
             rep.update(phase="aborting", abort_reason=why)
             self.save()
-        token = (rep.get("drain") or {}).get("host_cordon_token")
-        if token and old is not None and not rep.get("cordon_released"):
+        token = rep.get("cordon_intent")
+        if token and old is not None and not rep.get("cordon_released") and not rep.get("cordon_absent"):
             if not self.release_cordon(self._old_vm(old), self.args, token, self.lease.ensure):
                 self.say(f"aborting ({why}): the cordon release on {old.name} is unconfirmed; the old runners stay "
                          "without their labels until it is")
@@ -297,6 +363,20 @@ class Replacement:
             self.say(f"{old.name} is now another instance ({old.instance_id}); stopping without changes")
             return 1
         phase = rep["phase"]
+        if phase in ("verified", "draining", "aborting", "deleting"):
+            settled = reconcile_pending(rep, runners)
+            if settled:
+                self.save()
+                self.say(settled)
+        if phase == "aborting" and irreversible(rep):
+            # An old runner is already gone, so a rollback can't restore the old host: go forward instead, which
+            # waits for the managed host to be ready again and then finishes the drain and the deletion.
+            rep.update(phase="draining", abort_reason=None, irreversible_since=rep.get("irreversible_since")
+                       or self.clock())
+            self.save()
+            self.say("not rolling back: an old runner was already deregistered, so the old host can't be restored; "
+                     "the replacement continues once the managed host is ready again")
+            return None
         if phase == "aborting":
             return self._abort(rep.get("abort_reason") or "aborting", runners, old)
         if phase == "ensure_managed":
@@ -317,7 +397,7 @@ class Replacement:
             return None
         ready, why = managed_ready(rep.get("managed") or {}, hosts, runners, rep["required_labels"])
         if phase in ("verified", "draining") and not ready:
-            if not rep.get("deregistered") and not (rep.get("drain") or {}).get("deregistered_runner_ids"):
+            if not irreversible(rep):
                 return self._abort(f"the managed host is no longer ready ({why})", runners, old)
             self.say(f"waiting: {why}; old runners were already deregistered, so the old host can't be restored")
             return None
@@ -335,9 +415,17 @@ class Replacement:
             vm = self._old_vm(old)
             old_runners = self._old_runners(runners)
             if not rep.get("mode"):
-                state, detail = self.cordon(vm, self.args, f"replace-{old.instance_id}",
-                                            [r.name for r in old_runners], self.lease.ensure)
+                token = f"replace-{old.instance_id}"
+                if rep.get("cordon_intent") != token:
+                    # Durable before the call: an SSH timeout or a crash may leave a marker that only this token
+                    # lets an abort release.
+                    rep["cordon_intent"] = token
+                    rep["drain"] = {"target": self.target.name, "runner_ids": [], "host_cordon_token": token}
+                    self.save()
+                state, detail = self.cordon(vm, self.args, token, [r.name for r in old_runners], self.lease.ensure)
                 if state == "unsupported":
+                    # The cordon program refuses before it writes any marker: none exists to release.
+                    rep["cordon_absent"] = True
                     if not self.args.label_strip_drain:
                         rep.update(phase="held", hold_reason=detail.get("reason") or state)
                         self.save()
@@ -347,8 +435,6 @@ class Replacement:
                     rep["mode"] = "label_strip"
                 elif state in ("placed", "busy", "idle"):
                     rep["mode"] = "cordon"
-                    rep["drain"] = {"target": self.target.name, "runner_ids": [],
-                                    "host_cordon_token": f"replace-{old.instance_id}"}
                 else:
                     self.say(f"cordon of {old.name} is unverified ({state}); retrying")
                     return None
@@ -368,6 +454,9 @@ class Replacement:
             if leftover:
                 self.say(f"waiting for {', '.join(r.name for r in leftover)} to disappear from GitHub")
                 return None
+            unaccounted = self._unaccounted(runners)
+            if unaccounted:
+                return self._refuse_delete(unaccounted)
             if old is None:
                 rep.update(phase="done", done_at=self.clock())
                 self.save()
@@ -376,6 +465,11 @@ class Replacement:
             rep["delete_requested_at"] = self.clock()
             self.save()
             self.lease.ensure()
+            # A fresh inventory right before the delete: no runner attributed to this VM may still be registered.
+            fresh = self.github.list_runners(self.target.target)
+            remaining = self._old_runners(fresh) + [r for r in fresh if r.name in self._unaccounted(fresh)]
+            if remaining:
+                return self._refuse_delete([r.name for r in remaining])
             self.delete_old(old)
             return None
         if phase == "done":
@@ -400,6 +494,15 @@ class Replacement:
             self.sleep(self.args.poll_seconds)
 
 
+def resumable(recorded: dict, instance: str) -> bool:
+    """A recorded replacement of this VM that a rerun continues instead of starting over: one in progress, or one
+    marked aborted although an old runner was already deregistered (so it was never reversible)."""
+    if (recorded.get("old") or {}).get("name") != instance:
+        return False
+    phase = recorded.get("phase")
+    return phase not in ("done", "aborted", "held") or (phase == "aborted" and irreversible(recorded))
+
+
 def run_replace(args: argparse.Namespace, config: rf.FloorConfig) -> int:
     target = config.target(args.target)
     if not config.state_uri:
@@ -416,8 +519,7 @@ def run_replace(args: argparse.Namespace, config: rf.FloorConfig) -> int:
     runners = github.list_runners(target.target)
     hosts = inventory.list_hosts()
     recorded = record.get("replacement") or {}
-    if (recorded.get("old") or {}).get("name") == args.instance and \
-            recorded.get("phase") not in ("done", "aborted", "held"):
+    if resumable(recorded, args.instance):
         # A replacement in progress resumes from its record: its old runners may already be deregistered and its VM
         # deleted, which a fresh preflight would refuse.
         print(json.dumps({"target": target.name, "resume": {k: v for k, v in recorded.items()
@@ -463,7 +565,11 @@ def _apply(args: argparse.Namespace, config: rf.FloorConfig, target: rf.FloorTar
                 current.get("phase") not in ("aborted", "held", "done"):
             print(f"Another replacement ({(current.get('old') or {}).get('name')}) is in progress for this target")
             return 1
-        if not record.get("replacement") or record["replacement"].get("phase") in ("aborted", "held", "done"):
+        if resumable(current, args.instance) and current.get("phase") == "aborted":
+            # Recorded as aborted although an old runner is gone: the rollback was never possible, so it goes on.
+            current.update(phase="draining", abort_reason=None)
+            store.save(lease)
+        elif not current or current.get("phase") in ("aborted", "held", "done"):
             if record.get("replacement", {}).get("phase") == "done" and \
                     record["replacement"]["old"]["name"] == args.instance:
                 print("Already done.")
@@ -471,7 +577,8 @@ def _apply(args: argparse.Namespace, config: rf.FloorConfig, target: rf.FloorTar
             if check is None or old is None:
                 print("The recorded replacement changed while this command started; rerun it")
                 return EXIT_RESUMABLE
-            record["replacement"] = {"old": {"name": old.name, "zone": old.zone, "instance_id": old.instance_id},
+            record["replacement"] = {"old": {"name": old.name, "zone": old.zone, "instance_id": old.instance_id,
+                                             "machine_type": old.machine_type},
                                      "old_runner_names": [r.name for r in check.old_runners],
                                      "required_labels": check.required_labels, "phase": "ensure_managed",
                                      "started_at": time.time()}

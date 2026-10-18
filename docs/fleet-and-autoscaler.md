@@ -393,11 +393,12 @@ PYTHONPATH=src python3 src/runner_floor.py replace-unmanaged \
 
 The preview lists runner names that look like the old host's, the scheduling
 labels the managed host must carry, the labels that don't move, and the steps.
-A named runner must look like the old host's: its name contains the VM name,
-or its labels name the VM's machine type and region. The preview refuses when
-the target's `labels=` lacks a label that the old runners carry, when the old
-VM is a managed host, or when a named runner isn't registered or doesn't
-belong to the old VM. The old machine-type and region labels don't move; check that no
+The command attributes a runner to the old VM when its name contains the VM
+name or its labels name the VM's machine type and region, whatever the flags
+say. `--old-runner` must name exactly that set: every attributed runner, and
+no other. The preview refuses when it doesn't, when the target's `labels=`
+lacks a label that the old runners carry, or when the old VM is a managed
+host. The old machine-type and region labels don't move; check that no
 workflow selects them, then pass `--accept-dropped-labels`.
 
 With `--apply`, the command holds the target's floor lease, so the watchdog
@@ -411,10 +412,13 @@ skips the target, and saves each phase before it acts, so a rerun resumes:
    `gcloud compute ssh`. Then `drain_runners` removes the old runners' custom
    labels, waits until they're idle, and deregisters each one after a fresh
    idle read.
-4. When a fresh read shows every old registration gone, it deletes the old VM,
+4. When a fresh read shows every old registration gone, and no other runner
+   is attributed to the VM, it deletes the old VM,
    if the VM still has the instance ID recorded at the start, with its
    auto-delete disks. It keeps every other disk, and the preview names both
-   kinds. Then it waits until the VM is gone.
+   kinds. It reads the runners again right before the delete, and refuses
+   while any runner attributed to the VM is still registered. Then it waits
+   until the VM is gone.
 
 A rerun with the same `--instance` resumes the recorded phase, even after the
 old runners or the old VM are gone. Before every drain step, the command checks
@@ -422,8 +426,13 @@ the managed host again. If the managed host loses a runner before any old
 runner is deregistered, the command releases the cordon, then restores the old
 runners' labels, and stops. Until the release is confirmed, the old runners
 stay without labels and the command retries, because a host that is still
-cordoned refuses every job that its labels would route to it. After a
-deregistration, it waits for the managed host instead.
+cordoned refuses every job that its labels would route to it. The command saves the cordon's owner token before it
+calls the cordon, so a rollback also releases a cordon whose result was lost,
+for example to an SSH timeout. After a deregistration, the old host can't be
+put back, so the command waits for the managed host and then goes on. A
+deregistration whose result was never saved is settled from a fresh runner
+list first: a runner that is gone counts as deregistered. A rerun resumes such
+a replacement, even one recorded as aborted.
 
 An old host whose runner containers lack the read-only cordon mount or the
 cordon-aware job-started hook can't refuse jobs at job start. The command then

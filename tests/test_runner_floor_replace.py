@@ -92,7 +92,7 @@ class ReplaceWorld(World):
         self.lease_ = self.lease(self.store_.lock_name, owner="replace:mac:1")
         assert self.lease_.acquire()
         self.store_.record["replacement"] = {
-            "old": {"name": OLD, "zone": "asia-east2-a", "instance_id": "42"},
+            "old": {"name": OLD, "zone": "asia-east2-a", "instance_id": "42", "machine_type": "n4-highcpu-16"},
             "old_runner_names": [r.name for r in old_runners()], "required_labels": ["spot", "ubuntu-latest"],
             "phase": "ensure_managed", "started_at": NOW}
         self.store_.save(self.lease_)
@@ -297,6 +297,198 @@ class ReplacementTests(unittest.TestCase):
         world.clock[0] += 200
         self.assertEqual(rep.run(), rp.EXIT_RESUMABLE)
         self.assertNotIn("cordon", world.kinds())
+
+
+class CompleteRunnerSetTests(unittest.TestCase):
+    def test_naming_a_subset_of_the_vms_runners_is_refused(self):
+        target = World().config.target(TARGET)
+        out = rp.preflight(target, old_host(), ["newznab-asia-1"], old_runners(), [], {}, accept_dropped=True,
+                           instance=OLD)
+        problem = next(p for p in out.problems if "must name every runner" in p)
+        self.assertIn("newznab-asia-2, newznab-asia-3, newznab-asia-4", problem)
+
+    def test_attribution_is_independent_of_the_flags(self):
+        stray = GitHubRunner(300, f"{OLD}-extra", "online", False, ("self-hosted",))  # by name only
+        managed = GitHubRunner(301, "gha-oxidex-runners-x-1", "online", False, OLD_LABELS)
+        names = rp.associated_runner_names(OLD, "n4-highcpu-16", "asia-east2", [*old_runners(), stray, managed])
+        self.assertEqual(names, sorted([f"{OLD}-extra", *[f"newznab-asia-{i}" for i in range(1, 5)]]))
+
+    def deleting_world(self, recorded_names):
+        world = ReplaceWorld()
+        rep = world.replacement()
+        world.bring_managed_online(rep)
+        world.store_.record["replacement"].update(phase="deleting", old_runner_names=list(recorded_names))
+        return world, rep
+
+    def test_an_unaccounted_runner_blocks_the_delete(self):
+        # A record that drained only one runner (from before the complete-set check): the others still run jobs.
+        world, rep = self.deleting_world(["newznab-asia-1"])
+        world.runners[TARGET] = [GitHubRunner(r.runner_id, r.name, r.status, r.name.endswith("-2"), r.labels)
+                                 for r in old_runners() if r.name != "newznab-asia-1"] + \
+            [r for r in world.runners[TARGET] if r.name.startswith("gha-")]
+        self.assertEqual(rep.step(), 1)
+        self.assertFalse([e for e in world.log if e[1] == "delete_instance"])
+        self.assertIn("newznab-asia-2", world.out[-1])
+
+    def test_an_unaccounted_runner_keeps_a_vanished_vm_from_counting_as_done(self):
+        world, rep = self.deleting_world(["newznab-asia-1"])
+        world.hosts = [h for h in world.hosts if h.name != OLD]
+        world.runners[TARGET] = [r for r in old_runners() if r.name == "newznab-asia-3"] + \
+            [r for r in world.runners[TARGET] if r.name.startswith("gha-")]
+        self.assertEqual(rep.step(), 1)
+        self.assertEqual(world.store_.record["replacement"]["phase"], "deleting")
+
+    def test_a_runner_that_registers_right_before_the_delete_blocks_it(self):
+        world, rep = self.deleting_world([r.name for r in old_runners()])
+        world.runners[TARGET] = [r for r in world.runners[TARGET] if r.name.startswith("gha-")]
+        listed = world.github.list_runners
+        calls = []
+
+        def list_runners(t):
+            calls.append(1)
+            rows = listed(t)
+            if len(calls) >= 2:  # the fresh read right before the delete
+                rows.append(GitHubRunner(400, "newznab-asia-9", "online", True, OLD_LABELS))
+            return rows
+        world.github.list_runners = list_runners
+        self.assertEqual(rep.step(), 1)
+        self.assertFalse([e for e in world.log if e[1] == "delete_instance"])
+        self.assertIn("newznab-asia-9", world.out[-1])
+
+
+class CordonIntentTests(unittest.TestCase):
+    def test_the_intent_is_saved_before_the_cordon_call_and_an_ambiguous_result_is_released(self):
+        world = ReplaceWorld()
+        rep = world.replacement()
+        name = world.bring_managed_online(rep)
+        rep.step()  # draining
+        seen = []
+
+        def cordon(vm, args, token, names, guard):
+            saved = json.loads(world.server.objects[world.store_.object_name][0])["record"]["replacement"]
+            seen.append(saved.get("cordon_intent"))
+            return "unreachable", {"reason": "TimeoutExpired"}  # the marker may or may not exist now
+        rep.cordon = cordon
+        self.assertIsNone(rep.step())
+        self.assertEqual(seen, ["replace-42"])
+        self.assertNotIn("mode", world.store_.record["replacement"])
+        world.hosts = [h for h in world.hosts if h.name != name]
+        self.assertEqual(rep.step(), 1)
+        self.assertIn(("release_cordon", OLD, "replace-42"), world.log)
+        self.assertEqual(world.store_.record["replacement"]["phase"], "aborted")
+
+    def test_an_unsupported_cordon_placed_nothing_to_release(self):
+        world = ReplaceWorld()
+        world.cordon_result = ("unsupported", {"reason": "no hook"})
+        rep = world.replacement()
+        rep.args.label_strip_drain = True
+        name = world.bring_managed_online(rep)
+        rep.step()
+        rep.step()
+        self.assertTrue(world.store_.record["replacement"]["cordon_absent"])
+        world.hosts = [h for h in world.hosts if h.name != name]
+        self.assertEqual(rep.step(), 1)
+        self.assertNotIn("release_cordon", world.kinds())
+
+
+class PendingDeregistrationTests(unittest.TestCase):
+    def draining(self):
+        world = ReplaceWorld()
+        rep = world.replacement()
+        name = world.bring_managed_online(rep)
+        rep.step()
+        rep.step()  # cordon placed
+        return world, rep, name
+
+    def test_a_gone_pending_runner_is_irreversible_and_never_rolled_back(self):
+        world, rep, name = self.draining()
+        world.store_.record["replacement"]["drain"]["deregistering_runner_id"] = 101  # crashed after the DELETE
+        world.runners[TARGET] = [r for r in world.runners[TARGET] if r.runner_id != 101]
+        world.hosts = [h for h in world.hosts if h.name != name]
+        self.assertIsNone(rep.step())
+        recorded = world.store_.record["replacement"]
+        self.assertEqual(recorded["phase"], "draining")
+        self.assertEqual(recorded["drain"]["deregistered_runner_ids"], [101])
+        self.assertNotIn("deregistering_runner_id", recorded["drain"])
+        self.assertFalse([e for e in world.log if e[1] == "set_labels" or e[0] == "release_cordon"])
+        self.assertTrue(any("is gone" in line for line in world.out))
+        self.assertIn("can't be restored", world.out[-1])
+
+    def test_a_pending_runner_still_registered_is_reversible(self):
+        world, rep, name = self.draining()
+        world.store_.record["replacement"]["drain"]["deregistering_runner_id"] = 101
+        world.hosts = [h for h in world.hosts if h.name != name]
+        self.assertEqual(rep.step(), 1)
+        self.assertEqual(world.store_.record["replacement"]["phase"], "aborted")
+        self.assertNotIn("deregistering_runner_id", world.store_.record["replacement"]["drain"])
+
+    def test_an_abort_in_progress_goes_forward_once_a_runner_is_gone(self):
+        world, rep, name = self.draining()
+        recorded = world.store_.record["replacement"]
+        recorded.update(phase="aborting", abort_reason="managed host lost")
+        recorded["drain"]["deregistering_runner_id"] = 102
+        world.runners[TARGET] = [r for r in world.runners[TARGET] if r.runner_id != 102]
+        world.release = lambda *a: False
+        rep.release_cordon = world.release
+        self.assertIsNone(rep.step())
+        self.assertEqual(recorded["phase"], "draining")
+        self.assertIn("not rolling back", world.out[-1])
+
+    def test_label_strip_marks_the_runner_pending_before_its_delete(self):
+        world = ReplaceWorld()
+        rep = world.replacement()
+        rep_record = world.store_.record["replacement"]
+        states = []
+        original = world.github.delete_runner
+
+        def delete_runner(t, runner_id):
+            saved = json.loads(world.server.objects[world.store_.object_name][0])["record"]["replacement"]
+            states.append(saved.get("deregistering"))
+            return original(t, runner_id)
+        world.github.delete_runner = delete_runner
+        rep_record.update(labels_stripped=True, idle_since=NOW - rp.IDLE_CONFIRM_SECONDS)
+        rp.label_strip_step(rep_record, old_runners(), world.github, world.target, rep.save, NOW)
+        self.assertEqual(states, [f"newznab-asia-{i}" for i in range(1, 5)])
+        self.assertNotIn("deregistering", rep_record)
+        self.assertEqual(len(rep_record["deregistered"]), 4)
+        rep_record["deregistering"] = "newznab-asia-1"
+        rep_record["deregistered"] = []
+        self.assertIn("still registered", rp.reconcile_pending(rep_record, old_runners()))
+        rep_record["deregistering"] = "newznab-asia-1"
+        self.assertIn("is gone", rp.reconcile_pending(rep_record, []))
+        self.assertEqual(rep_record["deregistered"], ["newznab-asia-1"])
+
+    def test_an_aborted_but_irreversible_record_resumes_instead_of_failing_preflight(self):
+        world = ReplaceWorld()
+        world.store_.record["replacement"].update(phase="aborted", drain={"deregistered_runner_ids": [101]})
+        world.store_.save(world.lease_)
+        world.lease_.release()
+        world.runners[TARGET] = [r for r in old_runners() if r.runner_id != 101]
+        self.assertTrue(rp.resumable(world.store_.record["replacement"], OLD))
+        self.assertFalse(rp.resumable({"old": {"name": OLD}, "phase": "aborted"}, OLD))
+        # A record aborted with a deregistration still pending (from before reconciliation) resumes too.
+        self.assertTrue(rp.resumable({"old": {"name": OLD}, "phase": "aborted",
+                                      "drain": {"deregistering_runner_id": 101}}, OLD))
+        self.assertTrue(rp.resumable({"old": {"name": OLD}, "phase": "aborted", "deregistering": "newznab-asia-1"},
+                                     OLD))
+        args = argparse.Namespace(project=PROJECT, target=TARGET, instance=OLD, zone="asia-east2-a",
+                                  old_runner=[r.name for r in old_runners()], accept_dropped_labels=True,
+                                  label_strip_drain=False, github_user="", apply=False, max_wait_seconds=1,
+                                  poll_seconds=1)
+
+        class Tokens:
+            def __init__(self, *a, **k):
+                pass
+
+            def __call__(self, target):
+                return "gho_x"
+        out = io.StringIO()
+        with patch.object(rf, "TokenSource", Tokens), patch.object(rf, "GitHubClient", lambda token, **k: world.github), \
+                patch.object(rf, "ComputeInventory", lambda project: world.provider), \
+                patch.object(rp, "GcsClient", lambda bucket: world.client), redirect_stdout(out):
+            self.assertEqual(rp.run_replace(args, world.config), 0)
+        self.assertIn("resume phase aborted", out.getvalue())
+        self.assertNotIn("Refused", out.getvalue())
 
 
 class ResumeTests(unittest.TestCase):
