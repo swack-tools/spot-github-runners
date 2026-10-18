@@ -60,7 +60,7 @@ from .dashboard_auth import (
 from .dashboard_deferred_history import append_deferred_context, deferred_segments
 from .dashboard_history import (normalize_unpriced_intervals, add_unpriced_interval, history_components,
                                 history_in_window, compact_unpriced_intervals)
-from .fleet_inventory import fleet_source_from_env, gce_epoch, observe_detached_disks
+from .fleet_inventory import fleet_source_from_env, gce_epoch, observe_detached_disks, builder_shape_compatible
 from .patch_console import PatchConsole, PatchConsoleError, config_repo_token, executor_from_env, host_source_from_env
 from .edge_state import (
     CONTROL_OPS,
@@ -830,15 +830,38 @@ def _pricing_component_reasons(record: dict[str, Any]) -> tuple[list[str], list[
         storage.append("new disk metadata unavailable")
     if record.get("status") == "SUSPENDED":
         storage.append("suspended: preserved memory storage is not priced here")
-    if record.get("regional_disks"):
+    regional_unknown = bool(record.get("regional_disks"))
+    if record.get("retained_only_pricing"):
+        retained = [d for d in record.get("disks_detail") or [] if isinstance(d, dict)
+                    and d.get("auto_delete") is not True
+                    and (d.get("billing_owner") is not False or _disk_ambiguous_roles(record, d))]
+        if retained and all("regional" in d for d in retained):
+            regional_unknown = any(d.get("regional") for d in retained)
+    if regional_unknown:
         storage.append("regional replicated disk storage is not priced here")
     if record.get("disk_types_known") is False:
         storage.append("disk types unknown (no compute.disks.list)")
     if pricing.get("disk_rate_unknown"):
         storage.append("no known rate for disk type(s) " + ", ".join(pricing["disk_rate_unknown"]))
-    performance_disk = any(int(record.get(size) or 0) > 0 and record.get(kind) in ("pd-extreme", "hyperdisk-throughput")
-                           for size, kind in (("boot_disk_gb", "boot_disk_type"), ("data_disk_gb", "data_disk_type")))
-    if record.get("unpriced_disk_performance") or performance_disk:
+    performance_disk = any(gb > 0 and kind in ("pd-extreme", "hyperdisk-throughput") for gb, kind in (
+        (int(record.get("boot_disk_billed_gb", record.get("boot_disk_gb")) or 0), record.get("boot_disk_type")),
+        (_primary_data_disk_gb(record), record.get("data_disk_type"))))
+    performance_unknown = bool(record.get("unpriced_disk_performance"))
+    details = [d for d in list(record.get("disks_detail") or []) + list(record.get("unpaid_disk_details") or [])
+               if isinstance(d, dict)]
+    if record.get("retained_only_pricing") and details:
+        performance_disk = any(int(d.get("gb") or 0) > 0 and d.get("type") in ("pd-extreme", "hyperdisk-throughput")
+                               for d in details if d.get("auto_delete") is not True
+                               and (d.get("billing_owner") is not False or _disk_ambiguous_roles(record, d)))
+    if any("unpriced_disk_performance" in d or str(d.get("type") or "").startswith("hyperdisk-")
+           or d.get("type") == "pd-extreme" for d in details):
+        performance_unknown = any(
+            (d.get("billing_owner") is not False or _disk_ambiguous_roles(record, d))
+            and (d.get("unpriced_disk_performance") or d.get("type") in ("pd-extreme", "hyperdisk-throughput")
+                 or (record.get("unpriced_disk_performance") and str(d.get("type") or "").startswith("hyperdisk-")))
+            for d in details if not (record.get("retained_only_pricing") and d.get("auto_delete") is True))
+    unbilled_performance = record.get("unpriced_disk_performance") and not performance_unknown and not performance_disk
+    if performance_unknown or performance_disk:
         storage.append("provisioned IOPS or throughput is not priced here")
     if record.get("local_ssd_gb"):
         storage.append("Local SSD storage is not priced here")
@@ -848,7 +871,7 @@ def _pricing_component_reasons(record: dict[str, Any]) -> tuple[list[str], list[
         compute.append("region outside the dashboard's catalog: no trusted regional compute rate")
     if pricing.get("regional_disk_rate_unknown"):
         storage.append("region outside the dashboard's catalog: no trusted regional disk rate")
-    if pricing.get("complete") is False and not compute and not storage:
+    if pricing.get("complete") is False and not compute and not storage and not unbilled_performance:
         (storage if disk_only else compute).append("pricing source is incomplete")
     return compute, storage
 
@@ -914,6 +937,39 @@ def _same_disk(left: dict[str, Any], right: dict[str, Any]) -> bool:
                 and float(resource["created_epoch"]) > float(unpaid["billing_deferred_since"])):
             return False  # It was created after the unresolved attachment was observed: a reused name.
     return True
+
+
+def _disk_ambiguous_roles(record: dict[str, Any], disk: dict[str, Any]) -> list[str]:
+    """Disk-local evidence wins, including an explicit empty list. Migrate older record-level evidence only
+    onto known shared attachments where possible; a legacy record with no disk attribution stays conservative."""
+    if "storage_billing_ambiguous_roles" in disk:
+        return sorted(set(disk.get("storage_billing_ambiguous_roles") or []))
+    if not record.get("storage_billing_ambiguous"):
+        return []
+    shared = [d for d in record.get("shared_attachments") or [] if isinstance(d, dict)]
+    if shared and not any(_same_disk(disk, other) for other in shared):
+        return []
+    return sorted(set(record.get("storage_billing_ambiguous_roles") or ["cicd_runner", "rust_builder"]))
+
+
+def _sync_disk_ambiguity(record: dict[str, Any]) -> None:
+    """The VM/debt summary is derived from physical disks, never copied back onto unrelated attachments."""
+    evidence: set[str] = set()
+    for disk in list(record.get("disks_detail") or []) + list(record.get("unpaid_disk_details") or []):
+        if not isinstance(disk, dict):
+            continue
+        roles = _disk_ambiguous_roles(record, disk)
+        if roles or "storage_billing_ambiguous_roles" in disk or record.get("storage_billing_ambiguous"):
+            disk["storage_billing_ambiguous_roles"] = roles
+        if record.get("retained_only_pricing") and disk.get("auto_delete") is True:
+            continue
+        evidence.update(roles)
+    if len(evidence) > 1:
+        record["storage_billing_ambiguous"] = True
+        record["storage_billing_ambiguous_roles"] = sorted(evidence)
+    else:
+        record.pop("storage_billing_ambiguous", None)
+        record.pop("storage_billing_ambiguous_roles", None)
 
 
 def _disk_known(disk: dict[str, Any], known: frozenset[str]) -> bool:
@@ -1664,6 +1720,7 @@ def _live_instance_record(
     else:
         record.pop("storage_billing_ambiguous", None)
         record.pop("storage_billing_ambiguous_roles", None)
+    _sync_disk_ambiguity(record)
     _retain_unpriced_history(record, obs, previous, now)
     for source, recovered in initial_recoveries.items():
         current = next((d for d in obs.get("disks_detail") or [] if str(d.get("source")) == source), recovered)
@@ -1794,6 +1851,7 @@ def _mark_instance_deleted(record: dict[str, Any], now: float, *, disks_pending:
             if bounds[1] is None:
                 bounds[1] = max(float(bounds[0]), now)
     _save_unpriced_intervals(out, intervals, now)
+    _sync_disk_ambiguity(out)
     _mark_pricing_completeness(out)
     return out
 
@@ -1875,8 +1933,8 @@ def _remember_incomplete_pricing(record: dict[str, Any], pricing_record: dict[st
         unverified_paid = any(not d.get("id") or (record.get("disk_types_known") is True and not any(
             str(current.get("id")) == str(d["id"]) and current.get("type") == d.get("type")
             and int(current.get("gb") or 0) == int(d.get("gb") or 0) for current in current_details)) for d in paid)
-        disk_unknown = bool(independent_rates or pricing_record.get("unpriced_disk_performance")
-                            or pricing_record.get("regional_disks") or pricing_record.get("local_ssd_gb")
+        disk_unknown = bool(independent_rates or "provisioned IOPS or throughput is not priced here" in storage_reasons
+                            or "regional replicated disk storage is not priced here" in storage_reasons or pricing_record.get("local_ssd_gb")
                             or pricing_record.get("storage_billing_ambiguous")
                             or old_pricing.get("regional_disk_rate_unknown")
                             or (unverified_paid and pricing_record.get("disk_types_known") is False))
@@ -2068,6 +2126,9 @@ def reconcile_instance_records(
                 for r in copy.deepcopy(existing)]
     # A not-yet-priced disk can change billing owners while disk listing is unavailable. Carry its unpaid
     # interval with the physical attachment rather than losing it when the former owner becomes a non-owner.
+    for record in existing:
+        if is_live_instance_record(record):
+            _sync_disk_ambiguity(record)
     deferred_entries = []
     for old_record in existing:
         if not is_live_instance_record(old_record):
@@ -2082,9 +2143,6 @@ def reconcile_instance_records(
     if disks_listed and disk_inventory:
         # Resolve only physical disks already tracked as unpaid, even when their names are outside fleet prefixes.
         roles = {str(r.get("instance_id")): r.get("role") for r in existing if isinstance(r, dict)}
-        carrier_ambiguities = {str(r.get("instance_id")):
-            r.get("storage_billing_ambiguous_roles") or ["cicd_runner", "rust_builder"]
-            for r in existing if isinstance(r, dict) and r.get("storage_billing_ambiguous")}
         tracked_roles = {}
         tracked_ambiguities: dict[str, list[str]] = {}
         for record in existing:
@@ -2094,8 +2152,8 @@ def reconcile_instance_records(
                     if isinstance(disk, dict) and disk.get("id") and disk.get("billing_owner") is not False:
                         key = "id:" + str(disk["id"])
                         tracked_roles[key] = record["role"]
-                        if record.get("storage_billing_ambiguous"):
-                            evidence = record.get("storage_billing_ambiguous_roles") or ["cicd_runner", "rust_builder"]
+                        evidence = _disk_ambiguous_roles(record, disk)
+                        if evidence:
                             tracked_ambiguities[key] = sorted(set(tracked_ambiguities.get(key, [])) | set(evidence))
         attached = frozenset(str(d.get("source")) for obs in observed if isinstance(obs, dict)
                              for d in obs.get("disks_detail") or [] if isinstance(d, dict))
@@ -2104,13 +2162,14 @@ def reconcile_instance_records(
                 continue
             disk = {"source": source, "id": detail.get("id", ""),
                     "created_epoch": gce_epoch(detail.get("creationTimestamp"))}
-            carrier = next((carrier for carrier, unpaid in deferred_entries if _same_disk(disk, unpaid)), None)
-            if carrier is not None and roles.get(carrier):
+            found = next(((carrier, unpaid) for carrier, unpaid in deferred_entries if _same_disk(disk, unpaid)), None)
+            if found is not None and roles.get(found[0]):
+                carrier, unpaid = found
                 key = "id:" + str(detail.get("id", ""))
                 tracked_roles[key] = roles[carrier]
-                if carrier in carrier_ambiguities:
-                    tracked_ambiguities[key] = sorted(set(tracked_ambiguities.get(key, []))
-                                                      | set(carrier_ambiguities[carrier]))
+                evidence = unpaid.get("storage_billing_ambiguous_roles") or []
+                if evidence:
+                    tracked_ambiguities[key] = sorted(set(tracked_ambiguities.get(key, [])) | set(evidence))
         recovered = observe_detached_disks(disk_inventory, attached, tracked_roles=tracked_roles,
                                            tracked_ambiguities=tracked_ambiguities)
         recovered_ids = {obs["instance_id"] for obs in recovered}
@@ -2151,15 +2210,28 @@ def reconcile_instance_records(
                 if trusted is not None:
                     disk = {**disk, **{k: trusted[k] for k in ("type", "id", "created_epoch")
                                       if trusted.get(k) not in (None, "")}}
+                    if trusted.get("storage_billing_ambiguous_roles"):
+                        disk = dict(disk, storage_billing_ambiguous_roles=sorted(
+                            set(disk.get("storage_billing_ambiguous_roles") or []) |
+                            set(trusted["storage_billing_ambiguous_roles"])))
             candidates = [d for d in deferred_details if _same_disk(disk, d)]
             if candidates and disk.get("billing_owner") is not False:
                 earliest = min(candidates, key=lambda d: float(d["billing_deferred_since"]))
+                if (obs.get("disk_types_known") is False and earliest.get("id")
+                        and int(earliest.get("gb") or 0) == int(disk.get("gb") or 0)):
+                    disk = {**disk, **{key: copy.deepcopy(earliest[key]) for key in (
+                        "id", "type", "created_epoch", "unpriced_disk_performance", "regional")
+                        if key in earliest}}
                 disk = dict(disk, billing_deferred_since=float(earliest["billing_deferred_since"]),
                             billing_deferred_sizes=copy.deepcopy(earliest.get("billing_deferred_sizes")
                                 or [[float(earliest["billing_deferred_since"]), int(earliest.get("gb") or 0)]]))
                 for key in ("billing_initial_history", "billing_history_credits", "billing_deferred_pricing"):
                     if key in earliest:
                         disk = dict(disk, **{key: copy.deepcopy(earliest[key])})
+                if obs.get("disk_types_known") is False and earliest.get("storage_billing_ambiguous_roles"):
+                    disk = dict(disk, storage_billing_ambiguous_roles=sorted(
+                        set(disk.get("storage_billing_ambiguous_roles") or []) |
+                        set(earliest["storage_billing_ambiguous_roles"])))
             details.append(disk)
         if obs.get("disk_types_known") is False and details and all("boot" in d for d in details):
             billed_data: dict[str, int] = {}
@@ -2316,6 +2388,7 @@ def reconcile_instance_records(
                 else d for d in record.get("disks_detail") or []]
             record["deferred_disk_sources"] = [str(d.get("source")) for d in record.get("disks_detail") or []
                                                if _finite(d.get("billing_deferred_since"))]
+        _sync_disk_ambiguity(record)
         _mark_pricing_completeness(record)
     # Live VMs first (newest start first), then deleted history (newest deletion first), bounded in size.
     live = sorted((r for r in records if r.get("status") != "DELETED"),
@@ -4450,6 +4523,8 @@ class DashboardStore:
         if vm_tpl is None or vm_tpl.get("role", role) != role:
             tpl_id = profile.get("vm_template_id") if vm_tpl is None else vm_tpl.get("id")
             raise ValueError(f"VM template '{tpl_id}' does not belong to role '{role}'")
+        if vm_tpl.get("shared_attachments") or vm_tpl.get("storage_billing_ambiguous"):
+            raise ValueError("Shared or ambiguous disk attachments cannot be used as a VM template source")
         tpl_name = str(vm_tpl.get("name") or vm_tpl.get("id") or "template")
         tpl_vcpu = int(vm_tpl.get("vcpu", 0))
         tpl_ram = float(vm_tpl.get("ram_gib", 0.0))
@@ -6427,8 +6502,8 @@ class DashboardStore:
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
-            if inst.get("shared_attachments"):
-                raise ValueError("VMs with shared disk attachments cannot be copied to single-VM templates")
+            if inst.get("shared_attachments") or inst.get("storage_billing_ambiguous"):
+                raise ValueError("VMs with shared or ambiguous disk attachments cannot be copied to single-VM templates")
             if inst.get("kind") == "disk":
                 raise ValueError(f"{inst['name']} is a disk, not a VM; a VM template needs a VM as its source")
             if inst.get("disk_types_known") is False:
@@ -6456,6 +6531,8 @@ class DashboardStore:
                     f"Per-runner limits of {inst['name']} are not recorded in its instance metadata; "
                     "set them on the profile instead of copying them from this host"
                 )
+            if inst.get("role") == "rust_builder" and not builder_shape_compatible(inst):
+                raise ValueError("Dedicated builder templates require n4-highcpu-16 / 16 vCPU / 32 GiB")
             role = inst["role"]
             prof = self.state["profiles"].get(role)
             explicit_ci_id = str(payload.get("cloud_init_template_id", "")).strip()
@@ -6645,6 +6722,8 @@ class DashboardStore:
                         raise ValueError(
                             f"Assigned VM template '{prof.get('vm_template_id')}' not found for role '{role}'"
                         )
+                    if role == "rust_builder" and not builder_shape_compatible(vm_tpl):
+                        raise ValueError("Dedicated builder templates require n4-highcpu-16 / 16 vCPU / 32 GiB")
                     self._validate_vm_template_compatibility(vm_tpl, prof, role)
                     tpl_machine_type = str(vm_tpl.get("machine_type", ""))
                     tpl_family = tpl_machine_type.split("-", 1)[0]
@@ -6681,7 +6760,7 @@ class DashboardStore:
                         # A host with several data-disk types cannot be described by one type and size.
                         (i for i in running_in_region
                          if len(i.get("data_disks") or {}) <= 1 and not int(i.get("local_ssd_gb") or 0)
-                         and not i.get("shared_attachments")
+                         and not i.get("shared_attachments") and not i.get("storage_billing_ambiguous")
                          and not i.get("regional_disks") and not i.get("unpriced_disk_performance")
                          and i.get("disk_types_known") is not False), None)
                     if existing_cand is not None:
@@ -6731,6 +6810,8 @@ class DashboardStore:
                             "vm_template_id": None,
                         }
 
+                if role == "rust_builder" and not builder_shape_compatible(source_spec):
+                    raise ValueError("Planned dedicated builders require n4-highcpu-16 / 16 vCPU / 32 GiB")
                 default_ci_id = "ci-runner-default" if role == "cicd_runner" else "ci-rust-builder-199"
                 for idx in range(current_count + 1, target_count + 1):
                     zone = reg_info["zones"][(idx - 1) % len(reg_info["zones"])]
@@ -6793,6 +6874,8 @@ class DashboardStore:
                         now_epoch=now_ts,
                         tax_rate_percent=override_tax,
                     )
+                    if role == "rust_builder" and not builder_shape_compatible(created):
+                        raise ValueError("Planned dedicated builders require n4-highcpu-16 / 16 vCPU / 32 GiB")
                     new_records.append(created)
 
                 budget = prof.get("budget", {})
@@ -6912,6 +6995,8 @@ class DashboardStore:
                 for i in new_records + running_in_region
                 if not any(i is r for r in would_retire)
             ]
+            if role == "rust_builder" and any(not builder_shape_compatible(inst) for inst in planned_running):
+                raise ValueError("Planned dedicated builders require n4-highcpu-16 / 16 vCPU / 32 GiB")
             return {
                 "status": "plan_only",
                 "applied": False,

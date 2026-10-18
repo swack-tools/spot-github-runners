@@ -102,8 +102,13 @@ class DashboardComponentPricingTests(unittest.TestCase):
                                   "last_start_epoch": self.now - 3600}, history=True)
 
     def test_shared_role_ambiguity_is_consumed_as_storage_only_for_both_roles(self):
-        observations = [self.observation(role, storage_billing_ambiguous=True)
-                        for role in ("rust_builder", "cicd_runner")]
+        observations = [self.observation(role, storage_billing_ambiguous=True,
+            data_disk_gb=100, data_disk_type="pd-balanced", data_disks_attached_gb=100,
+            data_disks={"pd-balanced": 100} if role == "rust_builder" else {},
+            disks_detail=[{"id": "shared", "source": "z/custom-shared", "type": "pd-balanced", "gb": 100,
+                "created_epoch": self.now - 36000, "billing_owner": role == "rust_builder", "boot": False,
+                "auto_delete": False, "storage_billing_ambiguous_roles": ["cicd_runner", "rust_builder"]}])
+            for role in ("rust_builder", "cicd_runner")]
         records = self.install(observations)
         for record in records:
             self.assertTrue(record["storage_billing_ambiguous"])

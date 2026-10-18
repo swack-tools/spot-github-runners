@@ -188,6 +188,79 @@ class SharedDiskBillingRoleTests(unittest.TestCase):
         self.assertIs(obs[0]["storage_billing_ambiguous"], True)
         self.assertEqual(obs[0].get("storage_billing_ambiguous_roles"), ["cicd_runner", "rust_builder"])
 
+    def test_private_disk_does_not_inherit_shared_disk_ambiguity(self):
+        items = self._items("custom-cache")
+        catalog = self._catalog(items)
+        for index, item in enumerate(items):
+            source = "z/disks/" + item["name"] + "-private"
+            item["disks"].append({"source": source, "diskSizeGb": "40", "boot": True, "autoDelete": True})
+            catalog[source] = {"id": str(600 + index), "type": "pd-balanced"}
+        obs = observe_fleet_items(items, disk_types=catalog)
+        for row in obs:
+            shared, private = row["disks_detail"]
+            self.assertEqual(shared.get("storage_billing_ambiguous_roles"), ["cicd_runner", "rust_builder"])
+            self.assertEqual(private.get("storage_billing_ambiguous_roles"), [])
+            self.assertEqual(row["storage_billing_ambiguous_roles"], ["cicd_runner", "rust_builder"])
+            self.assertTrue(row["storage_billing_ambiguous"])
+            self.assertEqual((row["boot_disk_gb"], row["data_disk_gb"]), (40, 100))
+        self.assertEqual(sum(row["boot_disk_billed_gb"] + sum(row["data_disks"].values()) for row in obs), 180)
+
+    def test_explicit_builder_extreme_disk_only_affects_owner_billing_trust(self):
+        for ids, boot in itertools.product((("1", "2"), ("2", "1")), (False, True)):
+            with self.subTest(ids=ids, boot=boot):
+                items = self._items("builder-cache", ids=ids, boot=boot)
+                catalog = self._catalog(items)
+                next(iter(catalog.values())).update(type="pd-extreme", provisionedIops=12000,
+                                                    provisionedThroughput=300)
+                obs = observe_fleet_items(items, disk_types=catalog)
+                self._assert_single_charge(obs, boot=boot)
+                for row in obs:
+                    self.assertEqual(row["unpriced_disk_performance"], row["role"] == "rust_builder")
+                    detail = row["disks_detail"][0]
+                    self.assertIs(detail.get("unpriced_disk_performance"), True)
+                    self.assertEqual(detail.get("provisionedIops"), 12000)
+                    self.assertEqual(detail.get("provisionedThroughput"), 300)
+                    self.assertIs(detail.get("disk_types_known"), True)
+                    self.assertIs(detail.get("regional"), False)
+                    self.assertEqual(detail.get("storage_billing_ambiguous_roles"), [])
+
+    def test_ambiguous_extreme_disk_affects_both_roles_but_bills_once(self):
+        items = self._items("custom-cache")
+        catalog = self._catalog(items)
+        next(iter(catalog.values()))["type"] = "pd-extreme"
+        obs = observe_fleet_items(items, disk_types=catalog)
+        self._assert_single_charge(obs)
+        for row in obs:
+            self.assertTrue(row["unpriced_disk_performance"])
+            self.assertEqual(row["storage_billing_ambiguous_roles"], ["cicd_runner", "rust_builder"])
+            detail = row["disks_detail"][0]
+            self.assertIs(detail.get("unpriced_disk_performance"), True)
+            self.assertEqual(detail.get("storage_billing_ambiguous_roles"), ["cicd_runner", "rust_builder"])
+
+    def test_regional_storage_trust_uses_billing_owner_or_ambiguous_disk(self):
+        for name in ("builder-cache", "custom-cache"):
+            items = self._items(name)
+            catalog = self._catalog(items)
+            next(iter(catalog.values()))["regional"] = True
+            obs = observe_fleet_items(items, disk_types=catalog)
+            self._assert_single_charge(obs)
+            for row in obs:
+                self.assertEqual(row["regional_disks"], name == "custom-cache" or row["role"] == "rust_builder")
+                self.assertIs(row["disks_detail"][0].get("regional"), True)
+
+    def test_unresolved_disk_type_only_affects_relevant_billing_trust(self):
+        for name, listed in itertools.product(("builder-cache", "custom-cache"), (True, False)):
+            with self.subTest(name=name, listed=listed):
+                items = self._items(name)
+                catalog = self._catalog(items)
+                next(iter(catalog.values())).pop("type")
+                obs = observe_fleet_items(items, disk_types=catalog if listed else {}, disk_types_known=listed)
+                self._assert_single_charge(obs)
+                for row in obs:
+                    relevant = name == "custom-cache" or row["role"] == "rust_builder"
+                    self.assertEqual(row["disk_types_known"], not relevant)
+                    self.assertIs(row["disks_detail"][0].get("disk_types_known"), False)
+
 
 class SplitSnapshotDiskBillingRoleTests(unittest.TestCase):
     def catalog(self, name, users, *, include_name=True):
@@ -241,6 +314,42 @@ class SplitSnapshotDiskBillingRoleTests(unittest.TestCase):
         catalog = self.catalog("custom-cache", ("builder-a", "oxidex-runners-a"))
         self.assert_one_disk_charge(observe_detached_disks(catalog))
         self.assertEqual(observe_detached_disks(catalog, attached_sources=frozenset(catalog)), [])
+
+    def test_detached_detail_carries_its_roles_and_physical_trust_metadata(self):
+        for name, dtype in itertools.product(("custom-cache", "builder-cache"), ("pd-extreme", None)):
+            with self.subTest(name=name, dtype=dtype):
+                catalog = self.catalog(name, ("builder-a", "oxidex-runners-a"))
+                raw = next(iter(catalog.values()))
+                raw.update(type=dtype, regional=True, provisionedIops=12000)
+                obs = observe_detached_disks(catalog)
+                self.assert_one_disk_charge(obs)
+                row = obs[0]
+                detail = row["disks_detail"][0]
+                self.assertEqual(detail.get("storage_billing_ambiguous_roles"),
+                                 ["cicd_runner", "rust_builder"] if name == "custom-cache" else [])
+                self.assertEqual(row["storage_billing_ambiguous_roles"], detail["storage_billing_ambiguous_roles"])
+                self.assertIs(detail.get("regional"), True)
+                self.assertEqual(detail.get("unpriced_disk_performance"), dtype == "pd-extreme")
+                self.assertEqual(detail.get("disk_types_known"), dtype is not None)
+                self.assertEqual(detail.get("provisionedIops"), 12000)
+                self.assertEqual(row["disk_types_known"], detail["disk_types_known"])
+                self.assertEqual(row["regional_disks"], detail["regional"])
+                self.assertEqual(row["unpriced_disk_performance"], detail["unpriced_disk_performance"])
+
+
+class BuilderPhysicalShapeTests(unittest.TestCase):
+    def test_builder_shape_requires_exact_physical_capacity_and_no_explicit_unknown_specs(self):
+        from lib.fleet_inventory import builder_shape_compatible
+
+        base = {"machine_type": "n4-highcpu-16", "vcpu": 16, "ram_gib": 32.0}
+        for changes, expected in (({}, True), ({"specs_known": True}, True), ({"specs_known": False}, False),
+                                  ({"machine_type": "n4-standard-16"}, False), ({"vcpu": 8}, False),
+                                  ({"ram_gib": 64.0}, False), ({"ram_gib": 28.0}, False),
+                                  ({"ram_gib": float("nan")}, False), ({"vcpu": "16"}, False),
+                                  ({"runner_vcpu": 1, "runner_ram_gib": 1}, True)):
+            with self.subTest(changes=changes):
+                self.assertIs(builder_shape_compatible(dict(base, **changes)), expected)
+        self.assertFalse(builder_shape_compatible({}))
 
 
 if __name__ == "__main__":

@@ -54,6 +54,28 @@ def _unpriced_performance(detail: Mapping[str, Any]) -> bool:
             return True  # Unknown provisioned performance: never assume it is free.
     return False
 
+
+def _disk_billing_metadata(detail: Mapping[str, Any], source: str, *,
+                           disk_types_known: bool, ambiguous_roles: list[str]) -> dict[str, Any]:
+    """Physical disk evidence, independent of which attachment carries its charge."""
+    return {
+        "storage_billing_ambiguous_roles": list(ambiguous_roles),
+        "unpriced_disk_performance": _unpriced_performance(detail),
+        "regional": bool(detail.get("regional")) or "/regions/" in source,
+        "disk_types_known": bool(disk_types_known and detail.get("type")),
+        **{key: detail[key] for key in ("provisionedIops", "provisionedThroughput") if key in detail},
+    }
+
+
+def builder_shape_compatible(record: Mapping[str, Any]) -> bool:
+    """Whether physical capacity matches a dedicated builder; container limits are checked separately.
+
+    Templates can omit specs_known; an explicit False means the capacity is unverified.
+    """
+    return (record.get("specs_known") is not False and record.get("machine_type") == "n4-highcpu-16"
+            and record.get("vcpu") == 16 and record.get("ram_gib") == 32.0)
+
+
 _MACHINE_VCPU_RE = re.compile(r"-(\d+)$")
 
 
@@ -180,11 +202,6 @@ def observe_fleet_items(
         data_disk_type, data_disk_gb = DEFAULT_DISK_TYPE, 0
         data_disks: dict[str, int] = {}
         local_ssd_gb = 0
-        unpriced_performance = False
-        regional_disks = False
-        unresolved_disks = False
-        storage_billing_ambiguous = False
-        storage_billing_ambiguous_roles: set[str] = set()
         # Each persistent disk with its own creation time, so history before a later-attached disk is not billed
         # at its rate.
         disks_detail: list[dict[str, Any]] = []
@@ -205,17 +222,12 @@ def observe_fleet_items(
                 or billing_owners.get(identity, (str(item["id"]), name)) != (str(item["id"]), name))
             if identity and not shared_elsewhere:
                 billed_disks.add(identity)
-            storage_billing_ambiguous = storage_billing_ambiguous or identity in ambiguous_disks
-            storage_billing_ambiguous_roles.update(ambiguous_disks.get(identity, ()))
-            if disk_types_known and not detail.get("type"):
-                # The disk listing did not cover this attachment (for example a disk created between the two
-                # listings): its type is unknown, not the default.
-                unresolved_disks = True
-            regional_disks = regional_disks or bool(detail.get("regional")) or "/regions/" in str(disk.get("source", ""))
             dtype = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
-            unpriced_performance = unpriced_performance or (bool(detail) and _unpriced_performance(detail))
             disks_detail.append({"type": dtype, "gb": size, "created_epoch": gce_epoch(detail.get("creationTimestamp")),
                                  "source": str(disk.get("source", "") or ""), "id": str(detail.get("id", "") or ""),
+                                 **_disk_billing_metadata(detail, str(disk.get("source", "") or ""),
+                                     disk_types_known=disk_types_known,
+                                     ambiguous_roles=sorted(ambiguous_disks.get(identity, ()))),
                                  # None when the listing did not say (older observations).
                                  "boot": bool(disk.get("boot")),
                                  "billing_owner": not shared_elsewhere,
@@ -234,14 +246,19 @@ def observe_fleet_items(
                 data_disk_gb += size
                 if not shared_elsewhere:
                     data_disks[dtype] = data_disks.get(dtype, 0) + size
+        # Physical evidence remains on every attachment. Only owned or ambiguously attributed disks affect
+        # this VM's billing trust; a private disk never inherits another disk's cross-role uncertainty.
+        billing_details = [d for d in disks_detail if d["billing_owner"] or d["storage_billing_ambiguous_roles"]]
+        storage_billing_ambiguous_roles = sorted({role for d in billing_details
+                                                  for role in d["storage_billing_ambiguous_roles"]})
         scheduling = item.get("scheduling") if isinstance(item.get("scheduling"), dict) else {}
         spot = (str(scheduling.get("provisioningModel", "")).upper() == "SPOT"
                 or bool(scheduling.get("preemptible", False)))
         deployment = runner_deployment_from_gce_item(item)
         metadata = gce_metadata_items(item)
         if role == "rust_builder":
-            runner_limits_known = bool(specs_known and machine_type == "n4-highcpu-16"
-                                       and vcpu == 16 and ram_gib == 32.0)
+            runner_limits_known = builder_shape_compatible({"specs_known": specs_known, "machine_type": machine_type,
+                                                            "vcpu": vcpu, "ram_gib": ram_gib})
             runners_count = 1 if runner_limits_known else 0
             runner_vcpu = BUILDER_CONTAINER_VCPU if runner_limits_known else 0
             runner_ram_gib = BUILDER_CONTAINER_RAM_GIB if runner_limits_known else 0.0
@@ -281,13 +298,13 @@ def observe_fleet_items(
             "data_disks": data_disks,
             "data_disks_attached_gb": data_disk_gb,
             "shared_attachments": shared_attachments,
-            "storage_billing_ambiguous": storage_billing_ambiguous,
-            "storage_billing_ambiguous_roles": sorted(storage_billing_ambiguous_roles),
+            "storage_billing_ambiguous": bool(storage_billing_ambiguous_roles),
+            "storage_billing_ambiguous_roles": storage_billing_ambiguous_roles,
             "local_ssd_gb": local_ssd_gb,
-            "unpriced_disk_performance": unpriced_performance,
-            "regional_disks": regional_disks,
-            # False when disk types fell back to the default (no compute.disks.list): the record keeps known types.
-            "disk_types_known": disk_types_known and not unresolved_disks,
+            "unpriced_disk_performance": any(d["unpriced_disk_performance"] for d in billing_details),
+            "regional_disks": any(d["regional"] for d in billing_details),
+            # Unknown physical types stay on each detail; only relevant disks can make billing incomplete.
+            "disk_types_known": all(d["disk_types_known"] for d in billing_details),
             "disks_detail": disks_detail,
             "runners_count": runners_count,
             "runner_vcpu": runner_vcpu,
@@ -369,6 +386,8 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
         size = int(size_raw) if size_raw.isdigit() else 0
         kind = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
         created = gce_epoch(detail.get("creationTimestamp"))
+        disk_metadata = _disk_billing_metadata(detail, str(link), disk_types_known=True,
+                                              ambiguous_roles=ambiguous_roles if storage_billing_ambiguous else [])
         observed.append({
             "instance_id": f"disk-{detail['id']}",
             "name": name,
@@ -388,14 +407,14 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
             "data_disk_type": kind,
             "data_disk_gb": size,
             "data_disks": {kind: size},
-            "storage_billing_ambiguous": storage_billing_ambiguous,
-            "storage_billing_ambiguous_roles": ambiguous_roles if storage_billing_ambiguous else [],
+            "storage_billing_ambiguous": bool(disk_metadata["storage_billing_ambiguous_roles"]),
+            "storage_billing_ambiguous_roles": list(disk_metadata["storage_billing_ambiguous_roles"]),
             "local_ssd_gb": 0,
-            "unpriced_disk_performance": _unpriced_performance(detail),
-            "regional_disks": bool(detail.get("regional")),
-            "disk_types_known": True,
+            "unpriced_disk_performance": disk_metadata["unpriced_disk_performance"],
+            "regional_disks": disk_metadata["regional"],
+            "disk_types_known": disk_metadata["disk_types_known"],
             "disks_detail": [{"type": kind, "gb": size, "created_epoch": created, "source": str(link),
-                              "id": str(detail["id"])}],
+                              "id": str(detail["id"]), **disk_metadata}],
             "runners_count": 0,
             "runners_count_known": True,
             "runner_vcpu": 0,

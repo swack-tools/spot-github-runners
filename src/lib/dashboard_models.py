@@ -1995,7 +1995,9 @@ def calculate_spot_pricing(
     }
     custom_shape = bool(machine_type) and ("custom" in machine_type or machine_type.endswith("-ext"))
     # These types bill provisioned throughput or IOPS separately, which this capacity price leaves out.
-    performance_billed = {"hyperdisk-throughput", "pd-extreme"} & {boot_disk_type, data_disk_type if data_disk_gb else ""}
+    performance_billed = {"hyperdisk-throughput", "pd-extreme"} & {
+        kind for kind, gb in ((boot_disk_type, boot_disk_gb), (data_disk_type, data_disk_gb)) if gb > 0
+    }
     if on_demand:
         result["provisioning"] = "ondemand"
         result["complete"] = pricing_source == "gcp_billing_catalog" and not custom_shape
