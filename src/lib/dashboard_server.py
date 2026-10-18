@@ -781,6 +781,8 @@ def _live_instance_record(
         record["pricing"] = _with_secondary_disks(record["pricing"], obs, region=region,
                                                   family=record["family"], project=project)
     record["data_disks"] = obs.get("data_disks") or {}
+    # Capacity this VM adds, not yet counted toward OOM handling: set for a new identity, kept until counted.
+    record["capacity_pending"] = bool(previous.get("capacity_pending")) if previous is not None else True
     record["local_ssd_gb"] = int(obs.get("local_ssd_gb") or 0)
     record["unpriced_disk_performance"] = bool(obs.get("unpriced_disk_performance"))
     # The record shows the total data-disk size (pricing already covers each type).
@@ -2029,13 +2031,12 @@ class DashboardStore:
         def running(records: list[Any], role: str) -> list[dict[str, Any]]:
             return [r for r in records if isinstance(r, dict) and r.get("status") == "RUNNING" and r.get("role") == role]
 
-        # Capacity that already existed (running or stopped) adds none when it starts again; only running VMs whose
-        # identity is new add capacity.
-        existed = {str(r.get("instance_id")) for r in previous
-                   if isinstance(r, dict) and r.get("status") != "DELETED"}
-
+        # Only VMs first seen after the baseline add capacity (capacity_pending), and only once they are ready:
+        # RUNNING, and for runner hosts with a bootstrap confirmed in this boot. Each counts once; a restart of
+        # capacity that already existed adds none.
         def new_running(role: str) -> list[dict[str, Any]]:
-            return [r for r in running(current, role) if str(r.get("instance_id")) not in existed]
+            return [r for r in running(current, role) if r.get("capacity_pending")
+                    and (role != "cicd_runner" or r.get("runners_count_known") is not False)]
 
         previous_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(previous, "cicd_runner"))
         added_slots = sum(int(r.get("runners_count", 0) or 0) for r in new_running("cicd_runner"))
@@ -2050,8 +2051,11 @@ class DashboardStore:
                 step_runners=max(1, int(pol.get("scale_up_step_runners", 2))),
                 max_runners=max(int(prof.get("min_runners", 1)), int(pol.get("max_runners", 24))),
             )
-        if new_running("rust_builder"):
+        new_builders = new_running("rust_builder")
+        if new_builders:
             self._consume_active_oom_events(role="rust_builder")
+        for record in new_running("cicd_runner") + new_builders:
+            record["capacity_pending"] = False
 
     def fleet_inventory_status(self) -> dict[str, Any]:
         """Where the instance list comes from and how fresh it is (in memory; not part of the snapshot)."""
@@ -2112,6 +2116,8 @@ class DashboardStore:
                     self._consume_ooms_for_fleet_growth(previous_instances, records)
                 else:
                     self.state[FLEET_BASELINE_STATE_KEY] = _iso_epoch(self._clock())
+                    for record in records:
+                        record["capacity_pending"] = False  # The baseline fleet already existed.
                 self._sync_fleet_telemetry()
                 self._persist()
             except Exception:
@@ -3181,13 +3187,19 @@ class DashboardStore:
         """Inventory VMs (of the role, and of the other role under a shared budget) whose cost is understated."""
         roles = {role, "rust_builder" if role == "cicd_runner" else "cicd_runner"} if self._role_shares_budget(role) \
             else {role}
+        def budget_of(name: Any) -> dict[str, Any]:
+            budget = self.state.get("profiles", {}).get(name, {}).get("budget", {})
+            return budget if isinstance(budget, dict) else {}
+
+        evaluated = budget_of(role)
+
         def tax_unknown(inst: dict[str, Any]) -> bool:
-            # A region outside the catalog has no tax rate: unknown, not free, when the budget includes taxes
-            # (unless the profile overrides the regional rate).
-            budget = self.state.get("profiles", {}).get(inst.get("role"), {}).get("budget", {})
-            budget = budget if isinstance(budget, dict) else {}
-            return (inst.get("tax_rate_known") is False and bool(budget.get("include_taxes", False))
-                    and not budget.get("override_regional_tax"))
+            # A region outside the catalog has no tax rate: unknown, not free, when either the evaluated budget or
+            # the host's own budget (each prices it somewhere) includes taxes, unless the host's profile overrides
+            # the regional rate (its repricing then applies a known rate).
+            own = budget_of(inst.get("role"))
+            includes = bool(evaluated.get("include_taxes", False)) or bool(own.get("include_taxes", False))
+            return inst.get("tax_rate_known") is False and includes and not own.get("override_regional_tax")
 
         return [
             str(inst.get("name")) for inst in self.state.get("instances", [])
@@ -3968,6 +3980,7 @@ class DashboardStore:
             )
             normalized = normalize_budget({**base_budget, **payload})
             prev_profiles = copy.deepcopy(self.state["profiles"])
+            prev_instances = copy.deepcopy(self.state["instances"])
             prev_scaling = copy.deepcopy(self.state["scaling"])
             prev_global = copy.deepcopy(self.state.get("global_budget", {}))
             prev_global_enforced = bool(self.state.get("global_budget_enforced", False))
@@ -4002,8 +4015,11 @@ class DashboardStore:
                         self.state["scaling"][role_key]["include_disk_in_scale_budget"] = normalized["include_disk_costs"]
                         self.state["scaling"][role_key]["shared_global_budget"] = True
                 self._refresh_instances_pricing()
+                # Inventory records follow the new tax settings in this same saved change.
+                self._refresh_instances_pricing(live=True)
                 self._persist()
             except Exception:
+                self.state["instances"] = prev_instances
                 self.state["profiles"] = prev_profiles
                 self.state["scaling"] = prev_scaling
                 self.state["global_budget"] = prev_global
@@ -4133,6 +4149,7 @@ class DashboardStore:
             )
 
             prev_profiles = copy.deepcopy(self.state["profiles"])
+            prev_instances = copy.deepcopy(self.state["instances"])
             prev_scaling = copy.deepcopy(self.state["scaling"])
             prev_vm_templates = copy.deepcopy(self.state["vm_templates"])
             prev_ci_templates = copy.deepcopy(self.state["cloud_init_templates"])
@@ -4176,8 +4193,11 @@ class DashboardStore:
                     self._sync_template_density()
                 if normalized_budget is not None or tax_override_updated:
                     self._refresh_instances_pricing()
+                    # Inventory records follow the new tax settings in this same saved change.
+                    self._refresh_instances_pricing(live=True)
                 self._persist()
             except Exception:
+                self.state["instances"] = prev_instances
                 self.state["profiles"] = prev_profiles
                 self.state["scaling"] = prev_scaling
                 self.state["vm_templates"] = prev_vm_templates

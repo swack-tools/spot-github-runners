@@ -4859,6 +4859,61 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             budget["override_regional_tax"] = True
         self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), [])
 
+    def test_new_runner_counts_for_oom_only_once_ready(self):
+        base = fleet_observation("5500", "oxidex-runners-base-1", "us-south1-a", runners_count=1, now=self.now)
+        self.fleet = [base]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-r1", "instance_name": "oxidex-runners-base-1", "role": "cicd_runner",
+                 "baseline_runners": 1}]
+        booting = fleet_observation("5501", "oxidex-runners-new-1", "us-south1-a", runners_count=4, now=self.now)
+        booting["runners_count_known"] = False
+        self.fleet = [base, booting]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
+        self.assertTrue(self._record("oxidex-runners-new-1")["capacity_pending"])
+        self.fleet = [base, dict(booting, runners_count_known=True)]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
+        self.assertFalse(self._record("oxidex-runners-new-1")["capacity_pending"])
+
+    def test_vm_seen_staging_first_still_counts_when_running(self):
+        builder = fleet_observation("5600", "builder-oxidex-old-1", "us-south1-b", now=self.now)
+        self.fleet = [builder]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-b4", "instance_name": "builder-oxidex-old-1", "role": "rust_builder"}]
+        staging = fleet_observation("5601", "builder-oxidex-new-2", "us-south1-b", status="STAGING", now=self.now)
+        self.fleet = [builder, staging]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
+        self.fleet = [builder, dict(staging, status="RUNNING")]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
+
+    def test_unknown_tax_checked_against_evaluated_budget(self):
+        self.fleet = [fleet_observation("5700", "builder-oxidex-far-2", "mars-central1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["profiles"]["rust_builder"]["budget"].update(include_taxes=False, override_regional_tax=False)
+            self.store.state["profiles"]["cicd_runner"]["budget"].update(include_taxes=True)
+            self.store.state["scaling"]["cicd_runner"]["shared_global_budget"] = True
+        self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), [])
+        self.assertEqual(self.store._incomplete_cost_hosts("cicd_runner"), ["builder-oxidex-far-2"])
+
+    def test_tax_setting_change_reprices_inventory_in_same_save(self):
+        self.fleet = [fleet_observation("5800", "builder-oxidex-taxnow-1", "us-south1-b", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        version = self.store.state_version()
+        self.store.update_profile("rust_builder", {"budget": {"override_regional_tax": True, "tax_rate_percent": 25.0}})
+        self.assertEqual(self.store.state_version(), version + 1)
+        self.assertEqual(self._record("builder-oxidex-taxnow-1")["pricing"]["tax_rate_percent"], 25.0)
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        saved_rec = next(i for i in saved["instances"] if i["name"] == "builder-oxidex-taxnow-1")
+        self.assertEqual(saved_rec["pricing"]["tax_rate_percent"], 25.0)
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]
