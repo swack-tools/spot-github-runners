@@ -7643,6 +7643,25 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         failed = self.store.record_rust_build({"build_id": "rb-frac-fail", "compile_duration_seconds": 12.5})
         self.assertEqual(failed["build"]["compile_duration_seconds"], 12.5)
 
+    def test_failure_finish_keeps_request_precision(self):
+        build = self.store.record_rust_build({"build_id": "rb-prec", "status": "FAILED",
+                                              "requested_at": "2026-10-18T18:00:00.250Z",
+                                              "compile_duration_seconds": 12})["build"]
+        self.assertEqual(build["finished_at"], "2026-10-18T18:00:12.250000Z")
+        self.assertEqual(build["compile_duration_seconds"], 12.0)
+
+    def test_failure_with_delivery_field_keeps_compile_time(self):
+        build = self.store.record_rust_build({"build_id": "rb-del", "status": "OOM_KILLED",
+                                              "compile_duration_seconds": 30, "delivery_duration_seconds": 5})["build"]
+        self.assertEqual(build["compile_duration_seconds"], 30.0)
+        self.assertIsNone(build["delivered_at"])
+
+    def test_build_table_shows_status_and_terminal_failures(self):
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        self.assertIn("${esc(b.status)}", DASHBOARD_HTML)
+        self.assertIn("compile · not delivered", DASHBOARD_HTML)
+
     def test_blank_text_in_an_update_keeps_stored_values(self):
         self.store.record_rust_build({"build_id": "rb-blank", "status": "DELIVERED", "total_duration_seconds": 5.0,
                                       "project_name": "oxidex", "instance_name": "builder-oxidex-1",

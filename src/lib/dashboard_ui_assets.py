@@ -3140,7 +3140,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return `
           <tr>
             <td>
-              <div class="mono" style="font-weight:700; color:#fff;">${esc(b.build_id)}</div>
+              <div class="mono" style="font-weight:700; color:#fff;">${esc(b.build_id)} <span style="font-size:11px; color:var(--text-muted);">${esc(b.status)}</span></div>
               <div style="font-size:11.5px; color:var(--text-muted);">${esc(b.project_name || "project not reported")}${b.profile ? ` (<code class="mono">--${esc(b.profile)}</code>)` : ""} · <code class="mono">${esc(b.commit_sha ? b.commit_sha.slice(0, 8) : "commit not reported")}</code></div>
             </td>
             <td style="font-size:11.5px;">
@@ -3150,7 +3150,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </td>
             <td class="mono">
               <div style="font-weight:700; color:#fff;">${reportedOr(b.total_duration_seconds, v => `${v}s total`, "duration not reported")}</div>
-              <div style="font-size:11px; color:var(--text-muted);">${reportedOr(b.delivery_duration_seconds, v => `${b.compile_duration_seconds}s compile + ${v}s delivery`, reportedOr(b.compile_duration_seconds, c => `${c}s compile so far`, "compile/delivery split not reported"))}</div>
+              <div style="font-size:11px; color:var(--text-muted);">${reportedOr(b.delivery_duration_seconds, v => `${b.compile_duration_seconds}s compile + ${v}s delivery`, reportedOr(b.compile_duration_seconds, c => (["QUEUED", "PENDING", "WAITING", "RUNNING", "COMPILING", "ACTIVE", "IN_PROGRESS", "BUILDING"].includes(String(b.status).toUpperCase()) ? `${c}s compile so far` : `${c}s compile · not delivered`), "compile/delivery split not reported"))}</div>
             </td>
             <td class="mono">
               <div style="font-weight:700; color:#34d399;">${reportedOr(b.cache_hit_rate_percent, v => `${b.cache_hits} / ${b.total_crates} (${v}%)`, `${reportedOr(b.cache_hits, h => `${h} hits`, "cache not reported")}`)}</div>

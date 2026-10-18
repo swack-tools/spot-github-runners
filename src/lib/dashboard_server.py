@@ -243,6 +243,14 @@ def _iso_hours_ago(hours_ago: float, base_epoch: float | None = None) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _iso_at_epoch(epoch: float) -> str:
+    """UTC ISO timestamp of ``epoch``: whole seconds when it is one, else with microseconds."""
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    if abs(epoch - round(epoch)) < 1e-6:
+        return datetime.fromtimestamp(round(epoch), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def _iso_seconds_ago(seconds_ago: float, base_epoch: float | None = None) -> str:
     now_ts = base_epoch if base_epoch is not None else time.time()
     target_ts = now_ts - seconds_ago
@@ -6913,6 +6921,7 @@ class DashboardStore:
                 )
             )
             if is_non_delivered:
+                duration_includes_delivery = explicit_total is not None
                 if explicit_total is not None:
                     duration = explicit_total
                 elif explicit_compile is not None:
@@ -6997,14 +7006,15 @@ class DashboardStore:
                 elif existing_build.get("finished_at"):
                     fin_at = existing_build.get("finished_at")
                 elif is_unsuccessful and duration is not None:
-                    run_seconds = max(0.0, duration - delivery_sec)
+                    # Only a total includes delivery; a compile time (or request-to-failure span) is the run itself.
+                    run_seconds = max(0.0, duration - delivery_sec) if duration_includes_delivery else duration
                     if req_epoch + run_seconds > now_ts and not payload.get("requested_at"):
                         # The stored request time (often the first report's arrival) can't be right: the build
                         # ran for the reported time and ended by now, so it started that long before now.
                         req_epoch = float(math.floor(now_ts - run_seconds))
                         req_at = _iso_seconds_ago(0, req_epoch)
-                    # Request time plus the exact reported run time (fractional seconds kept when reported).
-                    fin_at = _iso_seconds_ago(-run_seconds, req_epoch)
+                    # Request time plus the exact reported run time, at the precision of the resulting time.
+                    fin_at = _iso_at_epoch(req_epoch + run_seconds)
                 else:
                     fin_at = None
                 del_at = (
