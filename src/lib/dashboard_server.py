@@ -2093,7 +2093,9 @@ class DashboardStore:
                 max_runners=max(int(prof.get("min_runners", 1)), int(pol.get("max_runners", 24))),
             )
         new_builders = new_running("rust_builder")
-        if new_builders:
+        # Builders have one fixed shape: a new one handles builder OOMs only when the running count actually grew
+        # (a replacement for a builder that stopped in the same listing adds nothing).
+        if new_builders and len(running(current, "rust_builder")) > len(running(previous, "rust_builder")):
             self._consume_active_oom_events(role="rust_builder")
         for record in new_running("cicd_runner") + new_builders:
             record["capacity_pending"] = False
@@ -3270,9 +3272,11 @@ class DashboardStore:
         }
 
     def _inventory_stale_reason(self) -> str:
-        """Why the live inventory cannot be trusted right now (empty when it can, or when none is configured)."""
+        """Why the live inventory cannot be trusted right now (empty when it can); without a configured inventory
+        the fleet is unknown, so scaling holds there too."""
         if self.fleet_source is None:
-            return ""
+            return ("The live Compute Engine inventory is not configured (DASHBOARD_FLEET_INVENTORY=gce), so the "
+                    "fleet and its burn are unknown")
         with self._lock:
             status = dict(self._fleet_status)
         if status.get("fresh"):
@@ -4985,6 +4989,11 @@ class DashboardStore:
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
+            if inst.get("regional_disks") or inst.get("unpriced_disk_performance"):
+                raise ValueError(
+                    f"{inst['name']} has regional disks or provisioned Hyperdisk performance, which a VM template "
+                    "cannot describe; create the template from the profile instead"
+                )
             if int(inst.get("local_ssd_gb") or 0) > 0:
                 raise ValueError(
                     f"{inst['name']} has {int(inst['local_ssd_gb'])} GiB of Local SSD, which a VM template cannot "
@@ -5212,7 +5221,8 @@ class DashboardStore:
                     existing_cand = next(
                         # A host with several data-disk types cannot be described by one type and size.
                         (i for i in running_in_region
-                         if len(i.get("data_disks") or {}) <= 1 and not int(i.get("local_ssd_gb") or 0)), None)
+                         if len(i.get("data_disks") or {}) <= 1 and not int(i.get("local_ssd_gb") or 0)
+                         and not i.get("regional_disks") and not i.get("unpriced_disk_performance")), None)
                     if existing_cand is not None:
                         try:
                             self._validate_vm_template_compatibility(existing_cand, prof, role)
@@ -5410,6 +5420,13 @@ class DashboardStore:
                     ),
                     4,
                 )
+                unpriced = [rec for rec in new_records if (rec.get("pricing") or {}).get("complete") is False]
+                if unpriced:
+                    raise ValueError(
+                        f"The planned {unpriced[0].get('machine_type')} VMs cannot be fully priced (custom or extended "
+                        "shape, or a standard VM without an on-demand rate); the scale-up cannot be checked against "
+                        "the budget"
+                    )
                 # Stopped inventory VMs bill no compute but keep billing their disks; transitional ones count fully.
                 stopped_disk_hourly = sum(
                     _nonrunning_hourly(i, include_disk=include_disk, include_tax=include_tax)

@@ -365,7 +365,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host. A VM with data disks of several types can't be a template
   source or the shape of a scale plan, since those hold one data-disk type. Neither can a VM with
-  Local SSD, which templates don't describe. When a running host has no recorded runner count, or
+  Local SSD, regional disks, or provisioned Hyperdisk performance, which templates don't describe. A
+  scale-up plan whose new VMs can't be fully priced is refused. When a running host has no recorded runner count, or
   hasn't confirmed its bootstrap in its current boot (an applied patch record for this boot with
   nothing pending), the runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
   plans are refused.
@@ -400,11 +401,13 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   already existed does: a VM first listed after the baseline adds capacity once, when it's `RUNNING`
   and, for a runner host, has confirmed its bootstrap. A stopped VM that starts again adds none. The
   OOM target is then checked against the ready runner slots actually running after the listing, so
-  replacing a host with one of the same size handles nothing. A held recommendation projects the cost
+  replacing a host with one of the same size handles nothing. A new builder handles builder OOM events
+  only when the number of running builders grew. A held recommendation projects the cost
   of the fleet it keeps. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
   snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
-  empty and the instances tab says that the inventory isn't configured. Inventory records loaded from
+  empty, the instances tab says that the inventory isn't configured, and scaling recommendations hold
+  and scale-up plans are refused, because the real fleet is unknown. Inventory records loaded from
   a state file or snapshot are dropped too, since nothing would keep them current, and so is the
   baseline: a later re-enabled inventory starts a new one.
 - On load, from the state file, a KV snapshot, or a handover import, the dashboard drops every instance

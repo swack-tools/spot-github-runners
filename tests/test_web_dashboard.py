@@ -773,6 +773,9 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             state_path=self.state_file,
         )
         install_fleet_fixture(self.store)
+        # The fixture fleet stands in for a current live inventory (scaling holds without one); no refresh loop runs.
+        self.store.fleet_source = lambda: []
+        self.store._fleet_status["fresh"] = True
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -5020,6 +5023,50 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         rec = self._record("builder-oxidex-reg-1")
         self.assertFalse(rec["pricing_complete"])
         self.assertIn("regional", rec["pricing_incomplete_reason"])
+
+    def test_scaling_holds_without_configured_inventory(self):
+        from lib.dashboard_server import DashboardStore
+
+        store = DashboardStore()
+        held = store._fail_closed_evaluation({"direction": "scale_up"}, "cicd_runner")
+        self.assertIn("not configured", held["hold_reason"])
+        with self.assertRaisesRegex(ValueError, "not configured"):
+            store.scale_region_instances({"region": "us-south1", "role": "cicd_runner", "target_instances": 1})
+
+    def test_builder_replacement_does_not_consume_oom(self):
+        old = fleet_observation("6500", "builder-oxidex-repl-1", "us-south1-b", now=self.now)
+        self.fleet = [old]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-b5", "instance_name": "builder-oxidex-repl-1", "role": "rust_builder"}]
+        self.fleet = [dict(old, status="TERMINATED", last_stop_epoch=self.now - 60.0),
+                      fleet_observation("6501", "builder-oxidex-repl-2", "us-south1-b", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
+
+    def test_unrepresentable_disk_sources_are_not_templates(self):
+        for i, flag in enumerate(("regional_disks", "unpriced_disk_performance")):
+            obs = fleet_observation(f"660{i}", f"builder-oxidex-tpl-{i}", "us-south1-b", now=self.now)
+            obs[flag] = True
+            self.fleet = [obs]
+            self.store.refresh_fleet_inventory()
+            with self.assertRaisesRegex(ValueError, "cannot describe"):
+                self.store.create_vm_template_from_instance({"instance_name": f"builder-oxidex-tpl-{i}"})
+
+    def test_scale_plan_rejects_unpriced_candidates(self):
+        self.fleet = [fleet_observation("6700", "oxidex-runners-plan-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.store.update_budget({"target": "cicd_runner", "max_hourly_usd": 50.0, "max_daily_usd": 1000.0,
+                                  "max_monthly_usd": 30000.0})
+        real = calculate_spot_pricing
+
+        def unpriced(*args, **kwargs):
+            return {**real(*args, **kwargs), "complete": False}
+
+        with unittest.mock.patch("lib.dashboard_server.calculate_spot_pricing", side_effect=unpriced):
+            with self.assertRaisesRegex(ValueError, "cannot be fully priced"):
+                self.store.scale_region_instances({"region": "us-south1", "role": "cicd_runner", "target_instances": 2})
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
