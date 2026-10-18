@@ -7594,9 +7594,13 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         self.assertEqual((build["instance_benchmark_score"], build["cpu_points"]), (2000, 200000.0))
         kept = self.store.record_rust_build({"build_id": "rb-bench", "cpu_time_seconds": 50.0})["build"]
         self.assertEqual((kept["instance_benchmark_score"], kept["cpu_points"]), (2000, 100000.0))
-        # A newly reported shape is scored again instead of keeping the stored score.
-        rescored = self.store.record_rust_build({"build_id": "rb-bench", "cpu_platform": "Intel Emerald Rapids",
-                                                 "vcpu": 16, "machine_type": "n4-highcpu-16"})["build"]
+        # Filling in a shape nobody reported before keeps the explicit score.
+        filled = self.store.record_rust_build({"build_id": "rb-bench", "cpu_platform": "Intel Emerald Rapids",
+                                               "vcpu": 16, "machine_type": "n4-highcpu-16"})["build"]
+        self.assertEqual(filled["instance_benchmark_score"], 2000)
+        # Changing a reported shape value means a different host, which is scored again.
+        rescored = self.store.record_rust_build({"build_id": "rb-bench", "vcpu": 8,
+                                                 "machine_type": "n4-highcpu-8"})["build"]
         self.assertNotEqual(rescored["instance_benchmark_score"], 2000)
 
     def test_record_form_requires_delivered_timing(self):

@@ -7871,8 +7871,8 @@ class DashboardStore:
                 value = given(key)
                 return value if value is not None else existing_build.get(key)
 
-            # An explicit benchmark score stands in for the host shape. A stored score is kept only while the
-            # report leaves the shape alone, so a changed shape is scored again.
+            # An explicit benchmark score stands in for the host shape. A stored score is kept unless the report
+            # changes an already reported shape value, so a different host is scored again.
             shape_keys = ("cpu_platform", "vcpu", "machine_type")
             def shape_value(value: Any) -> Any:
                 """A shape value in comparable form: whole numbers (16, "16", 16.0) as integers, names stripped."""
@@ -7883,8 +7883,10 @@ class DashboardStore:
                     return text
                 return int(number) if math.isfinite(number) and number.is_integer() else text
 
-            shape_changed = any(given(k) is not None and (existing_build.get(k) is None
-                                                          or shape_value(given(k)) != shape_value(existing_build[k]))
+            # Only a value that conflicts with a previously reported one means a different host; filling in a
+            # field nobody reported before keeps the stored score.
+            shape_changed = any(given(k) is not None and existing_build.get(k) is not None
+                                and shape_value(given(k)) != shape_value(existing_build[k])
                                 for k in shape_keys)
             benchmark_score = (given("instance_benchmark_score")
                                if given("instance_benchmark_score") is not None

@@ -588,7 +588,7 @@ machine type, commit, origin IP, crate count, memory peak, CPU time, or duration
   counts it reports. That stored count is then derived again from the others, a derived count before a
   reported one. `reported_crate_counts` lists which counts were reported.
 - The benchmark score needs `cpu_platform`, `vcpu`, and `machine_type`, or an explicit
-  `instance_benchmark_score`, which an update keeps unless it reports a different shape. CPU points need the benchmark score and `cpu_time_seconds`.
+  `instance_benchmark_score`, which an update keeps unless it changes an already reported shape value. CPU points need the benchmark score and `cpu_time_seconds`.
 - Without `origin_ip` the build has no network classification and shows the origin as not reported.
   `origin_hostname` is stored only when reported; the classification never supplies one.
 - The summary's cache, memory, and CPU totals count only completed builds that reported each figure. A
