@@ -390,7 +390,15 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   detached again keeps its earlier standalone interval and restarts billing at the new handoff.
 - Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
   scale-up plans are refused even when the listing is otherwise current. Grant the permission for
-  scaling to work.
+  scaling to work. For a disk newly attached during this outage, the dashboard defers its cost rather
+  than assigning a fallback rate. Once disk metadata is available, it fills that disk's history from
+  its creation or known handoff time at the verified rate, preserving observed size-change boundaries.
+  Deferred intervals follow a disk when its billing owner changes and survive detachment until metadata
+  can resolve them. Pending disk liabilities remain visible
+  when the deleted-instance filter is off. A complete project disk listing must confirm a resource is
+  missing before its unresolved history can expire. Once that confirmed absence is outside the 31-day
+  window, it no longer holds current budgets; `lifetime_cost_complete` stays false if the old amount
+  couldn't be recovered. A newer disk with the same source name cannot resolve the old uncertainty.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host; the dashboard hides the template action for such records.
@@ -441,6 +449,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   first listed after the baseline is `RUNNING` with its bootstrap confirmed and the ready slots reach
   the event's target. A restart of existing capacity, or a same-size replacement, handles nothing. New
   capacity stays pending through the OOM lookback, so an OOM reported late can still be answered by it.
+  Without a dated readiness transition, only a new identity created after the incident can satisfy it.
+  A poll time or missing bootstrap metadata cannot date readiness, so uncertain incidents stay active.
+  A later restart of the same identity cannot satisfy a newer incident.
   Hosts first listed together with an OOM that were already running before it count toward its baseline,
   and only ready runner slots count as current runners. Builder OOM events are never handled from the
   inventory, including by the builder scaling evaluation: a builder has no service account, so its
