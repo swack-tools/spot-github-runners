@@ -119,6 +119,7 @@ def observe_fleet_items(
     attachment_counts: dict[str, int] = {}
     disk_participants: dict[str, list[tuple[tuple[str, str], str]]] = {}
     disk_roles: dict[str, set[str]] = {}
+    disk_user_roles: dict[str, set[str]] = {}
     for vm in fleet_items:
         for disk in vm.get("disks") or []:
             if (isinstance(disk, dict) and disk.get("source")
@@ -129,6 +130,12 @@ def observe_fleet_items(
                 attachment_counts[identity] = attachment_counts.get(identity, 0) + 1
                 disk_participants.setdefault(identity, []).append(((str(vm["id"]), vm["name"]),
                                                                     fleet_role(vm["name"])))
+                # The disk listing is later than the VM snapshot. Its users can establish cross-role sharing
+                # even when the other VM or its attachment is absent from that snapshot.
+                for user in detail.get("users") or []:
+                    user_role = fleet_role(str(user).rstrip("/").rsplit("/", 1)[-1])
+                    if user_role:
+                        disk_user_roles.setdefault(identity, set()).add(user_role)
                 # Catalog name and source identify the actual disk. deviceName is only an attachment alias;
                 # disk labels are not in the API projection and cannot establish ownership here.
                 disk_name = str(detail.get("name") or source.rstrip("/").rsplit("/", 1)[-1])
@@ -137,15 +144,17 @@ def observe_fleet_items(
                 if named_role:
                     disk_roles.setdefault(identity, set()).add(named_role)
     billing_owners: dict[str, tuple[str, str]] = {}
-    ambiguous_disks: set[str] = set()
+    ambiguous_disks: dict[str, set[str]] = {}
     for identity, participants in disk_participants.items():
         candidates = participants
-        if len({role for _, role in participants}) > 1:
+        participating_roles = {role for _, role in participants} | disk_user_roles.get(identity, set())
+        if len(participating_roles) > 1:
             named_roles = disk_roles.get(identity, set())
             candidates = [p for p in participants if p[1] in named_roles] if len(named_roles) == 1 else []
             if not candidates:
-                # Keep fleet burn deduplicated, but every participant must fail closed for role storage budgets.
-                ambiguous_disks.add(identity)
+                # Keep fleet burn deduplicated. Persist all affected roles on the visible carrier(s), including
+                # when the named role has no attachment yet and therefore cannot own the numerical charge.
+                ambiguous_disks[identity] = participating_roles
                 candidates = participants
         billing_owners[identity] = candidates[0][0]
     for item in fleet_items:
@@ -175,6 +184,7 @@ def observe_fleet_items(
         regional_disks = False
         unresolved_disks = False
         storage_billing_ambiguous = False
+        storage_billing_ambiguous_roles: set[str] = set()
         # Each persistent disk with its own creation time, so history before a later-attached disk is not billed
         # at its rate.
         disks_detail: list[dict[str, Any]] = []
@@ -196,6 +206,7 @@ def observe_fleet_items(
             if identity and not shared_elsewhere:
                 billed_disks.add(identity)
             storage_billing_ambiguous = storage_billing_ambiguous or identity in ambiguous_disks
+            storage_billing_ambiguous_roles.update(ambiguous_disks.get(identity, ()))
             if disk_types_known and not detail.get("type"):
                 # The disk listing did not cover this attachment (for example a disk created between the two
                 # listings): its type is unknown, not the default.
@@ -271,6 +282,7 @@ def observe_fleet_items(
             "data_disks_attached_gb": data_disk_gb,
             "shared_attachments": shared_attachments,
             "storage_billing_ambiguous": storage_billing_ambiguous,
+            "storage_billing_ambiguous_roles": sorted(storage_billing_ambiguous_roles),
             "local_ssd_gb": local_ssd_gb,
             "unpriced_disk_performance": unpriced_performance,
             "regional_disks": regional_disks,
@@ -371,6 +383,7 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
             "data_disk_gb": size,
             "data_disks": {kind: size},
             "storage_billing_ambiguous": storage_billing_ambiguous,
+            "storage_billing_ambiguous_roles": user_roles if storage_billing_ambiguous else [],
             "local_ssd_gb": 0,
             "unpriced_disk_performance": _unpriced_performance(detail),
             "regional_disks": bool(detail.get("regional")),

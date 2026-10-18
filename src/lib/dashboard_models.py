@@ -1921,11 +1921,16 @@ def calculate_spot_pricing(
     price_kind = "ondemand" if on_demand else "spot"
     live_cpu_rate = comp_rates_map.get((price_kind, region, series_key, "CPU"))
     live_ram_rate = comp_rates_map.get((price_kind, region, series_key, "RAM"))
+    applicable_components_known = (
+        (vcpu > 0 or ram_gib > 0)
+        and (vcpu <= 0 or live_cpu_rate is not None)
+        and (ram_gib <= 0 or live_ram_rate is not None)
+    )
 
     if live_machine_rate is not None:
         compute_hourly = _dec(live_machine_rate)
         pricing_source = "gcp_capacity_history"
-    elif live_cpu_rate is not None and live_ram_rate is not None:
+    elif (live_cpu_rate is not None and live_ram_rate is not None) or applicable_components_known:
         compute_hourly = _dec(live_cpu_rate) * _dec(vcpu) + _dec(live_ram_rate) * _dec(ram_gib)
         pricing_source = "gcp_billing_catalog"
     else:
@@ -1938,15 +1943,15 @@ def calculate_spot_pricing(
     compute_daily = compute_hourly * HOURS_PER_DAY
     compute_monthly = compute_hourly * HOURS_PER_MONTH
 
-    live_boot_disk = (
-        disk_rates_map.get((region, boot_disk_type))
-        or disk_rates_map.get(f"{region}/{boot_disk_type}")
-        or disk_rates_map.get(boot_disk_type)
+    live_boot_disk = next(
+        (disk_rates_map[key] for key in ((region, boot_disk_type), f"{region}/{boot_disk_type}", boot_disk_type)
+         if disk_rates_map.get(key) is not None),
+        None,
     )
-    live_data_disk = (
-        disk_rates_map.get((region, data_disk_type))
-        or disk_rates_map.get(f"{region}/{data_disk_type}")
-        or disk_rates_map.get(data_disk_type)
+    live_data_disk = next(
+        (disk_rates_map[key] for key in ((region, data_disk_type), f"{region}/{data_disk_type}", data_disk_type)
+         if disk_rates_map.get(key) is not None),
+        None,
     )
     boot_rate = (
         _dec(live_boot_disk)
@@ -2012,6 +2017,16 @@ def calculate_spot_pricing(
         # No machine, component, or family rate: the generic per-vCPU/GiB fallback is not a trusted price.
         result["complete"] = False
         result["family_rate_unknown"] = True
+    # Static baselines have no regional multiplier outside the catalog. Tax trust is separate.
+    if reg_info is None:
+        if (vcpu > 0 or ram_gib > 0) and pricing_source == "catalog_baseline":
+            result["regional_compute_rate_unknown"] = True
+            result["complete"] = False
+        if any(gb > 0 and live is None for gb, live in (
+            (boot_disk_gb, live_boot_disk), (data_disk_gb, live_data_disk),
+        )):
+            result["regional_disk_rate_unknown"] = True
+            result["complete"] = False
     return result
 
 

@@ -13,7 +13,7 @@ from typing import Any
 
 Interval = list[float | None]
 Intervals = dict[str, list[Interval]]
-_STORAGE_REASONS = frozenset({"suspended_memory", "fallback_storage"})
+_STORAGE_REASONS = frozenset({"suspended_memory", "fallback_storage", "fallback_tax"})
 _COMPUTE_REASONS = frozenset({"prior_compute", "fallback_compute"})
 
 
@@ -85,7 +85,8 @@ def history_components(raw: Any) -> tuple[bool, bool]:
             any(reason not in _COMPUTE_REASONS for reason in reasons))
 
 
-def history_in_window(raw: Any, start: float, end: float, include_storage: bool = True) -> bool:
+def history_in_window(raw: Any, start: float, end: float, include_storage: bool = True,
+                      *, include_tax: bool | None = None) -> bool:
     """Check actual disjoint overlap with ``[start, end)`` in the selected mode.
 
     Compute-only mode excludes storage-only reasons. Empty/reversed windows and
@@ -97,7 +98,8 @@ def history_in_window(raw: Any, start: float, end: float, include_storage: bool 
         return False
     return any(left < end and (right is None or (right > start and right > left))
                for reason, ranges in normalize_unpriced_intervals(raw).items()
-               if include_storage or reason not in _STORAGE_REASONS
+               if ((include_storage if include_tax is None else include_tax) if reason == "fallback_tax"
+                   else include_storage or reason not in _STORAGE_REASONS)
                for left, right in ranges)
 
 

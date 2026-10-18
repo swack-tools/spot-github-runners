@@ -42,11 +42,12 @@ class DashboardComponentPricingTests(unittest.TestCase):
         self.assertEqual(self.store._inventory_stale_reason(), "")
         return self.store.state["instances"]
 
-    def assert_budget_mode(self, role, *, storage, complete):
+    def assert_budget_mode(self, role, *, storage, complete, expected_hosts=None):
         self.store.state["profiles"][role]["budget"].update(include_disk_costs=storage, include_taxes=False)
         self.store.state["scaling"][role]["include_disk_in_scale_budget"] = storage
         incomplete = self.store._incomplete_cost_hosts(role)
-        self.assertEqual(incomplete, [] if complete else [self.observation(role)["name"]])
+        self.assertEqual(incomplete, [] if complete else
+                         (expected_hosts if expected_hosts is not None else [self.observation(role)["name"]]))
         evaluation = self.store._fail_closed_evaluation(
             {"direction": "scale_up", "current_runners": 1, "desired_runners": 2,
              "current_instances": 1, "desired_instances": 2}, role)
@@ -109,7 +110,8 @@ class DashboardComponentPricingTests(unittest.TestCase):
             self.assertEqual(_pricing_component_reasons(record)[0], [])
             self.assertTrue(_pricing_component_reasons(record)[1])
             for storage in (False, True):
-                self.assert_budget_mode(record["role"], storage=storage, complete=not storage)
+                self.assert_budget_mode(record["role"], storage=storage, complete=not storage,
+                                        expected_hosts=[r["name"] for r in records])
         for storage in (False, True):
             view = self.store.query_instances(include_disk_and_tax=storage)
             self.assertEqual(len(view["instances"]), 2)

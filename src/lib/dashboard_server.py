@@ -57,6 +57,7 @@ from .dashboard_auth import (
     ENV_DEVICE_FLOW,
     ENV_REDIRECT_URI,
 )
+from .dashboard_deferred_history import append_deferred_context, deferred_segments
 from .dashboard_history import (normalize_unpriced_intervals, add_unpriced_interval, history_components,
                                 history_in_window, compact_unpriced_intervals)
 from .fleet_inventory import fleet_source_from_env, gce_epoch, observe_detached_disks
@@ -739,9 +740,10 @@ def _stopped_disk_hourly(pricing: dict[str, Any], *, include_tax: bool = True) -
 
 
 def _unpriced_history_in_window(record: dict[str, Any], start: float, end: float,
-                                *, include_storage: bool = True) -> bool:
-    """Whether known missing historical charges overlap the selected window."""
-    return history_in_window(record.get("unpriced_history_intervals"), start, end, include_storage)
+                                *, include_storage: bool = True, include_tax: bool | None = None) -> bool:
+    """Whether known missing historical charges overlap the selected cost components."""
+    return history_in_window(record.get("unpriced_history_intervals"), start, end, include_storage,
+                             include_tax=include_tax)
 
 
 def _save_unpriced_intervals(record: dict[str, Any], intervals: dict[str, Any], now: float) -> None:
@@ -842,26 +844,31 @@ def _pricing_component_reasons(record: dict[str, Any]) -> tuple[list[str], list[
         storage.append("Local SSD storage is not priced here")
     if record.get("storage_billing_ambiguous"):
         storage.append("shared disk billing role is ambiguous")
-    if record.get("tax_rate_known") is False:
-        if not disk_only:
-            compute.append("region outside the dashboard's catalog: no trusted regional compute rate")
+    if pricing.get("regional_compute_rate_unknown") and not disk_only:
+        compute.append("region outside the dashboard's catalog: no trusted regional compute rate")
+    if pricing.get("regional_disk_rate_unknown"):
         storage.append("region outside the dashboard's catalog: no trusted regional disk rate")
     if pricing.get("complete") is False and not compute and not storage:
         (storage if disk_only else compute).append("pricing source is incomplete")
     return compute, storage
 
 
-def _selected_pricing_complete(record: dict[str, Any], *, include_storage: bool) -> bool:
+def _tax_unknown(record: dict[str, Any]) -> bool:
+    return record.get("tax_rate_known") is False and not record.get("tax_rate_overridden")
+
+
+def _selected_pricing_complete(record: dict[str, Any], *, include_storage: bool, include_tax: bool = False) -> bool:
     compute, storage = _pricing_component_reasons(record)
-    return not compute and not (include_storage and storage)
+    return not compute and not (include_storage and storage) and not (include_tax and _tax_unknown(record))
 
 
 def _mark_pricing_completeness(record: dict[str, Any]) -> None:
     """Keep the all-in summary while component-specific consumers select their own costs."""
     compute, storage = _pricing_component_reasons(record)
-    record["pricing_complete"] = not (compute or storage)
-    record["pricing_incomplete_reason"] = "; ".join(compute + storage)
-    record["lifetime_cost_complete"] = not (compute or storage or record.get("unpriced_lifetime_history"))
+    tax = ["regional tax rate is unknown"] if _tax_unknown(record) else []
+    record["pricing_complete"] = not (compute or storage or tax)
+    record["pricing_incomplete_reason"] = "; ".join(compute + storage + tax)
+    record["lifetime_cost_complete"] = not (compute or storage or tax or record.get("unpriced_lifetime_history"))
 
 
 def _nonrunning_hourly(inst: dict[str, Any], *, include_disk: bool, include_tax: bool) -> float:
@@ -970,6 +977,88 @@ def _billed_record_disk_keys(record: dict[str, Any]) -> frozenset[str]:
     return (_record_disk_keys(record) - unowned) | frozenset(record.get("billed_disk_sources") or []) | aliases
 
 
+def _deferred_pricing_context(record: dict[str, Any], project: str,
+                               live_pricing: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Snapshot regional storage rates, including types not identified until a later disk listing."""
+    from . import dashboard_models
+    region = str(record.get("region") or "")
+    regional = next((r for r in REGIONS_CATALOG if r["region"] == region), None)
+    mult = float((regional or {}).get("price_multiplier", 1.0))
+    rates = {kind: float(rate) * mult for kind, rate in dashboard_models.DISK_MONTHLY_RATES_USD_PER_GIB.items()}
+    live = live_pricing if live_pricing is not None else dashboard_models.fetch_live_spot_pricing(
+        project=project, regions=[region], machine_types=None)
+    raw = (live or {}).get("disk_monthly_gib") or {}
+    kinds = set(rates)
+    for key in raw:
+        if isinstance(key, tuple) and len(key) == 2 and key[0] == region:
+            kinds.add(str(key[1]))
+        elif isinstance(key, str) and ("/" not in key or key.startswith(region + "/")):
+            kinds.add(key.split("/", 1)[-1])
+    trusted = set(rates) if regional is not None else set()
+    for kind in kinds:
+        rate = next((raw[key] for key in ((region, kind), f"{region}/{kind}", kind)
+                     if raw.get(key) is not None), None)
+        if rate is not None:
+            rates[kind] = float(rate)
+            trusted.add(kind)
+    context = {"tax_rate_percent": float((record.get("pricing") or {}).get("tax_rate_percent") or 0),
+               "tax_rate_known": not _tax_unknown(record), "disk_monthly_gib": rates,
+               "known_disk_types": sorted(trusted)}
+    return context
+
+
+def _snapshot_deferred_pricing(record: dict[str, Any], now: float, project: str,
+                               live_pricing: dict[str, Any] | None = None) -> bool:
+    initial = set(record.get("disk_history_deferred_sources") or [])
+    global_deferred = _finite(record.get("disk_history_deferred_at"))
+    disks = [d for d in record.get("disks_detail") or [] if isinstance(d, dict)
+             and d.get("billing_owner") is not False and (_finite(d.get("billing_deferred_since"))
+                 or (global_deferred and (not initial or str(d.get("source")) in initial)))]
+    disks += [d for d in record.get("unpaid_disk_details") or [] if isinstance(d, dict)]
+    if not disks:
+        return False
+    context = _deferred_pricing_context(record, project, live_pricing)
+    changed = False
+    for disk in disks:
+        changed = append_deferred_context(disk, now, context) or changed
+    return changed
+
+
+def _deferred_disk_rate(disk: dict[str, Any], context: dict[str, Any], *, family: str,
+                        region: str, project: str) -> float:
+    return _single_disk_all_in(disk, family=family, region=region, project=project,
+        tax_rate_percent=float(context.get("tax_rate_percent") or 0),
+        live_pricing={"disk_monthly_gib": context.get("disk_monthly_gib") or {}})
+
+
+def _deferred_context_at(disk: dict[str, Any], at: float) -> dict[str, Any] | None:
+    timeline = disk.get("billing_deferred_pricing") or []
+    if not timeline:
+        return None
+    chosen = timeline[0][1]
+    for boundary, context in timeline:
+        if float(boundary) <= at:
+            chosen = context
+    return chosen
+
+
+def _remember_deferred_trust(record: dict[str, Any], disk: dict[str, Any], start: float, end: float,
+                               now: float) -> None:
+    """Recovering an identity cannot manufacture old catalog prices or a formerly unknown tax rate."""
+    intervals = normalize_unpriced_intervals(record.get("unpriced_history_intervals"))
+    bounds = sorted({start, end} | {float(at) for at, _context in disk.get("billing_deferred_pricing") or []
+                                    if start < float(at) < end})
+    for begin, finish in zip(bounds, bounds[1:]):
+        context = _deferred_context_at(disk, begin)
+        if context is None:
+            continue  # Legacy debt has no recoverable context timeline.
+        if str(disk.get("type")) not in context.get("known_disk_types", []):
+            add_unpriced_interval(intervals, "fallback_storage", begin, finish)
+        if context.get("tax_rate_known") is False:
+            add_unpriced_interval(intervals, "fallback_tax", begin, finish)
+    _save_unpriced_intervals(record, intervals, now)
+
+
 def _initial_disk_history(
     obs: dict[str, Any], *, region: str, family: str, project: str, tax_rate_percent: float, now: float,
 ) -> tuple[list[tuple[float, float, float]], float | None]:
@@ -991,7 +1080,9 @@ def _initial_disk_history(
         return disk.get("recovered_sizes") or [[float(disk["created_epoch"]), int(disk.get("gb") or 0)]]
 
     times = sorted({min(float(d["created_epoch"]), now) for d in disks}
-                   | {min(now, max(float(d["created_epoch"]), float(at))) for d in disks for at, _gb in sizes(d)})
+                   | {min(now, max(float(d["created_epoch"]), float(at))) for d in disks for at, _gb in sizes(d)}
+                   | {min(now, max(float(d["created_epoch"]), float(at))) for d in disks
+                      for at, _context in d.get("billing_deferred_pricing") or []})
     segments = []
     for start, end in zip(times, times[1:]):
         rate = 0.0
@@ -1003,8 +1094,15 @@ def _initial_disk_history(
             for at, size in history:
                 if float(at) <= start:
                     gb = size
-            rate += _single_disk_all_in(dict(disk, gb=gb), family=family, region=region, project=project,
-                                        tax_rate_percent=tax_rate_percent)
+            if disk.get("billing_deferred_pricing"):
+                context = disk["billing_deferred_pricing"][0][1]
+                for at, selected in disk["billing_deferred_pricing"]:
+                    if float(at) <= start:
+                        context = selected
+                rate += _deferred_disk_rate(dict(disk, gb=gb), context, family=family, region=region, project=project)
+            else:
+                rate += _single_disk_all_in(dict(disk, gb=gb), family=family, region=region, project=project,
+                                           tax_rate_percent=tax_rate_percent)
         segments.append((start, end, rate))
     return segments, times[-1]
 
@@ -1087,7 +1185,7 @@ def _live_instance_record(
                          for d in obs.get("disks_detail") or [] if isinstance(d, dict)))):
                 deferred = now
             if _finite(deferred) and disk.get("billing_owner") is not False:
-                for key in ("billing_initial_history", "billing_history_credits"):
+                for key in ("billing_initial_history", "billing_history_credits", "billing_deferred_pricing"):
                     if key in (old or {}):
                         disk[key] = copy.deepcopy(old[key])
                 sizes = copy.deepcopy((old or {}).get("billing_deferred_sizes")
@@ -1102,6 +1200,7 @@ def _live_instance_record(
                     recovered = dict(disk, billing_deferred_since=float(deferred), recovered_sizes=sizes)
                     disk.pop("billing_initial_history", None)
                     disk.pop("billing_history_credits", None)
+                    disk.pop("billing_deferred_pricing", None)
                     if previous is not None:
                         recovered_disks.append(recovered)
                     else:
@@ -1224,6 +1323,8 @@ def _live_instance_record(
     record["disk_types_known"] = obs.get("disk_types_known") is not False
     # The record shows the total data-disk size (pricing already covers each type).
     record["data_disk_gb"] = int(obs.get("data_disk_gb") or 0)
+    if role in tax_overrides:
+        record["tax_rate_overridden"] = True
     if not region_known:
         # Outside the catalog the record must not borrow another region's location or tax.
         record.update({"display_location": region, "continent": "", "lat": None, "lon": None,
@@ -1279,7 +1380,11 @@ def _live_instance_record(
         if handed_off:
             obs = dict(obs, disks_detail=handed_off)
     if previous is None and initial_recoveries:
-        obs = dict(obs, disks_detail=[dict(d, recovered_sizes=initial_recoveries[str(d.get("source"))]["recovered_sizes"])
+        context = _deferred_pricing_context(record, project)
+        for disk in initial_recoveries.values():
+            append_deferred_context(disk, now, context)
+        obs = dict(obs, disks_detail=[dict(d, recovered_sizes=initial_recoveries[str(d.get("source"))]["recovered_sizes"],
+                    billing_deferred_pricing=initial_recoveries[str(d.get("source"))].get("billing_deferred_pricing") or [])
                    if str(d.get("source")) in initial_recoveries else d for d in obs.get("disks_detail") or []])
     recovered_sources = {str(d.get("source")) for d in recovered_disks}
     pending_open_disk_rate: float | None = None
@@ -1424,15 +1529,11 @@ def _live_instance_record(
                 disk, known_disk_sources | _billed_record_disk_keys(previous or {})):
             start = max(start, float(disk["billing_deferred_since"]))
         if start < now:
-            history_disk = {key: value for key, value in disk.items() if key not in ("billing_deferred_since", "billing_deferred_sizes")}
-            segments, open_from = _initial_disk_history(dict(obs, disks_detail=[dict(history_disk, created_epoch=start)]),
-                family=record["family"], region=region, project=project,
-                tax_rate_percent=float(record["pricing"].get("tax_rate_percent") or 0.0), now=now)
-            disk_segments.extend(segments)
-            if _finite(open_from) and open_from < now:
-                rate = _single_disk_all_in(disk, family=record["family"], region=region, project=project,
-                                          tax_rate_percent=float(record["pricing"].get("tax_rate_percent") or 0.0))
-                disk_segments.append((float(open_from), now, rate))
+            _remember_deferred_trust(record, disk, start, now, now)
+            fallback = _deferred_pricing_context(record, project)
+            disk_segments.extend(deferred_segments(disk, start, now, fallback,
+                lambda detail, context: _deferred_disk_rate(detail, context,
+                    family=record["family"], region=region, project=project)))
             disk_start = min(disk_start, start)
     history_credits = [credit for disk in recovered_disks + list(initial_recoveries.values())
                        for credit in disk.get("billing_history_credits") or []]
@@ -1558,9 +1659,15 @@ def _live_instance_record(
     })
     if obs.get("storage_billing_ambiguous"):
         record["storage_billing_ambiguous"] = True
+        if obs.get("storage_billing_ambiguous_roles"):
+            record["storage_billing_ambiguous_roles"] = sorted(obs["storage_billing_ambiguous_roles"])
     else:
         record.pop("storage_billing_ambiguous", None)
+        record.pop("storage_billing_ambiguous_roles", None)
     _retain_unpriced_history(record, obs, previous, now)
+    for source, recovered in initial_recoveries.items():
+        current = next((d for d in obs.get("disks_detail") or [] if str(d.get("source")) == source), recovered)
+        _remember_deferred_trust(record, recovered, min(now, float(current.get("created_epoch") or now)), now, now)
     if previous is not None:
         old_pricing = previous.get("pricing") or {}
         if old_pricing != record.get("pricing") or previous.get("pricing_complete") is False:
@@ -1574,6 +1681,7 @@ def _live_instance_record(
                                (previous.get("deleted_epoch") if not previous.get("disk_liability_pending") else None) or now))
             _remember_incomplete_pricing(record, previous, old_pricing, old_compute_start, old_run_end,
                 float(previous.get("disk_segment_start") or previous.get("disk_start_epoch") or now), old_disk_end)
+    _snapshot_deferred_pricing(record, now, project)
     _mark_pricing_completeness(record)
     if role == "cicd_runner":
         count = int(obs.get("runners_count") or 0)
@@ -1770,7 +1878,7 @@ def _remember_incomplete_pricing(record: dict[str, Any], pricing_record: dict[st
         disk_unknown = bool(independent_rates or pricing_record.get("unpriced_disk_performance")
                             or pricing_record.get("regional_disks") or pricing_record.get("local_ssd_gb")
                             or pricing_record.get("storage_billing_ambiguous")
-                            or pricing_record.get("tax_rate_known") is False
+                            or old_pricing.get("regional_disk_rate_unknown")
                             or (unverified_paid and pricing_record.get("disk_types_known") is False))
     intervals = normalize_unpriced_intervals(record.get("unpriced_history_intervals"))
     for reason, start, end, uncertain in (("fallback_compute", compute_start, compute_end, compute_unknown),
@@ -1778,6 +1886,10 @@ def _remember_incomplete_pricing(record: dict[str, Any], pricing_record: dict[st
         if not uncertain or end <= start:
             continue
         add_unpriced_interval(intervals, reason, start, end)
+    if _tax_unknown(pricing_record):
+        start, end = min(compute_start, disk_start), max(compute_end, disk_end)
+        if end > start:
+            add_unpriced_interval(intervals, "fallback_tax", start, end)
     _save_unpriced_intervals(record, intervals, max(compute_end, disk_end))
 
 
@@ -1887,10 +1999,16 @@ def _portable_initial_disk_history(record: dict[str, Any], now: float, project: 
     out = copy.deepcopy(record)
     pricing = out.get("pricing") or {}
     tax = float(pricing.get("tax_rate_percent") or 0.0)
-    rates = {str(d.get("source")): _single_disk_all_in(d, family=str(record.get("family") or ""),
-             region=str(record.get("region") or ""), project=project, tax_rate_percent=tax)
-             for d in details if d.get("billing_owner") is not False
-             and not _finite(d.get("billing_deferred_since"))}
+    def rate_at(disk: dict[str, Any], at: float) -> float:
+        context = _deferred_context_at(disk, at)
+        if context is not None:
+            return _deferred_disk_rate(disk, context, family=str(record.get("family") or ""),
+                                       region=str(record.get("region") or ""), project=project)
+        return _single_disk_all_in(disk, family=str(record.get("family") or ""),
+            region=str(record.get("region") or ""), project=project, tax_rate_percent=tax)
+    billed = [d for d in details if d.get("billing_owner") is not False
+              and not _finite(d.get("billing_deferred_since"))]
+    rates = {str(d.get("source")): rate_at(d, now) for d in billed}
     total = sum(rates.values())
     # Close the legacy fallback interval before removing its open rate. Its recorded charges stay on the old
     # carrier; recovery adds the authoritative full history less these credits, including in window queries.
@@ -1903,11 +2021,20 @@ def _portable_initial_disk_history(record: dict[str, Any], now: float, project: 
         source = str(disk.get("source"))
         if source not in pending_sources or disk.get("billing_owner") is False:
             continue
+        credits = []
+        for start, finish, rate in segments:
+            start = max(start, float(deferred_at))
+            if finish <= start:
+                continue
+            bounds = sorted({start, finish} | {float(at) for detail in billed
+                for at, _context in detail.get("billing_deferred_pricing") or [] if start < float(at) < finish})
+            for begin, end in zip(bounds, bounds[1:]):
+                total_at = sum(rate_at(detail, begin) for detail in billed)
+                if total_at > 0:
+                    credits.append([begin, end, rate * rate_at(disk, begin) / total_at])
         disk.update(billing_deferred_since=float(deferred_at), billing_initial_history=True,
                     billing_deferred_sizes=[[float(deferred_at), int(disk.get("gb") or 0)]],
-                    billing_history_credits=[[max(start, float(deferred_at)), finish,
-                        rate * rates.get(source, 0.0) / total]
-                        for start, finish, rate in segments if finish > float(deferred_at) and total > 0])
+                    billing_history_credits=credits)
     share = sum(rates[s] for s in pending_sources) / total if total > 0 else 0.0
     out["pricing"] = _with_extra_disks(pricing, -float(pricing.get("disk_hourly_usd") or 0.0) * share)
     out["deferred_disk_sources"] = sorted(set(out.get("deferred_disk_sources") or []) | pending_sources)
@@ -1957,10 +2084,10 @@ def reconcile_instance_records(
         roles = {str(r.get("instance_id")): r.get("role") for r in existing if isinstance(r, dict)}
         tracked_roles = {}
         for record in existing:
-            if (is_live_instance_record(record) and record.get("kind") == "disk"
-                    and record.get("status") != "DELETED"):
+            if (is_live_instance_record(record)
+                    and (record.get("status") != "DELETED" or _has_unresolved_storage(record))):
                 for disk in record.get("disks_detail") or []:
-                    if isinstance(disk, dict) and disk.get("id"):
+                    if isinstance(disk, dict) and disk.get("id") and disk.get("billing_owner") is not False:
                         tracked_roles["id:" + str(disk["id"])] = record["role"]
         attached = frozenset(str(d.get("source")) for obs in observed if isinstance(obs, dict)
                              for d in obs.get("disks_detail") or [] if isinstance(d, dict))
@@ -2016,7 +2143,7 @@ def reconcile_instance_records(
                 disk = dict(disk, billing_deferred_since=float(earliest["billing_deferred_since"]),
                             billing_deferred_sizes=copy.deepcopy(earliest.get("billing_deferred_sizes")
                                 or [[float(earliest["billing_deferred_since"]), int(earliest.get("gb") or 0)]]))
-                for key in ("billing_initial_history", "billing_history_credits"):
+                for key in ("billing_initial_history", "billing_history_credits", "billing_deferred_pricing"):
                     if key in earliest:
                         disk = dict(disk, **{key: copy.deepcopy(earliest[key])})
             details.append(disk)
@@ -2082,7 +2209,9 @@ def reconcile_instance_records(
                           for d in obs.get("disks_detail") or [] if isinstance(d, dict)
                           for key in (_disk_key(d), str(d.get("source") or "")) if key}
     # Disks some stored record already bills (or billed): a new record that takes one over starts it at the handoff.
-    known_disks = frozenset(key for r in existing if is_live_instance_record(r) for key in _billed_record_disk_keys(r))
+    known_disks = frozenset(key for r in existing if is_live_instance_record(r)
+                            and (r.get("status") != "DELETED" or _has_unresolved_storage(r))
+                            for key in _billed_record_disk_keys(r))
     for record in existing:
         if not is_live_instance_record(record):
             continue
@@ -2168,7 +2297,7 @@ def reconcile_instance_records(
             record["disks_detail"] = [
                 {k: v for k, v in dict(d, billing_owner=False).items()
                  if k not in ("billing_deferred_since", "billing_deferred_sizes", "billing_initial_history",
-                              "billing_history_credits")}
+                              "billing_history_credits", "billing_deferred_pricing")}
                 if _finite(d.get("billing_deferred_since")) and any(_same_disk(d, owner) for owner in owners)
                 else d for d in record.get("disks_detail") or []]
             record["deferred_disk_sources"] = [str(d.get("source")) for d in record.get("disks_detail") or []
@@ -4355,7 +4484,7 @@ class DashboardStore:
             return units
         return 1
 
-    def _running_role_hourly_rates(self, role: str, *, budget_role: str | None = None) -> list[float]:
+    def _running_role_hourly_rates(self, role: str, *, budget_role: str | None = None, usable_only: bool = False) -> list[float]:
         """Return per-instance hourly USD rates for all currently RUNNING instances of the given role, under the
         disk and tax flags of ``budget_role``'s budget (default: the role's own)."""
         prof = self.state.get("profiles", {}).get(budget_role or role, {})
@@ -4371,6 +4500,7 @@ class DashboardStore:
             if isinstance(inst, dict)
             and inst.get("status") == "RUNNING"
             and inst.get("role") == role
+            and not (usable_only and role == "rust_builder" and inst.get("runner_limits_known") is False)
         ]
         return [
             self._instance_hourly_for_budget(
@@ -4399,22 +4529,21 @@ class DashboardStore:
                                                                             evaluated.get("include_disk_costs", True)))
 
         def tax_unknown(inst: dict[str, Any]) -> bool:
-            # A region outside the catalog has no tax rate: unknown, not free, when either the evaluated budget or
-            # the host's own budget (each prices it somewhere) includes taxes, unless the host's profile overrides
-            # the regional rate (its repricing then applies a known rate).
+            # Regional tax uncertainty matters only to the evaluated budget. Component rates may independently
+            # be trusted, and the owning profile can supply an explicit tax rate.
             own = budget_of(inst.get("role"))
-            includes = bool(evaluated.get("include_taxes", False)) or bool(own.get("include_taxes", False))
-            return inst.get("tax_rate_known") is False and includes and not own.get("override_regional_tax")
+            includes = bool(evaluated.get("include_taxes", False))
+            return _tax_unknown(inst) and includes and not own.get("override_regional_tax")
 
         return [
             str(inst.get("name")) for inst in self.state.get("instances", [])
             if is_live_instance_record(inst) and (inst.get("role") in roles or
-                 (includes_storage and inst.get("kind") == "disk" and inst.get("storage_billing_ambiguous")))
+                 (includes_storage and inst.get("storage_billing_ambiguous")))
             and (inst.get("status") != "DELETED" or _has_unresolved_storage(inst)
                  or _unpriced_history_in_window(inst, now - DELETED_INSTANCE_RETENTION_SECONDS, now))
             and (not _selected_pricing_complete(inst, include_storage=includes_storage) or tax_unknown(inst)
                  or _unpriced_history_in_window(inst, now - DELETED_INSTANCE_RETENTION_SECONDS, now,
-                     include_storage=includes_storage))
+                     include_storage=includes_storage, include_tax=bool(evaluated.get("include_taxes", False))))
         ]
 
     def _transitional_hosts(self, role: str) -> list[str]:
@@ -4504,6 +4633,10 @@ class DashboardStore:
         the other role's running fleet and stopped disks. None when there is none and the budget is not shared."""
         other_role = "rust_builder" if role == "cicd_runner" else "cicd_runner"
         own = self._stopped_disk_burn(role)
+        if role == "rust_builder" and self.fleet_source is not None:
+            # Incompatible hosts add no usable fixed-shape slots, but their compute and storage still bill.
+            own += max(0.0, sum(self._running_role_hourly_rates(role))
+                       - sum(self._running_role_hourly_rates(role, usable_only=True)))
         if not shared:
             return own if own > 0.0 else None
         # Everything charged against this role's shared budget is priced with this budget's disk and tax flags.
@@ -4542,7 +4675,7 @@ class DashboardStore:
             float(inst.get("cpu_utilization_percent", 0.0)) for inst in running_builders
             if inst.get("utilization_known", True)
         ]
-        telem["builder_instance_hourly_rates"] = self._running_role_hourly_rates("rust_builder")
+        telem["builder_instance_hourly_rates"] = self._running_role_hourly_rates("rust_builder", usable_only=True)
         raw_journal_ooms = telem.get("journal_oom_events", [])
         if isinstance(raw_journal_ooms, list):
             telem["builder_journal_oom_events"] = [
@@ -4813,9 +4946,10 @@ class DashboardStore:
         by the inventory reconcile, which persists the change: a rate change first closes the open intervals at
         the old rates, so it must be durable. Returns True when an inventory record's rates changed.
         """
+        source_records = self.state.get("instances", []) if records is None else records
         running_insts = [
             inst
-            for inst in (self.state.get("instances", []) if records is None else records)
+            for inst in source_records
             if isinstance(inst, dict)
             and (is_live_instance_record(inst)
                  and (inst.get("status") != "DELETED" or bool(inst.get("disk_liability_pending"))) if live
@@ -4824,6 +4958,11 @@ class DashboardStore:
             # Disk-only records (DETACHED) have no machine type but still reprice their storage.
             and (inst.get("machine_type") or (live and inst.get("kind") == "disk"))
         ]
+        debt_only = [inst for inst in source_records if live and is_live_instance_record(inst)
+                     and inst.get("unpaid_disk_details") and inst.get("region")
+                     and not any(inst is active for active in running_insts)]
+        debt_only_ids = {id(inst) for inst in debt_only}
+        running_insts += debt_only
         repriced = False
         if not running_insts:
             return repriced
@@ -4835,6 +4974,12 @@ class DashboardStore:
             machine_types=active_mtypes,
         )
         for inst in running_insts:
+            if live and _finite(inst.get("disk_history_deferred_at")) and inst.get("disk_types_known") is False:
+                portable = _portable_initial_disk_history(inst, self._clock(), self.project)
+                if portable != inst:
+                    inst.clear()
+                    inst.update(portable)
+                    repriced = True
             cur_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else {}
             inst_role = str(inst.get("role", "cicd_runner"))
             prof_budget = (
@@ -4860,6 +5005,16 @@ class DashboardStore:
             old_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else None
             old_completeness = (inst.get("pricing_complete"), inst.get("pricing_incomplete_reason"))
             old_record = copy.deepcopy(inst) if is_live_instance_record(inst) else None
+            if is_live_instance_record(inst):
+                if isinstance(prof_budget, dict) and prof_budget.get("override_regional_tax"):
+                    inst["tax_rate_overridden"] = True
+                else:
+                    inst.pop("tax_rate_overridden", None)
+                context_record = dict(inst, pricing=dict(cur_pricing, tax_rate_percent=tax_rate_pct))
+                repriced = _snapshot_deferred_pricing(context_record, self._clock(), self.project,
+                                                      shared_live_pricing) or repriced
+            if id(inst) in debt_only_ids:
+                continue  # Closed VM rates remain historical; only its unresolved disk context advances.
             if inst.get("retained_only_pricing"):
                 # A deleted builder still billing its cache disk: reprice that disk alone (compute is closed).
                 new_pricing = _retained_pricing(inst, tax_rate_percent=tax_rate_pct, project=self.project,
@@ -4923,7 +5078,7 @@ class DashboardStore:
         with self._lock:
             self._refresh_instances_pricing()
             running_runner_rates = self._running_role_hourly_rates("cicd_runner")
-            running_builder_rates = self._running_role_hourly_rates("rust_builder")
+            running_builder_rates = self._running_role_hourly_rates("rust_builder", usable_only=self.fleet_source is not None)
             if self.state["scaling_telemetry"].get("current_instances") == len(running_runner_rates):
                 self.state["scaling_telemetry"]["running_instance_hourly_rates"] = running_runner_rates
             if self.state["scaling_telemetry"].get("current_builder_instances") == len(running_builder_rates):
@@ -5162,13 +5317,13 @@ class DashboardStore:
                     "active_monthly_usd": monthly_rate,
                     "compute_pricing_complete": not _pricing_component_reasons(inst)[0],
                     "storage_pricing_complete": not _pricing_component_reasons(inst)[1],
-                    "window_cost_complete": bool(_selected_pricing_complete(inst, include_storage=include_disk_and_tax)
+                    "window_cost_complete": bool(_selected_pricing_complete(inst, include_storage=include_disk_and_tax, include_tax=include_disk_and_tax)
                         and not _unpriced_history_in_window(inst, window_start_ts, now_ts,
                                                            include_storage=include_disk_and_tax)),
                     "hours_in_window": hours_in_window,
                     "total_cost_in_window_usd": total_cost_in_window,
                     "lifetime_cost_selected_mode_usd": lifetime_cost,
-                    "lifetime_selected_cost_complete": bool(_selected_pricing_complete(inst, include_storage=include_disk_and_tax)
+                    "lifetime_selected_cost_complete": bool(_selected_pricing_complete(inst, include_storage=include_disk_and_tax, include_tax=include_disk_and_tax)
                         and not _lifetime_history_components(inst)[0]
                         and not (include_disk_and_tax and _lifetime_history_components(inst)[1])),
                 }
@@ -5698,6 +5853,11 @@ class DashboardStore:
                         self.state["profiles"]["rust_builder"]["runner_ram_gib"] = builder_ram_ceil
                         self._sync_template_density()
                 telem_payload = payload.get("telemetry") if isinstance(payload.get("telemetry"), dict) else {}
+                if self.fleet_source is not None:
+                    owned = {"current_runners", "current_instances", "current_builder_instances", "current_builders",
+                             "running_instance_hourly_rates", "builder_instance_hourly_rates",
+                             "instance_cpu_percentages", "builder_cpu_percentages", "unknown_runner_count_hosts"}
+                    telem_payload = {key: value for key, value in telem_payload.items() if key not in owned}
                 if telem_payload:
                     if "current_runners" in telem_payload and "current_instances" not in telem_payload:
                         self.state["scaling_telemetry"].pop("current_instances", None)
@@ -5731,6 +5891,8 @@ class DashboardStore:
                                     or str(evt.get("instance_name", "")).startswith("builder-")
                                 )
                             ]
+                if self.fleet_source is not None:
+                    self._sync_fleet_telemetry()
                 if payload.get("acknowledge_all_ooms"):
                     self._consume_active_oom_events(role=role if "role" in payload else None)
                 if payload.get("acknowledge_oom_id"):
@@ -5787,7 +5949,7 @@ class DashboardStore:
                     self.state["scaling_telemetry"]["github_oom_runs"].insert(0, item)
 
                 running_runner_rates = self._running_role_hourly_rates("cicd_runner")
-                running_builder_rates = self._running_role_hourly_rates("rust_builder")
+                running_builder_rates = self._running_role_hourly_rates("rust_builder", usable_only=self.fleet_source is not None)
                 if (
                     "running_instance_hourly_rates" not in telem_payload
                     and self.state["scaling_telemetry"].get("current_instances") == len(running_runner_rates)
@@ -6434,6 +6596,13 @@ class DashboardStore:
                     f"VM(s) {', '.join(pending_hosts[:5])} are starting, stopping, or repairing; plan the "
                     "scale change once their capacity has settled"
                 )
+            if role == "cicd_runner":
+                unknown_counts = [str(i.get("name")) for i in instances
+                                  if i.get("role") == role and i.get("status") == "RUNNING"
+                                  and i.get("runners_count_known") is False]
+                if unknown_counts:
+                    raise ValueError(f"Runner count is not recorded on running host(s) {', '.join(unknown_counts[:5])}; "
+                                     "the runner total is unknown, so a regional scale plan cannot be checked")
             if role == "rust_builder" and any(
                     inst.get("role") == role and inst.get("status") == "RUNNING"
                     and inst.get("runner_limits_known") is False for inst in instances):
