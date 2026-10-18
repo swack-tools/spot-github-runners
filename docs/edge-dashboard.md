@@ -386,8 +386,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `tax_rate_known: false`, rather than with another region's default tax, and its pricing is marked
   incomplete, since the catalog has no trusted compute or disk rates for that region either. When the budget being
   checked or the VM's own budget includes taxes, without a tax override on the VM's profile, that
-  unknown tax holds scale-ups like other unpriced costs. Each inventory refresh,
-  and each budget or profile change, reprices the listed VMs, stopped ones included, but a page read
+  unknown tax holds scale-ups like other unpriced costs. A VM first listed while
+  its profile overrides the regional tax is priced with the override from the start. Each inventory
+  refresh, and each budget or profile change, reprices the listed VMs, stopped ones included, but a page read
   doesn't, so a tax override also applies to
   their disks, and the rate change is saved with the state.
 - A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, for a
@@ -405,7 +406,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   scale-up plans are refused, because its capacity hasn't settled.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error. Until the next
-  complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false: the rows
+  complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false and
+  `fleet_inventory.stale_reason` says why: the rows
   stay visible, but scaling recommendations hold and scale-up plans are refused. A listing that can't be
   saved, for example on a full disk, also leaves the inventory stale, and so does a refresh that hasn't
   completed for three refresh intervals (6 minutes), for example a hung API connection.

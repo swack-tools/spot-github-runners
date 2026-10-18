@@ -5391,6 +5391,42 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertFalse(self._record("oxidex-runners-trust-1")["pricing_complete"])
         self.assertEqual(self._record("oxidex-runners-trust-1")["disk_segments"], [])  # Rates unchanged: no segment.
 
+    def test_reported_freshness_ages_out(self):
+        self.fleet = [fleet_observation("8600", "oxidex-runners-age-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.fleet_inventory_status()["fresh"])
+        clock = time.time() + 4 * self.store.fleet_inventory_interval
+        with unittest.mock.patch.object(self.store, "_clock", return_value=clock):
+            status = self.store.query_instances()["fleet_inventory"]
+        self.assertFalse(status["fresh"])
+        self.assertIn("no complete listing", status["stale_reason"])
+
+    def test_first_sight_uses_profile_tax_override(self):
+        with self.store._lock:
+            budget = self.store.state["profiles"]["rust_builder"]["budget"]
+            budget["override_regional_tax"] = True
+            budget["tax_rate_percent"] = 17.0
+        self.fleet = [fleet_observation("8700", "builder-oxidex-ovr-1", "us-south1-b", started_hours_ago=48.0,
+                                        now=self.now)]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-ovr-1")
+        self.assertEqual(rec["pricing"]["tax_rate_percent"], 17.0)
+        self.assertEqual(rec["prior_runs"], [])  # No repricing closed history at a provisional rate.
+        self.assertEqual(rec["disk_segments"], [])
+
+    def test_shared_stopped_burn_uses_evaluated_budget_flags(self):
+        self.fleet = [fleet_observation("8800", "builder-oxidex-sh-1", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling"]["rust_builder"]["include_disk_in_scale_budget"] = False
+            self.store.state["scaling"]["cicd_runner"]["include_disk_in_scale_budget"] = True
+        self.assertEqual(self.store._stopped_disk_burn("rust_builder"), 0.0)
+        shared = self.store._outside_burn("cicd_runner", shared=True, other_running_burn=0.0)
+        self.assertGreater(shared, 0.0)
+        self.assertAlmostEqual(shared, self.store._stopped_disk_burn("rust_builder", budget_role="cicd_runner"),
+                               delta=0.0001)
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

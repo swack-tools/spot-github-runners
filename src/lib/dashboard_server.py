@@ -776,8 +776,10 @@ def _live_instance_record(
     now: float,
     previous: dict[str, Any] | None = None,
     known_disk_sources: frozenset[str] = frozenset(),
+    tax_overrides: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """A dashboard instance record for one Compute Engine observation (see fleet_inventory.observe_fleet_items)."""
+    tax_overrides = tax_overrides or {}
     if obs.get("disk_types_known") is False:
         obs = dict(obs)
         if previous is not None and previous.get("disk_types_known") is not False:
@@ -837,7 +839,9 @@ def _live_instance_record(
         project=project,
         now_epoch=now,
         # Outside the catalog no regional tax default is known: never borrow another region's.
-        tax_rate_percent=None if region_known else 0.0,
+        # The profile's tax override when set (so first-seen history is not archived at another rate), else the
+        # region's default; outside the catalog no default is known, so never borrow another region's.
+        tax_rate_percent=(tax_overrides[role] if role in tax_overrides else None if region_known else 0.0),
         pricing=copy.deepcopy(reuse_pricing) if reuse_pricing is not None else None,
         provisioning=provisioning,
     )
@@ -1219,6 +1223,7 @@ def reconcile_instance_records(
     project: str,
     now: float,
     compacted: dict[str, list[float]] | None = None,
+    tax_overrides: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Merge a complete Compute Engine fleet listing into the stored instance records.
 
@@ -1244,7 +1249,8 @@ def reconcile_instance_records(
         obs = by_id.get(instance_id)
         if obs is not None:
             seen.add(instance_id)
-            records.append(_live_instance_record(obs, project=project, now=now, previous=record))
+            records.append(_live_instance_record(obs, project=project, now=now, previous=record,
+                                                 tax_overrides=tax_overrides))
         elif record.get("status") == "DELETED":
             deleted = record.get("deleted_epoch")
             if isinstance(deleted, (int, float)) and now - float(deleted) <= DELETED_INSTANCE_RETENTION_SECONDS:
@@ -1253,7 +1259,8 @@ def reconcile_instance_records(
             records.append(_mark_instance_deleted(record, now))
     for instance_id, obs in by_id.items():
         if instance_id not in seen:
-            records.append(_live_instance_record(obs, project=project, now=now, known_disk_sources=known_disks))
+            records.append(_live_instance_record(obs, project=project, now=now, known_disk_sources=known_disks,
+                                                 tax_overrides=tax_overrides))
     # Live VMs first (newest start first), then deleted history (newest deletion first), bounded in size.
     live = sorted((r for r in records if r.get("status") != "DELETED"),
                   key=lambda r: -float(r.get("started_epoch") or 0.0))
@@ -2246,10 +2253,24 @@ class DashboardStore:
             for evt in events
         )
 
+    def _tax_overrides(self) -> dict[str, float]:
+        """``{role: tax_rate_percent}`` for profiles whose budget overrides the regional tax rate."""
+        out = {}
+        for role, prof in (self.state.get("profiles") or {}).items():
+            budget = prof.get("budget") if isinstance(prof, dict) else None
+            if isinstance(budget, dict) and budget.get("override_regional_tax"):
+                out[role] = float(budget.get("tax_rate_percent", 0.0) or 0.0)
+        return out
+
     def fleet_inventory_status(self) -> dict[str, Any]:
-        """Where the instance list comes from and how fresh it is (in memory; not part of the snapshot)."""
+        """Where the instance list comes from and how fresh it is (in memory; not part of the snapshot). ``fresh``
+        is recomputed (a hung refresh ages out) and ``stale_reason`` says why scaling holds, if it does."""
         with self._lock:
-            return dict(self._fleet_status)
+            status = dict(self._fleet_status)
+            reason = self._inventory_stale_reason()
+        status["fresh"] = not reason
+        status["stale_reason"] = reason
+        return status
 
     def refresh_fleet_inventory(self) -> bool:
         """List the live fleet (read-only) and reconcile the stored instance records with it.
@@ -2288,7 +2309,7 @@ class DashboardStore:
             compacted = copy.deepcopy(self.state.get(COMPACTED_COSTS_STATE_KEY) or {})
             records, changed = reconcile_instance_records(
                 self.state.get("instances", []), observed, project=self.project, now=self._clock(),
-                compacted=compacted)
+                compacted=compacted, tax_overrides=self._tax_overrides())
             changed = changed or compacted != (self.state.get(COMPACTED_COSTS_STATE_KEY) or {})
             # Current prices and tax settings, applied here (and so persisted) rather than on reads.
             changed = self._refresh_instances_pricing(records, live=True) or changed
@@ -3477,11 +3498,12 @@ class DashboardStore:
                                           "priced, so the scale-up budget check cannot be trusted", role)
         return evaluation
 
-    def _stopped_disk_burn(self, role: str) -> float:
+    def _stopped_disk_burn(self, role: str, *, budget_role: str | None = None) -> float:
         """Hourly USD of the role's not-running inventory VMs (disks of stopped ones, full rate of transitional
-        ones), under the role's disk and tax budget flags."""
-        prof = self.state.get("profiles", {}).get(role, {})
-        pol = self.state.get("scaling", {}).get(role, {})
+        ones), under the disk and tax flags of ``budget_role``'s budget (default: the role's own)."""
+        flags_role = budget_role or role
+        prof = self.state.get("profiles", {}).get(flags_role, {})
+        pol = self.state.get("scaling", {}).get(flags_role, {})
         budget = prof.get("budget", {}) if isinstance(prof.get("budget"), dict) else {}
         include_disk = bool(pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True)))
         include_tax = bool(budget.get("include_taxes", False))
@@ -3499,7 +3521,8 @@ class DashboardStore:
         own = self._stopped_disk_burn(role)
         if not shared:
             return own if own > 0.0 else None
-        return round(own + other_running_burn + self._stopped_disk_burn(other_role), 4)
+        # Everything charged against this role's shared budget is priced with this budget's disk and tax flags.
+        return round(own + other_running_burn + self._stopped_disk_burn(other_role, budget_role=role), 4)
 
     def _sync_fleet_telemetry(self) -> None:
         """Synchronize scaling telemetry counters, CPU percentages, and active fleet hourly rates with running instances."""

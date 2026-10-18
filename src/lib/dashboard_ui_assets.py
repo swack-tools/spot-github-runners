@@ -2253,7 +2253,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const summary = document.getElementById("inst-window-summary");
       const fi = iv.fleet_inventory || APP_STATE.fleet_inventory || {};
       const inventoryNote = fi.source === "gce"
-        ? `Source: live Compute Engine inventory${fi.last_success_at ? ", last listed " + esc(formatLocalTime(fi.last_success_at)) : ", not listed yet"}${fi.last_error ? ' · <span style="color:#fda4af;">' + esc(fi.last_error) + "</span>" : ""}`
+        ? `Source: live Compute Engine inventory${fi.last_success_at ? ", last listed " + esc(formatLocalTime(fi.last_success_at)) : ", not listed yet"}${(fi.stale_reason || fi.last_error) ? ' · <span style="color:#fda4af;">' + esc(fi.stale_reason || fi.last_error) + "</span>" : ""}`
         : `Source: live Compute Engine inventory is not configured on this dashboard (set DASHBOARD_FLEET_INVENTORY=gce); no instances are shown`;
       summary.innerHTML = `${inventoryNote}<br>Showing <strong>${iv.instances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} stopped or deleted) · Total Window Spend: <strong class="mono" style="color:#34d399;">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
 
