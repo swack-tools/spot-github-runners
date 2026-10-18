@@ -197,8 +197,11 @@ def observe_fleet_items(
         deployment = runner_deployment_from_gce_item(item)
         metadata = gce_metadata_items(item)
         if role == "rust_builder":
-            runners_count, runner_vcpu, runner_ram_gib = 1, BUILDER_CONTAINER_VCPU, BUILDER_CONTAINER_RAM_GIB
-            runner_limits_known = True
+            runner_limits_known = bool(specs_known and machine_type == "n4-highcpu-16"
+                                       and vcpu == 16 and ram_gib == 32.0)
+            runners_count = 1 if runner_limits_known else 0
+            runner_vcpu = BUILDER_CONTAINER_VCPU if runner_limits_known else 0
+            runner_ram_gib = BUILDER_CONTAINER_RAM_GIB if runner_limits_known else 0.0
         else:
             # Instance metadata records the listener count only; per-job limits depend on the tier and admission
             # (listeners are not memory capacity), so they are unknown here rather than guessed.
@@ -211,7 +214,8 @@ def observe_fleet_items(
             patch["patch_sha256"] and not patch["patch_pending_sha256"]
             and patch["patch_boot"] and patch["patch_boot"] == gce_timestamp(item.get("lastStartTimestamp"))
         )
-        runners_count_known = role == "rust_builder" or ("runners_count" in deployment and bootstrap_confirmed)
+        runners_count_known = (runner_limits_known if role == "rust_builder"
+                               else "runners_count" in deployment and bootstrap_confirmed)
         observed.append({
             "instance_id": instance_id,
             "name": name,
