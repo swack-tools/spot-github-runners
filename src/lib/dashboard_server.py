@@ -2082,13 +2082,21 @@ def reconcile_instance_records(
     if disks_listed and disk_inventory:
         # Resolve only physical disks already tracked as unpaid, even when their names are outside fleet prefixes.
         roles = {str(r.get("instance_id")): r.get("role") for r in existing if isinstance(r, dict)}
+        carrier_ambiguities = {str(r.get("instance_id")):
+            r.get("storage_billing_ambiguous_roles") or ["cicd_runner", "rust_builder"]
+            for r in existing if isinstance(r, dict) and r.get("storage_billing_ambiguous")}
         tracked_roles = {}
+        tracked_ambiguities: dict[str, list[str]] = {}
         for record in existing:
             if (is_live_instance_record(record)
                     and (record.get("status") != "DELETED" or _has_unresolved_storage(record))):
                 for disk in record.get("disks_detail") or []:
                     if isinstance(disk, dict) and disk.get("id") and disk.get("billing_owner") is not False:
-                        tracked_roles["id:" + str(disk["id"])] = record["role"]
+                        key = "id:" + str(disk["id"])
+                        tracked_roles[key] = record["role"]
+                        if record.get("storage_billing_ambiguous"):
+                            evidence = record.get("storage_billing_ambiguous_roles") or ["cicd_runner", "rust_builder"]
+                            tracked_ambiguities[key] = sorted(set(tracked_ambiguities.get(key, [])) | set(evidence))
         attached = frozenset(str(d.get("source")) for obs in observed if isinstance(obs, dict)
                              for d in obs.get("disks_detail") or [] if isinstance(d, dict))
         for source, detail in disk_inventory.items():
@@ -2098,8 +2106,13 @@ def reconcile_instance_records(
                     "created_epoch": gce_epoch(detail.get("creationTimestamp"))}
             carrier = next((carrier for carrier, unpaid in deferred_entries if _same_disk(disk, unpaid)), None)
             if carrier is not None and roles.get(carrier):
-                tracked_roles["id:" + str(detail.get("id", ""))] = roles[carrier]
-        recovered = observe_detached_disks(disk_inventory, attached, tracked_roles=tracked_roles)
+                key = "id:" + str(detail.get("id", ""))
+                tracked_roles[key] = roles[carrier]
+                if carrier in carrier_ambiguities:
+                    tracked_ambiguities[key] = sorted(set(tracked_ambiguities.get(key, []))
+                                                      | set(carrier_ambiguities[carrier]))
+        recovered = observe_detached_disks(disk_inventory, attached, tracked_roles=tracked_roles,
+                                           tracked_ambiguities=tracked_ambiguities)
         recovered_ids = {obs["instance_id"] for obs in recovered}
         # An external owner ends fleet billing, but complete metadata can still settle the unpaid fleet interval.
         for source, detail in disk_inventory.items():
@@ -2107,7 +2120,8 @@ def reconcile_instance_records(
                     or "id:" + str(detail.get("id", "")) not in tracked_roles
                     or "disk-" + str(detail.get("id", "")) in recovered_ids or source in attached):
                 continue
-            historical = observe_detached_disks({source: dict(detail, users=[])}, tracked_roles=tracked_roles)
+            historical = observe_detached_disks({source: dict(detail, users=[])}, tracked_roles=tracked_roles,
+                                                tracked_ambiguities=tracked_ambiguities)
             recovered.extend(dict(obs, disk_history_only=True) for obs in historical)
         known_ids = {str(obs.get("instance_id")) for obs in observed if isinstance(obs, dict)}
         observed = list(observed) + [obs for obs in recovered if obs["instance_id"] not in known_ids

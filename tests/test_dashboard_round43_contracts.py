@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lib.dashboard_server import DashboardStore, _live_instance_record, instance_usage, reconcile_instance_records, _single_disk_all_in
+from lib.dashboard_server import DashboardStore, instance_usage, reconcile_instance_records, _single_disk_all_in
 from lib.fleet_inventory import observe_fleet_items
 from lib.dashboard_scaling import evaluate_builder_scaling_decision
 

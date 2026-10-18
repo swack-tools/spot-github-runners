@@ -321,7 +321,8 @@ class FleetListing(list):
 def observe_detached_disks(disk_details: Mapping[str, Any],
                            attached_sources: frozenset[str] = frozenset(),
                            snapshot_names: frozenset[str] | None = None, *,
-                           tracked_roles: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+                           tracked_roles: Mapping[str, str] | None = None,
+                           tracked_ambiguities: Mapping[str, list[str]] | None = None) -> list[dict[str, Any]]:
     """Observations for fleet-named persistent disks that no VM uses (status ``DETACHED``, storage only).
 
     An attached disk is billed through its VM's record; once no VM uses it (a builder cache disk outlives its
@@ -338,7 +339,12 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
                       else fleet_role(disk_name))
         # A later disk listing can show users in both roles before either attachment reaches the VM snapshot.
         # Keep one numerical carrier, but flag both role budgets via this disk record when attribution is unknown.
-        storage_billing_ambiguous = len(user_roles) > 1 and named_role not in user_roles
+        ambiguous_roles = user_roles if len(user_roles) > 1 and named_role not in user_roles else []
+        if not user_roles and named_role is None:
+            # Detaching is not evidence of a workload role. Keep the previous physical disk's unresolved roles
+            # until its current users or an explicit disk name resolve them; never match a reused name by URL.
+            ambiguous_roles = sorted(set((tracked_ambiguities or {}).get("id:" + str(detail.get("id", "")), [])))
+        storage_billing_ambiguous = len(ambiguous_roles) > 1
         role = (named_role if named_role in user_roles else user_roles[0]) if user_roles else (
             named_role or (tracked_roles or {}).get("id:" + str(detail.get("id", ""))))
         if role is None or not detail.get("id"):
@@ -383,7 +389,7 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
             "data_disk_gb": size,
             "data_disks": {kind: size},
             "storage_billing_ambiguous": storage_billing_ambiguous,
-            "storage_billing_ambiguous_roles": user_roles if storage_billing_ambiguous else [],
+            "storage_billing_ambiguous_roles": ambiguous_roles if storage_billing_ambiguous else [],
             "local_ssd_gb": 0,
             "unpriced_disk_performance": _unpriced_performance(detail),
             "regional_disks": bool(detail.get("regional")),
