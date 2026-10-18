@@ -5813,6 +5813,65 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(sum(r["data_disk_gb"] for r in live), 1500)
         self.assertEqual(len([r for r in live if r["pricing"]["disk_hourly_usd"] > 0]), 1)
 
+    def test_delayed_replacement_oom_keeps_original_capacity_baseline(self):
+        old = {"instance_id": "old", "role": "cicd_runner", "status": "TERMINATED", "runners_count": 4,
+               "runners_count_known": True, "capacity_pending": False, "started_epoch": self.now - 7200}
+        new = dict(old, instance_id="new", status="RUNNING", capacity_pending=True, started_epoch=self.now - 120)
+        event = {"id": "late-replacement", "role": "cicd_runner", "baseline_runners": 4,
+                 "observed_at": datetime.fromtimestamp(self.now - 300, timezone.utc).isoformat()}
+        self.store.state["scaling_telemetry"]["journal_oom_events"] = [event]
+        self.store._consume_ooms_for_fleet_growth([old, new], [dict(old), dict(new)])
+        self.assertEqual(event["baseline_runners"], 4)
+        self.assertFalse(event.get("handled", False))
+
+    def test_resolved_disk_liability_stays_in_recent_cost_window(self):
+        from lib.dashboard_server import reconcile_instance_records, instance_usage
+
+        vm = fleet_observation("liability-window", "builder-window", "us-south1-b", now=self.now,
+                               started_hours_ago=120)
+        initial, _ = reconcile_instance_records([], [vm], project="p", now=self.now - 3 * 86400)
+        pending, _ = reconcile_instance_records(initial, [], project="p", now=self.now - 2 * 86400,
+                                                 disks_listed=False)
+        resolved, _ = reconcile_instance_records(pending, [], project="p", now=self.now)
+        self.store.state["instances"] = resolved
+        expected = instance_usage(resolved[0], self.now, self.now - 86400)["window_all_in"]
+        self.assertGreater(expected, 0)
+        result = self.store.query_instances(window_hours=24)
+        self.assertEqual(len(result["instances"]), 1)
+        self.assertAlmostEqual(result["total_window_spend_usd"], expected, delta=0.01)
+
+    def test_pending_disk_liability_stops_when_attachment_transfers_during_outage(self):
+        from lib.dashboard_server import reconcile_instance_records, instance_usage
+
+        vm = fleet_observation("liability-owner", "builder-owner", "us-south1-b", now=self.now)
+        vm["disks_detail"] = [{"source": "z/cache-transfer", "id": "91", "type": "pd-balanced",
+                               "gb": 100, "created_epoch": self.now - 7200, "auto_delete": False}]
+        initial, _ = reconcile_instance_records([], [vm], project="p", now=self.now - 3600)
+        pending, _ = reconcile_instance_records(initial, [], project="p", now=self.now - 1800, disks_listed=False)
+        replacement = dict(vm, instance_id="liability-new", name="builder-new")
+        after, _ = reconcile_instance_records(pending, [replacement], project="p", now=self.now, disks_listed=False)
+        retired = next(r for r in after if r["instance_id"] == "liability-owner")
+        self.assertFalse(retired["disk_liability_pending"])
+        self.assertEqual(instance_usage(retired, self.now)["cost_all_in"],
+                         instance_usage(retired, self.now + 3600)["cost_all_in"])
+
+    def test_partial_disk_transfer_keeps_unmatched_liability_billing(self):
+        from lib.dashboard_server import reconcile_instance_records, instance_usage
+
+        vm = fleet_observation("multi-owner", "builder-multi-owner", "us-south1-b", now=self.now)
+        vm["disks_detail"] = [{"source": f"z/cache-{i}", "id": str(i), "type": "pd-balanced", "gb": 100,
+                               "created_epoch": self.now - 7200, "auto_delete": False} for i in (91, 92)]
+        initial, _ = reconcile_instance_records([], [vm], project="p", now=self.now - 3600)
+        pending, _ = reconcile_instance_records(initial, [], project="p", now=self.now - 1800, disks_listed=False)
+        replacement = dict(vm, instance_id="partial-new", name="builder-partial-new",
+                           disks_detail=vm["disks_detail"][:1])
+        after, _ = reconcile_instance_records(pending, [replacement], project="p", now=self.now, disks_listed=False)
+        retired = next(r for r in after if r["instance_id"] == "multi-owner")
+        self.assertTrue(retired["disk_liability_pending"])
+        delta = instance_usage(retired, self.now + 3600)["cost_all_in"] - instance_usage(retired, self.now)["cost_all_in"]
+        self.assertGreater(delta, 0)
+        self.assertLess(retired["pricing"]["disk_hourly_usd"], pending[0]["pricing"]["disk_hourly_usd"])
+
     def test_shared_nonowner_does_not_suppress_owner_history_backfill(self):
         from lib.dashboard_server import reconcile_instance_records
         from lib.fleet_inventory import observe_fleet_items

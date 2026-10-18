@@ -1495,7 +1495,26 @@ def reconcile_instance_records(
                 # The disk listing is unavailable: a detached disk is not seen, not gone. Keep it (still billing).
                 records.append(record)
         elif record.get("status") == "DELETED" and record.get("disk_liability_pending"):
-            if disks_listed:
+            attached = [d for observed_vm in observed if isinstance(observed_vm, dict)
+                        and observed_vm.get("kind") != "disk"
+                        for d in observed_vm.get("disks_detail") or [] if isinstance(d, dict)]
+            retained = _retained_disks(record)
+            moved = [d for d in retained or [] if any(
+                _disk_known(current_disk, _record_disk_keys(dict(record, disks_detail=[d],
+                    disk_sources=[_disk_key(d), str(d.get("source") or "")],
+                    disk_ids={str(d.get("source")): d["id"]} if d.get("id") else {})))
+                for current_disk in attached)]
+            transferred = bool(retained) and len(moved) == len(retained)
+            if not disks_listed and moved and not transferred:
+                out = copy.deepcopy(record)
+                pricing = out.get("pricing") or {}
+                _close_open_segments(out, pricing, now)
+                out["disks_detail"] = [dict(d, billing_owner=False) if d in moved else d
+                                       for d in out.get("disks_detail") or []]
+                out["pricing"] = _retained_pricing(out, project=project,
+                    tax_rate_percent=float(pricing.get("tax_rate_percent") or 0.0))
+                records.append(out)
+            elif disks_listed or transferred:
                 # The disk listing is back: the cache disk is either listed on its own now (its DETACHED record
                 # takes over from this moment) or gone. Either way this record stops billing it here.
                 records.append(dict(record, disk_liability_pending=False, disk_end_epoch=now))
@@ -1503,6 +1522,8 @@ def reconcile_instance_records(
                 records.append(record)
         elif record.get("status") == "DELETED":
             deleted = record.get("deleted_epoch")
+            if _finite(record.get("disk_end_epoch")):
+                deleted = max(float(deleted or 0), float(record["disk_end_epoch"]))
             if isinstance(deleted, (int, float)) and now - float(deleted) <= DELETED_INSTANCE_RETENTION_SECONDS:
                 records.append(record)
         else:
@@ -2453,7 +2474,14 @@ class DashboardStore:
                               and r.get("status") == "RUNNING" and r.get("role") == "cicd_runner"
                               and r.get("runners_count_known") is not False
                               and when is not None and float(r.get("started_epoch") or now) <= when)
-            computed = max(0, previous_slots - later + earlier_new)
+            # A replaced/stopped host can still have been part of the fleet when a late OOM occurred.
+            # Include that historical capacity instead of treating its replacement as net growth.
+            ended_after_event = sum(int(r.get("runners_count", 0) or 0) for r in previous
+                                    if isinstance(r, dict) and r.get("role") == "cicd_runner"
+                                    and r.get("status") != "RUNNING" and r.get("runners_count_known") is not False
+                                    and when is not None and float(r.get("started_epoch") or now) <= when
+                                    and (_instance_end_epoch(r) is None or _instance_end_epoch(r) >= when))
+            computed = max(0, previous_slots - later + earlier_new + ended_after_event)
             existing = evt.get("baseline_runners")
             evt["baseline_runners"] = min(int(existing), computed) if isinstance(existing, int) else computed
             evt["baseline_source"] = "inventory"
@@ -4374,6 +4402,8 @@ class DashboardStore:
                     deleted_epoch = inst.get("deleted_epoch")
                     end_ts = (float(deleted_epoch) if inst["status"] == "DELETED" and isinstance(deleted_epoch, (int, float))
                               and not inst.get("disk_liability_pending") else now_ts)
+                    if _finite(inst.get("disk_end_epoch")):
+                        end_ts = max(end_ts, float(inst["disk_end_epoch"]))
 
                 # Exclude deleted instances whose deletion occurred before the selected window
                 if is_deleted and end_ts < window_start_ts:
