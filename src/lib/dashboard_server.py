@@ -589,6 +589,57 @@ SEEDED_TEMPLATE_SOURCE_INSTANCES = frozenset({
     ("tpl-builder-c4d-16", "builder-oxidex-turin-01"),
 })
 
+# Dedicated builders run on n4-highcpu-16 (16 vCPU, 32 GiB RAM). Earlier versions shipped the builder preset as
+# tpl-builder-c4d-16 on c4d-highcpu-16; loading a state without this marker replaces an unedited copy of that old
+# preset with tpl-builder-n4-16 once and repoints profiles that used it. An edited copy is the owner's template
+# and stays as it is.
+BUILDER_PRESET_MIGRATION_KEY = "builder_preset_migration"
+BUILDER_PRESET_MIGRATION_VERSION = 1
+BUILDER_PRESET_ID = "tpl-builder-n4-16"
+LEGACY_BUILDER_PRESET_ID = "tpl-builder-c4d-16"
+# The old preset exactly as earlier versions wrote it, without its generated created_at (and without the source
+# instance that drop_seeded_template_sources removes).
+LEGACY_BUILDER_PRESET: dict[str, Any] = {
+    "id": LEGACY_BUILDER_PRESET_ID,
+    "name": "Dedicated Rust Builder C4D-HighCPU-16 (AMD Turin)",
+    "role": "rust_builder",
+    "machine_type": "c4d-highcpu-16",
+    "vcpu": 16,
+    "ram_gib": 32,
+    "cpu_platform": "AMD Turin",
+    "benchmark_score": compute_cpu_benchmark_score("AMD Turin", 16, "c4d-highcpu-16"),
+    "disk_category": "hyperdrive",
+    "boot_disk_type": "hyperdisk-balanced",
+    "boot_disk_gb": 40,
+    "data_disk_type": "hyperdisk-balanced",
+    "data_disk_gb": 100,
+    "runners_count": 1,
+    "runner_vcpu": 16,
+    "runner_ram_gib": 28,
+    "cloud_init_template_id": "ci-rust-builder-199",
+}
+
+
+def migrate_builder_preset(state: dict[str, Any]) -> bool:
+    """Replace an unedited legacy c4d builder preset with the n4 preset in place; True when it changed ``state``."""
+    templates = state.get("vm_templates")
+    if not isinstance(templates, list) or any(
+            isinstance(t, dict) and t.get("id") == BUILDER_PRESET_ID for t in templates):
+        return False
+    preset = next(t for t in default_dashboard_state()["vm_templates"] if t["id"] == BUILDER_PRESET_ID)
+    for index, tpl in enumerate(templates):
+        if (isinstance(tpl, dict) and tpl.get("id") == LEGACY_BUILDER_PRESET_ID
+                and {k: v for k, v in tpl.items() if k != "created_at"} == LEGACY_BUILDER_PRESET):
+            templates[index] = dict(preset, created_at=tpl.get("created_at", preset["created_at"]))
+            break
+    else:
+        return False
+    profiles = state.get("profiles")
+    for profile in profiles.values() if isinstance(profiles, dict) else []:
+        if isinstance(profile, dict) and profile.get("vm_template_id") == LEGACY_BUILDER_PRESET_ID:
+            profile["vm_template_id"] = BUILDER_PRESET_ID
+    return True
+
 
 def drop_seeded_template_sources(state: dict[str, Any]) -> int:
     """Remove the fabricated ``source_instance`` of the preset VM templates in place; returns how many it removed."""
@@ -682,6 +733,9 @@ def _original_seed_reference(state: dict[str, Any]) -> float | None:
     ):
         expected = {row["id"]: {k: v for k, v in row.items() if k != timestamp}
                     for row in defaults[field]}
+        if field == "vm_templates":
+            # Seeded states hold the builder preset as it was then (see migrate_builder_preset).
+            expected[LEGACY_BUILDER_PRESET_ID] = dict(LEGACY_BUILDER_PRESET)
         records = state.get(field)
         for row in records if isinstance(records, list) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row["id"] not in offsets:
@@ -2366,14 +2420,14 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
             "created_at": _iso_hours_ago(18.0, ref_now),
         },
         {
-            "id": "tpl-builder-c4d-16",
-            "name": "Dedicated Rust Builder C4D-HighCPU-16 (AMD Turin)",
+            "id": BUILDER_PRESET_ID,
+            "name": "Dedicated Rust Builder N4-HighCPU-16 (Intel Emerald Rapids)",
             "role": "rust_builder",
-            "machine_type": "c4d-highcpu-16",
+            "machine_type": "n4-highcpu-16",
             "vcpu": 16,
             "ram_gib": 32,
-            "cpu_platform": "AMD Turin",
-            "benchmark_score": compute_cpu_benchmark_score("AMD Turin", 16, "c4d-highcpu-16"),
+            "cpu_platform": "Intel Emerald Rapids",
+            "benchmark_score": compute_cpu_benchmark_score("Intel Emerald Rapids", 16, "n4-highcpu-16"),
             "disk_category": "hyperdrive",
             "boot_disk_type": "hyperdisk-balanced",
             "boot_disk_gb": 40,
@@ -2432,7 +2486,7 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
             "boot_disk_gb": 40,
             "data_disk_gb": 100,
             "use_vm_template": True,
-            "vm_template_id": "tpl-builder-c4d-16",
+            "vm_template_id": BUILDER_PRESET_ID,
             "cloud_init_template_id": "ci-rust-builder-199",
             "budget": {
                 "active_period": "day",
@@ -2500,6 +2554,7 @@ def default_dashboard_state(project: str = "homelab-424523", org: str = "swack-t
         # drop_seeded_template_sources.
         DEMO_TELEMETRY_MIGRATION_KEY: DEMO_TELEMETRY_MIGRATION_VERSION,
         DEMO_TEMPLATE_SOURCE_MIGRATION_KEY: DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION,
+        BUILDER_PRESET_MIGRATION_KEY: BUILDER_PRESET_MIGRATION_VERSION,
     }
 
 
@@ -2935,6 +2990,15 @@ class DashboardStore:
                 # Template-only cleanup must also replace equal-version KV snapshots via the active writer.
                 base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
                 LOG.warning("Removed the nonexistent source instance from %d preset VM template(s)", dropped_sources)
+        preset_marker = loaded.get(BUILDER_PRESET_MIGRATION_KEY)
+        if not (isinstance(preset_marker, int) and not isinstance(preset_marker, bool)
+                and preset_marker >= BUILDER_PRESET_MIGRATION_VERSION):
+            base[BUILDER_PRESET_MIGRATION_KEY] = BUILDER_PRESET_MIGRATION_VERSION
+            if migrate_builder_preset(base):
+                # Content changed without a version: the active writer commits it as the next version.
+                base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
+                LOG.warning("Replaced the c4d-highcpu-16 builder preset %s with %s (n4-highcpu-16)",
+                            LEGACY_BUILDER_PRESET_ID, BUILDER_PRESET_ID)
         previous = getattr(self, "state", None)
         self.state = base
         try:

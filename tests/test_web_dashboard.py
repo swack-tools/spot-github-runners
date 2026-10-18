@@ -317,6 +317,14 @@ def fleet_fixture_records(project: str = "homelab-424523", ref_now: float | None
     return records
 
 
+def legacy_preset_templates(templates: list) -> list:
+    """The VM templates as earlier versions saved them: the builder preset was still tpl-builder-c4d-16."""
+    from lib.dashboard_server import BUILDER_PRESET_ID, LEGACY_BUILDER_PRESET
+
+    return [dict(LEGACY_BUILDER_PRESET, created_at=t["created_at"]) if t.get("id") == BUILDER_PRESET_ID else t
+            for t in templates]
+
+
 def seeded_demo_telemetry(project: str = "homelab-424523", ref_now: float | None = None) -> dict:
     """The demo telemetry earlier dashboard versions seeded into the default state (now dropped on load)."""
     ref_now = time.time() if ref_now is None else ref_now
@@ -545,7 +553,7 @@ def seeded_demo_telemetry(project: str = "homelab-424523", ref_now: float | None
     return {
         "scaling_telemetry": scaling_telemetry,
         "rust_builds": [enrich_rust_build_record(row, project=project) for row in raw_rust_builds],
-        "vm_templates": presets["vm_templates"],
+        "vm_templates": legacy_preset_templates(presets["vm_templates"]),
         "cloud_init_templates": presets["cloud_init_templates"],
     }
 
@@ -1357,7 +1365,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._post(
                 "/api/profile/cicd_runner",
-                {"use_vm_template": True, "vm_template_id": "tpl-builder-c4d-16"},
+                {"use_vm_template": True, "vm_template_id": "tpl-builder-n4-16"},
             )
         self.assertEqual(ctx.exception.code, 400)
         ctx.exception.close()
@@ -1503,7 +1511,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                 "/api/profile/rust_builder",
                 {
                     "use_vm_template": True,
-                    "vm_template_id": "tpl-builder-c4d-16",
+                    "vm_template_id": "tpl-builder-n4-16",
                     "min_instance_ram_gib": 64,
                 },
             )
@@ -7601,6 +7609,92 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
             self.assertNotIn(fabricated, DASHBOARD_HTML)
 
 
+class BuilderPresetMigrationTests(unittest.TestCase):
+    """The builder preset matches the dedicated builder shape (n4-highcpu-16); saved c4d presets migrate once."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_file = Path(self.tmp.name) / "dashboard-state.json"
+        from lib.dashboard_server import DashboardStore
+
+        self.store = DashboardStore(state_path=self.state_file)
+        self.addCleanup(self.store.close)
+
+    def _legacy_raw(self, **edits) -> dict:
+        raw = json.loads(self.state_file.read_text(encoding="utf-8"))
+        raw.pop("builder_preset_migration")
+        raw["vm_templates"] = legacy_preset_templates(raw["vm_templates"])
+        for tpl in raw["vm_templates"]:
+            if tpl["id"] == "tpl-builder-c4d-16":
+                tpl.update(edits)
+        raw["profiles"]["rust_builder"]["vm_template_id"] = "tpl-builder-c4d-16"
+        return raw
+
+    def _reload(self, raw: dict):
+        from lib.dashboard_server import DashboardStore
+
+        self.state_file.write_text(json.dumps(raw), encoding="utf-8")
+        reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        return reloaded
+
+    def test_default_builder_preset_is_n4_highcpu_16(self):
+        from lib.dashboard_server import default_dashboard_state
+
+        for state in (default_dashboard_state(), self.store.state):
+            (preset,) = [t for t in state["vm_templates"] if t["role"] == "rust_builder"]
+            self.assertEqual((preset["id"], preset["machine_type"], preset["vcpu"], preset["ram_gib"],
+                              preset["cpu_platform"]),
+                             ("tpl-builder-n4-16", "n4-highcpu-16", 16, 32, "Intel Emerald Rapids"))
+            self.assertEqual(preset["benchmark_score"],
+                             compute_cpu_benchmark_score("Intel Emerald Rapids", 16, "n4-highcpu-16"))
+            profile = state["profiles"]["rust_builder"]
+            self.assertEqual(profile["vm_template_id"], "tpl-builder-n4-16")
+            self.assertGreaterEqual(preset["benchmark_score"], profile["min_benchmark_score"])
+            self.assertEqual(state["builder_preset_migration"], 1)
+        # The profile accepts the preset against its sizing rules.
+        self.store.update_profile("rust_builder", {"use_vm_template": True, "vm_template_id": "tpl-builder-n4-16"})
+
+    def test_unedited_legacy_preset_is_replaced_once(self):
+        raw = self._legacy_raw()
+        created = next(t["created_at"] for t in raw["vm_templates"] if t["id"] == "tpl-builder-c4d-16")
+        with self.assertLogs("spot_dashboard", "WARNING") as logs:
+            reloaded = self._reload(raw)
+        self.assertIn("tpl-builder-n4-16", "\n".join(logs.output))
+        for state in (reloaded.state, json.loads(self.state_file.read_text(encoding="utf-8"))):
+            ids = [t["id"] for t in state["vm_templates"]]
+            self.assertNotIn("tpl-builder-c4d-16", ids)
+            (preset,) = [t for t in state["vm_templates"] if t["id"] == "tpl-builder-n4-16"]
+            self.assertEqual((preset["machine_type"], preset["created_at"]), ("n4-highcpu-16", created))
+            self.assertEqual(state["profiles"]["rust_builder"]["vm_template_id"], "tpl-builder-n4-16")
+            self.assertEqual(state["builder_preset_migration"], 1)
+        self.assertIs(reloaded.state.get("demo_telemetry_migration_pending"), True)
+
+    def test_edited_legacy_preset_is_kept(self):
+        reloaded = self._reload(self._legacy_raw(boot_disk_gb=80))
+        ids = [t["id"] for t in reloaded.state["vm_templates"]]
+        self.assertIn("tpl-builder-c4d-16", ids)
+        self.assertNotIn("tpl-builder-n4-16", ids)
+        self.assertEqual(reloaded.state["profiles"]["rust_builder"]["vm_template_id"], "tpl-builder-c4d-16")
+        self.assertEqual(reloaded.state["builder_preset_migration"], 1)
+
+    def test_migrated_state_keeps_a_legacy_preset(self):
+        raw = self._legacy_raw()
+        raw["builder_preset_migration"] = 1
+        reloaded = self._reload(raw)
+        self.assertIn("tpl-builder-c4d-16", [t["id"] for t in reloaded.state["vm_templates"]])
+        self.assertEqual(reloaded.state["profiles"]["rust_builder"]["vm_template_id"], "tpl-builder-c4d-16")
+
+    def test_legacy_preset_with_seeded_source_migrates(self):
+        raw = self._legacy_raw(source_instance="builder-oxidex-turin-01")
+        raw.pop("demo_template_source_migration")
+        reloaded = self._reload(raw)
+        (preset,) = [t for t in reloaded.state["vm_templates"] if t["role"] == "rust_builder"]
+        self.assertEqual(preset["id"], "tpl-builder-n4-16")
+        self.assertNotIn("source_instance", preset)
+
+
 class AddGithubOomRunTests(unittest.TestCase):
     """A reported GitHub CI failure run holds only what the caller supplied."""
 
@@ -7655,6 +7749,8 @@ class SeededTemplateSourceMigrationTests(unittest.TestCase):
     SEEDED = {"tpl-runner-n4-std16": "oxidex-runners-dallas-01",
               "tpl-runner-za-n2-16": "oxidex-runners-za-jnb-01",
               "tpl-builder-c4d-16": "builder-oxidex-turin-01"}
+    # The presets today; a seeded state's tpl-builder-c4d-16 becomes tpl-builder-n4-16 on load.
+    PRESET_IDS = ("tpl-runner-n4-std16", "tpl-runner-za-n2-16", "tpl-builder-n4-16")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -7669,6 +7765,8 @@ class SeededTemplateSourceMigrationTests(unittest.TestCase):
         """The persisted state as a version that seeded the template sources wrote it, plus a real template."""
         raw = json.loads(self.state_file.read_text(encoding="utf-8"))
         raw.pop("demo_template_source_migration")
+        raw.pop("builder_preset_migration")
+        raw["vm_templates"] = legacy_preset_templates(raw["vm_templates"])
         for tpl in raw["vm_templates"]:
             tpl["source_instance"] = self.SEEDED[tpl["id"]]
         raw["vm_templates"].append(dict(raw["vm_templates"][0], id="tpl-real0001",
@@ -7677,13 +7775,13 @@ class SeededTemplateSourceMigrationTests(unittest.TestCase):
 
     def _assert_sources_dropped(self, state: dict) -> None:
         self.assertEqual({t["id"]: t.get("source_instance") for t in state["vm_templates"]},
-                         {**{tid: None for tid in self.SEEDED}, "tpl-real0001": "oxidex-runners-us-south1-a-1"})
+                         {**{tid: None for tid in self.PRESET_IDS}, "tpl-real0001": "oxidex-runners-us-south1-a-1"})
 
     def test_default_presets_name_no_source_instance(self):
         from lib.dashboard_server import default_dashboard_state
 
         for state in (default_dashboard_state(), self.store.state):
-            self.assertEqual(sorted(t["id"] for t in state["vm_templates"]), sorted(self.SEEDED))
+            self.assertEqual(sorted(t["id"] for t in state["vm_templates"]), sorted(self.PRESET_IDS))
             for tpl in state["vm_templates"]:
                 self.assertNotIn("source_instance", tpl)
             self.assertEqual(state["demo_template_source_migration"], 1)

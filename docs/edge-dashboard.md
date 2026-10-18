@@ -569,8 +569,10 @@ machine type, commit, origin IP, crate count, memory peak, CPU time, or duration
 
 ## Machine shape templates
 
-The VM templates `tpl-runner-n4-std16`, `tpl-runner-za-n2-16`, and `tpl-builder-c4d-16` are preset
-machine shapes, so they don't name a source VM. A template created from a listed instance with
+The VM templates `tpl-runner-n4-std16`, `tpl-runner-za-n2-16`, and `tpl-builder-n4-16` are preset
+machine shapes, so they don't name a source VM. The builder preset `tpl-builder-n4-16` is the dedicated
+builder shape, `n4-highcpu-16` (16 vCPU, 32 GiB RAM, Intel Emerald Rapids), and the Rust builder profile
+uses it. A template created from a listed instance with
 `POST /api/vm-templates/from-instance` records that VM as its `source_instance`.
 
 - Earlier versions gave the presets the source VMs `oxidex-runners-dallas-01`,
@@ -582,6 +584,11 @@ machine shapes, so they don't name a source VM. A template created from a listed
 - Cleanup uses the telemetry migration's pending commit path. The active slot saves a new state version
   before publishing to KV, including when only template sources changed. A standby waits until active,
   and a pending commit survives a restart.
+- Earlier versions shipped the builder preset as `tpl-builder-c4d-16` on `c4d-highcpu-16`. When the
+  dashboard loads a state without the `builder_preset_migration` marker, it replaces an unedited copy of
+  that preset with `tpl-builder-n4-16`, keeps its creation time, and points any profile that used it at
+  the new preset. A copy that someone edited is their template, so it stays, and so do the profiles that
+  use it. This runs once and commits through the same pending path.
 
 ## State durability
 
