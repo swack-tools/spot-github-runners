@@ -409,13 +409,59 @@ DEMO_TELEMETRY_MIGRATION_KEY = "demo_telemetry_migration"
 DEMO_TELEMETRY_MIGRATION_VERSION = 1
 # True while the drop is saved only at the loaded state_version (it survives a restart); any new version clears it.
 DEMO_TELEMETRY_MIGRATION_PENDING_KEY = "demo_telemetry_migration_pending"
-# build_id -> (commit_sha, instance_name, origin_ip)
-SEEDED_RUST_BUILDS = {
-    "rb-20261015-001": ("af7c14f8cb2c", "builder-oxidex-turin-01", "185.159.157.42"),
-    "rb-20261015-002": ("ce4af62b32cc", "builder-oxidex-eu-01", "185.220.101.34"),
-    "rb-20261015-003": ("f20f9f9b780f", "builder-oxidex-turin-01", "73.162.44.19"),
-    "rb-20261015-004": ("e3c84b8190aa", "builder-oxidex-eu-01", "193.138.218.77"),
-    "rb-20261015-005": ("3317b1b902ef", "builder-oxidex-turin-01", "24.28.119.82"),
+# build_id -> every field the seed set except its timestamps, which were relative to when the state was created.
+# record_rust_build merges a partial update into the existing row, so a real update to a seeded build_id keeps
+# whatever it omits; matching every field (and the seeded gaps between the timestamps) means any real change keeps
+# the row.
+SEEDED_RUST_BUILDS: dict[str, dict[str, Any]] = {
+    "rb-20261015-001": {
+        "project_name": "oxidex", "profile": "release", "target_triple": "x86_64-unknown-linux-gnu",
+        "commit_sha": "af7c14f8cb2c", "status": "DELIVERED", "cache_hits": 412, "cache_misses": 18,
+        "total_crates": 430, "instance_name": "builder-oxidex-turin-01", "zone": "us-south1-b",
+        "machine_type": "c4d-highcpu-16", "vcpu": 16, "cpu_platform": "AMD Turin", "origin_ip": "185.159.157.42",
+        "origin_hostname": "node-ch-14.protonvpn.net", "peak_ram_gib": 21.8, "container_ram_cap_gib": 28.0,
+        "cpu_time_seconds": 1184.5,
+    },
+    "rb-20261015-002": {
+        "project_name": "oxidex-cli", "profile": "release", "target_triple": "x86_64-unknown-linux-musl",
+        "commit_sha": "ce4af62b32cc", "status": "DELIVERED", "cache_hits": 295, "cache_misses": 94,
+        "total_crates": 389, "instance_name": "builder-oxidex-eu-01", "zone": "europe-west4-a",
+        "machine_type": "n4-highcpu-16", "vcpu": 16, "cpu_platform": "Intel Emerald Rapids",
+        "origin_ip": "185.220.101.34", "origin_hostname": "tor-exit-101.zwiebelfreunde.de", "peak_ram_gib": 24.6,
+        "container_ram_cap_gib": 28.0, "cpu_time_seconds": 1892.0,
+    },
+    "rb-20261015-003": {
+        "project_name": "oxidex", "profile": "debug", "target_triple": "x86_64-unknown-linux-gnu",
+        "commit_sha": "f20f9f9b780f", "status": "DELIVERED", "cache_hits": 424, "cache_misses": 6,
+        "total_crates": 430, "instance_name": "builder-oxidex-turin-01", "zone": "us-south1-b",
+        "machine_type": "c4d-highcpu-16", "vcpu": 16, "cpu_platform": "AMD Turin", "origin_ip": "73.162.44.19",
+        "origin_hostname": "m4air-workstation.local", "peak_ram_gib": 14.2, "container_ram_cap_gib": 28.0,
+        "cpu_time_seconds": 542.0,
+    },
+    "rb-20261015-004": {
+        "project_name": "nzbget-rust-ffi", "profile": "release", "target_triple": "aarch64-apple-darwin",
+        "commit_sha": "e3c84b8190aa", "status": "DELIVERED", "cache_hits": 318, "cache_misses": 42,
+        "total_crates": 360, "instance_name": "builder-oxidex-eu-01", "zone": "europe-west4-a",
+        "machine_type": "n4-highcpu-16", "vcpu": 16, "cpu_platform": "Intel Emerald Rapids",
+        "origin_ip": "193.138.218.77", "origin_hostname": "se-got-wg-004.mullvad.net", "peak_ram_gib": 19.7,
+        "container_ram_cap_gib": 28.0, "cpu_time_seconds": 1510.4,
+    },
+    "rb-20261015-005": {
+        "project_name": "oxidex-bench", "profile": "release", "target_triple": "x86_64-unknown-linux-gnu",
+        "commit_sha": "3317b1b902ef", "status": "DELIVERED", "cache_hits": 260, "cache_misses": 170,
+        "total_crates": 430, "instance_name": "builder-oxidex-turin-01", "zone": "us-south1-b",
+        "machine_type": "c4d-highcpu-16", "vcpu": 16, "cpu_platform": "AMD Turin", "origin_ip": "24.28.119.82",
+        "origin_hostname": "dev-macbook-pro.tx.rr.com", "peak_ram_gib": 26.1, "container_ram_cap_gib": 28.0,
+        "cpu_time_seconds": 2480.0,
+    },
+}
+# build_id -> seconds from requested_at to finished_at, and from finished_at to delivered_at
+SEEDED_RUST_BUILD_GAPS = {
+    "rb-20261015-001": (102, 12),
+    "rb-20261015-002": (160, 16),
+    "rb-20261015-003": (64, 8),
+    "rb-20261015-004": (145, 14),
+    "rb-20261015-005": (190, 14),
 }
 # id -> (run_id, job_id)
 SEEDED_GITHUB_CI_RUNS = {
@@ -439,9 +485,17 @@ def demo_telemetry_migrated(state: dict[str, Any]) -> bool:
 
 
 def _is_seeded_build(record: dict[str, Any]) -> bool:
-    fingerprint = SEEDED_RUST_BUILDS.get(record.get("build_id"))
-    return fingerprint is not None and (
-        record.get("commit_sha"), record.get("instance_name"), record.get("origin_ip")) == fingerprint
+    build_id = record.get("build_id")
+    fingerprint = SEEDED_RUST_BUILDS.get(build_id)
+    if fingerprint is None or any(record.get(k) != v or type(record.get(k)) is not type(v)
+                                  for k, v in fingerprint.items()):
+        return False
+    try:
+        requested, finished, delivered = (_iso_to_epoch(str(record[k]))
+                                          for k in ("requested_at", "finished_at", "delivered_at"))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (round(finished - requested), round(delivered - finished)) == SEEDED_RUST_BUILD_GAPS[build_id]
 
 
 def _is_seeded_ci_run(record: dict[str, Any]) -> bool:

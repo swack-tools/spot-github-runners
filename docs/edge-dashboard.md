@@ -427,8 +427,10 @@ GitHub CI failure runs, journal OOM events, or job counters.
   wrote, is left as it is.
 - A record is dropped only when its ID and the fields that every seeded version gave it all match, so a
   real report merged into a seeded row stays:
-  - The Rust builds `rb-20261015-001` through `rb-20261015-005`, matched with their commit SHA, builder
-    (`builder-oxidex-turin-01` or `builder-oxidex-eu-01`), and origin IP.
+  - The Rust builds `rb-20261015-001` through `rb-20261015-005`, on `builder-oxidex-turin-01` and
+    `builder-oxidex-eu-01`. `POST /api/rust-builds` merges a partial update into an existing build, so
+    these match only when every field the seed set is unchanged, including the seeded gaps between the
+    requested, finished, and delivered times.
   - The GitHub CI runs `gh-oom-37192272062`, `gh-oom-37192994059`, and `gh-timeout-38596411473`, and
     the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`, matched with their
     run and job IDs.

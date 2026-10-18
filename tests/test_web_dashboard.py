@@ -5497,6 +5497,21 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [run])
         self.assertEqual(state["scaling_telemetry"]["journal_oom_events"], [event])
 
+    def test_partial_real_updates_to_a_seeded_build_are_kept(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        seed = seeded_demo_telemetry()["rust_builds"][0]
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        # record_rust_build merges a partial update into the seeded row: every field it omits stays as seeded.
+        for update in ({"status": "FAILED"}, {"cache_hits": 413}, {"project_name": "oxidex-cli"},
+                       {"delivered_at": later}, {"peak_ram_gib": 22}):
+            with self.subTest(update=update):
+                state = {"rust_builds": [dict(seed, **update)]}
+                self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+                self.assertEqual(len(state["rust_builds"]), 1)
+        state = {"rust_builds": [dict(seed)]}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 1)
+
     def test_newer_migration_marker_is_kept_and_not_rerun(self):
         from lib.dashboard_server import DashboardStore
 
