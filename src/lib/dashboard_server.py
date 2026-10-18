@@ -634,25 +634,49 @@ def _is_seeded_journal_oom(record: dict[str, Any], reference: float | None) -> b
     return _seed_fields_match(record, expected)
 
 
-def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
+def _original_seed_reference(state: dict[str, Any]) -> float | None:
+    """Recover the original startup time from unchanged saved presets, independently of telemetry timings.
+
+    At least two distinct preset IDs must agree, and any conflicting preset time makes the evidence ambiguous.
+    Defaults filled in for absent saved fields must never serve as anchors (_apply_loaded_state passes loaded).
+    """
+    defaults = default_dashboard_state()
+    epochs: dict[str, float] = {}
+    for field, timestamp, offsets in (
+        ("vm_templates", "created_at", {"tpl-runner-n4-std16": 12, "tpl-runner-za-n2-16": 18,
+                                       "tpl-builder-c4d-16": 24}),
+        ("cloud_init_templates", "updated_at", {"ci-runner-default": 2, "ci-runner-strict-pool": 6,
+                                               "ci-rust-builder-199": 4}),
+    ):
+        expected = {row["id"]: {k: v for k, v in row.items() if k != timestamp}
+                    for row in defaults[field]}
+        records = state.get(field)
+        for row in records if isinstance(records, list) else []:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row["id"] not in offsets:
+                continue
+            if {k: v for k, v in row.items() if k != timestamp} != expected[row["id"]]:
+                continue
+            stamp = row.get(timestamp)
+            if not isinstance(stamp, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp):
+                continue
+            try:
+                epoch = _iso_to_epoch(stamp) + offsets[row["id"]] * 3600
+            except ValueError:
+                continue
+            identity = field + "/" + row["id"]
+            if identity in epochs and epochs[identity] != epoch:
+                return None
+            epochs[identity] = epoch
+    times = set(epochs.values())
+    return next(iter(times)) if len(epochs) >= 2 and len(times) == 1 else None
+
+
+def drop_seeded_demo_telemetry(state: dict[str, Any], *, source_state: dict[str, Any] | None = None) -> int:
     """Remove seeded demo telemetry from ``state`` in place; returns how many records or counters it dropped."""
     dropped = 0
-    reference = None
+    reference = _original_seed_reference(state if source_state is None else source_state)
     builds = state.get("rust_builds")
     if isinstance(builds, list):
-        # All five build seeds were generated against one startup time. A single corrected row can preserve
-        # its internal gaps while moving every timestamp, so require independent build IDs to corroborate the
-        # startup time and keep any row that disagrees. Ambiguous ties and isolated remnants stay untouched.
-        candidates: dict[float, set[str]] = {}
-        for build in builds:
-            if isinstance(build, dict):
-                epoch = _seeded_build_reference(build)
-                if epoch is not None:
-                    candidates.setdefault(epoch, set()).add(build["build_id"])
-        ranked = sorted(candidates, key=lambda epoch: len(candidates[epoch]), reverse=True)
-        if (ranked and len(candidates[ranked[0]]) >= 2
-                and (len(ranked) == 1 or len(candidates[ranked[0]]) > len(candidates[ranked[1]]))):
-            reference = ranked[0]
         kept = [b for b in builds if not (
             reference is not None and isinstance(b, dict) and _seeded_build_reference(b) == reference)]
         dropped += len(builds) - len(kept)
@@ -670,7 +694,8 @@ def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
             kept = [r for r in records if not (isinstance(r, dict) and is_seed(r, reference))]
             dropped += len(records) - len(kept)
             telem[key] = kept
-    if all(telem.get(k) == v and type(telem.get(k)) is int for k, v in SEEDED_JOB_COUNTERS.items()):
+    # Values alone cannot establish provenance: real reported counters can equal the demo tuple.
+    if dropped and all(telem.get(k) == v and type(telem.get(k)) is int for k, v in SEEDED_JOB_COUNTERS.items()):
         for key in SEEDED_JOB_COUNTERS:
             telem[key] = 0
         dropped += len(SEEDED_JOB_COUNTERS)
@@ -2463,7 +2488,7 @@ class DashboardStore:
         dropped_seeds = 0
         if not demo_telemetry_migrated(loaded):
             # A state written before the migration: drop its seeds once (a newer marker is kept as it is).
-            dropped_seeds = drop_seeded_demo_telemetry(base)
+            dropped_seeds = drop_seeded_demo_telemetry(base, source_state=loaded)
             base[DEMO_TELEMETRY_MIGRATION_KEY] = DEMO_TELEMETRY_MIGRATION_VERSION
             if dropped_seeds:
                 base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True

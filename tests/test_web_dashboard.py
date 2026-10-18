@@ -537,9 +537,15 @@ def seeded_demo_telemetry(project: str = "homelab-424523", ref_now: float | None
             "cpu_time_seconds": 2480.0,
         },
     ]
+    from lib.dashboard_server import default_dashboard_state
+
+    with unittest.mock.patch("lib.dashboard_server.time.time", return_value=ref_now):
+        presets = default_dashboard_state(project=project)
     return {
         "scaling_telemetry": scaling_telemetry,
         "rust_builds": [enrich_rust_build_record(row, project=project) for row in raw_rust_builds],
+        "vm_templates": presets["vm_templates"],
+        "cloud_init_templates": presets["cloud_init_templates"],
     }
 
 
@@ -6651,6 +6657,8 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
                                             "observed_at": "2026-10-17T10:00:00Z", "process": "rustc"})
         real_build = dict(seeds["rust_builds"][0], build_id="rb-real0001", instance_name="builder-oxidex-1")
         raw["scaling_telemetry"] = telem
+        raw["vm_templates"] = seeds["vm_templates"]
+        raw["cloud_init_templates"] = seeds["cloud_init_templates"]
         raw["rust_builds"] = seeds["rust_builds"] + [real_build]
         return raw
 
@@ -6764,8 +6772,8 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
             for update in updates:
                 with self.subTest(key=key, update=update):
                     record = dict(seeds[key][0], **update)
-                    state = {"rust_builds": copy.deepcopy(seeded_demo_telemetry()["rust_builds"]),
-                             "scaling_telemetry": {key: [record]}}
+                    state = seeded_demo_telemetry()
+                    state["scaling_telemetry"] = {key: [record]}
                     self.assertEqual(drop_seeded_demo_telemetry(state), 5)
                     self.assertEqual(state["scaling_telemetry"][key], [record])
 
@@ -6793,6 +6801,37 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
                 self.assertEqual(drop_seeded_demo_telemetry(state), 11)
                 self.assertEqual(state["rust_builds"], [build])
                 self.assertEqual(state["scaling_telemetry"]["journal_oom_events"], [])
+
+    def test_batch_shifted_builds_are_not_evidence_for_their_own_startup_time(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        state = seeded_demo_telemetry(ref_now=1800000000)
+        builds = state["rust_builds"]
+        for build in builds:
+            for key in ("requested_at", "finished_at", "delivered_at"):
+                stamp = datetime.fromisoformat(build[key].replace("Z", "+00:00")).timestamp()
+                build[key] = datetime.fromtimestamp(stamp + 60, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        drop_seeded_demo_telemetry(state)
+        self.assertEqual(state["rust_builds"], builds)
+
+    def test_markerless_reported_counter_tuple_without_seed_evidence_is_kept(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        counters = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3,
+                    "github_oom_runs": [], "journal_oom_events": []}
+        state = {"rust_builds": [], "scaling_telemetry": dict(counters)}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+        self.assertEqual(state["scaling_telemetry"], counters)
+
+    def test_missing_saved_presets_cannot_be_replaced_with_fresh_time_anchors(self):
+        state = seeded_demo_telemetry()
+        state.pop("vm_templates")
+        state.pop("cloud_init_templates")
+        state["scaling_telemetry"] = {"github_oom_runs": [], "journal_oom_events": [],
+                                      "jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
+        self.store._apply_loaded_state(state)
+        self.assertEqual(len(self.store.state["rust_builds"]), 5)
+        self.assertEqual(self.store.state["scaling_telemetry"]["queued_jobs"], 3)
 
     def test_extra_event_evidence_survives_legacy_cleanup(self):
         from lib.dashboard_server import drop_seeded_demo_telemetry
