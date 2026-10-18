@@ -3718,17 +3718,17 @@ class DashboardStore:
                 and template_marker >= DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION):
             dropped_sources = drop_seeded_template_sources(base)
             base[DEMO_TEMPLATE_SOURCE_MIGRATION_KEY] = DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION
+            # The one-time marker must also reach KV when no source pairs needed removal.
+            base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
             if dropped_sources:
-                # Template-only cleanup must also replace equal-version KV snapshots via the active writer.
-                base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
                 LOG.warning("Removed the nonexistent source instance from %d preset VM template(s)", dropped_sources)
         preset_marker = loaded.get(BUILDER_PRESET_MIGRATION_KEY)
         if not (isinstance(preset_marker, int) and not isinstance(preset_marker, bool)
                 and preset_marker >= BUILDER_PRESET_MIGRATION_VERSION):
             base[BUILDER_PRESET_MIGRATION_KEY] = BUILDER_PRESET_MIGRATION_VERSION
+            # Like the template marker, the new marker must reach KV even when nothing else changed.
+            base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
             if migrate_builder_preset(base, self._validate_vm_template_compatibility):
-                # Content changed without a version: the active writer commits it as the next version.
-                base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
                 LOG.warning("Replaced the c4d-highcpu-16 builder preset %s with %s (n4-highcpu-16)",
                             LEGACY_BUILDER_PRESET_ID, BUILDER_PRESET_ID)
         previous = getattr(self, "state", None)
@@ -5036,7 +5036,8 @@ class DashboardStore:
                 try:
                     dt = datetime.fromisoformat(str(ts_str).strip().replace("Z", "+00:00"))
                     age_sec = ref_ts - dt.timestamp()
-                    if 0.0 <= age_sec <= 3600.0:
+                    # A build stamped at the report's arrival can round a microsecond past ref_ts.
+                    if -1.0 <= age_sec <= 3600.0:
                         builds_past_hour += 1
                 except ValueError:
                     # Safe to ignore unparseable timestamps in legacy or partial build records.

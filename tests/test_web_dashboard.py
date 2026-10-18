@@ -7840,7 +7840,9 @@ class BuilderPresetMigrationTests(unittest.TestCase):
         self.assertIn("tpl-builder-c4d-16", ids)
         self.assertNotIn("tpl-builder-n4-16", ids)
         self.assertEqual(reloaded.state["profiles"]["rust_builder"]["vm_template_id"], "tpl-builder-c4d-16")
-        self.assertNotIn("demo_telemetry_migration_pending", reloaded.state)
+        # Only the new marker changed; it is still published as the next version.
+        self.assertIs(reloaded.state.get("demo_telemetry_migration_pending"), True)
+        self.assertEqual(reloaded.state["builder_preset_migration"], 1)
         # The profile still accepts unrelated edits.
         reloaded.update_profile("rust_builder", {"max_instances": 3})
 

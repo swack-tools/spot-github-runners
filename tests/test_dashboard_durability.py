@@ -66,9 +66,9 @@ def no_live_pricing(test: unittest.TestCase) -> None:
     test.addCleanup(patcher.stop)
 
 
-# States written by a version that already ran the one-time demo telemetry migration: a markerless state is legacy
+# States written by a version that already ran the one-time telemetry and template migrations: a missing marker is legacy
 # and gets one version of its own on the active slot (DemoTelemetryMigrationCommitTests covers that).
-MIGRATED = {"demo_telemetry_migration": 1}
+MIGRATED = {"demo_telemetry_migration": 1, "demo_template_source_migration": 1, "builder_preset_migration": 1}
 
 
 def write_state(path: Path, version: int, targets: list[str]) -> None:
@@ -1149,6 +1149,17 @@ class DemoTelemetryMigrationCommitTests(unittest.TestCase):
         published = parse_snapshot(self.fake.values[KV_STATE_KEY])
         self.assertEqual(published["state_version"], 6)
         self.assert_migrated(published["state"])
+
+    def test_template_marker_only_migration_is_published(self):
+        raw = {"state_version": 5, "demo_telemetry_migration": 1, "vm_templates": []}
+        self.fake.values[KV_STATE_KEY] = json.dumps(build_snapshot(raw, 5, "a", now=1))
+        store = self.store("template-marker.json")
+        store.hydrate()
+        self.tick_until_published(store)
+        published = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual(published["state_version"], 6)
+        self.assertEqual(published["state"]["demo_template_source_migration"], 1)
+        self.assertNotIn("demo_telemetry_migration_pending", published["state"])
 
     def test_template_only_cleanup_waits_for_active_slot_and_publishes_a_new_version(self):
         raw = {"state_version": 5, "demo_telemetry_migration": 1,
