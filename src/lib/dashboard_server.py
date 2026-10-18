@@ -881,6 +881,12 @@ def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previo
     def add(reason: str, start: float, end: float | None) -> None:
         add_unpriced_interval(intervals, reason, start, end)
 
+    resume_boundary = (previous or {}).get("suspension_resume_boundary")
+    if (isinstance(resume_boundary, (list, tuple)) and len(resume_boundary) == 2
+            and all(_finite(value) for value in resume_boundary) and resume_boundary[1] > resume_boundary[0]):
+        record["suspension_resume_boundary"] = list(resume_boundary)
+    else:
+        resume_boundary = None
     status = record.get("status")
     started = float(record["started_epoch"])
     if (previous or {}).get("status") == "SUSPENDED" and "suspended_memory" not in intervals:
@@ -893,16 +899,43 @@ def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previo
                 if bounds[1] is None:
                     bounds[1] = max(float(bounds[0]), min(now, started if started >= float(bounds[0]) else now))
     suspended = obs.get("last_suspended_epoch")
+    if not _finite(suspended):
+        suspended = (previous or {}).get("pending_suspension_epoch")
+    if not _finite(suspended) and (previous or {}).get("status") == "SUSPENDED":
+        suspended = previous.get("stopped_epoch")
+        if not _finite(suspended):
+            prior_memory = normalize_unpriced_intervals(previous.get("unpriced_history_intervals"))
+            open_starts = [start for start, end in prior_memory.get("suspended_memory", []) if end is None]
+            suspended = max(open_starts) if open_starts else None
     if status == "SUSPENDED":
         at = float(suspended) if _finite(suspended) else float(record.get("stopped_epoch") or now)
         add("suspended_memory", min(at, now), None)
+        record["pending_suspension_epoch"] = min(at, now)
+    elif _finite(suspended) and float(suspended) >= started:
+        # The actual resume start has not arrived, including transitional snapshots.
+        record["pending_suspension_epoch"] = float(suspended)
+        add("suspended_memory", float(suspended), None)
     elif _finite(suspended) and float(suspended) < started:
-        add("suspended_memory", float(suspended), started)
+        # GCE retains the latest suspension timestamp across unrelated stop/start cycles.
+        # Keep its confirmed resume independently of uncertainty intervals, which age out.
+        previous_start = (previous or {}).get("started_epoch")
+        if resume_boundary is not None and resume_boundary[0] == float(suspended):
+            resumed = float(resume_boundary[1])
+        elif _finite(previous_start) and float(previous_start) > float(suspended):
+            # A legacy interval may have closed provisionally in STAGING. Only its
+            # reported post-suspension start proves that a resume has happened.
+            resumed = float(previous_start)
+        else:
+            # A transitional observation with the old start time cannot confirm a resume.
+            resumed = started
+        add("suspended_memory", float(suspended), resumed)
+        record["suspension_resume_boundary"] = [float(suspended), resumed]
     stopped = obs.get("last_stop_epoch")
-    if previous is None and obs.get("kind") != "disk" and _finite(stopped) and float(stopped) < started:
+    earlier_ends = [float(t) for t in (stopped, suspended) if _finite(t) and float(t) < started]
+    if previous is None and obs.get("kind") != "disk" and earlier_ends:
         created = obs.get("created_epoch")
-        add("prior_compute", float(created) if _finite(created) and float(created) < float(stopped) else 0.0,
-            float(stopped))
+        ended = max(earlier_ends)
+        add("prior_compute", float(created) if _finite(created) and float(created) < ended else 0.0, ended)
     previous_stop = (previous or {}).get("stopped_epoch")
     if _finite(previous_stop):
         # A newer end before the current latest start proves an intervening run after the observed stop. Its
