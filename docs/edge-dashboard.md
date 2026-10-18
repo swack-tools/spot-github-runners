@@ -343,8 +343,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
   `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
   that disk-only rate, and a deleted VM's row shows no current rate. When a VM starts again, its earlier running intervals stay in its runtime and
-  window spend. When its machine type or disks change, the time before the change keeps the earlier
-  rates. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
+  window spend. When its machine type or disks change, or its prices change, the time before the change
+  keeps the earlier rates. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
   toward the runner and builder telemetry, but the disks of stopped VMs count against the scaling
   budgets. Hiding deleted instances doesn't hide stopped VMs, because they still exist. The listing
   carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.
@@ -361,7 +361,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host. A VM with data disks of several types can't be a template
-  source or the shape of a scale plan, since those hold one data-disk type. When a running host has no recorded runner count, the
+  source or the shape of a scale plan, since those hold one data-disk type. Neither can a VM with
+  Local SSD, which templates don't describe. When a running host has no recorded runner count, the
   runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
   plans are refused.
 - A VM in a region outside the dashboard's region catalog is priced with no tax, marked
@@ -397,7 +398,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `POST /api/instances/scale-region`, are plans only. They check the request against budgets and caps
   and report what would launch or retire. The budget projection includes the disks of stopped VMs.
   They don't change the instance list or any VM, and they run like reads: each request is computed
-  from the current state, and an `Idempotency-Key` stores nothing. The autoscaler
+  from the current state, an `Idempotency-Key` stores nothing, and a frozen or unreconciled slot still
+  answers them. The autoscaler
   (`src/spot_runner_autoscaler.py`) drains and retires runner hosts, `src/spot_runner_manager.py`
   provisions them, and `src/render_builder_startup.py` renders a dedicated builder.
 

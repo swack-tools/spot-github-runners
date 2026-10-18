@@ -146,10 +146,11 @@ KV_STALE_REFUSAL_BACKOFF_SECONDS = 30.0
 
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # POST endpoints that compute a response without changing dashboard state; they skip idempotency storage.
+# Plan-only lifecycle endpoints: recomputed from current state, never stored, and answered even while the slot is
+# frozen or unreconciled (they only read).
+PLAN_ONLY_POST_PATHS = frozenset({"/api/instances/delete", "/api/instances/scale-region"})
 NON_MUTATING_POST_PATHS = frozenset({"/api/qualify", "/api/cloud-init/parse", "/api/ip-intel",
-                                     "/api/patches/validate", "/api/patches/preview",
-                                     # Plan-only lifecycle endpoints: recomputed from current state, never stored.
-                                     "/api/instances/delete", "/api/instances/scale-region"})
+                                     "/api/patches/validate", "/api/patches/preview"}) | PLAN_ONLY_POST_PATHS
 # POST endpoints whose side effect is outside dashboard state (a GitHub pull request, live runner hosts): they
 # need an Idempotency-Key and run through DashboardStore.run_external.
 EXTERNAL_MUTATION_PATHS = frozenset({"/api/patches/save", "/api/patches/hot-patch"})
@@ -845,6 +846,11 @@ def _live_instance_record(
         for s0, e0, r0 in kept_disks[:-MAX_DETAILED_SEGMENTS]:
             _add_to_buckets(folded, "", s0, e0, r0, 0.0, compute=False)
         kept_disks = kept_disks[-MAX_DETAILED_SEGMENTS:]
+    expired_hours, expired_all_in, expired_compute = _bucket_window_costs(
+        {k: v for k, v in folded.items() if float(k) + _BUCKET_SECONDS < cutoff}, float("-inf"), now)
+    pruned_hours += expired_hours
+    pruned_all_in += expired_all_in
+    pruned_compute += expired_compute
     _prune_buckets(folded, cutoff)
     record["folded_cost_buckets"] = folded
     record.update({
@@ -952,6 +958,25 @@ def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[floa
         bucket = buckets.setdefault(f"{prefix}{key}", [0.0, 0.0, 0.0])
         for i in range(3):
             bucket[i] += float(value[i])
+
+
+def _close_open_segments(record: dict[str, Any], old_pricing: dict[str, Any], now: float) -> None:
+    """Close a live record's open compute and disk intervals at ``old_pricing``'s rates up to ``now``."""
+    compute_all_in, compute_only, disk_all_in = _pricing_rates(old_pricing)
+    started = float(record.get("started_epoch") or now)
+    seg = record.get("compute_segment_start")
+    open_start = max(started, float(seg)) if _finite(seg) else started
+    run_end = min(_current_run_end(record, now), now)
+    runs = record.setdefault("prior_runs", [])
+    if run_end > open_start:
+        runs.append([open_start, run_end, compute_all_in, compute_only])
+    record["compute_segment_start"] = max(open_start, run_end)
+    disks = _disk_segments(record)
+    disk_open = max([float(record.get("disk_start_epoch") or started)] + [e for _s, e, _r in disks]
+                    + ([float(record["disk_segment_start"])] if _finite(record.get("disk_segment_start")) else []))
+    if now > disk_open:
+        record.setdefault("disk_segments", []).append([disk_open, now, disk_all_in])
+    record["disk_segment_start"] = now
 
 
 def _serialized_size(value: Any) -> int:
@@ -3467,6 +3492,7 @@ class DashboardStore:
                     )
                 )
             )
+            old_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else None
             inst["pricing"] = calculate_spot_pricing(
                 family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
                 vcpu=int(inst.get("vcpu", 16)),
@@ -3490,6 +3516,9 @@ class DashboardStore:
                     family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
                     project=self.project, live_pricing=shared_live_pricing)
                 _mark_pricing_completeness(inst)
+                if old_pricing is not None and _pricing_rates(old_pricing) != _pricing_rates(inst["pricing"]):
+                    # New rates apply from now on: time already billed keeps the rates it had.
+                    _close_open_segments(inst, old_pricing, time.time())
 
     def get_overview(
         self,
@@ -4784,6 +4813,11 @@ class DashboardStore:
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
+            if int(inst.get("local_ssd_gb") or 0) > 0:
+                raise ValueError(
+                    f"{inst['name']} has {int(inst['local_ssd_gb'])} GiB of Local SSD, which a VM template cannot "
+                    "describe; create the template from the profile instead"
+                )
             if len(inst.get("data_disks") or {}) > 1:
                 raise ValueError(
                     f"{inst['name']} has data disks of several types ({', '.join(sorted(inst['data_disks']))}); "
@@ -5005,7 +5039,8 @@ class DashboardStore:
                 if source_spec is None:
                     existing_cand = next(
                         # A host with several data-disk types cannot be described by one type and size.
-                        (i for i in running_in_region if len(i.get("data_disks") or {}) <= 1), None)
+                        (i for i in running_in_region
+                         if len(i.get("data_disks") or {}) <= 1 and not int(i.get("local_ssd_gb") or 0)), None)
                     if existing_cand is not None:
                         try:
                             self._validate_vm_template_compatibility(existing_cand, prof, role)
@@ -6079,7 +6114,8 @@ def make_handler(
             if not store.hydrated:
                 self._send_unavailable()
                 return True
-            if method in MUTATING_METHODS and (store.frozen or not store.reconciled):
+            if method in MUTATING_METHODS and path not in PLAN_ONLY_POST_PATHS and (
+                    store.frozen or not store.reconciled):
                 self._send_unavailable()
                 return True
             return False

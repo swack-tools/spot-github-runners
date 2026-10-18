@@ -798,6 +798,17 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def test_plan_only_lifecycle_posts_answer_on_frozen_slot(self):
+        self.store.frozen = True
+        self.addCleanup(setattr, self.store, "frozen", False)
+        plan = self._post("/api/instances/scale-region",
+                          {"region": "us-south1", "role": "cicd_runner", "target_instances": 0})
+        self.assertFalse(plan["applied"])
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post("/api/budget", {"target": "global", "max_hourly_usd": 4.0})
+        self.assertEqual(ctx.exception.code, 503)
+        ctx.exception.close()
+
     def test_plan_only_lifecycle_posts_do_not_store_state(self):
         version = self.store.state_version()
         for path, payload in (("/api/instances/scale-region",
@@ -4704,6 +4715,47 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         rec = self._record("oxidex-runners-lssd-1")
         self.assertFalse(rec["pricing_complete"])
         self.assertIn("Local SSD", rec["pricing_incomplete_reason"])
+
+    def test_repricing_keeps_completed_history(self):
+        from lib.dashboard_server import instance_usage
+
+        self.fleet = [fleet_observation("4600", "builder-oxidex-reprice-1", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=10.0, stopped_hours_ago=4.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        before = instance_usage(self._record("builder-oxidex-reprice-1"), time.time())
+        with self.store._lock:
+            budget = self.store.state["profiles"]["rust_builder"]["budget"]
+            budget["override_regional_tax"] = True
+            budget["tax_rate_percent"] = 40.0
+        self.store.get_overview()
+        rec = self._record("builder-oxidex-reprice-1")
+        self.assertEqual(rec["pricing"]["tax_rate_percent"], 40.0)
+        self.assertEqual(len(rec["disk_segments"]), 1)
+        after = instance_usage(rec, time.time())
+        self.assertAlmostEqual(after["cost_compute"], before["cost_compute"], delta=0.001)
+        self.assertAlmostEqual(after["cost_all_in"], before["cost_all_in"], delta=0.01)
+
+    def test_expired_folded_buckets_keep_lifetime_totals(self):
+        obs = fleet_observation("4700", "oxidex-runners-expire-1", "us-south1-a", started_hours_ago=2.0, now=self.now)
+        self.fleet = [obs]
+        self.store.refresh_fleet_inventory()
+        base = self._record("oxidex-runners-expire-1")["runtime_hours"]
+        old_hour = int((self.now - 40 * 86400.0) // 3600 * 3600)
+        with self.store._lock:
+            self._record("oxidex-runners-expire-1")["folded_cost_buckets"] = {str(old_hour): [5.0, 1.0, 0.5]}
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        rec = self._record("oxidex-runners-expire-1")
+        self.assertEqual(rec["folded_cost_buckets"], {})
+        self.assertAlmostEqual(rec["pruned_compute_hours"], 5.0, delta=0.001)
+        self.assertAlmostEqual(rec["runtime_hours"], base + 5.0, delta=0.05)
+
+    def test_local_ssd_host_is_not_a_template_source(self):
+        obs = fleet_observation("4800", "builder-oxidex-lssd-2", "us-south1-b", now=self.now)
+        obs["local_ssd_gb"] = 375
+        self.fleet = [obs]
+        self.store.refresh_fleet_inventory()
+        with self.assertRaisesRegex(ValueError, "Local SSD"):
+            self.store.create_vm_template_from_instance({"instance_name": "builder-oxidex-lssd-2"})
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
