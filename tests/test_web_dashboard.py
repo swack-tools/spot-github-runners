@@ -7609,6 +7609,20 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         self.assertEqual((build["compile_duration_seconds"], build["delivery_duration_seconds"],
                           build["total_duration_seconds"]), (None, None, None))
 
+    def test_finish_time_replaces_in_progress_compile_time(self):
+        started = self.store.record_rust_build({"build_id": "rb-fin", "status": "RUNNING",
+                                                "compile_duration_seconds": 30.0})["build"]
+        finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_iso_to_epoch(started["requested_at"]) + 60))
+        update = self.store.record_rust_build({"build_id": "rb-fin", "finished_at": finished_at})["build"]
+        self.assertEqual(update["compile_duration_seconds"], 60.0)
+
+    def test_unknown_failure_timing_survives_metadata_updates(self):
+        self.store.record_rust_build({"build_id": "rb-fail-meta", "status": "FAILED"})
+        with unittest.mock.patch("lib.dashboard_server.time.time", return_value=time.time() + 300):
+            later = self.store.record_rust_build({"build_id": "rb-fail-meta", "cache_hits": 3})["build"]
+        self.assertIsNone(later["finished_at"])
+        self.assertEqual((later["compile_duration_seconds"], later["total_duration_seconds"]), (None, None))
+
     def test_explicit_benchmark_survives_an_echoed_shape(self):
         self.store.record_rust_build({"build_id": "rb-echo", "status": "DELIVERED", "total_duration_seconds": 10.0,
                                       "instance_benchmark_score": 2000, "vcpu": 16, "cpu_time_seconds": 10.0})

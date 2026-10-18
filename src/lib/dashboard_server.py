@@ -6871,7 +6871,8 @@ class DashboardStore:
             # A build still in progress keeps its reported stage durations across partial updates; once it
             # finishes, its final timing replaces them. (An active build's total is its compile time, re-derived.)
             keep_stage_durations = not was_non_delivered or (
-                is_unfinished and prev_status_norm in UNFINISHED_BUILD_STATUSES)
+                is_unfinished and prev_status_norm in UNFINISHED_BUILD_STATUSES
+                and not payload.get("finished_at") and not payload.get("delivered_at"))
             raw_delivery = (
                 payload.get("delivery_duration_seconds")
                 if "delivery_duration_seconds" in payload
@@ -6916,7 +6917,11 @@ class DashboardStore:
                     duration = explicit_total
                 elif explicit_compile is not None:
                     duration = explicit_compile
-                elif is_unsuccessful and (payload.get("requested_at") or existing_build.get("requested_at")):
+                elif is_unsuccessful and (payload.get("requested_at") or existing_build.get("requested_at")) and (
+                        payload.get("finished_at") or existing_build.get("finished_at")
+                        or not (existing_build and prev_status_norm in UNSUCCESSFUL_BUILD_STATUSES)):
+                    # A failure reported now ended now; a stored failure whose end was never reported stays
+                    # unknown on later updates.
                     req_epoch_existing = _iso_to_epoch(
                         str(payload.get("requested_at") or existing_build["requested_at"])
                     )
