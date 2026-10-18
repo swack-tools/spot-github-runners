@@ -266,11 +266,13 @@ class FleetListing(list):
     """Fleet observations plus whether the project's disks could be listed (detached disks are counted only then)."""
 
     disks_listed: bool = True
+    disk_inventory: dict[str, Any] | None = None
 
 
 def observe_detached_disks(disk_details: Mapping[str, Any],
                            attached_sources: frozenset[str] = frozenset(),
-                           snapshot_names: frozenset[str] | None = None) -> list[dict[str, Any]]:
+                           snapshot_names: frozenset[str] | None = None, *,
+                           tracked_roles: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """Observations for fleet-named persistent disks that no VM uses (status ``DETACHED``, storage only).
 
     An attached disk is billed through its VM's record; once no VM uses it (a builder cache disk outlives its
@@ -280,7 +282,7 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
     for link, raw in disk_details.items():
         detail = raw if isinstance(raw, Mapping) else {}
         name = str(detail.get("name", "") or "")
-        role = fleet_role(name)
+        role = fleet_role(name) or (tracked_roles or {}).get("id:" + str(detail.get("id", "")))
         if role is None or not detail.get("id"):
             continue
         # Instance names are zonal: compare "<zone>/<name>" keys (from the users' self-links).
@@ -404,6 +406,7 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                                                     for i in items if isinstance(i, dict)))
                                          if types_known else []))
                 result.disks_listed = types_known
+                result.disk_inventory = disk_types if types_known else None
                 return result
             finally:
                 while not api.connections.empty():
