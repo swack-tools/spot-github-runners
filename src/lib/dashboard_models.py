@@ -1888,8 +1888,14 @@ def calculate_spot_pricing(
     machine_type: str | None = None,
     live_pricing: dict[str, Any] | None = None,
     project: str = "homelab-424523",
+    provisioning: str = "spot",
 ) -> dict[str, Any]:
-    """Calculate compute-only and all-in (with disk & taxes) hourly, daily, and monthly prices."""
+    """Calculate compute-only and all-in (with disk & taxes) hourly, daily, and monthly prices.
+
+    ``provisioning="ondemand"`` prices a standard (non-Spot) VM from the Billing Catalog's on-demand component
+    rates. Without them the Spot baseline would understate it, so the result is marked ``"complete": False``.
+    """
+    on_demand = provisioning == "ondemand"
     reg_info = next((r for r in REGIONS_CATALOG if r["region"] == region), None)
     mult = _dec(reg_info["price_multiplier"] if reg_info else "1.0")
     resolved_live = (
@@ -1906,14 +1912,15 @@ def calculate_spot_pricing(
     disk_rates_map = (resolved_live or {}).get("disk_monthly_gib") or {}
 
     live_machine_rate = None
-    if machine_type:
+    if machine_type and not on_demand:  # capacityHistory prices are Spot prices
         live_machine_rate = machine_hourly_map.get((region, machine_type))
         if live_machine_rate is None:
             live_machine_rate = machine_hourly_map.get(f"{region}/{machine_type}")
 
     series_key = family.lower()
-    live_cpu_rate = comp_rates_map.get(("spot", region, series_key, "CPU"))
-    live_ram_rate = comp_rates_map.get(("spot", region, series_key, "RAM"))
+    price_kind = "ondemand" if on_demand else "spot"
+    live_cpu_rate = comp_rates_map.get((price_kind, region, series_key, "CPU"))
+    live_ram_rate = comp_rates_map.get((price_kind, region, series_key, "RAM"))
 
     if live_machine_rate is not None:
         compute_hourly = _dec(live_machine_rate)
@@ -1965,7 +1972,7 @@ def calculate_spot_pricing(
     total_daily = total_hourly * HOURS_PER_DAY
     total_monthly = total_hourly * HOURS_PER_MONTH
 
-    return {
+    result = {
         "pricing_source": pricing_source,
         "compute_hourly_usd": _money4(compute_hourly),
         "compute_daily_usd": _money(compute_daily),
@@ -1981,6 +1988,12 @@ def calculate_spot_pricing(
         "total_daily_usd": _money(total_daily),
         "total_monthly_usd": _money(total_monthly),
     }
+    if on_demand:
+        result["provisioning"] = "ondemand"
+        result["complete"] = pricing_source == "gcp_billing_catalog"
+        if not result["complete"]:
+            result["pricing_source"] = "spot_baseline_for_on_demand_vm"
+    return result
 
 
 def normalize_budget(budget: dict[str, Any]) -> dict[str, Any]:

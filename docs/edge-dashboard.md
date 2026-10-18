@@ -358,7 +358,13 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
   plans are refused.
 - A VM in a region outside the dashboard's region catalog is priced with no tax, marked
-  `tax_rate_known: false`, rather than with another region's default tax.
+  `tax_rate_known: false`, rather than with another region's default tax. Stopped VMs are repriced
+  with running ones, so a tax override also applies to their disks.
+- A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, and for
+  a `SUSPENDED` VM, whose preserved memory Compute Engine also bills, the record is marked
+  `pricing_complete: false`. While the role's fleet (both roles under a shared budget) has such a VM,
+  scale-up recommendations hold and scale-up plans are refused, because their budget check would pass
+  on a cost that's too low.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or

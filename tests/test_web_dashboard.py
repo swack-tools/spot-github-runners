@@ -4330,6 +4330,78 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertAlmostEqual(cap_without - cap_with, self.store._stopped_disk_burn("rust_builder"), delta=0.0002)
         self.assertGreater(self.store._stopped_disk_burn("rust_builder"), 0.0)
 
+    def test_stopped_vm_pricing_follows_tax_override(self):
+        self.fleet = [fleet_observation("2500", "builder-oxidex-tax-1", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            budget = self.store.state["profiles"]["rust_builder"]["budget"]
+            budget["override_regional_tax"] = True
+            budget["tax_rate_percent"] = 20.0
+        self.store.get_overview()
+        self.assertEqual(self._record("builder-oxidex-tax-1")["pricing"]["tax_rate_percent"], 20.0)
+
+    def test_build_record_evaluation_counts_shared_runner_burn(self):
+        from lib import dashboard_server
+
+        self.fleet = [fleet_observation("2600", "oxidex-runners-burn-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["global_budget_enforced"] = True
+        captured = {}
+        real = dashboard_server.evaluate_builder_scaling_decision
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return real(*args, **kwargs)
+
+        with unittest.mock.patch.object(dashboard_server, "evaluate_builder_scaling_decision", spy):
+            self.store.record_rust_build({"build_id": "rb-shared-01", "cache_hits": 1, "cache_misses": 1})
+        runner_burn = sum(self.store._running_role_hourly_rates("cicd_runner"))
+        self.assertGreater(runner_burn, 0.0)
+        self.assertAlmostEqual(captured["other_role_hourly_usd"], runner_burn, delta=0.0002)
+
+    def test_on_demand_vm_uses_on_demand_rates_or_fails_closed(self):
+        live = {"machine_hourly": {("us-south1", "n4-standard-16"): 0.10},
+                "component_rates": {("ondemand", "us-south1", "n4", "CPU"): 0.04,
+                                    ("ondemand", "us-south1", "n4", "RAM"): 0.005},
+                "disk_monthly_gib": {}}
+        args = dict(family="n4", vcpu=16, ram_gib=64.0, region="us-south1", boot_disk_type="pd-balanced",
+                    boot_disk_gb=40, data_disk_type="pd-balanced", data_disk_gb=0, machine_type="n4-standard-16")
+        priced = calculate_spot_pricing(**args, live_pricing=live, provisioning="ondemand")
+        self.assertTrue(priced["complete"])
+        self.assertAlmostEqual(priced["compute_hourly_usd"], 16 * 0.04 + 64 * 0.005, places=4)
+        self.assertEqual(calculate_spot_pricing(**args, live_pricing=live)["compute_hourly_usd"], 0.10)
+        unpriced = calculate_spot_pricing(**args, live_pricing={}, provisioning="ondemand")
+        self.assertFalse(unpriced["complete"])
+
+        standard = fleet_observation("2700", "oxidex-runners-std-1", "us-south1-a", now=self.now)
+        standard["spot"] = False
+        self.fleet = [standard]
+        self.store.update_budget({"target": "cicd_runner", "max_hourly_usd": 50.0, "max_daily_usd": 1000.0,
+                                  "max_monthly_usd": 30000.0})
+        with unittest.mock.patch("lib.dashboard_models.fetch_live_spot_pricing", return_value={}):
+            self.store.refresh_fleet_inventory()
+            rec = self._record("oxidex-runners-std-1")
+            self.assertEqual(rec["pricing"]["provisioning"], "ondemand")
+            self.assertFalse(rec["pricing_complete"])
+            with self.assertRaisesRegex(ValueError, "not fully priced"):
+                self.store.scale_region_instances({"region": "us-south1", "role": "cicd_runner",
+                                                   "target_instances": 2})
+            held = self.store._fail_closed_evaluation({"direction": "scale_up", "current_runners": 4,
+                                                       "current_instances": 1}, "cicd_runner")
+            self.assertEqual(held["direction"], "hold")
+            self.assertIn("not fully priced", held["hold_reason"])
+
+    def test_suspended_vm_cost_is_incomplete(self):
+        self.fleet = [fleet_observation("2800", "builder-oxidex-susp-1", "us-south1-b", status="SUSPENDED",
+                                        started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-susp-1")
+        self.assertFalse(rec["pricing_complete"])
+        self.assertIn("preserved memory", rec["pricing_incomplete_reason"])
+        self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), ["builder-oxidex-susp-1"])
+
     def test_inventory_status_reports_source(self):
         from lib.dashboard_server import DashboardStore
 
