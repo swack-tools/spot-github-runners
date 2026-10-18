@@ -238,7 +238,8 @@ class FleetListing(list):
     disks_listed: bool = True
 
 
-def observe_detached_disks(disk_details: Mapping[str, Any]) -> list[dict[str, Any]]:
+def observe_detached_disks(disk_details: Mapping[str, Any],
+                           attached_sources: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
     """Observations for fleet-named persistent disks that no VM uses (status ``DETACHED``, storage only).
 
     An attached disk is billed through its VM's record; once no VM uses it (a builder cache disk outlives its
@@ -250,6 +251,9 @@ def observe_detached_disks(disk_details: Mapping[str, Any]) -> list[dict[str, An
         name = str(detail.get("name", "") or "")
         role = fleet_role(name)
         if role is None or detail.get("users") or not detail.get("id"):
+            continue
+        if str(link) in attached_sources:
+            # The instance listing (taken just before) still shows it attached: its VM's record bills it.
             continue
         zone = str(detail.get("zone", "") or "").rsplit("/", 1)[-1]
         region = zone.rsplit("-", 1)[0] if "-" in zone else zone
@@ -354,7 +358,10 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                     raise RuntimeError(f"machine type capacity unavailable: {', '.join(missing[:5])}")
                 result = FleetListing(observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache,
                                                           disk_types_known=types_known)
-                                      + (observe_detached_disks(disk_types) if types_known else []))
+                                      + (observe_detached_disks(disk_types, frozenset(
+                                          str(d.get("source", "")) for i in fleet_items
+                                          for d in (i.get("disks") or []) if isinstance(d, dict)))
+                                         if types_known else []))
                 result.disks_listed = types_known
                 return result
             finally:

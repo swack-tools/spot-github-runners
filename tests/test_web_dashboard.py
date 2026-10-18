@@ -5579,6 +5579,25 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(DASHBOARD_HTML.count("${canTemplate(inst) ? `<button"), 2)
         self.assertEqual(DASHBOARD_HTML.count("onclick=\"makeTemplateFromInstance("), 2)
 
+    def test_disk_still_attached_in_instance_listing_is_not_detached(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        detail = {"z/disks/builder-oxidex-a-cache": {"id": "99", "name": "builder-oxidex-a-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced"}}
+        self.assertEqual(observe_detached_disks(detail, frozenset({"z/disks/builder-oxidex-a-cache"})), [])
+        self.assertEqual(len(observe_detached_disks(detail)), 1)
+
+    def test_disk_record_is_not_a_template_source(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        self.fleet = observe_detached_disks({"z/disks/builder-oxidex-t-cache": {
+            "id": "100", "name": "builder-oxidex-t-cache", "zone": "z/us-south1-b", "sizeGb": "100",
+            "type": "pd-balanced"}})
+        self.store.refresh_fleet_inventory()
+        with self.assertRaisesRegex(ValueError, "is a disk, not a VM"):
+            self.store.create_vm_template_from_instance({"instance_name": "builder-oxidex-t-cache",
+                                                         "assign_to_profile": False})
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

@@ -5263,6 +5263,8 @@ class DashboardStore:
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
+            if inst.get("kind") == "disk":
+                raise ValueError(f"{inst['name']} is a disk, not a VM; a VM template needs a VM as its source")
             if inst.get("disk_types_known") is False:
                 raise ValueError(
                     f"The disk types of {inst['name']} are not verified (no compute.disks.list), so a VM template "
