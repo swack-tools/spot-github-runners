@@ -1105,6 +1105,15 @@ def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previo
         created = obs.get("created_epoch")
         add("prior_compute", float(created) if _finite(created) and float(created) < float(stopped) else 0.0,
             float(stopped))
+    previous_stop = (previous or {}).get("stopped_epoch")
+    if _finite(previous_stop):
+        # A newer end before the current latest start proves an intervening run after the observed stop. Its
+        # start is no longer in GCE's latest-start field, so preserve bounded uncertainty instead of billing the
+        # whole known stopped gap or silently dropping that run.
+        unseen_ends = [float(t) for t in (obs.get("last_stop_epoch"), obs.get("last_suspended_epoch"))
+                       if _finite(t) and float(previous_stop) < float(t) < started]
+        if unseen_ends:
+            add("prior_compute", float(previous_stop), max(unseen_ends))
     record["unpriced_history_intervals"] = intervals
     if intervals:
         record["unpriced_lifetime_history"] = True
@@ -1526,6 +1535,22 @@ def _live_instance_record(
                    "the VM and its disks still exist")
     else:
         trigger = f"Compute Engine status {status}"
+        # A restart can still report the completed run's lastStartTimestamp. Its known stop must not disappear
+        # merely because the VM is staging again; pending capacity still reserves its full active budget rate.
+        previous_stop = (previous or {}).get("stopped_epoch")
+        if (_finite(previous_stop) and float(previous_stop) >= started_epoch
+                and float((previous or {}).get("started_epoch") or started_epoch) == started_epoch):
+            stopped_epoch = float(previous_stop)
+        else:
+            ends = [float(t) for t in (obs.get("last_stop_epoch"), obs.get("last_suspended_epoch"))
+                    if _finite(t) and started_epoch <= float(t) <= now]
+            if ends:
+                stopped_epoch = max(ends)
+    transitional = status not in GCE_STOPPED_STATUSES and status not in ("RUNNING", "DELETED", "DETACHED")
+    prior_transition = (previous or {}).get("transitional_since_epoch")
+    if transitional:
+        record["transitional_since_epoch"] = (float(prior_transition) if _finite(prior_transition)
+            and float((previous or {}).get("started_epoch") or started_epoch) == started_epoch else now)
     created = obs.get("created_epoch")
     if not _finite(created) and previous is not None:
         created = previous.get("disk_start_epoch")
@@ -2098,6 +2123,11 @@ def _coarsen_record_buckets(record: dict[str, Any]) -> dict[str, Any]:
     out["folded_cost_buckets"] = _rebucket(out.get("folded_cost_buckets") or {}, "", _record_bucket_span(out),
                                            COARSE_BUCKET_SECONDS)
     out["folded_bucket_seconds"] = COARSE_BUCKET_SECONDS
+    # Empty optional billing indexes have exactly the same meaning as absent indexes. Under size pressure,
+    # omit that bookkeeping overhead while preserving every nonempty physical-disk identity and cost bucket.
+    for key in ("billed_disk_sources", "billed_disk_source_bounds", "billed_disk_identified_sources"):
+        if out.get(key) in ([], {}):
+            out.pop(key, None)
     return out
 
 
@@ -4577,7 +4607,7 @@ class DashboardStore:
                 return self._held(evaluation, f"Runner count not recorded on {len(unknown)} running host(s) "
                                               f"({', '.join(unknown[:5])}); slot totals are unknown", role)
         pending = self._transitional_hosts(role)
-        if pending and evaluation.get("direction") == "scale_up":
+        if pending:
             return self._held(evaluation, f"{len(pending)} VM(s) ({', '.join(pending[:5])}) are starting, stopping, "
                                           "or repairing; their capacity is not settled yet", role)
         incomplete = self._incomplete_cost_hosts(role)
@@ -6473,6 +6503,12 @@ class DashboardStore:
             stale_reason = self._inventory_stale_reason()
             if stale_reason:
                 raise ValueError(f"{stale_reason}; plan the scale change after the next complete listing")
+            pending_hosts = self._transitional_hosts(role)
+            if pending_hosts:
+                raise ValueError(
+                    f"VM(s) {', '.join(pending_hosts[:5])} are starting, stopping, or repairing; plan the "
+                    "scale change once their capacity has settled"
+                )
             now_ts = time.time()
             would_retire: list[dict[str, Any]] = []
             new_records: list[dict[str, Any]] = []
@@ -6681,12 +6717,6 @@ class DashboardStore:
                     raise ValueError(
                         f"Runner count is not recorded on running host(s) {', '.join(unknown_counts[:5])}; "
                         "the runner total is unknown, so a scale-up cannot be checked against max_runners"
-                    )
-                pending_hosts = self._transitional_hosts(role)
-                if pending_hosts:
-                    raise ValueError(
-                        f"VM(s) {', '.join(pending_hosts[:5])} are starting, stopping, or repairing; plan the "
-                        "scale-up once their capacity has settled"
                     )
                 incomplete_costs = self._incomplete_cost_hosts(role)
                 if incomplete_costs:

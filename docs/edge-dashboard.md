@@ -446,11 +446,14 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   at an incomplete fallback price keeps that history marked incomplete even after current rates
   become trusted. Retained cache-disk prices preserve each disk's pricing-completeness flags.
 - A VM in a transitional state, such as `PROVISIONING`, `STAGING`, `STOPPING`, or `REPAIRING`, counts
-  at its full rate in burn and budgets. While the role has one, scale-up recommendations hold and
-  scale-up plans are refused, because its capacity hasn't settled. For a newly provisioned VM, creation
+  at its full rate in burn and budgets. While the role has one, scaling recommendations hold and
+  regional scale plans are refused, including scale-down and no-op plans, because its capacity hasn't settled. For a newly provisioned VM, creation
   is a provisional boundary until GCE reports its first start. Repricing and state reloads don't turn
   creation-to-first-start time into a completed compute run; a VM with an earlier proven run retains
-  that history through a restart.
+  that history through a restart. Restart staging keeps a completed run's known stop separate from
+  `transitional_since_epoch`, so the stopped gap isn't charged as compute. If a newer stop before the
+  latest start proves an unobserved intervening run whose start can't be recovered, its bounded
+  compute-history uncertainty remains explicit instead of being silently omitted.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error. Until the next
   complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false and
