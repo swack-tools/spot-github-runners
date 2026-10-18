@@ -10,7 +10,6 @@ import hashlib
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from http.cookies import SimpleCookie
 import ipaddress
 import json
 import logging
@@ -96,6 +95,7 @@ from .dashboard_models import (
     parse_cloud_init,
     qualify_instances,
     render_cloud_init_for_profile,
+    validate_builder_container_limits,
 )
 from .dashboard_scaling import (
     _assert_finite_json_tree,
@@ -717,6 +717,16 @@ def _has_unresolved_storage(record: dict[str, Any]) -> bool:
     return bool(record.get("disk_liability_pending") or record.get("unpaid_disk_details"))
 
 
+def _disk_history_recovery_pending(record: dict[str, Any] | None) -> bool:
+    """Keep exact disk coverage while a future backfill can overlap existing history."""
+    if not record:
+        return False
+    return bool(record.get("deferred_disk_sources") or record.get("unpaid_disk_details")
+                or record.get("disk_liability_pending") or _finite(record.get("disk_history_deferred_at"))
+                or any(isinstance(d, dict) and _finite(d.get("billing_deferred_since"))
+                       for d in record.get("disks_detail") or []))
+
+
 def _select_instance_record(instances: list[Any], instance_id: str, instance_name: str) -> dict[str, Any] | None:
     """IDs are exact; names alone must identify one current or retained historical record."""
     matches = [i for i in instances if isinstance(i, dict)
@@ -793,26 +803,33 @@ _BUCKET_SECONDS = 3600.0
 def _add_to_buckets(buckets: dict[str, list[float]], prefix: str, start: float, end: float,
                         all_in_rate: float, compute_rate: float, *, compute: bool,
                         span: float = _BUCKET_SECONDS) -> None:
-    """Spread one interval's cost over hour buckets ``{prefix + hour_epoch: [compute_hours, all_in, compute]}``."""
+    """Spread cost and duration into [compute_hours, all_in, compute, disk_hours] buckets."""
     cursor = start
     while cursor < end:
         hour = math.floor(cursor / span) * span
         chunk_end = min(end, hour + span)
         hours = (chunk_end - cursor) / 3600.0
-        bucket = buckets.setdefault(f"{prefix}{int(hour)}", [0.0, 0.0, 0.0])
+        bucket = buckets.setdefault(f"{prefix}{int(hour)}", [0.0, 0.0, 0.0, 0.0])
+        if len(bucket) == 3:
+            bucket.append(0.0)  # Legacy history has no recorded disk duration.
         if compute:
             bucket[0] += hours
             bucket[2] += hours * compute_rate
+        else:
+            bucket[3] += hours
         bucket[1] += hours * all_in_rate
         cursor = chunk_end
 
 
-def _bucket_window_costs(buckets: Any, window_start: float, now: float, prefix: str = "",
-                         span: float = _BUCKET_SECONDS) -> tuple[float, float, float]:
-    """(compute hours, all-in cost, compute cost) of buckets inside the window, pro rata for a partial hour."""
-    hours = all_in = compute = 0.0
+def _bucket_window_totals(buckets: Any, window_start: float, now: float, prefix: str = "",
+                          span: float = _BUCKET_SECONDS) -> tuple[float, float, float, float]:
+    """Compute hours, all-in cost, compute cost, and recorded disk hours, pro rata by bucket.
+
+    Three-slot legacy buckets retain costs but contain no recoverable disk duration.
+    """
+    hours = all_in = compute = disk_hours = 0.0
     for key, value in (buckets or {}).items() if isinstance(buckets, dict) else []:
-        if not str(key).startswith(prefix) or not isinstance(value, list) or len(value) != 3:
+        if not str(key).startswith(prefix) or not isinstance(value, list) or len(value) not in (3, 4):
             continue
         try:
             hour = float(str(key)[len(prefix):])
@@ -825,7 +842,15 @@ def _bucket_window_costs(buckets: Any, window_start: float, now: float, prefix: 
         hours += float(value[0]) * fraction
         all_in += float(value[1]) * fraction
         compute += float(value[2]) * fraction
-    return hours, all_in, compute
+        if len(value) == 4:
+            disk_hours += float(value[3]) * fraction
+    return hours, all_in, compute, disk_hours
+
+
+def _bucket_window_costs(buckets: Any, window_start: float, now: float, prefix: str = "",
+                         span: float = _BUCKET_SECONDS) -> tuple[float, float, float]:
+    """Preserve the three-value cost-reader API for legacy callers."""
+    return _bucket_window_totals(buckets, window_start, now, prefix, span)[:3]
 
 
 COARSE_BUCKET_SECONDS = 86_400.0
@@ -849,15 +874,15 @@ def _rebucket(buckets: dict[str, list[float]], prefix: str, from_span: float, to
         except ValueError:
             continue
         if to_span >= from_span:
-            target = out.setdefault(f"{prefix}{int(math.floor(start / to_span) * to_span)}", [0.0, 0.0, 0.0])
-            for i in range(3):
+            target = out.setdefault(f"{prefix}{int(math.floor(start / to_span) * to_span)}", [0.0, 0.0, 0.0, 0.0])
+            for i in range(min(4, len(value))):
                 target[i] += float(value[i])
         else:
             span_end = start + from_span if until is None else min(start + from_span, until)
             parts = max(1, int(math.ceil(max(0.0, span_end - start) / to_span)))
             for n in range(parts):
-                target = out.setdefault(f"{prefix}{int(start + n * to_span)}", [0.0, 0.0, 0.0])
-                for i in range(3):
+                target = out.setdefault(f"{prefix}{int(start + n * to_span)}", [0.0, 0.0, 0.0, 0.0])
+                for i in range(min(4, len(value))):
                     target[i] += float(value[i]) / parts
     return out
 
@@ -916,6 +941,7 @@ def instance_usage(record: dict[str, Any], now: float, window_start: float | Non
         disk_open_start = max(disk_open_start, float(disk_seg_start))
     if disk_end > disk_open_start:
         disks = disks + [(disk_open_start, disk_end, cur_disk_all_in)]
+    pruned_disk = record.get("pruned_disk_hours")
     pruned = record.get("pruned_compute_hours")
     pruned_cost = record.get("pruned_cost_usd")
     pruned_all_in, pruned_compute = (
@@ -925,14 +951,15 @@ def instance_usage(record: dict[str, Any], now: float, window_start: float | Non
     )
     folded = record.get("folded_cost_buckets") if isinstance(record.get("folded_cost_buckets"), dict) else {}
     span = _record_bucket_span(record)
-    folded_total = _bucket_window_costs(folded, float("-inf"), now, span=span)
-    folded_window = _bucket_window_costs(folded, window, now, span=span)
+    folded_total = _bucket_window_totals(folded, float("-inf"), now, span=span)
+    folded_window = _bucket_window_totals(folded, window, now, span=span)
     return {
         "compute_hours": sum(e - s for s, e, _a, _c in runs) / 3600.0 + (float(pruned) if _finite(pruned) else 0.0)
         + folded_total[0],
         "compute_hours_in_window": sum(_overlap_hours(s, e, window) for s, e, _a, _c in runs) + folded_window[0],
-        "disk_hours": sum(e - s for s, e, _r in disks) / 3600.0,
-        "disk_hours_in_window": sum(_overlap_hours(s, e, window) for s, e, _r in disks),
+        "disk_hours": sum(e - s for s, e, _r in disks) / 3600.0 + folded_total[3]
+        + (float(pruned_disk) if _finite(pruned_disk) else 0.0),
+        "disk_hours_in_window": sum(_overlap_hours(s, e, window) for s, e, _r in disks) + folded_window[3],
         "cost_all_in": pruned_all_in + folded_total[1] + sum((e - s) / 3600.0 * a for s, e, a, _c in runs)
         + sum((e - s) / 3600.0 * r for s, e, r in disks),
         "cost_compute": pruned_compute + folded_total[2] + sum((e - s) / 3600.0 * c for s, e, _a, c in runs),
@@ -1058,7 +1085,7 @@ def _taxable_history_ranges(record: dict[str, Any], now: float) -> tuple[list[li
                 compute = None  # Missing timestamps cannot prove there was no taxable compute.
     storage = [[start, end] for start, end, rate in _disk_segments(record) if rate > 0]
     for key, value in (record.get("folded_cost_buckets") or {}).items():
-        if not isinstance(value, (list, tuple)) or len(value) != 3 or not all(_finite(v) for v in value):
+        if not isinstance(value, (list, tuple)) or len(value) not in (3, 4) or not all(_finite(v) for v in value):
             continue
         try:
             start = float(key)
@@ -1152,6 +1179,18 @@ def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previo
     def add(reason: str, start: float, end: float | None) -> None:
         add_unpriced_interval(intervals, reason, start, end)
 
+    resume_boundary = (previous or {}).get("suspension_resume_boundary")
+    if (isinstance(resume_boundary, (list, tuple)) and len(resume_boundary) == 2
+            and all(_finite(value) for value in resume_boundary) and resume_boundary[1] > resume_boundary[0]):
+        record["suspension_resume_boundary"] = list(resume_boundary)
+    else:
+        resume_boundary = None
+    terminal_boundary = (previous or {}).get("suspension_terminal_boundary")
+    if (isinstance(terminal_boundary, (list, tuple)) and len(terminal_boundary) == 2
+            and all(_finite(value) for value in terminal_boundary) and terminal_boundary[1] >= terminal_boundary[0]):
+        record["suspension_terminal_boundary"] = list(terminal_boundary)
+    else:
+        terminal_boundary = None
     status = record.get("status")
     started = float(record["started_epoch"])
     if (previous or {}).get("status") == "SUSPENDED" and "suspended_memory" not in intervals:
@@ -1164,30 +1203,80 @@ def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previo
                 if bounds[1] is None:
                     bounds[1] = max(float(bounds[0]), min(now, started if started >= float(bounds[0]) else now))
     suspended = obs.get("last_suspended_epoch")
-    if status == "SUSPENDED":
+    if not _finite(suspended):
+        suspended = (previous or {}).get("pending_suspension_epoch")
+    if not _finite(suspended) and (previous or {}).get("status") == "SUSPENDED":
+        suspended = previous.get("stopped_epoch")
+        if not _finite(suspended):
+            prior_memory = normalize_unpriced_intervals(previous.get("unpriced_history_intervals"))
+            open_starts = [start for start, end in prior_memory.get("suspended_memory", []) if end is None]
+            suspended = max(open_starts) if open_starts else None
+    terminal_end = None
+    if _finite(suspended) and status in ("TERMINATED", "STOPPED") and float(suspended) >= started:
+        stopped = obs.get("last_stop_epoch")
+        if _finite(stopped) and float(suspended) <= float(stopped) <= now:
+            terminal_end = float(stopped)
+        elif terminal_boundary is not None and terminal_boundary[0] == float(suspended):
+            terminal_end = float(terminal_boundary[1])
+        else:
+            terminal_end = now  # The first terminal observation bounds saved-memory billing.
+        terminal_boundary = [float(suspended), terminal_end]
+        record["suspension_terminal_boundary"] = terminal_boundary
+    elif (status != "SUSPENDED" and _finite(suspended) and terminal_boundary is not None
+            and terminal_boundary[0] == float(suspended)):
+        terminal_end = float(terminal_boundary[1])
+    if terminal_end is not None:
+        # A saved terminal boundary also survives a later staging/start and interval retention.
+        intervals["suspended_memory"] = [[begin, min(end if end is not None else terminal_end, terminal_end)]
+            for begin, end in intervals.get("suspended_memory", []) if begin <= terminal_end]
+        add("suspended_memory", float(suspended), terminal_end)
+        record.pop("pending_suspension_epoch", None)
+    elif status == "SUSPENDED":
         at = float(suspended) if _finite(suspended) else float(record.get("stopped_epoch") or now)
         add("suspended_memory", min(at, now), None)
+        record["pending_suspension_epoch"] = min(at, now)
+    elif (_finite(suspended) and float(suspended) >= started
+            and status not in ("TERMINATED", "STOPPED", "DELETED", "DETACHED")):
+        # The actual resume start has not arrived, including transitional snapshots.
+        record["pending_suspension_epoch"] = float(suspended)
+        add("suspended_memory", float(suspended), None)
     elif _finite(suspended) and float(suspended) < started:
-        add("suspended_memory", float(suspended), started)
+        # GCE retains the latest suspension timestamp across unrelated stop/start cycles.
+        # Keep its confirmed resume independently of uncertainty intervals, which age out.
+        previous_start = (previous or {}).get("started_epoch")
+        if resume_boundary is not None and resume_boundary[0] == float(suspended):
+            resumed = float(resume_boundary[1])
+        elif _finite(previous_start) and float(previous_start) > float(suspended):
+            # A legacy interval may have closed provisionally in STAGING. Only its
+            # reported post-suspension start proves that a resume has happened.
+            resumed = float(previous_start)
+        else:
+            # A transitional observation with the old start time cannot confirm a resume.
+            resumed = started
+        add("suspended_memory", float(suspended), resumed)
+        record["suspension_resume_boundary"] = [float(suspended), resumed]
     stopped = obs.get("last_stop_epoch")
-    if previous is None and obs.get("kind") != "disk" and _finite(stopped) and float(stopped) < started:
+    earlier_ends = [float(t) for t in (stopped, suspended) if _finite(t) and float(t) < started]
+    if previous is None and obs.get("kind") != "disk" and earlier_ends:
         created = obs.get("created_epoch")
-        add("prior_compute", float(created) if _finite(created) and float(created) < float(stopped) else 0.0,
-            float(stopped))
+        ended = max(earlier_ends)
+        add("prior_compute", float(created) if _finite(created) and float(created) < ended else 0.0, ended)
     previous_stop = (previous or {}).get("stopped_epoch")
     if _finite(previous_stop):
-        # A newer end before the current latest start proves an intervening run after the observed stop. Its
-        # start is no longer in GCE's latest-start field, so preserve bounded uncertainty instead of billing the
-        # whole known stopped gap or silently dropping that run.
+        # A terminal timestamp after suspension ended saved memory, not a second compute run.
+        # Only a still later end can prove unseen compute after that known storage-only interval.
+        inference_start = float(previous_stop)
+        if terminal_boundary is not None and terminal_boundary[0] == inference_start:
+            inference_start = max(inference_start, float(terminal_boundary[1]))
         unseen_ends = [float(t) for t in (obs.get("last_stop_epoch"), obs.get("last_suspended_epoch"))
-                       if _finite(t) and float(previous_stop) < float(t) < started]
+                       if _finite(t) and inference_start < float(t) < started]
         if unseen_ends:
-            add("prior_compute", float(previous_stop), max(unseen_ends))
+            add("prior_compute", inference_start, max(unseen_ends))
     _save_unpriced_intervals(record, intervals, now)
 
 
-def _pricing_component_reasons(record: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """Separate uncertain compute from uncertain storage; budgets select the components they charge."""
+def _pricing_component_reasons(record: dict[str, Any], *, historical: bool = False) -> tuple[list[str], list[str]]:
+    """Separate current billable uncertainty from historical rate uncertainty when closing intervals."""
     compute, storage = [], []
     pricing = record.get("pricing") or {}
     disk_only = record.get("kind") == "disk" or record.get("retained_only_pricing")
@@ -1248,6 +1337,8 @@ def _pricing_component_reasons(record: dict[str, Any]) -> tuple[list[str], list[
         storage.append("region outside the dashboard's catalog: no trusted regional disk rate")
     if pricing.get("complete") is False and not compute and not storage and not unbilled_performance:
         (storage if disk_only else compute).append("pricing source is incomplete")
+    if not historical and record.get("status") in GCE_STOPPED_STATUSES | {"DELETED"}:
+        compute = []
     return compute, storage
 
 
@@ -1784,10 +1875,18 @@ def _live_instance_record(
         stopped_epoch = started_epoch  # A disk on its own never runs compute.
         trigger = "Fleet disk that no VM uses (for example a builder cache disk); it bills storage until deleted"
     elif status in GCE_STOPPED_STATUSES:
-        stop = obs.get("last_suspended_epoch") if status == "SUSPENDED" else obs.get("last_stop_epoch")
-        if isinstance(stop, (int, float)) and stop >= started_epoch:
-            stopped_epoch = float(stop)
-        elif previous is not None and isinstance(previous.get("stopped_epoch"), (int, float)):
+        stops = (obs.get("last_suspended_epoch"),) if status == "SUSPENDED" else (
+            obs.get("last_stop_epoch"), obs.get("last_suspended_epoch"))
+        ends = [float(stop) for stop in stops if _finite(stop) and started_epoch <= float(stop) <= now]
+        previous_stop = (previous or {}).get("stopped_epoch")
+        if (_finite(previous_stop) and (previous or {}).get("started_epoch") == started_epoch
+                and started_epoch <= float(previous_stop) <= now):
+            ends.append(float(previous_stop))  # A later terminal timestamp cannot reopen known stopped compute.
+        if ends:
+            # Saved memory can outlive compute: termination must not bill the suspended gap as a run.
+            stopped_epoch = min(ends)
+        elif previous is not None and _finite(previous.get("stopped_epoch")) \
+                and started_epoch <= float(previous["stopped_epoch"]) <= now:
             stopped_epoch = float(previous["stopped_epoch"])
         else:
             stopped_epoch = now
@@ -2009,9 +2108,15 @@ def _live_instance_record(
             trimmed.append((s0, e0, ca, co))
         prior_runs = trimmed
         compute_segment_start = min(compute_segment_start, max(started_epoch, stopped_epoch))
+    # Preserve the effective open boundary before removing the last detailed interval.
+    if disk_segments:
+        disk_segment_start = max([end for _start, end, _rate in disk_segments]
+                                 + ([float(disk_segment_start)] if _finite(disk_segment_start) else []))
     # Prune by time only (every accepted window is inside the retention period); keep lifetime totals.
     cutoff = now - DELETED_INSTANCE_RETENTION_SECONDS
     pruned_hours = float(previous.get("pruned_compute_hours") or 0.0) if previous is not None else 0.0
+    prior_disk_hours = (previous or {}).get("pruned_disk_hours")
+    pruned_disk_hours = float(prior_disk_hours) if _finite(prior_disk_hours) else 0.0
     prev_pruned = (previous or {}).get("pruned_cost_usd")
     pruned_all_in, pruned_compute = (
         (float(prev_pruned[0]), float(prev_pruned[1]))
@@ -2028,9 +2133,14 @@ def _live_instance_record(
             pruned_compute += hours * (co if co is not None else cur_compute_only)
         else:
             kept_runs.append((s0, e0, ca, co))
+    # The prior record also carries debt not yet reattached by reconciliation. Keep coverage
+    # through the recovery poll; a subsequent poll can prune/fold the merged disjoint history.
+    preserve_disk_detail = (_disk_history_recovery_pending(previous)
+                            or _disk_history_recovery_pending(record))
     kept_disks = []
     for s0, e0, r0 in disk_segments:
-        if e0 < cutoff:
+        if e0 < cutoff and not preserve_disk_detail:
+            pruned_disk_hours += (e0 - s0) / 3600.0
             pruned_all_in += (e0 - s0) / 3600.0 * r0
         else:
             kept_disks.append((s0, e0, r0))
@@ -2042,13 +2152,14 @@ def _live_instance_record(
             _add_to_buckets(folded, "", s0, e0, ca if ca is not None else cur_compute_all_in,
                                 co if co is not None else cur_compute_only, compute=True, span=folded_span)
         kept_runs = kept_runs[-MAX_DETAILED_SEGMENTS:]
-    if len(kept_disks) > MAX_DETAILED_SEGMENTS:
+    if len(kept_disks) > MAX_DETAILED_SEGMENTS and not preserve_disk_detail:
         kept_disks.sort(key=lambda seg: seg[0])
         for s0, e0, r0 in kept_disks[:-MAX_DETAILED_SEGMENTS]:
             _add_to_buckets(folded, "", s0, e0, r0, 0.0, compute=False, span=folded_span)
         kept_disks = kept_disks[-MAX_DETAILED_SEGMENTS:]
-    expired_hours, expired_all_in, expired_compute = _bucket_window_costs(
+    expired_hours, expired_all_in, expired_compute, expired_disk_hours = _bucket_window_totals(
         {k: v for k, v in folded.items() if float(k) + folded_span < cutoff}, float("-inf"), now, span=folded_span)
+    pruned_disk_hours += expired_disk_hours
     pruned_hours += expired_hours
     pruned_all_in += expired_all_in
     pruned_compute += expired_compute
@@ -2062,6 +2173,7 @@ def _live_instance_record(
         "compute_segment_start": compute_segment_start,
         "disk_segment_start": float(disk_segment_start) if _finite(disk_segment_start) else None,
         "pruned_compute_hours": round(pruned_hours, 4),
+        "pruned_disk_hours": pruned_disk_hours,
         "pruned_cost_usd": [round(pruned_all_in, 6), round(pruned_compute, 6)],
         "disk_start_epoch": disk_start,
         "disk_history_deferred_at": (
@@ -2130,7 +2242,7 @@ def _live_instance_record(
                                (previous.get("deleted_epoch") if not previous.get("disk_liability_pending") else None) or now))
             _remember_incomplete_pricing(record, previous, old_pricing, old_compute_start, old_run_end,
                 float(previous.get("disk_segment_start") or previous.get("disk_start_epoch") or now), old_disk_end)
-    if previous is None and _tax_unknown(record):
+    if previous is None:
         start = float(record.get("compute_segment_start") or record.get("started_epoch") or now)
         _remember_incomplete_pricing(record, record, record.get("pricing") or {},
             start, min(now, _current_run_end(record, now)),
@@ -2293,8 +2405,10 @@ def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[floa
     own = _rebucket(record.get("folded_cost_buckets") or {}, "", _record_bucket_span(record), _BUCKET_SECONDS,
                     until=max(usage_end, disk_end))
     for key, value in own.items():
-        bucket = buckets.setdefault(f"{prefix}{key}", [0.0, 0.0, 0.0])
-        for i in range(3):
+        bucket = buckets.setdefault(f"{prefix}{key}", [0.0, 0.0, 0.0, 0.0])
+        if len(bucket) == 3:
+            bucket.append(0.0)
+        for i in range(min(4, len(value))):
             bucket[i] += float(value[i])
 
 
@@ -2304,7 +2418,7 @@ def _remember_incomplete_pricing(record: dict[str, Any], pricing_record: dict[st
     """Save trust bounds with closed fallback-priced intervals, independently of the new prospective price."""
     if old_pricing.get("complete") is not False and pricing_record.get("pricing_complete") is not False             and not _tax_unknown(pricing_record):
         return
-    compute_reasons, storage_reasons = _pricing_component_reasons(dict(pricing_record, pricing=old_pricing))
+    compute_reasons, storage_reasons = _pricing_component_reasons(dict(pricing_record, pricing=old_pricing), historical=True)
     compute_unknown = bool(compute_reasons)
     # Suspension memory has its own exact interval; it does not invalidate the attached disks' rate.
     disk_unknown = any(reason != "suspended: preserved memory storage is not priced here" for reason in storage_reasons)
@@ -2393,10 +2507,19 @@ def _fold_record_detail(record: dict[str, Any], keep: int) -> dict[str, Any]:
         _add_to_buckets(folded, "", s0, e0, ca if ca is not None else cur_all_in,
                         co if co is not None else cur_compute, compute=True, span=span)
     disks = sorted(_disk_segments(out), key=lambda seg: seg[0])
-    fold_disks, keep_disks = (disks[:-keep], disks[-keep:]) if keep else (disks, [])
+    # Aggregated duration cannot be unioned with later per-disk backfill. Retain exact
+    # intervals until recovery, even if _fit_size_budget must refuse the oversized state.
+    if _disk_history_recovery_pending(out):
+        fold_disks, keep_disks = [], disks
+    else:
+        fold_disks, keep_disks = (disks[:-keep], disks[-keep:]) if keep else (disks, [])
     for s0, e0, r0 in fold_disks:
         _add_to_buckets(folded, "", s0, e0, r0, 0.0, compute=False, span=span)
     out["prior_runs"] = [[s0, e0] if ca is None else [s0, e0, ca, co] for s0, e0, ca, co in keep_runs]
+    if disks:
+        prior_start = out.get("disk_segment_start")
+        out["disk_segment_start"] = max([end for _start, end, _rate in disks]
+                                        + ([float(prior_start)] if _finite(prior_start) else []))
     out["disk_segments"] = [list(seg) for seg in keep_disks]
     out["folded_cost_buckets"] = folded
     return out
@@ -2760,7 +2883,19 @@ def reconcile_instance_records(
             # whether it still exists, so its storage keeps billing here until a disk listing resolves it.
             pending = (not disks_listed and str(record.get("kind") or "vm") != "disk"
                        and _retained_disks(record) != [])
-            records.append(_mark_instance_deleted(record, now, disks_pending=pending, project=project))
+            out = _mark_instance_deleted(record, now, disks_pending=pending, project=project)
+            retained = _retained_disks(out) if pending else []
+            moved = [d for d in retained or [] if any(_same_disk(d, owned) for owned in owners)]
+            if moved:
+                pricing = out.get("pricing") or {}
+                _close_open_segments(out, pricing, now)
+                out["disks_detail"] = [dict(d, billing_owner=False) if d in moved else d
+                                       for d in out.get("disks_detail") or []]
+                out["pricing"] = _retained_pricing(out, project=project,
+                    tax_rate_percent=float(pricing.get("tax_rate_percent") or 0.0))
+                if len(moved) == len(retained):
+                    out.update(disk_liability_pending=False, disk_end_epoch=now)
+            records.append(out)
     for instance_id, obs in by_id.items():
         if instance_id not in seen:
             records.append(_live_instance_record(obs, project=project, now=now, known_disk_sources=known_disks,
@@ -3424,6 +3559,13 @@ class DashboardStore:
             if key in loaded and isinstance(default_value, (list, dict)) and not isinstance(loaded[key], type(default_value)):
                 raise ValueError(f"dashboard state field {key!r} must be a JSON {type(default_value).__name__}")
         base.update(copy.deepcopy(loaded))
+        # Local load, KV hydration, recovery and control-plane import share this path.
+        # Retain legacy limits for repair/budget edits; qualification and plans fail closed.
+        for section in ("profiles", "scaling"):
+            try:
+                validate_builder_container_limits(base.get(section, {}).get("rust_builder", {}))
+            except ValueError as exc:
+                LOG.warning("Retained incompatible legacy builder %s: %s", section, exc)
         instances = base.get("instances")
         if isinstance(instances, list):
             # Malformed (non-object) entries stay so that validation below rejects the whole state.
@@ -4718,6 +4860,11 @@ class DashboardStore:
                     )
         b_prof = self.state.get("profiles", {}).get("rust_builder", {})
         if b_prof and b_prof.get("cloud_init_template_id"):
+            try:
+                validate_builder_container_limits(b_prof)
+            except ValueError:
+                # A budget edit/load must not re-render incompatible legacy container limits.
+                return
             b_vcpu = max(1, int(b_prof.get("runner_vcpu", 16)))
             b_ram = max(1.0, float(b_prof.get("runner_ram_gib", 28)))
             for ci_tpl in self.state.get("cloud_init_templates", []):
@@ -4773,6 +4920,11 @@ class DashboardStore:
             raise ValueError(f"VM template '{tpl_id}' does not belong to role '{role}'")
         if vm_tpl.get("shared_attachments") or vm_tpl.get("storage_billing_ambiguous"):
             raise ValueError("Shared or ambiguous disk attachments cannot be used as a VM template source")
+        if role == "rust_builder":
+            validate_builder_container_limits(profile)
+            validate_builder_container_limits(vm_tpl)
+            if not builder_shape_compatible(vm_tpl):
+                raise ValueError("Dedicated builders require n4-highcpu-16 (16 vCPU / 32 GiB)")
         tpl_name = str(vm_tpl.get("name") or vm_tpl.get("id") or "template")
         tpl_vcpu = int(vm_tpl.get("vcpu", 0))
         tpl_ram = float(vm_tpl.get("ram_gib", 0.0))
@@ -4931,6 +5083,12 @@ class DashboardStore:
     def _fail_closed_evaluation(self, evaluation: dict[str, Any], role: str) -> dict[str, Any]:
         """Hold recommendations that cannot be checked: a stale inventory or unknown runner totals (any change),
         or an understated fleet cost (scale-ups, whose budget check would pass on the low figure)."""
+        if role == "rust_builder":
+            try:
+                validate_builder_container_limits(self.state.get("profiles", {}).get(role, {}))
+                validate_builder_container_limits(self.state.get("scaling", {}).get(role, {}))
+            except ValueError as exc:
+                return self._held(evaluation, str(exc), role)
         stale = self._inventory_stale_reason()
         if stale:
             return self._held(evaluation, stale, role)
@@ -5794,6 +5952,8 @@ class DashboardStore:
         """Update CI/CD runner or Rust builder sizing, benchmark, disk, and template settings."""
         if role not in ("cicd_runner", "rust_builder"):
             raise ValueError(f"Unsupported workload role: {role}")
+        if role == "rust_builder":
+            validate_builder_container_limits(payload)
         with self._lock:
             if payload.get("vm_template_id"):
                 vm_tpl = next(
@@ -5900,7 +6060,12 @@ class DashboardStore:
                     ),
                     None,
                 )
-            if candidate.get("use_vm_template") and candidate.get("vm_template_id"):
+            template_fields = {"runner_vcpu", "runner_ram_gib", "host_overhead_gib", "min_instance_vcpu",
+                               "min_instance_ram_gib", "min_benchmark_score", "disk_category", "disk_type",
+                               "boot_disk_gb", "data_disk_gb", "use_vm_template", "vm_template_id",
+                               "cloud_init_template_id"}
+            if (candidate.get("use_vm_template") and candidate.get("vm_template_id")
+                    and (role != "rust_builder" or template_fields.intersection(payload))):
                 validated_tpl_units = self._validate_vm_template_compatibility(active_tpl, candidate, role)
 
             qual = qualify_instances(
@@ -6063,6 +6228,10 @@ class DashboardStore:
             role = str(payload.get("role", "cicd_runner")).strip()
             if role not in ("cicd_runner", "rust_builder"):
                 raise ValueError(f"Unsupported workload role: {role}")
+            if role == "rust_builder" and isinstance(payload.get("policy"), dict):
+                if {"runner_vcpu", "runner_ram_gib"}.intersection(payload["policy"]):
+                    raise ValueError("Builder scaling uses container_vcpu/container_ram_gib or builder_vcpu/builder_ram_gib")
+                validate_builder_container_limits(payload["policy"])
             prev_scaling = copy.deepcopy(self.state["scaling"])
             prev_profiles = copy.deepcopy(self.state["profiles"])
             prev_ci_templates = copy.deepcopy(self.state["cloud_init_templates"])
@@ -6136,35 +6305,36 @@ class DashboardStore:
                             raise ValueError("max_instances must be >= min_instances")
                         pol["min_instances"] = min_inst_val
                         pol["max_instances"] = max_inst_val
-                        if "builder_vcpu" in payload["policy"] and "container_vcpu" not in payload["policy"]:
-                            pol["container_vcpu"] = _finite_int(pol["builder_vcpu"], "builder_vcpu", min_val=1)
-                        elif "container_vcpu" in payload["policy"] and "builder_vcpu" not in payload["policy"]:
-                            pol["builder_vcpu"] = _finite_int(pol["container_vcpu"], "container_vcpu", min_val=1)
-                        if "builder_ram_gib" in payload["policy"] and "container_ram_gib" not in payload["policy"]:
-                            pol["container_ram_gib"] = _finite_float(
-                                pol["builder_ram_gib"], "builder_ram_gib", min_val=0.1
-                            )
-                        elif "container_ram_gib" in payload["policy"] and "builder_ram_gib" not in payload["policy"]:
-                            pol["builder_ram_gib"] = _finite_float(
-                                pol["container_ram_gib"], "container_ram_gib", min_val=0.1
-                            )
-                        builder_ram_ceil = float(
-                            math.ceil(
-                                _finite_float(
-                                    pol.get("container_ram_gib", pol.get("builder_ram_gib", 28)),
-                                    "container_ram_gib",
-                                    min_val=0.1,
-                                )
-                            )
-                        )
-                        pol["container_ram_gib"] = builder_ram_ceil
-                        pol["builder_ram_gib"] = builder_ram_ceil
                         self.state["profiles"]["rust_builder"]["min_instances"] = min_inst_val
                         self.state["profiles"]["rust_builder"]["max_instances"] = max_inst_val
-                        self.state["profiles"]["rust_builder"]["runner_vcpu"] = _finite_int(
-                            pol.get("container_vcpu", pol.get("builder_vcpu", 16)), "container_vcpu", min_val=1
-                        )
-                        self.state["profiles"]["rust_builder"]["runner_ram_gib"] = builder_ram_ceil
+                        if {"container_vcpu", "builder_vcpu", "container_ram_gib", "builder_ram_gib"}.intersection(payload["policy"]):
+                            if "builder_vcpu" in payload["policy"] and "container_vcpu" not in payload["policy"]:
+                                pol["container_vcpu"] = _finite_int(pol["builder_vcpu"], "builder_vcpu", min_val=1)
+                            elif "container_vcpu" in payload["policy"] and "builder_vcpu" not in payload["policy"]:
+                                pol["builder_vcpu"] = _finite_int(pol["container_vcpu"], "container_vcpu", min_val=1)
+                            if "builder_ram_gib" in payload["policy"] and "container_ram_gib" not in payload["policy"]:
+                                pol["container_ram_gib"] = _finite_float(
+                                    pol["builder_ram_gib"], "builder_ram_gib", min_val=0.1
+                                )
+                            elif "container_ram_gib" in payload["policy"] and "builder_ram_gib" not in payload["policy"]:
+                                pol["builder_ram_gib"] = _finite_float(
+                                    pol["container_ram_gib"], "container_ram_gib", min_val=0.1
+                                )
+                            builder_ram_ceil = float(
+                                math.ceil(
+                                    _finite_float(
+                                        pol.get("container_ram_gib", pol.get("builder_ram_gib", 28)),
+                                        "container_ram_gib",
+                                        min_val=0.1,
+                                    )
+                                )
+                            )
+                            pol["container_ram_gib"] = builder_ram_ceil
+                            pol["builder_ram_gib"] = builder_ram_ceil
+                            self.state["profiles"]["rust_builder"]["runner_vcpu"] = _finite_int(
+                                pol.get("container_vcpu", pol.get("builder_vcpu", 16)), "container_vcpu", min_val=1
+                            )
+                            self.state["profiles"]["rust_builder"]["runner_ram_gib"] = builder_ram_ceil
                         self._sync_template_density()
                 telem_payload = payload.get("telemetry") if isinstance(payload.get("telemetry"), dict) else {}
                 if self.fleet_source is not None:
@@ -6930,6 +7100,9 @@ class DashboardStore:
             if target_count < current_count:
                 would_retire = running_in_region[target_count:]
             elif target_count > current_count:
+                if role == "rust_builder":
+                    validate_builder_container_limits(prof)
+                    validate_builder_container_limits(pol)
                 if not bool(self.state["regions_enabled"].get(region, True)):
                     raise ValueError(f"Cannot scale up in disabled region '{region}'")
                 vm_tpl = None

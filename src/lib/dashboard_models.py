@@ -2130,6 +2130,28 @@ def measure_region_latencies(timeout_seconds: float = 0.25) -> dict[str, int]:
     return measured
 
 
+def validate_builder_container_limits(values: dict[str, Any]) -> None:
+    """Validate supplied builder limit fields before coercion; unrelated patches are allowed.
+
+    Call with mutation fields to preserve unrelated edits to legacy profiles, and with
+    the full profile/policy before rendering or planning new builder capacity.
+    """
+    for keys, cap, integer in (
+        (("runner_vcpu", "container_vcpu", "builder_vcpu"), Decimal("16"), True),
+        (("runner_ram_gib", "container_ram_gib", "builder_ram_gib"), Decimal("28"), False),
+    ):
+        supplied = []
+        for key in keys:
+            if key not in values:
+                continue
+            value = _dec(values[key])
+            if value <= 0 or value > cap or (integer and value != value.to_integral_value()):
+                raise ValueError(f"{key} must be {'an integer ' if integer else ''}> 0 and <= {cap} for a dedicated builder")
+            supplied.append(value)
+        if len(set(supplied)) > 1:
+            raise ValueError(f"Builder limit aliases must agree: {', '.join(keys)}")
+
+
 def qualify_instances(
     profile_config: dict[str, Any],
     regions_state: dict[str, bool],
@@ -2143,6 +2165,17 @@ def qualify_instances(
     Supports both 'cicd_runner' and 'rust_builder' profiles independently.
     """
     role = profile_config.get("role", "cicd_runner")
+    if role == "rust_builder":
+        try:
+            validate_builder_container_limits(profile_config)
+        except ValueError as exc:
+            # Keep old profiles readable and budget-editable, but never recommend impossible capacity.
+            return {
+                "role": role, "pricing_source": "unavailable", "requirements": dict(profile_config),
+                "hardware_qualifying_count": 0, "spot_price_qualifying_count": 0,
+                "hardware_qualifying": [], "spot_price_qualifying": [],
+                "disqualified_counts": {}, "validation_error": str(exc),
+            }
     min_runners = max(1, int(profile_config.get("min_runners", 4 if role == "cicd_runner" else 1)))
     min_instances = max(1, int(profile_config.get("min_instances", 1)))
     max_instances = max(min_instances, int(profile_config.get("max_instances", 10)))
@@ -2204,6 +2237,10 @@ def qualify_instances(
         tax_rate = reg_tax_rate if include_taxes else 0.0
 
         for shape in MACHINE_SHAPES_CATALOG:
+            if role == "rust_builder" and (
+                shape["machine_type"] != "n4-highcpu-16" or shape["vcpu"] != 16 or shape["ram_gib"] != 32
+            ):
+                continue
             family = shape["family"]
             if family not in reg["families"]:
                 continue
@@ -3210,6 +3247,8 @@ def render_cloud_init_for_profile(
     host_overhead_gib: float = 0.0,
 ) -> str:
     """Synchronize runner density and per-slot resource limits in a cloud-init template."""
+    if role == "rust_builder":
+        validate_builder_container_limits({"runner_vcpu": runner_vcpu, "runner_ram_gib": runner_ram_gib})
     text = str(content or "")
     slots = max(1, int(runners_count))
     vcpu = max(1, int(runner_vcpu))

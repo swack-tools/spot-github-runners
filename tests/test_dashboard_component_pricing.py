@@ -58,7 +58,14 @@ class DashboardComponentPricingTests(unittest.TestCase):
     def assert_storage_only(self, changes, *, history=False):
         for role in ("rust_builder", "cicd_runner"):
             with self.subTest(role=role, changes=changes):
-                record = self.install([self.observation(role, **changes)])[0]
+                if history:
+                    # The earlier run was observed and priced before the suspension.
+                    self.install([self.observation(role)])
+                    self.store.fleet_source = lambda: [self.observation(role, **changes)]
+                    self.store.refresh_fleet_inventory()
+                    record = self.store.state["instances"][0]
+                else:
+                    record = self.install([self.observation(role, **changes)])[0]
                 compute_reasons, storage_reasons = _pricing_component_reasons(record)
                 self.assertEqual(compute_reasons, [])
                 if not history:
