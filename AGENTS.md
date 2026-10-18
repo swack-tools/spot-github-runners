@@ -76,6 +76,7 @@ This repository provisions and operates persistent GitHub Actions runners and de
 | `src/lib/builder_runtime_update.py` | Capture, verify, apply, finish, or recover an in-place runtime update on an occupied dedicated builder | Capture and default `--plan` check are read-only; mutates only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed` |
 | `src/web_dashboard.py` | Run the Web UI dashboard (GitHub sign-in, runner-patch console, telemetry); on the control VM it runs in edge mode behind the Cloudflare Worker | Writes the local dashboard state file; patch saves open pull requests on the config repository |
 | `src/control_vm.py` | Inspect (`status`, `plan`), render the startup script, or run lifecycle steps (`ensure`, `rotate`) for the Spot control VM that hosts the dashboard | Only with `--apply`; the autoscaler's `--manage-control-vm` runs the same lifecycle each check |
+| `src/runner_floor.py` | Keep at least one minimal Spot runner host per `SPOT_RUNNER_FLOOR_TARGETS` target (`status`, `tick`), or replace an unmanaged runner host make-before-break (`replace-unmanaged`); the control VM watchdog runs `tick --apply` every tick | Only with `tick --apply` or `replace-unmanaged --apply` |
 
 ### Key directories and modules
 
@@ -88,6 +89,7 @@ This repository provisions and operates persistent GitHub Actions runners and de
 | `runner/` | Docker runner image (`Dockerfile`), entrypoint (`entrypoint.sh`), job admission hooks (`job-started.sh`, `job-completed.sh`), and safe descriptor-relative target cleanup (`clean_target.py`). |
 | `builder/standalone/` and `builder/dedicated/` | Standalone Rust 1.99.0 builder image, Node/Playwright website audit tools, toolchain probe, worktree command runner, root-owned host launcher (`host-launcher.py`), and Docker admission wrapper (`docker-admission.py`). |
 | `tools/` | Standalone Spot price command-line tool (`spot_prices.py`) and signed-source remote test proof runners (`infra_python_test_proof.py`, `infra_python_complete_proof.py`). |
+| `docs/` and `mkdocs.yml` | MkDocs Material documentation site, built and deployed to GitHub Pages by `.github/workflows/docs.yml`. The site is public: describing the architecture, including the edge and tunnel design, is fine, but keep deployment identifiers out of it: project, account, namespace, runner group, and tunnel IDs, internal hostnames other than the public dashboard URL, and any token or secret value. Resource names fixed in the code, such as the `spot-control-a` and `spot-control-b` control VM slots, are part of the design and may appear. `docs/requirements.txt` holds build-time dependencies only. |
 | `tests/` | Comprehensive `unittest` suite (`test_*.py`) covering pricing, storage, admission, draining, OOM classification, builder startup, runtime updates, and recovery invariants. |
 
 ## Codebase invariants and synchronization rules
@@ -127,7 +129,7 @@ Several modules embed or load canonical scripts and Dockerfiles that are tested 
 
 ### Environment and dependencies
 
-- Control-plane scripts target Python 3.11+ on macOS and Linux using the Python standard library. Do not add third-party runtime dependencies without explicit user approval.
+- Control-plane scripts target Python 3.11+ on macOS and Linux using the Python standard library. Do not add third-party runtime dependencies without explicit user approval. The pinned MkDocs packages in `docs/requirements.txt` are build-time only for the documentation site.
 - Keep secrets, `.env`, SSH private keys, approved uploader JSON files, rendered launch directories, and operational state outside the Git checkout (for example under `$HOME/oxidex-ops`). If a change adds or renames an environment variable, document it in `.env.example`.
 
 ### Running tests and checks
