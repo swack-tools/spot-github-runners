@@ -6184,18 +6184,24 @@ class DashboardStore:
                 else 0.0
             )
             # Aggregates cover only the builds that reported each figure (unreported figures are None).
-            total_hits = sum(b["cache_hits"] for b in completed_builds if b.get("cache_hits") is not None)
+            # An aggregate with no reported figure behind it is None (unknown), not 0.
+
+            def reported_values(key: str) -> list[Any]:
+                return [b[key] for b in completed_builds if b.get(key) is not None]
+
+            hits = reported_values("cache_hits")
+            total_hits = sum(hits) if hits else None
             with_crates = [b for b in completed_builds
-                           if b.get("cache_hits") is not None and b.get("total_crates") is not None]
-            rate_hits = sum(b["cache_hits"] for b in with_crates)
+                           if b.get("cache_hits") is not None and b.get("total_crates")]
             total_crates = sum(b["total_crates"] for b in with_crates)
-            overall_hit_rate = round((rate_hits / total_crates * 100.0) if total_crates else 0.0, 1)
-            max_peak_ram = max((b["peak_ram_gib"] for b in completed_builds if b.get("peak_ram_gib") is not None),
-                               default=0.0)
-            total_cpu_time = round(sum(b["cpu_time_seconds"] for b in completed_builds
-                                       if b.get("cpu_time_seconds") is not None), 2)
-            total_cpu_points = round(sum(b["cpu_points"] for b in completed_builds
-                                         if b.get("cpu_points") is not None), 2)
+            overall_hit_rate = (round(sum(b["cache_hits"] for b in with_crates) / total_crates * 100.0, 1)
+                                if total_crates else None)
+            peaks = reported_values("peak_ram_gib")
+            max_peak_ram = max(peaks) if peaks else None
+            cpu_times = reported_values("cpu_time_seconds")
+            total_cpu_time = round(sum(cpu_times), 2) if cpu_times else None
+            points = reported_values("cpu_points")
+            total_cpu_points = round(sum(points), 2) if points else None
             vpn_or_tor_count = sum(
                 1 for b in builds if b["network_security"]["is_vpn"] or b["network_security"]["is_tor"]
             )
@@ -6469,6 +6475,14 @@ class DashboardStore:
                 value = payload.get(key)
                 return value if value is not None else existing_build.get(key)
 
+            # An explicit benchmark score stands in for the host shape. A stored score is kept only while the
+            # report leaves the shape alone, so a changed shape is scored again.
+            shape_keys = ("cpu_platform", "vcpu", "machine_type")
+            benchmark_score = (payload.get("instance_benchmark_score")
+                               if payload.get("instance_benchmark_score") is not None
+                               else (None if any(payload.get(k) is not None for k in shape_keys)
+                                     else existing_build.get("instance_benchmark_score")))
+
             raw = {
                 "build_id": incoming_build_id or f"rb-{uuid.uuid4().hex[:8]}",
                 "project_name": reported("project_name"),
@@ -6500,6 +6514,7 @@ class DashboardStore:
                 "machine_type": reported("machine_type"),
                 "vcpu": reported("vcpu"),
                 "cpu_platform": reported("cpu_platform"),
+                "instance_benchmark_score": benchmark_score,
                 "origin_ip": reported("origin_ip"),
                 "origin_hostname": (
                     payload.get("origin_hostname")

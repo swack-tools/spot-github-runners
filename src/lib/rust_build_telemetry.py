@@ -470,12 +470,16 @@ def enrich_rust_build_record(
             "Invalid Rust build timestamps: requested_at <= finished_at <= delivered_at is required"
         )
 
-    # A completed build without a reported finish time has an unknown compile/delivery split (None, not a guess).
-    split_unknown = is_successful and fin_ts is None
-    compile_seconds = round(fin_ts - req_ts, 2) if fin_ts is not None else (None if split_unknown else 0.0)
-    delivery_seconds = (round(del_ts - fin_ts, 2) if (del_ts is not None and fin_ts is not None)
-                        else (None if split_unknown else 0.0))
+    # Without a finish time the compile time is only what was reported (an active build's elapsed compile, for
+    # example) and the delivery time is unknown: None, never 0 or a guess.
     raw_compile = record.get("compile_duration_seconds")
+    if fin_ts is not None:
+        compile_seconds: float | None = round(fin_ts - req_ts, 2)
+    elif raw_compile is not None:
+        compile_seconds = round(_finite_float(raw_compile, "compile_duration_seconds", min_val=0.0), 2)
+    else:
+        compile_seconds = None
+    delivery_seconds = round(del_ts - fin_ts, 2) if (del_ts is not None and fin_ts is not None) else None
     if raw_compile is not None and fin_ts is not None:
         explicit_compile = round(
             _finite_float(raw_compile, "compile_duration_seconds", min_val=0.0), 2

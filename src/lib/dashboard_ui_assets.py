@@ -2004,7 +2004,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const runningBuilders = allRunning.filter(i => i.role === "rust_builder");
       const runningBuilderVms = fs.running_builder_vms !== undefined ? fs.running_builder_vms : runningBuilders.length;
       document.getElementById("kpi-builders-online").textContent = `${runningBuilderVms} Builders Online`;
-      document.getElementById("kpi-builders-sub").textContent = `Min benchmark: ${APP_STATE.profiles.rust_builder.min_benchmark_score} · Peak RAM floor: ${APP_STATE.rust_builds.max_peak_ram_gib} GiB`;
+      document.getElementById("kpi-builders-sub").textContent = `Min benchmark: ${APP_STATE.profiles.rust_builder.min_benchmark_score} · Peak RAM floor: ${reportedOr(APP_STATE.rust_builds.max_peak_ram_gib, v => `${v} GiB`)}`;
 
       const cq = APP_STATE.qualifications.cicd_runner;
       document.getElementById("kpi-qualifying-offers").textContent = `${cq.spot_price_qualifying_count} Spot-Qualifying`;
@@ -3103,18 +3103,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">Crate Cache Hits &amp; Rate</div>
-          <div class="kpi-value" style="color:#34d399;">${rb.total_cache_hits.toLocaleString()} Hits (${rb.overall_cache_hit_rate_percent}%)</div>
+          <div class="kpi-value" style="color:#34d399;">${reportedOr(rb.total_cache_hits, v => `${v.toLocaleString()} Hits`)}${reportedOr(rb.overall_cache_hit_rate_percent, v => ` (${v}%)`, "")}</div>
           <div class="kpi-sub">Persistent NVMe /mnt/runner-data/remote-build</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">Peak Active Memory (OOM Floor)</div>
-          <div class="kpi-value" style="color:#fbbf24;">${rb.max_peak_ram_gib} GiB</div>
+          <div class="kpi-value" style="color:#fbbf24;">${reportedOr(rb.max_peak_ram_gib, v => `${v} GiB`)}</div>
           <div class="kpi-sub">Active RAM required without OOM killing</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">Total CPU Time &amp; CPU Points</div>
-          <div class="kpi-value" style="color:#38bdf8;">${rb.total_cpu_points.toLocaleString()} pts</div>
-          <div class="kpi-sub">${rb.total_cpu_time_seconds.toLocaleString()}s CPU time × Instance Bench</div>
+          <div class="kpi-value" style="color:#38bdf8;">${reportedOr(rb.total_cpu_points, v => `${v.toLocaleString()} pts`)}</div>
+          <div class="kpi-sub">${reportedOr(rb.total_cpu_time_seconds, v => `${v.toLocaleString()}s CPU time × Instance Bench`, "CPU time not reported")}</div>
         </div>
         <div class="kpi-card">
           <div class="kpi-label">VPN / Proxy / Tor Origins</div>
@@ -3149,8 +3149,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <div><strong>Del:</strong> ${esc(formatLocalTime(b.delivered_at))}</div>
             </td>
             <td class="mono">
-              <div style="font-weight:700; color:#fff;">${b.total_duration_seconds}s total</div>
-              <div style="font-size:11px; color:var(--text-muted);">${reportedOr(b.compile_duration_seconds, v => `${v}s compile + ${b.delivery_duration_seconds}s delivery`, "compile/delivery split not reported")}</div>
+              <div style="font-weight:700; color:#fff;">${reportedOr(b.total_duration_seconds, v => `${v}s total`, "duration not reported")}</div>
+              <div style="font-size:11px; color:var(--text-muted);">${reportedOr(b.delivery_duration_seconds, v => `${b.compile_duration_seconds}s compile + ${v}s delivery`, reportedOr(b.compile_duration_seconds, c => `${c}s compile so far`, "compile/delivery split not reported"))}</div>
             </td>
             <td class="mono">
               <div style="font-weight:700; color:#34d399;">${reportedOr(b.cache_hit_rate_percent, v => `${b.cache_hits} / ${b.total_crates} (${v}%)`, `${reportedOr(b.cache_hits, h => `${h} hits`, "cache not reported")}`)}</div>
@@ -3212,6 +3212,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       };
       // Send only what was entered; the server records the rest as not reported.
       const payload = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== null && v !== ""));
+      if (payload.status === "DELIVERED"
+          && (payload.compile_duration_seconds === undefined || payload.delivery_duration_seconds === undefined)) {
+        showToast("A delivered build needs its compile and delivery seconds");
+        return;
+      }
       const res = await fetch("/api/rust-builds", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

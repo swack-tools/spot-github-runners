@@ -536,12 +536,16 @@ machine type, commit, origin IP, crate count, memory peak, CPU time, or duration
 - The finish time comes from `finished_at`, from the delivery time minus `delivery_duration_seconds`, or
   from `requested_at` plus `compile_duration_seconds`. Without any of these, `finished_at` and the compile
   and delivery durations stay `null`. The dashboard doesn't split the total between compiling and delivery.
+- An active build, such as `RUNNING`, keeps a reported `compile_duration_seconds`. A build that hasn't been
+  delivered has no delivery time.
 - `cache_hits`, `cache_misses`, and `total_crates` are stored as reported. A missing count is derived only
   when the other two are present. An update keeps the stored counts it omits, unless one contradicts the
   counts it reports. That stored count is then derived again from the others.
 - The benchmark score needs `cpu_platform`, `vcpu`, and `machine_type`, or an explicit
   `instance_benchmark_score`. CPU points need the benchmark score and `cpu_time_seconds`.
 - Without `origin_ip` the build has no network classification and shows the origin as not reported.
+- The summary's cache, memory, and CPU totals count only completed builds that reported each figure. A
+  total that no build reported is `null`, not 0.
 - `container_ram_cap_gib` defaults to 28, the dedicated builder container's memory cap.
 - The dashboard's own form sends only what you enter in it.
 

@@ -1674,7 +1674,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         q_build = q_res["build"]
         self.assertIsNone(q_build["finished_at"])
         self.assertIsNone(q_build["delivered_at"])
-        self.assertEqual(q_build["total_duration_seconds"], 0.0)
+        self.assertIsNone(q_build["total_duration_seconds"])
         self.assertIsNone(q_build["total_crates"])
         self.assertIsNone(q_build["cpu_time_seconds"])
         self.assertIsNone(q_build["cpu_points"])
@@ -2539,7 +2539,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         )["build"]
         self.assertEqual(failed_resp["status"], "FAILED")
         self.assertEqual(failed_resp["compile_duration_seconds"], 0.0)
-        self.assertEqual(failed_resp["delivery_duration_seconds"], 0.0)
+        self.assertIsNone(failed_resp["delivery_duration_seconds"])  # never delivered
         self.assertIsNone(failed_resp["cache_hits"])
         self.assertIsNone(failed_resp["peak_ram_gib"])
         self.assertIsNone(failed_resp["delivered_at"])
@@ -6934,8 +6934,11 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         self.assertEqual(build["network_security"]["badge_text"], "Origin Not Reported")
         self.assertFalse(build["network_security"]["is_vpn"] or build["network_security"]["is_tor"])
         summary = self.store.get_rust_builds_summary()
-        self.assertEqual((summary["completed_builds"], summary["total_cache_hits"], summary["max_peak_ram_gib"],
-                          summary["total_cpu_points"], summary["average_duration_seconds"]), (1, 0, 0.0, 0.0, 42.0))
+        # Aggregates with no reported figure behind them are unknown, not 0.
+        self.assertEqual((summary["completed_builds"], summary["average_duration_seconds"]), (1, 42.0))
+        for key in ("total_cache_hits", "overall_cache_hit_rate_percent", "max_peak_ram_gib",
+                    "total_cpu_time_seconds", "total_cpu_points"):
+            self.assertIsNone(summary[key], key)
 
     def test_reported_host_and_usage_are_used(self):
         build = self.store.record_rust_build({
@@ -7001,6 +7004,33 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         self.assertIsNotNone(build["finished_at"])
         self.assertEqual(build["delivery_duration_seconds"], 5.0)
         self.assertAlmostEqual(build["compile_duration_seconds"], 55.0, delta=2.0)
+
+    def test_active_build_keeps_reported_compile_time(self):
+        build = self.store.record_rust_build({"build_id": "rb-active", "status": "RUNNING",
+                                              "compile_duration_seconds": 30.0})["build"]
+        self.assertEqual(build["compile_duration_seconds"], 30.0)
+        self.assertEqual(build["total_duration_seconds"], 30.0)
+        self.assertIsNone(build["delivery_duration_seconds"])
+        queued = self.store.record_rust_build({"build_id": "rb-queued", "status": "QUEUED"})["build"]
+        self.assertEqual((queued["compile_duration_seconds"], queued["delivery_duration_seconds"],
+                          queued["total_duration_seconds"]), (None, None, None))
+
+    def test_explicit_benchmark_score_is_used(self):
+        build = self.store.record_rust_build({"build_id": "rb-bench", "status": "DELIVERED",
+                                              "total_duration_seconds": 10.0, "instance_benchmark_score": 2000,
+                                              "cpu_time_seconds": 100.0})["build"]
+        self.assertEqual((build["instance_benchmark_score"], build["cpu_points"]), (2000, 200000.0))
+        kept = self.store.record_rust_build({"build_id": "rb-bench", "cpu_time_seconds": 50.0})["build"]
+        self.assertEqual((kept["instance_benchmark_score"], kept["cpu_points"]), (2000, 100000.0))
+        # A newly reported shape is scored again instead of keeping the stored score.
+        rescored = self.store.record_rust_build({"build_id": "rb-bench", "cpu_platform": "Intel Emerald Rapids",
+                                                 "vcpu": 16, "machine_type": "n4-highcpu-16"})["build"]
+        self.assertNotEqual(rescored["instance_benchmark_score"], 2000)
+
+    def test_record_form_requires_delivered_timing(self):
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        self.assertIn("A delivered build needs its compile and delivery seconds", DASHBOARD_HTML)
 
     def test_summary_counts_hits_without_crate_totals(self):
         self.store.record_rust_build({"build_id": "rb-h", "status": "DELIVERED", "total_duration_seconds": 60.0,
