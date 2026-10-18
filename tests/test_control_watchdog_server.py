@@ -491,3 +491,32 @@ class FloorStepTests(unittest.TestCase):
         runner, _ = self.two_step(record, clock=lambda: next(times))
         runner.run()
         self.assertEqual(timeouts, [server.TICK_TIMEOUT_SECONDS, server.TICK_TIMEOUT_SECONDS - 800.0])
+
+
+class ShutdownTests(unittest.TestCase):
+    def test_no_floor_step_starts_after_sigterm_between_steps(self):
+        made = []
+        holder = {}
+
+        def clock():
+            # The clock is read for the second step's timeout, after the first child is gone and before the next
+            # Popen: SIGTERM lands exactly in that gap.
+            holder["calls"] = holder.get("calls", 0) + 1
+            if holder["calls"] == 2:
+                holder["runner"].terminate()
+            return 0.0
+        runner = server.TickRunner(["control"], then=[["floor"]], popen=fake_popen(
+            lambda a, k: SimpleNamespace(returncode=0, stdout="ok", stderr=""), made),
+            killpg=lambda p, s: None, clock=clock, wall=lambda: 1_000.0)
+        holder["runner"] = runner
+        status, summary = runner.run()
+        self.assertEqual((status, summary["status"]), (500, "terminated"))
+        self.assertEqual([p.argv for p in made], [["control"]])
+
+    def test_a_terminated_server_starts_no_tick_at_all(self):
+        made = []
+        runner = server.TickRunner(["control"], then=[["floor"]], popen=fake_popen(
+            lambda a, k: SimpleNamespace(returncode=0, stdout="ok", stderr=""), made), killpg=lambda p, s: None)
+        runner.terminate()  # no child was running: the shutdown must still stick
+        self.assertEqual(runner.run()[1]["status"], "terminated")
+        self.assertEqual(made, [])

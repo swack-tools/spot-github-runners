@@ -643,7 +643,7 @@ the container with the signature removed.
 
 Each tick step runs in its own process group. A tick whose steps together run longer than 14 minutes answers
 500, and the server stops the running step's whole group, including `gcloud` processes that the step started. It sends `SIGTERM`, waits 10
-seconds, then sends `SIGKILL`. The server does the same when Cloud Run sends it `SIGTERM` at shutdown. The group is gone within
+seconds, then sends `SIGKILL`. The server does the same when Cloud Run sends it `SIGTERM` at shutdown, and from then on it starts no further step, so no floor step starts after `SIGTERM`. The group is gone within
 855 seconds of the tick's start. No other controller can take the lease earlier than 1,260 seconds after the
 start (its 20-minute time to live plus the 60-second grace), so nothing that the tick started still runs when
 another controller acts. The lease guard returns only while more than 11 minutes of the lease remain, even

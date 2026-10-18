@@ -333,7 +333,7 @@ while someone else holds it.
 Set `SPOT_RUNNER_FLOOR_STATE_URI` in the environment of an autoscaler that
 manages a floor target, to the same `gs://<bucket>/runner-floor` location that
 the watchdog uses. The autoscaler then holds its target's floor lease while it
-runs and checks it every minute, so the keeper leaves that target alone. While
+runs and checks it every 5 seconds, so the keeper leaves that target alone. While
 the autoscaler runs, it alone keeps the target's floor: `tiered` mode launches
 a first host into an empty fleet, but `resource` and `legacy` modes only
 restore lost hosts. The lease covers the controller's whole run, not each
@@ -348,6 +348,13 @@ check, because both controllers would otherwise replace one lost floor host:
   can't, for example after a workstation slept past the lease, the mutation is
   held and the controller exits with status 75 at its next check, so a restart
   takes the lease again before it acts.
+- A launch runs `src/spot_runner_manager.py` in its own process group, fenced
+  by the lease. The first check that can't prove the lease kills that whole
+  group at once, including its `gcloud` processes, and the launch stops. The
+  lease keeps at least 11 minutes left while it's proven, and nobody can break
+  it until a minute after it expires, so the manager is gone before another
+  controller may act. The controller's other provider calls time out within
+  10 minutes.
 - `--dry-run` takes no lease.
 
 An autoscaler without `SPOT_RUNNER_FLOOR_STATE_URI` doesn't coordinate. Two
@@ -412,13 +419,15 @@ skips the target, and saves each phase before it acts, so a rerun resumes:
    `gcloud compute ssh`. Then `drain_runners` removes the old runners' custom
    labels, waits until they're idle, and deregisters each one after a fresh
    idle read.
-4. When a fresh read shows every old registration gone, and no other runner
-   is attributed to the VM, it deletes the old VM,
+4. When a fresh read shows every old registration gone, no other runner is
+   attributed to the VM, and the managed host is still ready, it deletes the
+   old VM,
    if the VM still has the instance ID recorded at the start, with its
    auto-delete disks. It keeps every other disk, and the preview names both
-   kinds. It reads the runners again right before the delete, and refuses
-   while any runner attributed to the VM is still registered. Then it waits
-   until the VM is gone.
+   kinds. Right before the delete, it reads the runners, the managed host, and
+   the old VM again. It refuses while any runner attributed to the VM is still
+   registered, or when the VM is now another instance. A VM that's already gone
+   counts as deleted. Then it waits until the VM is gone.
 
 A rerun with the same `--instance` resumes the recorded phase, even after the
 old runners or the old VM are gone. Before every drain step, the command checks
@@ -426,7 +435,11 @@ the managed host again. If the managed host loses a runner before any old
 runner is deregistered, the command releases the cordon, then restores the old
 runners' labels, and stops. Until the release is confirmed, the old runners
 stay without labels and the command retries, because a host that is still
-cordoned refuses every job that its labels would route to it. The command saves the cordon's owner token before it
+cordoned refuses every job that its labels would route to it. If the managed host stops being ready after
+an old runner is deregistered, during the drain or before the delete, the
+command keeps the old VM, because it may be the only host that can recover. It
+provisions the managed floor host again with the keeper's launch steps, then
+continues where it stopped. The command saves the cordon's owner token before it
 calls the cordon, so a rollback also releases a cordon whose result was lost,
 for example to an SSH timeout. After a deregistration, the old host can't be
 put back, so the command waits for the managed host and then goes on. A

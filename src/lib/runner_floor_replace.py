@@ -310,6 +310,17 @@ class Replacement:
         names = set(self.rep["old_runner_names"])
         return [r for r in runners if r.name in names]
 
+    def _hold_for_managed(self, phase: str, why: str) -> None:
+        """The old runners are (partly) gone, so the old host can't be restored, and the managed host isn't ready:
+        keep the old VM, return to ensure_managed (which waits for, or re-provisions, the managed floor host), then
+        continue the interrupted phase."""
+        self.rep.update(phase="ensure_managed", return_phase=phase)
+        self.save()
+        self.say(f"holding: {why}. The old host stays, because it may be the only recoverable host and its "
+                 f"drained runners can't be restored; the managed floor host is checked or provisioned again, then "
+                 f"{phase} continues")
+        return None
+
     def _unaccounted(self, runners: Sequence[GitHubRunner]) -> list[str]:
         """Runners attributed to the old VM that this replacement never drained (they registered later, or the
         record predates the complete-set check)."""
@@ -384,9 +395,10 @@ class Replacement:
             identity = managed_identity(self.store.record, plan, runners)
             ready, why = managed_ready(identity, hosts, runners, rep["required_labels"])
             if ready:
-                rep.update(phase="verified", managed=identity)
+                # A hold during the drain or the deletion returns to where it stopped.
+                rep.update(phase=rep.pop("return_phase", None) or "verified", managed=identity)
                 self.save()
-                self.say(f"managed floor host verified: {why}")
+                self.say(f"managed floor host verified: {why}; continuing with {rep['phase']}")
                 return None
             if plan.idle:
                 self.say(f"waiting for the managed floor host: {plan.describe()} ({why})")
@@ -396,11 +408,10 @@ class Replacement:
             self.say(keeper.execute(plan, hosts))
             return None
         ready, why = managed_ready(rep.get("managed") or {}, hosts, runners, rep["required_labels"])
-        if phase in ("verified", "draining") and not ready:
-            if not irreversible(rep):
+        if phase in ("verified", "draining", "deleting") and not ready:
+            if phase != "deleting" and not irreversible(rep):
                 return self._abort(f"the managed host is no longer ready ({why})", runners, old)
-            self.say(f"waiting: {why}; old runners were already deregistered, so the old host can't be restored")
-            return None
+            return self._hold_for_managed(phase, why)
         if phase == "verified":
             rep["original_labels"] = {r.name: sorted(rf.custom_labels(r)) for r in self._old_runners(runners)}
             rep["phase"] = "draining"
@@ -465,12 +476,27 @@ class Replacement:
             rep["delete_requested_at"] = self.clock()
             self.save()
             self.lease.ensure()
-            # A fresh inventory right before the delete: no runner attributed to this VM may still be registered.
+            # Fresh reads right before the delete. No runner attributed to this VM may still be registered.
             fresh = self.github.list_runners(self.target.target)
             remaining = self._old_runners(fresh) + [r for r in fresh if r.name in self._unaccounted(fresh)]
             if remaining:
                 return self._refuse_delete([r.name for r in remaining])
-            self.delete_old(old)
+            # The managed host must still be ready: the old VM is never deleted while it is the only recoverable
+            # host, for example after the managed host was preempted once the drain had finished.
+            ready_now, why_now = managed_ready(rep.get("managed") or {}, self.inventory.list_hosts(), fresh,
+                                               rep["required_labels"])
+            if not ready_now:
+                return self._hold_for_managed("deleting", why_now)
+            # And the VM must still be the recorded instance.
+            current = self.inventory.describe(rep["old"]["name"], rep["old"]["zone"])
+            if current is None:
+                self.say(f"{rep['old']['name']} is already gone; the next check confirms it")
+                return None
+            if current.instance_id != rep["old"]["instance_id"]:
+                self.say(f"refusing to delete {current.name}: it is now instance {current.instance_id}, not the "
+                         f"recorded {rep['old']['instance_id']}")
+                return 1
+            self.delete_old(current)
             return None
         if phase == "done":
             self.say("already done")

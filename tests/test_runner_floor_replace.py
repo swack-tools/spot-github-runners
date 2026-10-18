@@ -226,7 +226,8 @@ class ReplacementTests(unittest.TestCase):
         rep.step()
         world.hosts = [h for h in world.hosts if h.name != name]
         self.assertIsNone(rep.step())
-        self.assertEqual(world.store_.record["replacement"]["phase"], "draining")
+        recorded = world.store_.record["replacement"]
+        self.assertEqual((recorded["phase"], recorded["return_phase"]), ("ensure_managed", "draining"))
         self.assertFalse([e for e in world.log if e[1] in ("delete_instance", "set_labels")])
 
     def test_an_uncordonable_host_holds_unless_label_strip_is_allowed(self):
@@ -356,6 +357,90 @@ class CompleteRunnerSetTests(unittest.TestCase):
         self.assertIn("newznab-asia-9", world.out[-1])
 
 
+class DeleteGuardTests(unittest.TestCase):
+    def deleting(self):
+        world = ReplaceWorld()
+        rep = world.replacement()
+        name = world.bring_managed_online(rep)
+        world.store_.record["replacement"]["phase"] = "deleting"
+        world.runners[TARGET] = [r for r in world.runners[TARGET] if r.name.startswith("gha-")]  # drained
+        return world, rep, name
+
+    def test_a_managed_host_lost_after_the_drain_holds_and_is_provisioned_again(self):
+        world, rep, name = self.deleting()
+        world.hosts = [h for h in world.hosts if h.name != name]  # preempted after the drain finished
+        world.runners[TARGET] = []
+        self.assertIsNone(rep.step())
+        recorded = world.store_.record["replacement"]
+        self.assertEqual((recorded["phase"], recorded["return_phase"]), ("ensure_managed", "deleting"))
+        self.assertFalse([e for e in world.log if e[1] == "delete_instance"])
+        self.assertIn("only recoverable host", world.out[-1])
+        self.assertIsNone(rep.step())  # the keeper's launch of a new managed host
+        new = world.managed_name()
+        self.assertNotEqual(new, name)
+        world.bootstrap(new)
+        self.assertIsNone(rep.step())  # finish_launch
+        self.assertIsNone(rep.step())  # verified again -> back to deleting
+        self.assertEqual(recorded["phase"], "deleting")
+        self.assertEqual(recorded["managed"]["name"], new)
+        self.assertIsNone(rep.step())
+        self.assertEqual([e for e in world.log if e[1] == "delete_instance"],
+                         [("provider", "delete_instance", OLD, "42", "keep")])
+
+    def test_the_deleting_phase_holds_for_the_managed_host_even_once_the_old_vm_is_gone(self):
+        world, rep, name = self.deleting()
+        world.hosts = [h for h in world.hosts if h.name not in (name, OLD)]
+        world.runners[TARGET] = []
+        self.assertIsNone(rep.step())
+        recorded = world.store_.record["replacement"]
+        self.assertEqual((recorded["phase"], recorded["return_phase"]), ("ensure_managed", "deleting"))
+
+    def test_a_managed_host_lost_right_before_the_delete_holds(self):
+        world, rep, name = self.deleting()
+        listed = world.provider.list_hosts
+        calls = []
+
+        def list_hosts():
+            calls.append(1)
+            hosts = listed()
+            return [h for h in hosts if h.name != name] if len(calls) >= 2 else hosts
+        world.provider.list_hosts = list_hosts
+        self.assertIsNone(rep.step())
+        self.assertEqual(world.store_.record["replacement"]["phase"], "ensure_managed")
+        self.assertFalse([e for e in world.log if e[1] == "delete_instance"])
+
+    def test_the_old_vm_is_described_again_right_before_the_delete(self):
+        world, rep, _ = self.deleting()
+        described = world.provider.describe
+        calls = []
+
+        def describe(vm_name, zone):
+            calls.append(vm_name)
+            found = described(vm_name, zone)
+            if vm_name == OLD and calls.count(OLD) >= 2 and found is not None:
+                return rf.Host(found.name, found.zone, found.status, "43", found.machine_type)  # recreated
+            return found
+        world.provider.describe = describe
+        self.assertEqual(rep.step(), 1)
+        self.assertFalse([e for e in world.log if e[1] == "delete_instance"])
+        self.assertIn("now instance 43", world.out[-1])
+
+    def test_an_old_vm_gone_right_before_the_delete_counts_as_deleted(self):
+        world, rep, _ = self.deleting()
+        described = world.provider.describe
+        calls = []
+
+        def describe(vm_name, zone):
+            calls.append(vm_name)
+            return None if vm_name == OLD and calls.count(OLD) >= 2 else described(vm_name, zone)
+        world.provider.describe = describe
+        self.assertIsNone(rep.step())
+        self.assertFalse([e for e in world.log if e[1] == "delete_instance"])
+        world.hosts = [h for h in world.hosts if h.name != OLD]
+        self.assertEqual(rep.step(), 0)
+        self.assertEqual(world.store_.record["replacement"]["phase"], "done")
+
+
 class CordonIntentTests(unittest.TestCase):
     def test_the_intent_is_saved_before_the_cordon_call_and_an_ambiguous_result_is_released(self):
         world = ReplaceWorld()
@@ -407,7 +492,7 @@ class PendingDeregistrationTests(unittest.TestCase):
         world.hosts = [h for h in world.hosts if h.name != name]
         self.assertIsNone(rep.step())
         recorded = world.store_.record["replacement"]
-        self.assertEqual(recorded["phase"], "draining")
+        self.assertEqual((recorded["phase"], recorded["return_phase"]), ("ensure_managed", "draining"))
         self.assertEqual(recorded["drain"]["deregistered_runner_ids"], [101])
         self.assertNotIn("deregistering_runner_id", recorded["drain"])
         self.assertFalse([e for e in world.log if e[1] == "set_labels" or e[0] == "release_cordon"])

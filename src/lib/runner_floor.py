@@ -1535,15 +1535,67 @@ def status_report(config: FloorConfig, services: Services) -> list[dict[str, Any
 # The operator autoscaler's per-target lease (opt-in: SPOT_RUNNER_FLOOR_STATE_URI in its environment)
 # --------------------------------------------------------------------------------------------
 
+def kill_process_group(pid: int, *, grace: float = 2.0, killpg: Callable[[int, int], None] = os.killpg,
+                       sleep: Callable[[float], None] = time.sleep,
+                       clock: Callable[[], float] = time.monotonic) -> bool:
+    """SIGTERM a child's whole process group, wait up to ``grace``, then SIGKILL it. Never reaps (the thread that
+    waits on the child does), so it is safe from any thread. True when the group is gone."""
+    def send(sig: int) -> bool:
+        try:
+            killpg(pid, sig)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+    if not send(signal.SIGTERM):
+        return True
+    deadline = clock() + grace
+    while clock() < deadline:
+        if not send(0):
+            return True
+        sleep(0.05)
+    send(signal.SIGKILL)
+    return not send(0)
+
+
+def run_fenced(command: Sequence[str], *, timeout: float, holder: "AutoscalerTargetLease | None",
+               popen: Callable[..., Any] = subprocess.Popen) -> subprocess.CompletedProcess:
+    """``subprocess.run`` for a long child that mutates providers, fenced by the floor lease: it runs in its own
+    process group (with its gcloud grandchildren), and ``holder`` kills that whole group the moment the lease can
+    no longer be proven held, instead of letting it act until its own deadline."""
+    process = popen(list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    if holder is not None:
+        holder.fence(process)
+    try:
+        try:
+            out, err = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_process_group(process.pid)
+            try:
+                out, err = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+            raise subprocess.TimeoutExpired(list(command), timeout, output=out, stderr=err) from None
+    finally:
+        if holder is not None:
+            holder.unfence(process)
+    return subprocess.CompletedProcess(list(command), process.returncode, out, err)
+
+
 class AutoscalerTargetLease:
     """Holds the floor lease of the autoscaler's target for the controller's lifetime.
 
     A heartbeat thread renews it; ``guard`` (hooked into the autoscaler's fleet mutation guard) raises once it can
     no longer be proven held, so the autoscaler and the floor keeper never act on one target at once. While the
     autoscaler holds it, the keeper skips the target.
+
+    Children that act on providers for a long time (the deployment manager) are fenced: on the first failed proof,
+    from the heartbeat or any guard call, their process groups are killed at once. The lease keeps at least 660 s
+    left while it is proven (``GcsLease.ensure``), and nobody can break it until 60 s after it expires, so a fenced
+    child is gone long before another controller may act. The heartbeat checks every few seconds, so a workstation
+    waking from sleep notices a lease taken over within that time.
     """
 
-    HEARTBEAT_SECONDS = 60.0
+    HEARTBEAT_SECONDS = 5.0
 
     def __init__(self, lease: GcsLease, *, location: StateLocation | None = None, project: str = "",
                  target: str = "") -> None:
@@ -1553,6 +1605,7 @@ class AutoscalerTargetLease:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.lost: BaseException | None = None
+        self._children: set[Any] = set()
 
     @classmethod
     def for_target(cls, project: str, target: str, uri: str, *, client: GcsClient | None = None) -> \
@@ -1574,13 +1627,30 @@ class AutoscalerTargetLease:
 
     def guard(self) -> None:
         with self._lock:
-            if self.lost is not None:
-                raise RuntimeError(f"Fleet mutation held: the runner floor lease was lost ({self.lost})")
-            try:
-                self.lease.ensure()
-            except LeaseLost as exc:
-                self.lost = exc
-                raise RuntimeError(f"Fleet mutation held: the runner floor lease was lost ({exc})") from exc
+            if self.lost is None:
+                try:
+                    self.lease.ensure()
+                    return
+                except LeaseLost as exc:
+                    self.lost = exc
+            lost, children = self.lost, list(self._children)
+            self._children.clear()
+        for child in children:
+            LOG.error("Runner floor lease lost (%s); killing the process group of fenced child %s", lost, child.pid)
+            kill_process_group(child.pid)
+        raise RuntimeError(f"Fleet mutation held: the runner floor lease was lost ({lost})")
+
+    def fence(self, process: Any) -> None:
+        """Kill ``process``'s group the moment the lease is lost (at once when it already is)."""
+        with self._lock:
+            if self.lost is None:
+                self._children.add(process)
+                return
+        kill_process_group(process.pid)
+
+    def unfence(self, process: Any) -> None:
+        with self._lock:
+            self._children.discard(process)
 
     def _beat(self) -> None:
         while not self._stop.wait(self.HEARTBEAT_SECONDS):

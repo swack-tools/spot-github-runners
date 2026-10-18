@@ -210,6 +210,10 @@ class TickRunner:
         self.killpg = killpg
         self.clock = clock
         self._lock = threading.Lock()
+        # Set once by terminate() and never cleared: after SIGTERM no further step (no floor child) may start. The
+        # spawn lock makes "check the flag, start the child, publish it" atomic against terminate().
+        self._shutdown = False
+        self._spawn_lock = threading.Lock()
         self._process: Any = None
         self._terminated = False
 
@@ -244,8 +248,10 @@ class TickRunner:
         return out or "", err or ""
 
     def terminate(self) -> None:
-        """Kill the running tick's process group (the server got SIGTERM)."""
-        process = self._process
+        """Kill the running tick's process group and start no further step (the server got SIGTERM)."""
+        with self._spawn_lock:
+            self._shutdown = True
+            process = self._process
         if process is not None:
             self._terminated = True
             self._signal_group(process, signal.SIGTERM)
@@ -266,13 +272,17 @@ class TickRunner:
                     steps.append({"exit_code": None, "result": "skipped: the tick's time is used up"})
                     break
                 env = dict(os.environ, **{ENV_TICK_DEADLINE: f"{deadline_epoch:.3f}"})
-                try:
-                    process = self.popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                         start_new_session=True, env=env)
-                except OSError as exc:
-                    LOG.error("Watchdog tick could not start: %s", exc)
-                    return 500, {"status": "error", "error": type(exc).__name__}
-                self._process = process
+                with self._spawn_lock:
+                    if self._shutdown:
+                        LOG.warning("Watchdog is shutting down; step %d of the tick does not start", index + 1)
+                        return 500, {"status": "terminated", "seconds": round(self.clock() - started, 1)}
+                    try:
+                        process = self.popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                             start_new_session=True, env=env)
+                    except OSError as exc:
+                        LOG.error("Watchdog tick could not start: %s", exc)
+                        return 500, {"status": "error", "error": type(exc).__name__}
+                    self._process = process
                 try:
                     try:
                         stdout, stderr = process.communicate(timeout=timeout)
@@ -285,7 +295,7 @@ class TickRunner:
                     self._process = None
                 # The child's log lines (stderr) go to Cloud Logging; the response carries only the step summary.
                 _write_stderr(stderr)
-                if self._terminated:
+                if self._terminated or self._shutdown:
                     return 500, {"status": "terminated", "seconds": round(self.clock() - started, 1)}
                 lines = [line for line in (stdout or "").splitlines() if line.strip()]
                 steps.append({"exit_code": process.returncode,

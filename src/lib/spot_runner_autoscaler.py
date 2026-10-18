@@ -255,6 +255,14 @@ def runner_inventory_stale(state):
 # While this controller holds its target's runner floor lease (SPOT_RUNNER_FLOOR_STATE_URI set), the lease's guard:
 # every fleet mutation first proves the lease still held, so the floor keeper and this controller never both act.
 _FLOOR_LEASE_GUARD = None
+# The held lease itself: long provider-mutating children run fenced by it (runner_floor.run_fenced).
+_FLOOR_LEASE_HOLDER = None
+
+
+def raise_if_floor_lease_lost() -> None:
+    if _FLOOR_LEASE_HOLDER is not None and _FLOOR_LEASE_HOLDER.lost is not None:
+        raise RuntimeError('Fleet mutation held: the runner floor lease was lost while the deployment manager ran; '
+                           'its process group was stopped, and the launch is reconciled once the lease is held again')
 
 
 def guard_inventory_fresh(state):
@@ -415,12 +423,12 @@ def terminate_spot_vm(vm: GceVm, project: str, org: str, runners: list[GitHubRun
         on_deleted()
     subprocess.run(["gcloud", "compute", "instances", "delete", vm.name,
                     f"--zone={vm.zone}", f"--project={project}", "--delete-disks=all", "--quiet"],
-                   check=True, text=True, capture_output=True)
+                   check=True, text=True, capture_output=True, timeout=300)
     LOG.info("Deleted idle Spot VM %s and its attached disks", vm_details(vm))
     for runner in assigned:
         subprocess.run(["gh", "api", "-X", "DELETE",
                         f"{target_api_prefix(org)}/actions/runners/{runner.runner_id}"],
-                       check=True, text=True, capture_output=True)
+                       check=True, text=True, capture_output=True, timeout=60)
 
 
 def read_scale_state(path: Path) -> dict:
@@ -2691,7 +2699,7 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         result = subprocess.run(
             ["gcloud", "compute", "zones", "list", f"--project={args.project}",
              f"--filter=name~'^{offer.region}-' AND status=UP", "--format=value(name)"],
-            check=True, text=True, capture_output=True,
+            check=True, text=True, capture_output=True, timeout=60,
         )
         zones = result.stdout.split()
     if not zones:
@@ -2785,15 +2793,21 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
         started = time.monotonic()
         manager_hung = False
         try:
-            # The manager enforces the registration deadline; this backstop covers a hung manager.
+            # The manager enforces the registration deadline; this backstop covers a hung manager. With a floor lease
+            # held, the manager runs in its own process group, killed the moment the lease is lost (runner_floor).
             guard_fleet_mutation(state)
-            result = subprocess.run(command, check=False, text=True, capture_output=True,
-                                    timeout=deadline + 120)
+            if _FLOOR_LEASE_HOLDER is None:
+                result = subprocess.run(command, check=False, text=True, capture_output=True,
+                                        timeout=deadline + 120)
+            else:
+                from .runner_floor import run_fenced
+                result = run_fenced(command, timeout=deadline + 120, holder=_FLOOR_LEASE_HOLDER)
         except subprocess.TimeoutExpired:
             manager_hung = True
             result = SimpleNamespace(returncode=-9, stdout="",
                                      stderr="Deployment manager timed out before reporting an outcome")
         identity_observed = import_deployment_receipt(state, state_path)
+        raise_if_floor_lease_lost()
         for output in (result.stdout, result.stderr):
             for line in (output or "").splitlines():
                 if line.strip():
@@ -2989,7 +3003,7 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
     if getattr(args, 'make_before_break', False):
         plist['ProgramArguments'].append('--make-before-break')
     plist_path.write_bytes(plistlib.dumps(plist))
-    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], check=False)
+    subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], check=False, timeout=60)
     return plist_path
 
 
@@ -3054,7 +3068,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError('Resource mode requires 300-second checks and a positive maximum host count')
     load_env(ROOT / ".env")
     if args.github_user:
-        secret=subprocess.check_output(["gh","auth","token","--user",args.github_user],text=True).strip()
+        secret=subprocess.check_output(["gh","auth","token","--user",args.github_user],text=True,timeout=30).strip()
         if not secret:raise RuntimeError("Missing requested GitHub account credential")
         os.environ["GH_TOKEN"]=secret
     args.billing_export_table = args.billing_export_table or os.environ.get('GCP_BILLING_EXPORT_TABLE')
@@ -3134,7 +3148,7 @@ def acquire_floor_lease(args: argparse.Namespace):
     Returns None when the variable is unset (no floor coordination), False with --once while another controller
     (the floor keeper, or a replacement command) holds the lease, else the held lease. Without --once it waits.
     """
-    global _FLOOR_LEASE_GUARD
+    global _FLOOR_LEASE_GUARD, _FLOOR_LEASE_HOLDER
     from .runner_floor import ENV_STATE_URI, AutoscalerTargetLease
 
     uri = str(os.environ.get(ENV_STATE_URI, '') or '').strip()
@@ -3159,14 +3173,16 @@ def acquire_floor_lease(args: argparse.Namespace):
         time.sleep(args.interval_seconds)
     holder.start()
     _FLOOR_LEASE_GUARD = holder.guard
+    _FLOOR_LEASE_HOLDER = holder
     LOG.info('Holding the runner floor lease of %s; the floor keeper skips this target while this controller runs',
              target)
     return holder
 
 
 def release_floor_lease(holder) -> None:
-    global _FLOOR_LEASE_GUARD
+    global _FLOOR_LEASE_GUARD, _FLOOR_LEASE_HOLDER
     _FLOOR_LEASE_GUARD = None
+    _FLOOR_LEASE_HOLDER = None
     holder.release()
 
 

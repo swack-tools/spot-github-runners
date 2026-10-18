@@ -1077,3 +1077,174 @@ class CommandLineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GRANDCHILD_SCRIPT = """
+import os, signal, subprocess, sys, time
+path = sys.argv[1]
+script = ("import os, signal, sys, time\\n"
+          "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"  # like a gcloud that ignores SIGTERM
+          "open(sys.argv[1], 'w').write(str(os.getpid()))\\n"
+          "time.sleep(120)\\n")
+subprocess.Popen([sys.executable, "-c", script, path])
+time.sleep(120)
+"""
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+class FakeLease:
+    def __init__(self):
+        self.lose = False
+        self.released = False
+
+    def ensure(self):
+        if self.lose:
+            raise gcs.LeaseLost("the lease object is no longer this controller's")
+
+    def acquire(self):
+        return True
+
+    def release(self):
+        self.released = True
+
+
+class FencingTests(unittest.TestCase):
+    """Real processes: a deployment-manager-like child whose grandchild ignores SIGTERM."""
+
+    def start_fenced(self, holder, timeout=60):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        pidfile = Path(directory.name) / "grandchild.pid"
+        outcome = {}
+        import threading
+
+        def run():
+            try:
+                outcome["result"] = rf.run_fenced([sys.executable, "-c", GRANDCHILD_SCRIPT, str(pidfile)],
+                                                  timeout=timeout, holder=holder)
+            except subprocess.TimeoutExpired as exc:
+                outcome["timeout"] = exc
+        thread = threading.Thread(target=run)
+        thread.start()
+        for _ in range(500):
+            if pidfile.exists() and pidfile.read_text():
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("the grandchild never started")
+        return thread, int(pidfile.read_text()), outcome
+
+    def assert_gone(self, pid):
+        for _ in range(200):
+            if not _alive(pid):
+                return
+            time.sleep(0.025)
+        os.kill(pid, 9)
+        self.fail(f"grandchild {pid} survived the lease loss")
+
+    def test_a_lost_lease_kills_the_fenced_childs_whole_group_at_once(self):
+        lease = FakeLease()
+        holder = rf.AutoscalerTargetLease(lease)
+        thread, grandchild, outcome = self.start_fenced(holder)
+        holder.guard()  # still held: nothing happens
+        self.assertTrue(_alive(grandchild))
+        lease.lose = True
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError):
+            holder.guard()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertLess(outcome["result"].returncode, 0)  # killed by a signal, not finished
+        self.assert_gone(grandchild)
+
+    def test_the_heartbeat_fences_without_any_guard_call(self):
+        lease = FakeLease()
+        holder = rf.AutoscalerTargetLease(lease)
+        with patch.object(rf.AutoscalerTargetLease, "HEARTBEAT_SECONDS", 0.05):
+            holder.start()
+            thread, grandchild, outcome = self.start_fenced(holder)
+            lease.lose = True
+            thread.join(10)
+            holder.release()
+        self.assertFalse(thread.is_alive())
+        self.assert_gone(grandchild)
+
+    def test_a_child_fenced_after_the_loss_is_killed_immediately(self):
+        lease = FakeLease()
+        lease.lose = True
+        holder = rf.AutoscalerTargetLease(lease)
+        with self.assertRaises(RuntimeError):
+            holder.guard()
+        started = time.monotonic()
+        result = rf.run_fenced([sys.executable, "-c", "import time; time.sleep(60)"], timeout=60, holder=holder)
+        self.assertLess(result.returncode, 0)  # never got to run its course
+        self.assertLess(time.monotonic() - started, 8)
+
+    def test_a_timed_out_fenced_child_loses_its_whole_group(self):
+        thread, grandchild, outcome = self.start_fenced(None, timeout=1)
+        thread.join(15)
+        self.assertIn("timeout", outcome)
+        self.assert_gone(grandchild)
+
+    def test_the_heartbeat_checks_every_few_seconds(self):
+        # A workstation that wakes from sleep must notice a taken-over lease well inside the 60 s stale grace.
+        self.assertLessEqual(rf.AutoscalerTargetLease.HEARTBEAT_SECONDS, 5)
+
+
+class FencedLaunchTests(unittest.TestCase):
+    def test_a_launch_stops_when_the_lease_is_lost_while_the_manager_runs(self):
+        import test_launch_failover as tlf
+        from lib import spot_runner_autoscaler as controller
+        harness = tlf.LaunchFailoverTests("test_failure_memory_survives_a_controller_restart")
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        lease = FakeLease()
+        holder = rf.AutoscalerTargetLease(lease)
+        calls = []
+
+        def fenced(command, *, timeout, holder):
+            calls.append((command, timeout, holder))
+            result = harness.cloud.manager(command, timeout=timeout)
+            lease.lose = True
+            with self.assertRaises(RuntimeError):
+                holder.guard()  # the heartbeat noticed while the manager ran
+            return result
+        with patch.object(controller, "_FLOOR_LEASE_HOLDER", holder), patch.object(rf, "run_fenced", fenced):
+            with self.assertRaises(RuntimeError) as caught:
+                controller.launch_offer(tlf.candidate("us-west4-a"), harness.args, {}, harness.path)
+        self.assertIn("runner floor lease was lost", str(caught.exception))
+        self.assertIs(calls[0][2], holder)
+        # Nothing acted after the loss: no cleanup delete, no second candidate.
+        self.assertFalse([c for c in harness.cloud.commands if c[:4] == ["gcloud", "compute", "instances", "delete"]])
+        self.assertEqual(len(calls), 1)
+
+    def test_autoscaler_children_end_inside_the_lease_margin(self):
+        import ast
+        from lib import spot_runner_autoscaler as controller
+        source = Path(controller.__file__).read_text()
+        bounded, unbounded = [], []
+        for node in ast.walk(ast.parse(source)):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess"
+                    and node.func.attr in ("run", "check_output", "Popen")):
+                timeout = next((k.value for k in node.keywords if k.arg == "timeout"), None)
+                text = ast.unparse(timeout) if timeout is not None else "none"
+                if isinstance(timeout, ast.Constant) and timeout.value <= 600 or text == "docker_timeout()":
+                    bounded.append(node.lineno)
+                else:
+                    unbounded.append((node.lineno, text))
+        # The only longer child is the deployment manager, and only on the path without a floor lease; with the
+        # lease held it runs fenced (killed on loss) instead.
+        self.assertEqual([text for _, text in unbounded], ["deadline + 120"])
+        line = unbounded[0][0]
+        self.assertIn("if _FLOOR_LEASE_HOLDER is None:", "\n".join(source.splitlines()[line - 3:line]))
+        self.assertGreater(len(bounded), 10)
+        self.assertGreater(gcs.LEASE_MIN_REMAINING_SECONDS, 600)
