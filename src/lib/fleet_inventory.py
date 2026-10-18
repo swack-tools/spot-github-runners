@@ -197,8 +197,11 @@ def observe_fleet_items(
         deployment = runner_deployment_from_gce_item(item)
         metadata = gce_metadata_items(item)
         if role == "rust_builder":
-            runners_count, runner_vcpu, runner_ram_gib = 1, BUILDER_CONTAINER_VCPU, BUILDER_CONTAINER_RAM_GIB
-            runner_limits_known = True
+            runner_limits_known = bool(specs_known and machine_type == "n4-highcpu-16"
+                                       and vcpu == 16 and ram_gib == 32.0)
+            runners_count = 1 if runner_limits_known else 0
+            runner_vcpu = BUILDER_CONTAINER_VCPU if runner_limits_known else 0
+            runner_ram_gib = BUILDER_CONTAINER_RAM_GIB if runner_limits_known else 0.0
         else:
             # Instance metadata records the listener count only; per-job limits depend on the tier and admission
             # (listeners are not memory capacity), so they are unknown here rather than guessed.
@@ -211,7 +214,8 @@ def observe_fleet_items(
             patch["patch_sha256"] and not patch["patch_pending_sha256"]
             and patch["patch_boot"] and patch["patch_boot"] == gce_timestamp(item.get("lastStartTimestamp"))
         )
-        runners_count_known = role == "rust_builder" or ("runners_count" in deployment and bootstrap_confirmed)
+        runners_count_known = (runner_limits_known if role == "rust_builder"
+                               else "runners_count" in deployment and bootstrap_confirmed)
         observed.append({
             "instance_id": instance_id,
             "name": name,
@@ -266,11 +270,13 @@ class FleetListing(list):
     """Fleet observations plus whether the project's disks could be listed (detached disks are counted only then)."""
 
     disks_listed: bool = True
+    disk_inventory: dict[str, Any] | None = None
 
 
 def observe_detached_disks(disk_details: Mapping[str, Any],
                            attached_sources: frozenset[str] = frozenset(),
-                           snapshot_names: frozenset[str] | None = None) -> list[dict[str, Any]]:
+                           snapshot_names: frozenset[str] | None = None, *,
+                           tracked_roles: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
     """Observations for fleet-named persistent disks that no VM uses (status ``DETACHED``, storage only).
 
     An attached disk is billed through its VM's record; once no VM uses it (a builder cache disk outlives its
@@ -280,17 +286,16 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
     for link, raw in disk_details.items():
         detail = raw if isinstance(raw, Mapping) else {}
         name = str(detail.get("name", "") or "")
-        role = fleet_role(name)
+        role = fleet_role(name) or (tracked_roles or {}).get("id:" + str(detail.get("id", "")))
         if role is None or not detail.get("id"):
             continue
-        # Instance names are zonal: compare "<zone>/<name>" keys (from the users' self-links).
-        users = ["/".join(str(u).rstrip("/").split("/")[-3::2]) for u in (detail.get("users") or [])]
-        if users and (snapshot_names is None or any(u in snapshot_names or fleet_role(u.rsplit("/", 1)[-1]) is None
-                                                    for u in users)):
-            # Used by a VM in this instance snapshot (its record bills it), or by a VM outside the fleet.
+        # Users from the later disk listing cannot prove the earlier instance snapshot contained this
+        # attachment, even when the user VM was already present. Only attached_sources proves billing ownership.
+        users = [str(u).rstrip("/").rsplit("/", 1)[-1] for u in (detail.get("users") or [])]
+        if any(fleet_role(name) is None for name in users):
+            # Current external ownership is outside fleet billing.
             continue
-        # Otherwise any user is a fleet VM the instance listing (taken just before) has not shown yet: bill the disk
-        # here for now, so no time is lost; that VM's record takes it over at the handoff.
+        # Keep fleet-used disks here until an instance snapshot actually includes their attachment.
         if str(link) in attached_sources:
             # The instance listing (taken just before) still shows it attached: its VM's record bills it.
             continue
@@ -404,6 +409,7 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                                                     for i in items if isinstance(i, dict)))
                                          if types_known else []))
                 result.disks_listed = types_known
+                result.disk_inventory = disk_types if types_known else None
                 return result
             finally:
                 while not api.connections.empty():

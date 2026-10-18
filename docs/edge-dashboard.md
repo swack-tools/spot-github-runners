@@ -390,7 +390,18 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   detached again keeps its earlier standalone interval and restarts billing at the new handoff.
 - Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
   scale-up plans are refused even when the listing is otherwise current. Grant the permission for
-  scaling to work.
+  scaling to work. For a disk newly attached during this outage, the dashboard defers its cost rather
+  than assigning a fallback rate. Once disk metadata is available, it fills that disk's history from
+  its creation or known handoff time at the verified rate, preserving observed size-change boundaries.
+  Deferred intervals follow a disk when its billing owner changes and survive detachment until metadata
+  can resolve them. Pending disk liabilities remain visible
+  when the deleted-instance filter is off. A complete project disk listing must confirm a resource is
+  missing before its unresolved history can expire. Once that confirmed absence is outside the 31-day
+  window, it no longer holds current budgets; `lifetime_cost_complete` stays false if the old amount
+  couldn't be recovered. A newer disk with the same source name cannot resolve the old uncertainty.
+- A builder name identifies the host's role, but its fixed build capacity is counted only after the
+  machine inventory verifies `n4-highcpu-16`, 16 vCPUs, and 32 GiB of host RAM. Other shapes and unknown
+  capacities have no known container limits and can't be copied into a VM template.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host; the dashboard hides the template action for such records.
@@ -441,6 +452,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   first listed after the baseline is `RUNNING` with its bootstrap confirmed and the ready slots reach
   the event's target. A restart of existing capacity, or a same-size replacement, handles nothing. New
   capacity stays pending through the OOM lookback, so an OOM reported late can still be answered by it.
+  Without a dated readiness transition, only a new identity created after the incident can satisfy it.
+  A poll time or missing bootstrap metadata cannot date readiness, so uncertain incidents stay active.
+  A later restart of the same identity cannot satisfy a newer incident.
   Hosts first listed together with an OOM that were already running before it count toward its baseline,
   and only ready runner slots count as current runners. Builder OOM events are never handled from the
   inventory, including by the builder scaling evaluation: a builder has no service account, so its
@@ -485,17 +499,21 @@ GitHub CI failure runs, journal OOM events, or job counters.
     `builder-oxidex-eu-01`. `POST /api/rust-builds` merges a partial update into an existing build, so
     these match only when every field the seed set is unchanged, including the seeded gaps between the
     requested, finished, and delivered times and their original whole-second UTC format. Fractional timing
-    corrections stay even when all three times shift together.
+    corrections stay even when all three times shift together. The original startup time must be confirmed
+    independently by at least two unchanged saved preset templates. Shifted builds cannot provide their own
+    time evidence; without agreeing saved presets, they stay untouched.
   - The GitHub CI runs `gh-oom-37192272062`, `gh-oom-37192994059`, and `gh-timeout-38596411473`, and
     the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`, matched with their
     complete seeded report content, including logs, links, and failure times.
   - The journal OOM event `oom-journal-01`, matched with its complete seeded report content. Its generated
-    observation time and older CI failure times are checked against the startup time recovered from an
-    unchanged seeded build. If that time cannot be recovered, these events stay rather than risking a
+    observation time and older CI failure times are checked against the original startup time confirmed
+    by the unchanged saved presets. If that time cannot be recovered, these events stay rather than risking a
     reported correction. Additional source evidence, such as a log hash or cgroup path, also keeps the
     event; only known classification and handling fields may be added to an unchanged seed.
-- The migration also resets the job counters to 0 when all three still hold the seeded values, 14 jobs in
-  the past hour, 7 provisioned, and 3 queued. Any other combination stays as reported.
+- The migration preserves all saved job counters, including the old demo tuple of 14 jobs in the past
+  hour, 7 provisioned, and 3 queued. Earlier versions stored no provenance for counters: a fresh partial
+  report could produce that tuple while leaving old demo events untouched. There is no way to prove the
+  saved counters are still demo data. New states start at 0; later reports replace the saved counters.
 - The drop keeps the loaded `state_version` and sets `demo_telemetry_migration_pending` in the saved
   state, so a restart doesn't lose it. The active slot then commits the migrated state as the next
   `state_version` through the same checks as any change, and publishes it to KV. Any new version clears
