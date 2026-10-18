@@ -7846,12 +7846,13 @@ class DashboardStore:
                 fin_epoch = _iso_to_epoch(str(fin_at)) if fin_at else None
                 if payload.get("requested_at"):
                     req_at = payload["requested_at"]
+                elif existing_build.get("requested_at"):
+                    # A stored request time is evidence: keep it (enrichment rejects timing that contradicts it).
+                    req_at = existing_build["requested_at"]
                 elif known_compile is not None and fin_epoch is not None:
                     req_at = _iso_at_epoch(fin_epoch - max(0.0, known_compile))
                 elif duration is not None:
                     req_at = _iso_at_epoch(del_epoch - max(0.0, duration))
-                elif existing_build.get("requested_at"):
-                    req_at = existing_build["requested_at"]
                 else:
                     raise ValueError(UNKNOWN_BUILD_TIMING_MESSAGE)
 

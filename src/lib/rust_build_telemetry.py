@@ -593,7 +593,8 @@ def enrich_rust_build_record(
         "instance_benchmark_score": benchmark_score,
         "ssh_command": format_gcloud_ssh_command(instance_name, zone, project) if instance_name and zone else None,
         "origin_ip": ip_intel["ip_address"],
-        "origin_hostname": ip_intel["hostname"],
+        # Only a reported hostname; the classifier's default or "unknown" name is not the build's host.
+        "origin_hostname": _optional_str(record.get("origin_hostname")),
         "geolocation": ip_intel["geolocation"],
         "network_security": {
             "provider_label": ip_intel["provider_label"],

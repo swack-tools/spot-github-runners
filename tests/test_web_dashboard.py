@@ -7694,6 +7694,29 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         self.assertEqual((done["requested_at"], done["finished_at"]), ("2026-10-18T18:00:00Z", "2026-10-18T18:01:00Z"))
         self.assertEqual(done["delivery_duration_seconds"], 10.0)
 
+    def test_completion_keeps_stored_request_time(self):
+        self.store.record_rust_build({"build_id": "rb-keep-req", "status": "RUNNING",
+                                      "requested_at": "2026-10-18T18:00:00Z"})
+        with self.assertRaisesRegex(ValueError, "Inconsistent total_duration_seconds"):
+            self.store.record_rust_build({"build_id": "rb-keep-req", "status": "DELIVERED",
+                                          "delivered_at": "2026-10-18T18:02:00Z", "total_duration_seconds": 60})
+        done = self.store.record_rust_build({"build_id": "rb-keep-req", "status": "DELIVERED",
+                                             "delivered_at": "2026-10-18T18:02:00Z",
+                                             "total_duration_seconds": 120})["build"]
+        self.assertEqual(done["requested_at"], "2026-10-18T18:00:00Z")
+
+    def test_unreported_origin_hostname_stays_null(self):
+        for ip in ("185.159.157.42", "8.8.8.8"):
+            build = self.store.record_rust_build({"build_id": f"rb-host-{ip}", "status": "QUEUED",
+                                                  "origin_ip": ip})["build"]
+            self.assertIsNone(build["origin_hostname"])
+        named = self.store.record_rust_build({"build_id": "rb-host-named", "status": "QUEUED",
+                                              "origin_ip": "8.8.8.8", "origin_hostname": "ci.example"})["build"]
+        self.assertEqual(named["origin_hostname"], "ci.example")
+        self.assertEqual(self.store.record_rust_build({"build_id": "rb-host-proton", "status": "QUEUED",
+                                                        "origin_ip": "185.159.157.42"})["build"]
+                         ["network_security"]["provider_label"], "ProtonVPN")
+
     def test_failure_with_delivery_field_keeps_compile_time(self):
         build = self.store.record_rust_build({"build_id": "rb-del", "status": "OOM_KILLED",
                                               "compile_duration_seconds": 30, "delivery_duration_seconds": 5})["build"]

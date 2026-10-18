@@ -570,7 +570,8 @@ build carries stays `null`, and the page shows it as not reported. It never fill
 machine type, commit, origin IP, crate count, memory peak, CPU time, or duration.
 
 - A new build needs a `status`. An update without one keeps the stored status.
-- A blank text value counts as not reported, so it doesn't replace a stored value.
+- A blank text value counts as not reported, so it doesn't replace a stored value. An update without
+  `requested_at` keeps the stored request time, and timing that contradicts it is rejected.
 - A completed build, such as `DELIVERED`, needs enough timing to place it. `delivered_at` defaults to
   when the report arrives. The request time comes from `requested_at`, from `total_duration_seconds`, or
   from both `compile_duration_seconds` and `delivery_duration_seconds`. Without one of these the request
@@ -589,6 +590,7 @@ machine type, commit, origin IP, crate count, memory peak, CPU time, or duration
 - The benchmark score needs `cpu_platform`, `vcpu`, and `machine_type`, or an explicit
   `instance_benchmark_score`, which an update keeps unless it reports a different shape. CPU points need the benchmark score and `cpu_time_seconds`.
 - Without `origin_ip` the build has no network classification and shows the origin as not reported.
+  `origin_hostname` is stored only when reported; the classification never supplies one.
 - The summary's cache, memory, and CPU totals count only completed builds that reported each figure. A
   total that no build reported is `null`, not 0.
 - `container_ram_cap_gib` defaults to 28, the dedicated builder container's memory cap.
