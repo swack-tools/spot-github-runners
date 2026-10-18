@@ -5268,6 +5268,69 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertFalse(calculate_spot_pricing(**common, data_disk_type="pd-extreme")["complete"])
         self.assertNotIn("complete", calculate_spot_pricing(**common, data_disk_type="pd-ssd"))
 
+    def test_cache_disk_handoff_is_not_billed_twice(self):
+        from lib.dashboard_server import instance_usage
+
+        created = self.now - 10 * 86400.0
+        cache = "projects/p/zones/us-south1-b/disks/builder-oxidex-h-cache"
+        vm = fleet_observation("8100", "builder-oxidex-h", "us-south1-b", started_hours_ago=240.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "hyperdisk-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-h"},
+            {"type": "hyperdisk-balanced", "gb": 100, "created_epoch": created, "source": cache}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        detached = {"instance_id": "disk-91", "name": "builder-oxidex-h-cache", "role": "rust_builder",
+                    "status": "DETACHED", "kind": "disk", "zone": "us-south1-b", "region": "us-south1",
+                    "machine_type": "", "cpu_platform": "", "vcpu": 0, "ram_gib": 0.0, "spot": True,
+                    "boot_disk_type": "hyperdisk-balanced", "boot_disk_gb": 0, "data_disk_type": "hyperdisk-balanced",
+                    "data_disk_gb": 100, "data_disks": {"hyperdisk-balanced": 100},
+                    "disks_detail": [{"type": "hyperdisk-balanced", "gb": 100, "created_epoch": created,
+                                      "source": cache}],
+                    "created_epoch": created, "last_start_epoch": created, "last_stop_epoch": created}
+        self.fleet = [detached]  # The VM is deleted; its cache disk stays.
+        handoff = time.time()
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-h-cache")
+        usage = instance_usage(rec, handoff + 3600.0)
+        self.assertLess(usage["disk_hours"], 1.1)  # Billed from the handoff, not from its creation 10 days ago.
+
+    def test_detached_disk_reprices_and_lists_without_fleet_vms(self):
+        from lib import compute_api
+        from lib.fleet_inventory import gce_fleet_source
+
+        async def listing(api, project, *, instance_fields=compute_api.INSTANCE_LIST_FIELDS):
+            return [], []
+
+        async def disks(api, project):
+            return {"z/disks/builder-oxidex-z-cache": {"type": "pd-balanced", "id": "95", "name": "builder-oxidex-z-cache",
+                                                       "zone": "z/us-south1-b", "sizeGb": "100"}}
+
+        with unittest.mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("t", "p")), \
+                unittest.mock.patch.object(compute_api, "list_instances", listing), \
+                unittest.mock.patch.object(compute_api, "list_disk_types", disks):
+            observed = gce_fleet_source("p")()
+        self.assertEqual([o["name"] for o in observed], ["builder-oxidex-z-cache"])
+        self.fleet = observed
+        self.store.refresh_fleet_inventory()
+        before = self._record("builder-oxidex-z-cache")["pricing"]["tax_rate_percent"]
+        self.store.update_profile("rust_builder", {"budget": {"override_regional_tax": True, "tax_rate_percent": 21.0}})
+        self.assertNotEqual(before, 21.0)
+        self.assertEqual(self._record("builder-oxidex-z-cache")["pricing"]["tax_rate_percent"], 21.0)
+
+    def test_unknown_family_generic_rate_is_incomplete(self):
+        priced = calculate_spot_pricing(family="zz9", vcpu=8, ram_gib=32.0, region="us-south1",
+                                        boot_disk_type="pd-balanced", boot_disk_gb=40, data_disk_type="pd-balanced",
+                                        data_disk_gb=0, machine_type="zz9-standard-8", live_pricing={})
+        self.assertFalse(priced["complete"])
+        obs = fleet_observation("8200", "oxidex-runners-zz-1", "us-south1-a", machine_type="zz9-standard-8", vcpu=8,
+                                ram_gib=32.0, now=self.now)
+        self.fleet = [obs]
+        with unittest.mock.patch("lib.dashboard_models.fetch_live_spot_pricing", return_value={}):
+            self.store.refresh_fleet_inventory()
+        rec = self._record("oxidex-runners-zz-1")
+        self.assertFalse(rec["pricing_complete"])
+        self.assertIn("no known rate for the zz9", rec["pricing_incomplete_reason"])
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

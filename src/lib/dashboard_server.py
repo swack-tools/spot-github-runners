@@ -709,6 +709,8 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
         reasons.append("regional (replicated) persistent disk, priced here only at the zonal rate")
     if record.get("disk_types_known") is False:
         reasons.append("disk types unknown (no compute.disks.list), priced at the default type")
+    if pricing.get("family_rate_unknown"):
+        reasons.append(f"no known rate for the {record.get('family') or 'unknown'} machine family")
     if pricing.get("complete") is False and custom:
         reasons.append("custom or extended machine shape, which predefined rates do not price")
     if record.get("unpriced_disk_performance"):
@@ -773,6 +775,7 @@ def _live_instance_record(
     project: str,
     now: float,
     previous: dict[str, Any] | None = None,
+    known_disk_sources: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """A dashboard instance record for one Compute Engine observation (see fleet_inventory.observe_fleet_items)."""
     if obs.get("disk_types_known") is False:
@@ -843,6 +846,8 @@ def _live_instance_record(
         record["pricing"] = _with_secondary_disks(record["pricing"], obs, region=region,
                                                   family=record["family"], project=project)
     record["data_disks"] = obs.get("data_disks") or {}
+    record["disk_sources"] = sorted({str(d.get("source")) for d in obs.get("disks_detail") or []
+                                     if isinstance(d, dict) and d.get("source")})
     # Capacity this VM adds, not yet counted toward OOM handling: set for a new identity, kept until counted.
     record["capacity_pending"] = bool(previous.get("capacity_pending")) if previous is not None else True
     record["local_ssd_gb"] = int(obs.get("local_ssd_gb") or 0)
@@ -877,6 +882,13 @@ def _live_instance_record(
     if not _finite(created) and previous is not None:
         created = previous.get("disk_start_epoch")
     disk_start = min(float(created), started_epoch) if _finite(created) else started_epoch
+    if previous is None and known_disk_sources:
+        # A disk that another record already billed (a cache disk moving between a VM and its own DETACHED record)
+        # starts here at the handoff, not again at its creation.
+        handed_off = [dict(d, created_epoch=now) if d.get("source") in known_disk_sources else d
+                      for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
+        if handed_off:
+            obs = dict(obs, disks_detail=handed_off)
     prior_runs = _prior_runs(previous)
     disk_segments = _disk_segments(previous)
     initial_disk_segment_start: float | None = None
@@ -1208,6 +1220,8 @@ def reconcile_instance_records(
             by_id[str(obs["instance_id"])] = obs
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
+    # Disks some stored record already bills (or billed): a new record that takes one over starts it at the handoff.
+    known_disks = frozenset(src for r in existing if is_live_instance_record(r) for src in (r.get("disk_sources") or []))
     for record in existing:
         if not is_live_instance_record(record):
             continue
@@ -1226,7 +1240,7 @@ def reconcile_instance_records(
             records.append(_mark_instance_deleted(record, now))
     for instance_id, obs in by_id.items():
         if instance_id not in seen:
-            records.append(_live_instance_record(obs, project=project, now=now))
+            records.append(_live_instance_record(obs, project=project, now=now, known_disk_sources=known_disks))
     # Live VMs first (newest start first), then deleted history (newest deletion first), bounded in size.
     live = sorted((r for r in records if r.get("status") != "DELETED"),
                   key=lambda r: -float(r.get("started_epoch") or 0.0))
@@ -3759,13 +3773,14 @@ class DashboardStore:
             and (is_live_instance_record(inst) and inst.get("status") != "DELETED" if live
                  else inst.get("status") == "RUNNING" and not is_live_instance_record(inst))
             and inst.get("region")
-            and inst.get("machine_type")
+            # Disk-only records (DETACHED) have no machine type but still reprice their storage.
+            and (inst.get("machine_type") or (live and inst.get("kind") == "disk"))
         ]
         repriced = False
         if not running_insts:
             return repriced
         active_regions = sorted({str(inst["region"]) for inst in running_insts})
-        active_mtypes = sorted({str(inst["machine_type"]) for inst in running_insts})
+        active_mtypes = sorted({str(inst["machine_type"]) for inst in running_insts if inst.get("machine_type")})
         shared_live_pricing = fetch_live_spot_pricing(
             project=self.project,
             regions=active_regions,

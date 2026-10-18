@@ -2001,6 +2001,10 @@ def calculate_spot_pricing(
         result["complete"] = False
     if performance_billed:
         result["complete"] = False
+    if pricing_source == "catalog_baseline" and vcpu and family not in SERIES_SPOT_BASE_RATES:
+        # No machine, component, or family rate: the generic per-vCPU/GiB fallback is not a trusted price.
+        result["complete"] = False
+        result["family_rate_unknown"] = True
     return result
 
 

@@ -366,7 +366,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   recreated with the same name gets a new record, because the record follows the instance ID.
 - Spend covers each VM's attached disks while the VM exists. A fleet-named disk that no VM uses, such
   as a dedicated builder's cache disk (`auto-delete=no`) after its VM is deleted, gets its own
-  `DETACHED` record that bills storage until the disk is deleted.
+  `DETACHED` record that bills storage until the disk is deleted. Disks are listed even when no fleet VM
+  is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
+  is billed by the new record only from the handoff, never again from its creation.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host. A VM with data disks of several types can't be a template
@@ -387,7 +389,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, for a
   `SUSPENDED` VM, whose preserved memory Compute Engine also bills, for a VM with Local SSD (counted
   as `local_ssd_gb`, not as a persistent data disk), for a VM with a regional (replicated) persistent
-  disk or an Extreme Persistent Disk (`pd-extreme`, whose provisioned IOPS bill separately), for a custom or extended machine shape, which predefined rates don't price, and for a VM whose
+  disk or an Extreme Persistent Disk (`pd-extreme`, whose provisioned IOPS bill separately), for a custom or extended machine shape, which predefined rates don't price, for a machine family
+  without a known rate (when no live price was found), and for a VM whose
   Hyperdisk bills provisioned IOPS or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
   no reported performance), the record is marked
   `pricing_complete: false`. While the role's fleet (both roles under a shared budget) has such a VM,

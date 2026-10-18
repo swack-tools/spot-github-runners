@@ -154,7 +154,8 @@ def observe_fleet_items(
             regional_disks = regional_disks or bool(detail.get("regional")) or "/regions/" in str(disk.get("source", ""))
             dtype = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
             unpriced_performance = unpriced_performance or (bool(detail) and _unpriced_performance(detail))
-            disks_detail.append({"type": dtype, "gb": size, "created_epoch": gce_epoch(detail.get("creationTimestamp"))})
+            disks_detail.append({"type": dtype, "gb": size, "created_epoch": gce_epoch(detail.get("creationTimestamp")),
+                                 "source": str(disk.get("source", "") or "")})
             if disk.get("boot"):
                 boot_disk_type, boot_disk_gb = dtype, size
             else:
@@ -272,7 +273,7 @@ def observe_detached_disks(disk_details: Mapping[str, Any]) -> list[dict[str, An
             "unpriced_disk_performance": _unpriced_performance(detail),
             "regional_disks": bool(detail.get("regional")),
             "disk_types_known": True,
-            "disks_detail": [{"type": kind, "gb": size, "created_epoch": created}],
+            "disks_detail": [{"type": kind, "gb": size, "created_epoch": created, "source": str(link)}],
             "runners_count": 0,
             "runners_count_known": True,
             "runner_vcpu": 0,
@@ -313,9 +314,9 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                 disk_types: dict[str, Any] = {}
                 types_known = True
                 try:
-                    if fleet_items:
-                        disk_types = await compute_api.list_disk_types(api, auth.project)
-                        disk_listing["ok_before"] = True
+                    # Always: a fleet disk can outlive the last fleet VM (a builder cache disk) and still bill.
+                    disk_types = await compute_api.list_disk_types(api, auth.project)
+                    disk_listing["ok_before"] = True
                 except Exception as exc:
                     if disk_listing["ok_before"] or not _permission_denied(exc):
                         # Transient (or after a restart, when this process has not listed disks yet but stored
