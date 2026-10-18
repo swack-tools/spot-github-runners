@@ -2177,7 +2177,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     // A VM template copies one shape: records whose per-runner limits or disks it cannot describe cannot be sources.
     function canTemplate(inst) {
-      return inst.kind !== "disk" && inst.runner_limits_known !== false && inst.disk_types_known !== false
+      return inst.kind !== "disk" && !(inst.shared_attachments || []).length && inst.runner_limits_known !== false && inst.disk_types_known !== false
         && !inst.regional_disks && !inst.unpriced_disk_performance && !(inst.local_ssd_gb > 0)
         && Object.keys(inst.data_disks || {}).length <= 1;
     }

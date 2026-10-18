@@ -378,7 +378,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `DETACHED` record that bills storage until the disk is deleted (shown as present storage). A disk the instance listing still shows
   attached is billed only by its VM's record, and a disk attached to a fleet VM that the instance listing
   doesn't show yet is billed on its own until that VM appears. A disk attached to several fleet VMs is
-  billed once. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
+  billed once, while every VM keeps the full attachment metadata. VM templates cannot copy shared
+  attachments. Disk users are matched by zone and instance name. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
   is billed by the new record only from the handoff, never again from its creation. Disks are matched
   by their immutable disk ID, so a new disk that reuses a name is billed from its own creation. While
   disks can't be listed, existing `DETACHED` records are kept, not marked deleted, unless a listed VM

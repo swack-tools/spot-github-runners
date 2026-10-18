@@ -5712,9 +5712,11 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             "id": "101", "name": "builder-oxidex-sp-cache", "zone": "z/us-south1-b", "sizeGb": "100",
             "type": "pd-balanced", "users": ["projects/p/zones/us-south1-b/instances/builder-oxidex-sp-2"]}}
         # The replacement builder was created after the instance listing: bill the disk here for now.
-        self.assertEqual(len(observe_detached_disks(detail, frozenset(), frozenset({"builder-oxidex-sp-1"}))), 1)
+        self.assertEqual(len(observe_detached_disks(detail, frozenset(), frozenset({"us-south1-b/builder-oxidex-sp-1"}))), 1)
         # Its user is in the snapshot: that VM's record bills it.
-        self.assertEqual(observe_detached_disks(detail, frozenset(), frozenset({"builder-oxidex-sp-2"})), [])
+        self.assertEqual(observe_detached_disks(detail, frozenset(), frozenset({"us-south1-b/builder-oxidex-sp-2"})), [])
+        # A same-named VM in another zone is a different VM: the disk is still billed here.
+        self.assertEqual(len(observe_detached_disks(detail, frozenset(), frozenset({"us-east1-c/builder-oxidex-sp-2"}))), 1)
         other = {"z/disks/builder-oxidex-x-cache": dict(detail["z/disks/builder-oxidex-sp-cache"], id="102",
                                                         name="builder-oxidex-x-cache",
                                                         users=["projects/p/zones/z/instances/someone-else"])}
@@ -5782,7 +5784,86 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                   "machineType": "machineTypes/n4-standard-16", "disks": [shared]} for i in range(2)]
         obs = observe_fleet_items(items, disk_types={"z/disks/shared-ro": {"type": "pd-ssd", "id": "500"}},
                                   shapes={("us-south1-a", "n4-standard-16"): {"vcpu": 16, "ram_gib": 64.0}})
-        self.assertEqual([o["data_disk_gb"] for o in obs], [500, 0])
+        self.assertEqual([o["data_disk_gb"] for o in obs], [500, 500])  # Both VMs' shapes include it.
+        self.assertEqual([o["data_disks"] for o in obs], [{"pd-ssd": 500}, {}])  # Billed once.
+        self.assertEqual(obs[1]["disks_detail"][0]["id"], "500")
+        self.assertFalse(obs[1]["disks_detail"][0]["billing_owner"])
+        self.fleet = obs
+        self.store.refresh_fleet_inventory()
+        second = self._record("oxidex-runners-ro-1")
+        self.assertEqual(second["data_disk_gb"], 500)
+        self.assertLess(second["pricing"]["disk_hourly_usd"], self._record("oxidex-runners-ro-0")["pricing"]["disk_hourly_usd"])
+
+    def test_shared_disk_ownership_transfer_during_denied_listing(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        shared = {"boot": False, "diskSizeGb": "500", "source": "z/shared-transfer"}
+        items = [{"id": str(i), "name": f"builder-transfer-{i}", "zone": "zones/us-south1-a",
+                  "status": "RUNNING", "machineType": "types/n4-highcpu-16", "disks": [shared]}
+                 for i in (2, 3)]
+        shapes = {("us-south1-a", "n4-highcpu-16"): {"vcpu": 16, "ram_gib": 32.0}}
+        self.fleet = observe_fleet_items(items, shapes=shapes,
+                                         disk_types={"z/shared-transfer": {"id": "888", "type": "pd-balanced"}})
+        self.store.refresh_fleet_inventory()
+        items.append(dict(items[0], id="1", name="builder-transfer-1"))
+        self.fleet = observe_fleet_items(items, shapes=shapes, disk_types={}, disk_types_known=False)
+        self.store.refresh_fleet_inventory()
+        live = [r for r in self.store.state["instances"] if r["status"] == "RUNNING"]
+        self.assertEqual(sum(sum(r["data_disks"].values()) for r in live), 500)
+        self.assertEqual(sum(r["data_disk_gb"] for r in live), 1500)
+        self.assertEqual(len([r for r in live if r["pricing"]["disk_hourly_usd"] > 0]), 1)
+
+    def test_shared_nonowner_does_not_suppress_owner_history_backfill(self):
+        from lib.dashboard_server import reconcile_instance_records
+        from lib.fleet_inventory import observe_fleet_items
+
+        shared = {"boot": False, "diskSizeGb": "500", "source": "z/backfill-shared", "autoDelete": False}
+        items = [{"id": str(i), "name": f"builder-backfill-{i}", "zone": "zones/us-south1-a",
+                  "status": "RUNNING", "machineType": "types/n4-highcpu-16", "disks": [shared]}
+                 for i in (1, 2)]
+        shapes = {("us-south1-a", "n4-highcpu-16"): {"vcpu": 16, "ram_gib": 32.0}}
+        before = observe_fleet_items(items, shapes=shapes, disk_types={}, disk_types_known=False)
+        records, _ = reconcile_instance_records([], before, project="p", now=self.now, disks_listed=False)
+        stamp = datetime.fromtimestamp(self.now - 86400, timezone.utc).isoformat()
+        after = observe_fleet_items(items, shapes=shapes, disk_types={
+            "z/backfill-shared": {"id": "99", "type": "pd-balanced", "creationTimestamp": stamp}})
+        records, _ = reconcile_instance_records(records, after, project="p", now=self.now + 3600)
+        owner = next(r for r in records if r["instance_id"] == "1")
+        nonowner = next(r for r in records if r["instance_id"] == "2")
+        self.assertTrue(owner["disk_segments"])
+        self.assertAlmostEqual(owner["disk_segments"][0][0], self.now - 86400, places=5)
+        self.assertEqual(nonowner["disk_segments"], [])
+
+    def test_unowned_unknown_disk_does_not_defer_owned_history(self):
+        from lib.dashboard_server import _live_instance_record, instance_usage
+
+        obs = fleet_observation("shared-history", "builder-shared-history", "us-south1-a", now=self.now)
+        obs["disks_detail"] = [
+            {"source": "boot", "gb": 40, "type": "pd-balanced", "boot": True,
+             "billing_owner": True, "created_epoch": self.now - 7200},
+            {"source": "owned", "gb": 100, "type": "pd-balanced", "boot": False,
+             "billing_owner": True, "created_epoch": self.now - 3600},
+            {"source": "shared", "gb": 100, "type": "pd-balanced", "boot": False,
+             "billing_owner": False, "created_epoch": None},
+        ]
+        first = _live_instance_record(obs, project="p", now=self.now)
+        self.assertIsNone(first["disk_history_deferred_at"])
+        second = _live_instance_record(obs, project="p", now=self.now, previous=first)
+        self.assertEqual(first["disk_segments"], second["disk_segments"])
+        self.assertEqual(instance_usage(first, self.now), instance_usage(second, self.now))
+
+    def test_shared_boot_shape_and_billing_are_separate(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        disk = {"boot": True, "diskSizeGb": "40", "source": "z/shared-boot"}
+        items = [{"id": str(i), "name": f"builder-shared-{i}", "zone": "zones/us-south1-a",
+                  "status": "RUNNING", "machineType": "types/n4-highcpu-16", "disks": [disk]} for i in (2, 1)]
+        args = dict(disk_types={"z/shared-boot": {"type": "pd-balanced", "id": "88"}},
+                    shapes={("us-south1-a", "n4-highcpu-16"): {"vcpu": 16, "ram_gib": 32.0}})
+        observed = observe_fleet_items(items, **args)
+        self.assertEqual([r["boot_disk_gb"] for r in observed], [40, 40])
+        self.assertEqual([r["boot_disk_billed_gb"] for r in observed], [40, 0])
+        self.assertEqual(observed, observe_fleet_items(list(reversed(items)), **args))
 
     def test_compaction_keeps_resolved_liability_interval(self):
         from lib.dashboard_server import _bucket_window_costs, _compact_deleted_record, _live_instance_record
@@ -5899,6 +5980,45 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.fleet.append(self._runner("9998", "oxidex-runners-ex-2", started_hours_ago=0.01))
         self.store.refresh_fleet_inventory()
         self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
+
+    def test_source_only_alias_requires_pending_liability(self):
+        from lib.dashboard_server import _disk_known, _record_disk_keys
+
+        record = {"disk_sources": ["z/cache"], "disk_ids": {}, "status": "DELETED"}
+        disk = {"source": "z/cache", "id": "new-id"}
+        self.assertFalse(_disk_known(disk, _record_disk_keys(record)))
+        self.assertFalse(_disk_known(disk, _record_disk_keys(dict(record, status="RUNNING"))))
+        self.assertTrue(_disk_known(disk, _record_disk_keys(dict(record, disk_liability_pending=True))))
+        pending = dict(record, disk_liability_pending=True, deleted_epoch=self.now - 3600)
+        self.assertFalse(_disk_known(dict(disk, created_epoch=self.now), _record_disk_keys(pending)))
+        self.assertTrue(_disk_known(dict(disk, created_epoch=self.now - 7200), _record_disk_keys(pending)))
+
+    def test_source_only_liability_matches_id_at_handoff(self):
+        from lib.dashboard_server import instance_usage
+        from lib.fleet_inventory import FleetListing, observe_detached_disks
+
+        created = self.now - 5 * 86400.0
+        cache = "projects/p/zones/us-south1-b/disks/builder-oxidex-so-cache"
+        vm = fleet_observation("9999", "builder-oxidex-so", "us-south1-b", started_hours_ago=120.0, now=self.now)
+        vm.update(disk_types_known=False, disks_detail=[{"type": "pd-balanced", "gb": 100, "created_epoch": None,
+                                                         "source": cache, "id": "", "auto_delete": False}])
+        listing = FleetListing([vm])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        gone = FleetListing([])
+        gone.disks_listed = False
+        self.store.fleet_source = lambda: gone
+        self.store.refresh_fleet_inventory()  # Vanished during the outage: source-only liability pending.
+        stamp = datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.fleet = observe_detached_disks({cache: {"id": "404", "name": "builder-oxidex-so-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced",
+                                                     "creationTimestamp": stamp}})
+        self.store.fleet_source = lambda: list(self.fleet)
+        resumed = time.time()
+        self.store.refresh_fleet_inventory()
+        detached = self._record("builder-oxidex-so-cache")
+        self.assertLess(instance_usage(detached, resumed + 3600.0)["disk_hours"], 1.1)  # Handoff, not creation.
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
