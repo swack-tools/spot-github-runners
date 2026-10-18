@@ -1532,6 +1532,14 @@ def _mark_instance_deleted(record: dict[str, Any], now: float, *, disks_pending:
                            project: str = "homelab-424523") -> dict[str, Any]:
     """The record of a VM that is no longer in the Compute Engine inventory."""
     out = copy.deepcopy(record)
+    pricing = record.get("pricing") or {}
+    started = float(record.get("started_epoch") or now)
+    _remember_incomplete_pricing(out, record, pricing,
+        max(started, float(record.get("compute_segment_start") or started)),
+        min(now, _current_run_end(record, now)),
+        float(record.get("disk_segment_start") or record.get("disk_start_epoch") or now),
+        min(now, float(record.get("disk_end_epoch") or
+            (record.get("deleted_epoch") if not record.get("disk_liability_pending") else None) or now)))
     if disks_pending:
         retained = _retained_disks(out)
         if retained == []:
@@ -2010,7 +2018,8 @@ def reconcile_instance_records(
                 records.append(out)
             elif disks_listed or transferred:
                 # The disk listing is back: the cache disk is either listed on its own now (its DETACHED record
-                # takes over from this moment) or gone. Either way this record stops billing it here.
+                # takes over from this moment) or gone. Close the liability's rate and its trust bounds together.
+                _close_open_segments(record, record.get("pricing") or {}, now)
                 records.append(dict(record, disk_liability_pending=False, disk_end_epoch=now))
             else:
                 records.append(record)
