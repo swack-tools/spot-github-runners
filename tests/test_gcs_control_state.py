@@ -300,6 +300,79 @@ class LeaseTests(unittest.TestCase):
         self.assertGreater(gcs.LEASE_MIN_REMAINING_SECONDS, 600, "must outlast default_gcloud's 600 s timeout")
 
 
+class SuspendAwareLeaseTests(unittest.TestCase):
+    """The holder's clock: macOS time.monotonic() stops during system sleep; the wall clock doesn't."""
+
+    def setUp(self):
+        self.w = World()
+        self.mono = [500.0]  # the holder's monotonic clock; the server and wall clocks are self.w.clock
+
+    def lease(self, owner):
+        return RealLease(self.w.client, self.w.lock_name, owner=owner, wall=lambda: self.w.clock[0],
+                         monotonic=lambda: self.mono[0])
+
+    def sleep(self, wall_seconds, mono_seconds=1.0):
+        self.w.advance(wall_seconds)
+        self.mono[0] += mono_seconds
+
+    def test_sleeping_past_the_expiry_fails_the_guard(self):
+        mac, watchdog = self.lease("mac"), self.lease("watchdog")
+        self.assertTrue(mac.acquire())
+        self.sleep(TTL + GRACE + 5)  # the lid was closed; monotonic time barely moved
+        self.assertTrue(watchdog.acquire())  # the watchdog broke the expired lease
+        self.assertLessEqual(mac.remaining(), 0)
+        with self.assertRaises(gcs.LeaseLost):
+            mac.ensure()
+        self.assertFalse(mac.held)
+        watchdog.ensure()  # only the new holder passes its guard
+        self.assertEqual(self.w.server.json(self.w.lock_name)["owner"], "watchdog")
+
+    def test_a_short_sleep_renews_before_acting(self):
+        mac = self.lease("mac")
+        self.assertTrue(mac.acquire())
+        generation = mac.generation
+        self.sleep(60)
+        writes = len(self.w.server.writes())
+        mac.ensure()
+        self.assertEqual(len(self.w.server.writes()), writes + 1, "a suspected suspend renews the lease")
+        self.assertEqual(self.w.server.writes()[-1][2]["ifGenerationMatch"], str(generation))
+        self.sleep(60)
+        self.w.server.put_raw(self.w.lock_name, b'{"owner": "intruder"}')  # replaced while asleep
+        with self.assertRaises(gcs.LeaseLost):
+            mac.ensure()
+
+    def test_the_guard_rereads_the_lease_periodically(self):
+        mac = self.lease("mac")
+        self.assertTrue(mac.acquire())
+
+        def tick(seconds):
+            self.w.advance(seconds)
+            self.mono[0] += seconds
+        reads = lambda: len(self.w.server.writes("GET"))  # noqa: E731
+        before = reads()
+        tick(gcs.LEASE_REVALIDATE_SECONDS - 1)
+        mac.ensure()
+        self.assertEqual(reads(), before, "confirmed recently: no read")
+        tick(1)
+        mac.ensure()
+        self.assertGreater(reads(), before, "re-read once the revalidation interval passed")
+        writes = len(self.w.server.writes())
+        tick(gcs.LEASE_REVALIDATE_SECONDS)
+        self.w.server.put_raw(self.w.lock_name, self.w.server.objects[self.w.lock_name][0])  # new generation
+        with self.assertRaises(gcs.LeaseLost):
+            mac.ensure()
+        self.assertEqual(len(self.w.server.writes()), writes, "a lost lease is detected by reading, not writing")
+
+    def test_a_wall_clock_stepped_back_keeps_monotonic_time(self):
+        mac = self.lease("mac")
+        self.assertTrue(mac.acquire())
+        self.w.advance(-1000)  # NTP step backwards
+        self.mono[0] += TTL - gcs.LEASE_MIN_REMAINING_SECONDS + 1
+        writes = len(self.w.server.writes())
+        mac.ensure()  # the monotonic delta still says the lease is short: renew
+        self.assertEqual(len(self.w.server.writes()), writes + 1)
+
+
 class ProjectStateTests(unittest.TestCase):
     def setUp(self):
         self.w = World()
@@ -560,6 +633,35 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(cv.ControlStateConflict, "moved to gs://"):
             cv.ProjectControlState(self.local).load()
         self.assertEqual(self.w.server.json(self.w.state_name)["state"]["control_vm"]["transition"]["id"], "remote")
+
+    def test_a_marker_for_another_location_refuses(self):
+        self.write_local({"control_vm": {"history": [1]}})
+        gcs.write_moved_marker(self.local, "gs://other-bucket/control", self.w.clock[0])
+        for apply in (False, True):
+            code, message = self.migrate(apply=apply)
+            self.assertEqual(code, 1, message)
+            self.assertIn("is fenced for gs://other-bucket/control", message)
+        self.assertNotIn(self.w.state_name, self.w.server.objects)
+        self.w.init_state()
+        code, message = self.migrate(apply=True)
+        self.assertEqual(code, 1, message)  # also when the current location has state
+
+    def test_a_marker_for_the_same_location_resumes_whatever_its_spelling(self):
+        state = {"control_vm": {"history": [1]}}
+        self.write_local(state)
+        gcs.write_moved_marker(self.local, URI + "/", self.w.clock[0])
+        code, message = self.migrate(apply=True)
+        self.assertEqual(code, 0, message)
+        self.assertEqual(self.w.server.json(self.w.state_name)["state"], state)
+
+    def test_a_missing_marker_next_to_a_backup_never_initializes_empty_state(self):
+        (self.dir / f"{self.local.name}.migrated-20261018T000000Z").write_text('{"control_vm": {"history": [1]}}')
+        for apply in (False, True):
+            code, message = self.migrate(apply=apply)
+            self.assertEqual(code, 1, message)
+            self.assertIn("shows an earlier migration", message)
+        self.assertNotIn(self.w.state_name, self.w.server.objects)
+        self.assertFalse(self.local.exists())
 
     def test_marker_without_remote_state_refuses(self):
         self.local.write_text(json.dumps({cv.CONTROL_STATE_MOVED_KEY: URI}))

@@ -14,8 +14,12 @@ based on a version its writer did not read:
   ``ifGenerationMatch=<its generation>``. A stale lease is broken only after its expiry plus a grace period, as
   measured by the Cloud Storage server clock (the object's ``updated`` time and the response ``Date``), again
   with ``ifGenerationMatch=<the stale generation>``, so of two contenders exactly one wins.
-* The holder trusts its lease only until ``send time of its last successful write + ttl`` by its own monotonic
-  clock, which ends no later than any contender's server-clock expiry. :meth:`GcsLease.ensure` renews the lease
+* The holder trusts its lease only until ``send time of its last successful write + ttl``, measuring the elapsed
+  time as the larger of its monotonic and its wall-clock deltas. On macOS ``time.monotonic()`` stops while the
+  machine sleeps, so a workstation that slept past the expiry would otherwise wake up still trusting the lease; the
+  wall clock keeps counting through a sleep. A wall-clock jump well ahead of the monotonic clock (a suspend) makes
+  the next guard renew the lease, and the guard re-reads the lease object at least every
+  ``LEASE_REVALIDATE_SECONDS`` to confirm the generation is still its own. :meth:`GcsLease.ensure` renews the lease
   whenever less than ``min_remaining`` seconds are left, so the longest single provider call (``gcloud`` times out
   after 600 s) always completes inside the lease; it raises :class:`LeaseLost` instead of letting the caller act.
 * The state is saved with ``ifGenerationMatch=<the generation it loaded or last wrote>``. A save after another
@@ -64,6 +68,11 @@ LEASE_MIN_REMAINING_SECONDS = 660
 LEASE_STALE_GRACE_SECONDS = 60
 # A lease never blocks for longer than this, whatever ttl its object claims.
 LEASE_MAX_TTL_SECONDS = 3600
+# The guard re-reads the lease object (two reads) when this long passed since it last confirmed its generation.
+LEASE_REVALIDATE_SECONDS = 120
+# Wall-clock time that ran this far ahead of monotonic time since the last confirmation means the process was
+# suspended (or the clock was stepped): renew, which also proves the lease is still ours, before acting.
+LEASE_SUSPEND_SLACK_SECONDS = 5
 MAX_OBJECT_BYTES = 8 * 1024 * 1024
 GCS_API = "https://storage.googleapis.com"
 HTTP_TIMEOUT_SECONDS = 20.0
@@ -375,14 +384,29 @@ class GcsLease:
         self.generation: int | None = None
         self.holder: LockHolder | None = None
         self.broke: LockHolder | None = None
-        self._deadline = 0.0
+        # (monotonic, wall) when the last successful write was sent: the lease runs ttl from there.
+        self._sent = (0.0, 0.0)
+        # (monotonic, wall) when the generation was last confirmed as ours (a write or a re-read).
+        self._confirmed = (0.0, 0.0)
 
     @property
     def held(self) -> bool:
         return self.generation is not None
 
+    def _now(self) -> tuple[float, float]:
+        return self.monotonic(), self.wall()
+
+    @staticmethod
+    def _elapsed(since: tuple[float, float], now: tuple[float, float]) -> float:
+        """Suspend-aware elapsed time: the larger of the monotonic and the wall-clock deltas."""
+        return max(now[0] - since[0], now[1] - since[1])
+
     def remaining(self) -> float:
-        return (self._deadline - self.monotonic()) if self.held else 0.0
+        return (self.ttl - self._elapsed(self._sent, self._now())) if self.held else 0.0
+
+    def _suspended(self, now: tuple[float, float]) -> bool:
+        """The wall clock ran well ahead of the monotonic clock since the last confirmation."""
+        return (now[1] - self._confirmed[1]) - (now[0] - self._confirmed[0]) > LEASE_SUSPEND_SLACK_SECONDS
 
     def _content(self, write_id: str, acquired_at: float | None = None) -> bytes:
         now = self.wall()
@@ -390,9 +414,10 @@ class GcsLease:
                            "acquired_at": acquired_at or now, "renewed_at": now, "ttl_seconds": self.ttl,
                            "expires_at": now + self.ttl}, sort_keys=True).encode("utf-8")
 
-    def _took(self, generation: int, sent: float) -> None:
+    def _took(self, generation: int, sent: tuple[float, float]) -> None:
         self.generation = generation
-        self._deadline = sent + self.ttl
+        self._sent = sent
+        self._confirmed = self._now()
         self.holder = None
 
     def _read_lock(self) -> tuple[ObjectInfo, dict[str, Any]] | None:
@@ -429,7 +454,7 @@ class GcsLease:
         return LockHolder(info.generation, str(content.get("owner") or ""), str(content.get("token") or ""),
                           breakable, server_now >= breakable, server_now)
 
-    def _confirm(self, write_id: str, sent: float) -> bool:
+    def _confirm(self, write_id: str, sent: tuple[float, float]) -> bool:
         """After an ambiguous write: True (and held) only if the live lock object is exactly that write."""
         try:
             read = self._read_lock()
@@ -447,7 +472,7 @@ class GcsLease:
     def _write(self, if_generation_match: int, acquired_at: float | None = None) -> bool | None:
         """True: written and held. False: the precondition failed. None: unknown and not confirmed."""
         write_id = uuid.uuid4().hex
-        sent = self.monotonic()
+        sent = self._now()
         try:
             info = self.client.put(self.name, self._content(write_id, acquired_at),
                                    if_generation_match=if_generation_match)
@@ -472,7 +497,7 @@ class GcsLease:
             if current.token == self.token:
                 # An earlier ambiguous create of ours landed after all (its read-back missed it). Its send time is
                 # unknown, so it is trusted only after a renewal conditioned on that generation.
-                self.generation, self._deadline = current.generation, self.monotonic()
+                self.generation, self._sent = current.generation, (float("-inf"), float("-inf"))
                 try:
                     self.renew()
                 except LeaseLost:
@@ -504,16 +529,38 @@ class GcsLease:
             raise LeaseLost("the control VM lease was taken over or could not be renewed; stopping before the "
                             "next provider call")
 
+    def revalidate(self) -> None:
+        """Re-read the lease object; raises LeaseLost unless it is still exactly this holder's generation."""
+        if not self.held:
+            raise LeaseLost("the control VM lease is not held")
+        try:
+            read = self._read_lock()
+        except GcsError as exc:
+            self.generation = None
+            raise LeaseLost(f"could not re-read the control VM lease: {exc}") from exc
+        if read is None or read[0].generation != self.generation or read[1].get("token") != self.token:
+            self.generation = None
+            raise LeaseLost("the control VM lease object is no longer this controller's; stopping before the next "
+                            "provider call")
+        self._confirmed = self._now()
+
     def ensure(self, min_remaining: float | None = None) -> None:
-        """Guard before any provider call or state write: renew unless enough of the lease is left."""
+        """Guard before any provider call or state write.
+
+        Renews when less than ``min_remaining`` is left (suspend-aware), or when the process looks suspended since
+        the last confirmation; otherwise re-reads the lease once ``LEASE_REVALIDATE_SECONDS`` have passed.
+        """
         need = self.min_remaining if min_remaining is None else min_remaining
         if not self.held:
             raise LeaseLost("the control VM lease is not held")
-        if self.remaining() >= need:
+        now = self._now()
+        if self.remaining() < need or self._suspended(now):
+            self.renew()
+            if self.remaining() < need:
+                raise LeaseLost("the renewed control VM lease is shorter than the next call may take")
             return
-        self.renew()
-        if self.remaining() < need:
-            raise LeaseLost("the renewed control VM lease is shorter than the next call may take")
+        if self._elapsed(self._confirmed, now) >= LEASE_REVALIDATE_SECONDS:
+            self.revalidate()
 
     def release(self) -> None:
         """Delete the lock only if it is still our generation; a lost lease is left alone and logged."""
@@ -670,6 +717,10 @@ def read_local(path: Path) -> tuple[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
+        backups = sorted(path.parent.glob(f"{path.name}.migrated-*"))
+        if backups:
+            # Migrated once, and the marker is gone: never "no local state" (ProjectControlState.load refuses too).
+            return "orphaned", backups[-1].name
         return "absent", None
     except (ValueError, UnicodeDecodeError) as exc:
         raise RuntimeError(f"local control VM state {path} is not JSON; repair it before migrating") from exc
@@ -764,8 +815,20 @@ def migrate_local_state(project: str, local_dir: Path | str | None, uri: str, *,
     local_path, local_lock = project_control_paths(project, local_dir)
     target = f"{location.uri}/{location.state_object(project).rsplit('/', 1)[-1]}"
 
+    def same_location(marked: Any) -> bool:
+        try:
+            return parse_state_uri(str(marked or "")).uri == location.uri
+        except ValueError:
+            return False
+
     def decide(kind: str, local: Any, remote_exists: bool, remote_state: Any) -> tuple[int, str, str]:
+        if kind == "orphaned":
+            return 1, "refuse", (f"{local_path} is missing but {local} next to it shows an earlier migration; restore "
+                                 "the marker or the state file by hand before migrating")
         if kind == "moved":
+            if not same_location(local):
+                return 1, "refuse", (f"{local_path} is fenced for {local}, not {location.uri}; set "
+                                     f"{ENV_CONTROL_STATE_URI} to the location it names, or reconcile them by hand")
             if remote_exists:
                 return 0, "none", f"already migrated: {local_path} points at {local}"
             ok, backup = _marker_backup(local_path)

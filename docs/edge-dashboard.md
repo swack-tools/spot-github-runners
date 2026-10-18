@@ -644,11 +644,16 @@ writer didn't read:
 - **Take**: the lease object is created with `ifGenerationMatch=0`. Of two contenders, exactly one create
   succeeds; the other reads the lease and stops.
 - **Hold**: the lease records its owner, a token, a 20-minute time to live, and its expiry. Its holder trusts
-  it only until the send time of its last successful write plus the time to live, by its own monotonic
-  clock. Before every `gcloud` call, HTTP request, and state save, the holder renews the lease once less than
-  11 minutes are left. A single `gcloud` call times out after 10 minutes, so a call that starts inside the
-  lease also ends inside it. A renewal is conditioned on the lease's generation. When it fails, the step stops
-  before its next provider call.
+  it only until the send time of its last successful write plus the time to live. It measures the time since
+  then as the larger of its monotonic and its wall-clock deltas, because on macOS the monotonic clock stops
+  while the machine sleeps. Before every `gcloud` call, HTTP request, and state save, the holder renews the
+  lease once less than 11 minutes are left. A single `gcloud` call times out after 10 minutes, so a call that
+  starts inside the lease also ends inside it. A renewal is conditioned on the lease's generation. When it
+  fails, the step stops before its next provider call.
+- **Suspend**: when the wall clock ran more than 5 seconds ahead of the monotonic clock since the holder last
+  confirmed the lease, the process was suspended, so the next guard renews before it acts. A workstation that
+  slept past the expiry finds the lease taken and stops. Without such a jump, the guard still reads the lease
+  object again every 2 minutes and stops when its generation is no longer the holder's.
 - **Break**: another controller breaks a lease only 60 seconds after its expiry. The expiry comes from the
   Cloud Storage server clock: the lease object's `updated` time plus its time to live, or the expiry it
   records when that's later, up to one hour. The break is a write conditioned on the stale generation, so of
@@ -820,6 +825,8 @@ Cloud Storage object exist and differ, and then changes nothing.
 
    If the upload fails, the local file stays fenced, and running the command again uploads the backup that the
    marker names. When there is no local file but the state object exists, the command only installs the marker.
+   It refuses a marker that names another `SPOT_CONTROL_STATE_URI` (a trailing slash doesn't count), and a
+   missing state file next to a `.migrated-*` backup, rather than creating an empty state object.
 1. Check that `PYTHONPATH=src python3 src/control_vm.py status` shows the same `transition` and
    `retained_disks` as before.
 
