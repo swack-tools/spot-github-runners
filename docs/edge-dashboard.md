@@ -337,7 +337,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `spot-runners-`, or `oxidex-spot-runners-`) or `builder-` (dedicated builders). Control VMs and other VMs aren't
   listed. The control VM's service account needs `compute.instances.list` and
   `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
-  (HTTP 403) a VM keeps the types stored from an earlier listing and a new VM shows `pd-balanced`,
+  (HTTP 403) a VM keeps the types and disk IDs stored from an earlier listing (across any number of
+  denied listings) and a new VM shows `pd-balanced`,
   but both are marked unverified and incompletely priced, and neither can be a template source. Any other failed or partial disk listing fails the whole refresh,
   so known disk types are never replaced by the default. An attached disk the listing doesn't cover is
   treated as an unknown type. On a VM's first listing, each disk is billed from its own creation time,
@@ -377,7 +378,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   scaling to work.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
-  template can't copy them from such a host. A VM with data disks of several types can't be a template
+  template can't copy them from such a host; the dashboard hides the template action for such records.
+  The "Runners online" figure counts only confirmed runner slots and names hosts not yet confirmed. A VM with data disks of several types can't be a template
   source or the shape of a scale plan, since those hold one data-disk type. Neither can a VM with
   Local SSD, regional disks, or provisioned Hyperdisk performance, which templates don't describe. A
   scale-up plan whose new VMs can't be fully priced is refused. When a running host has no recorded runner count, or

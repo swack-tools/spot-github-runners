@@ -1959,7 +1959,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         ? fs.running_runner_slots
         : runningRunners.reduce((acc, i) => acc + i.runners_count, 0);
       const runningRunnerVms = fs.running_runner_vms !== undefined ? fs.running_runner_vms : runningRunners.length;
-      document.getElementById("kpi-runners-online").textContent = `${totalRunnerSlots} Runners (${runningRunnerVms} VMs)`;
+      const unconfirmed = fs.unconfirmed_runner_hosts || 0;
+      document.getElementById("kpi-runners-online").textContent = `${totalRunnerSlots} Runners (${runningRunnerVms} VMs)${unconfirmed ? ` · ${unconfirmed} host(s) not confirmed` : ""}`;
       const st = APP_STATE.scaling_telemetry;
       document.getElementById("kpi-runners-sub").textContent = `Min floor: ${APP_STATE.profiles.cicd_runner.min_runners} · ${st.queued_jobs} queued · ${st.jobs_ran_past_hour} runs in past 1h`;
 
@@ -2131,7 +2132,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               </div>
 
               <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
-                <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">🖥️ Create VM Template</button>
+                ${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">🖥️ Create VM Template</button>` : ""}
               </div>
             </div>
           `;
@@ -2172,6 +2173,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         ${instancesHtml}
       `;
+    }
+
+    // A VM template copies one shape: records whose per-runner limits or disks it cannot describe cannot be sources.
+    function canTemplate(inst) {
+      return inst.kind !== "disk" && inst.runner_limits_known !== false && inst.disk_types_known !== false
+        && !inst.regional_disks && !inst.unpriced_disk_performance && !(inst.local_ssd_gb > 0)
+        && Object.keys(inst.data_disks || {}).length <= 1;
     }
 
     async function scaleRegion(region, role, targetCount) {
@@ -2306,7 +2314,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <td>
               <div style="display:flex; gap:5px; flex-wrap:wrap;">
                 <button class="btn btn-sm btn-secondary" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'SSH command')">📋 SSH</button>
-                <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">Template</button>
+                ${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">Template</button>` : ""}
               </div>
             </td>
           </tr>

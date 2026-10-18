@@ -745,6 +745,15 @@ def _disk_key(disk: dict[str, Any]) -> str:
     return f"id:{disk_id}" if disk_id else str(disk.get("source") or "")
 
 
+def _disk_known(disk: dict[str, Any], known: frozenset[str]) -> bool:
+    """True when another record already billed this disk: by immutable ID when the listing gives one (a reused
+    name with a new ID is a new disk), else by source URL."""
+    disk_id = str(disk.get("id") or "").strip()
+    if disk_id:
+        return f"id:{disk_id}" in known
+    return bool(disk.get("source")) and str(disk["source"]) in known
+
+
 def _initial_disk_history(
     obs: dict[str, Any], *, region: str, family: str, project: str, tax_rate_percent: float, now: float,
 ) -> tuple[list[tuple[float, float, float]], float | None]:
@@ -789,7 +798,7 @@ def _live_instance_record(
     tax_overrides = tax_overrides or {}
     if obs.get("disk_types_known") is False:
         obs = dict(obs)
-        if previous is not None and previous.get("disk_types_known") is not False:
+        if previous is not None:  # Even if the previous listing was also unverified: keep the last known types.
             # This listing could not read disk types: keep the stored ones where the disks are unchanged in size.
             if int(previous.get("boot_disk_gb") or 0) == int(obs.get("boot_disk_gb") or 0):
                 obs["boot_disk_type"] = previous.get("boot_disk_type") or obs.get("boot_disk_type")
@@ -857,8 +866,19 @@ def _live_instance_record(
         record["pricing"] = _with_secondary_disks(record["pricing"], obs, region=region,
                                                   family=record["family"], project=project)
     record["data_disks"] = obs.get("data_disks") or {}
-    record["disk_sources"] = sorted({_disk_key(d) for d in obs.get("disks_detail") or []
-                                     if isinstance(d, dict) and _disk_key(d)})
+    # Disk identities: the immutable ID (kept from the previous record when this listing could not read it) and the
+    # source URL as an alias, so a handoff is recognized by either.
+    previous_ids = (previous or {}).get("disk_ids") or {}
+    disk_ids = {}
+    for d in obs.get("disks_detail") or []:
+        if isinstance(d, dict) and d.get("source"):
+            disk_id = str(d.get("id") or previous_ids.get(str(d["source"])) or "")
+            if disk_id:
+                disk_ids[str(d["source"])] = disk_id
+    record["disk_ids"] = disk_ids
+    record["disk_sources"] = sorted({f"id:{i}" for i in disk_ids.values()}
+                                    | {str(d.get("source")) for d in obs.get("disks_detail") or []
+                                       if isinstance(d, dict) and d.get("source")})
     # Capacity this VM adds, not yet counted toward OOM handling: set for a new identity, kept until counted.
     record["capacity_pending"] = bool(previous.get("capacity_pending")) if previous is not None else True
     record["local_ssd_gb"] = int(obs.get("local_ssd_gb") or 0)
@@ -896,7 +916,7 @@ def _live_instance_record(
     if previous is None and known_disk_sources:
         # A disk that another record already billed (a cache disk moving between a VM and its own DETACHED record)
         # starts here at the handoff, not again at its creation.
-        handed_off = [dict(d, created_epoch=now) if _disk_key(d) in known_disk_sources else d
+        handed_off = [dict(d, created_epoch=now) if _disk_known(d, known_disk_sources) else d
                       for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
         if handed_off:
             obs = dict(obs, disks_detail=handed_off)
@@ -4220,7 +4240,10 @@ class DashboardStore:
             deleted_count = sum(1 for r in rows if r["status"] != "RUNNING")
             running_runner_rows = [r for r in running_rows if r.get("role") == "cicd_runner"]
             running_builder_rows = [r for r in running_rows if r.get("role") == "rust_builder"]
-            running_runner_slots = sum(int(r.get("runners_count", 0)) for r in running_runner_rows)
+            # Confirmed (ready) runner slots only; hosts whose bootstrap is unconfirmed are counted separately.
+            running_runner_slots = sum(int(r.get("runners_count", 0)) for r in running_runner_rows
+                                       if r.get("runners_count_known") is not False)
+            unconfirmed_runner_hosts = sum(1 for r in running_runner_rows if r.get("runners_count_known") is False)
             if include_deleted and not q:
                 # Deleted VMs compacted into hour buckets (see MAX_DETAILED_INSTANCE_RECORDS) still count.
                 compacted_prefixes = ([f"{r_filter}|"] if r_filter and r_filter != "all"
@@ -4251,6 +4274,7 @@ class DashboardStore:
                 "deleted_count": deleted_count,
                 "running_runner_vms": len(running_runner_rows),
                 "running_runner_slots": running_runner_slots,
+                "unconfirmed_runner_hosts": unconfirmed_runner_hosts,
                 "running_builder_vms": len(running_builder_rows),
                 "total_window_spend_usd": total_window_spend,
                 "active_hourly_burn_usd": active_hourly_burn,

@@ -5516,6 +5516,69 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.store.refresh_fleet_inventory()
         self.assertEqual(self._record("builder-oxidex-k-cache")["status"], "DETACHED")
 
+    def test_repeated_denied_disk_listing_keeps_types(self):
+        known = fleet_observation("9500", "builder-oxidex-den-1", "us-south1-b", now=self.now)
+        self.fleet = [known]
+        self.store.refresh_fleet_inventory()
+        fallback = dict(known, boot_disk_type="pd-balanced", data_disk_type="pd-balanced", disk_types_known=False)
+        for _ in range(3):
+            self.fleet = [fallback]
+            self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-den-1")
+        self.assertEqual((rec["boot_disk_type"], rec["data_disk_type"]), ("hyperdisk-balanced", "hyperdisk-balanced"))
+        self.assertEqual(rec["disk_segments"], [])  # No false shape change.
+
+    def test_disk_ids_survive_outage_for_handoff(self):
+        from lib.dashboard_server import instance_usage
+        from lib.fleet_inventory import observe_detached_disks
+
+        created = self.now - 10 * 86400.0
+        cache = "projects/p/zones/us-south1-b/disks/builder-oxidex-o-cache"
+        vm = fleet_observation("9600", "builder-oxidex-o", "us-south1-b", started_hours_ago=240.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "pd-balanced", "gb": 100, "created_epoch": created, "source": cache, "id": "77"}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        outage = dict(vm, disk_types_known=False,
+                      disks_detail=[{"type": "pd-balanced", "gb": 100, "created_epoch": None, "source": cache, "id": ""}])
+        self.fleet = [outage]
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self._record("builder-oxidex-o")["disk_ids"], {cache: "77"})
+        stamp = datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.fleet = observe_detached_disks({cache: {"id": "77", "name": "builder-oxidex-o-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced",
+                                                     "creationTimestamp": stamp}})
+        handoff = time.time()
+        self.store.refresh_fleet_inventory()
+        usage = instance_usage(self._record("builder-oxidex-o-cache"), handoff + 3600.0)
+        self.assertLess(usage["disk_hours"], 1.1)
+
+    def test_detached_regional_disk_gets_region(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        disks = observe_detached_disks({"projects/p/regions/us-south1/disks/builder-oxidex-rg-cache": {
+            "id": "98", "name": "builder-oxidex-rg-cache", "region": "regions/us-south1", "sizeGb": "100",
+            "type": "pd-ssd", "regional": True}})
+        self.assertEqual((disks[0]["zone"], disks[0]["region"]), ("", "us-south1"))
+
+    def test_online_runner_kpi_counts_confirmed_slots(self):
+        booting = self._runner("9700", "oxidex-runners-kpi-1")
+        booting["runners_count_known"] = False
+        self.fleet = [self._runner("9701", "oxidex-runners-kpi-2"), booting]
+        self.store.refresh_fleet_inventory()
+        view = self.store.query_instances()
+        self.assertEqual(view["running_runner_slots"], 4)
+        self.assertEqual(view["unconfirmed_runner_hosts"], 1)
+
+    def test_template_action_hidden_for_unrepresentable_records(self):
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        self.assertIn("function canTemplate(inst)", DASHBOARD_HTML)
+        self.assertIn("inst.runner_limits_known !== false", DASHBOARD_HTML)
+        # Both template buttons (map inspector and instance table) are behind canTemplate.
+        self.assertEqual(DASHBOARD_HTML.count("${canTemplate(inst) ? `<button"), 2)
+        self.assertEqual(DASHBOARD_HTML.count("onclick=\"makeTemplateFromInstance("), 2)
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

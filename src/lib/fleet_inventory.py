@@ -251,7 +251,13 @@ def observe_detached_disks(disk_details: Mapping[str, Any]) -> list[dict[str, An
         role = fleet_role(name)
         if role is None or detail.get("users") or not detail.get("id"):
             continue
-        zone = str(detail.get("zone", "")).rsplit("/", 1)[-1]
+        zone = str(detail.get("zone", "") or "").rsplit("/", 1)[-1]
+        region = zone.rsplit("-", 1)[0] if "-" in zone else zone
+        if not zone:
+            # A regional disk has a region, not a zone (also in its self-link: .../regions/<region>/disks/...).
+            region = str(detail.get("region", "") or "").rsplit("/", 1)[-1]
+            if not region and "/regions/" in str(link):
+                region = str(link).split("/regions/", 1)[1].split("/", 1)[0]
         size_raw = str(detail.get("sizeGb", "") or "")
         size = int(size_raw) if size_raw.isdigit() else 0
         kind = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
@@ -263,7 +269,7 @@ def observe_detached_disks(disk_details: Mapping[str, Any]) -> list[dict[str, An
             "status": DETACHED_DISK_STATUS,
             "kind": "disk",
             "zone": zone,
-            "region": zone.rsplit("-", 1)[0] if "-" in zone else zone,
+            "region": region,
             "machine_type": "",
             "cpu_platform": "",
             "vcpu": 0,
