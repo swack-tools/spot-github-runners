@@ -97,6 +97,8 @@ def validate_github_oom_run(raw: Any) -> dict[str, Any]:
         if not isinstance(deep_link, str):
             raise ValueError("add_github_oom_run.deep_link must be a string")
         parsed = parse_github_oom_deep_link(deep_link)
+        for field in GITHUB_OOM_RUN_LOCATION_FIELDS[1:]:
+            parsed[field] = _positive_int_field(parsed[field], field)
         for field in GITHUB_OOM_RUN_LOCATION_FIELDS:
             if item.get(field) in (None, ""):
                 continue
