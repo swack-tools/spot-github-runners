@@ -1248,3 +1248,258 @@ class FencedLaunchTests(unittest.TestCase):
         self.assertIn("if _FLOOR_LEASE_HOLDER is None:", "\n".join(source.splitlines()[line - 3:line]))
         self.assertGreater(len(bounded), 10)
         self.assertGreater(gcs.LEASE_MIN_REMAINING_SECONDS, 600)
+
+
+class MutationFenceTests(unittest.TestCase):
+    """Every mutating child process proves the floor lease first, whichever module starts it."""
+
+    MUTATING_WORDS = {"delete", "add-metadata", "remove-metadata", "add-labels", "remove-labels", "set-scheduling",
+                      "start", "stop", "create", "attach-disk", "detach-disk", "reset", "update", "ssh", "scp",
+                      "set-disk-auto-delete", "add-iam-policy-binding", "remove-iam-policy-binding"}
+
+    def tearDown(self):
+        rf.install_mutation_fence(None)
+
+    def test_classification(self):
+        mutating = [["gcloud", "compute", "instances", "delete", "vm", "--zone=z"],
+                    ["gcloud", "compute", "disks", "delete", "d"], ["gcloud", "compute", "ssh", "vm", "--command=x"],
+                    ["gcloud", "compute", "instances", "add-metadata", "vm"], ["gh", "api", "-X", "DELETE", "p"],
+                    ["gh", "api", "--method", "PUT", "p"], ["gh", "api", "--method=POST", "p"], ["gh", "api", "-XPATCH", "p"],
+                    ["gh", "api", "p", "--input", "-"], ["gh", "api", "p", "-f", "a=b"], ["gh", "run", "rerun", "1"],
+                    ["ssh", "host"], [sys.executable, "src/spot_runner_manager.py", "--apply"],
+                    ["gcloud", "compute", "something-new", "x"]]
+        reading = [["gcloud", "compute", "instances", "list"], ["gcloud", "compute", "disks", "describe", "d"],
+                   ["gcloud", "auth", "print-access-token"], ["gh", "api", "p"], ["gh", "api", "--paginate", "p"],
+                   ["gh", "api", "-X", "GET", "p"], ["gh", "auth", "token", "--user", "u"], ["python3", "x.py"],
+                   "gcloud compute zones list"]
+        for argv in mutating:
+            with self.subTest(argv=argv):
+                self.assertTrue(rf.is_mutating_command(argv))
+        for argv in reading:
+            with self.subTest(argv=argv):
+                self.assertFalse(rf.is_mutating_command(argv))
+
+    def test_every_mutating_command_in_the_code_is_fenced(self):
+        import ast
+        found, missed = [], []
+        root = Path(rf.__file__).resolve().parent
+        for path in sorted(root.glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if not (isinstance(node, ast.List) and node.elts and isinstance(node.elts[0], ast.Constant)
+                        and node.elts[0].value in ("gcloud", "gh")):
+                    continue
+                argv = []
+                for element in node.elts:
+                    if isinstance(element, ast.Constant):
+                        argv.append(str(element.value))
+                    elif isinstance(element, ast.JoinedStr):
+                        argv.append("".join(str(v.value) if isinstance(v, ast.Constant) else "X"
+                                            for v in element.values))
+                    elif not isinstance(element, ast.Starred):
+                        argv.append("X")
+                independent = (bool(self.MUTATING_WORDS & set(argv)) or
+                               (argv[:2] == ["gh", "api"] and any(a in ("-X", "--method", "--input") for a in argv)
+                                and "GET" not in argv))
+                if independent:
+                    found.append(f"{path.name}:{node.lineno}")
+                    if not rf.is_mutating_command(argv):
+                        missed.append(f"{path.name}:{node.lineno} {argv}")
+        self.assertEqual(missed, [])
+        # The two cleanups the review named are among the commands the fence covers.
+        names = "\n".join(found)
+        self.assertGreater(len(found), 25)
+        self.assertIn("spot_runner_autoscaler.py", names)
+        self.assertIn("vm_recovery.py", names)
+        self.assertIn("runner_drain.py", names)
+
+    def test_a_lost_lease_stops_a_mutating_child_before_it_starts(self):
+        calls = []
+
+        def lost():
+            calls.append(1)
+            raise RuntimeError("Fleet mutation held: the runner floor lease was lost")
+        rf.install_mutation_fence(lost)
+        with self.assertRaises(RuntimeError):
+            subprocess.run(["gcloud", "compute", "instances", "delete", "vm", "--quiet"], capture_output=True)
+        with self.assertRaises(RuntimeError):
+            subprocess.Popen(["gh", "api", "-X", "DELETE", "repos/o/r/actions/runners/1"])
+        reads = subprocess.run(["gcloud", "compute", "instances", "list"], capture_output=True, text=True)
+        self.assertNotEqual(reads.returncode, None)  # reads still run (here against the refusing stub)
+        self.assertEqual(len(calls), 2)
+        rf.install_mutation_fence(None)
+        subprocess.run(["gcloud", "compute", "instances", "delete", "vm"], capture_output=True)  # fence off
+
+    def test_holding_the_lease_installs_the_fence_and_releasing_removes_it(self):
+        from lib import spot_runner_autoscaler as autoscaler
+        world = World()
+        holder = rf.AutoscalerTargetLease.for_target(PROJECT, "xbmc4lyfe/newznab-tmux", URI, client=world.client)
+        args = argparse.Namespace(project=PROJECT, target="xbmc4lyfe/newznab-tmux", org="swack-tools", once=True,
+                                  interval_seconds=300)
+        with patch.dict(os.environ, {rf.ENV_STATE_URI: URI}), \
+                patch.object(rf.AutoscalerTargetLease, "for_target", lambda *a, **k: holder):
+            held = autoscaler.acquire_floor_lease(args)
+        try:
+            self.assertIsNotNone(rf._MUTATION_GUARD)
+        finally:
+            autoscaler.release_floor_lease(held)
+        self.assertIsNone(rf._MUTATION_GUARD)
+
+    def test_a_failed_pending_read_releases_the_lease(self):
+        from lib import spot_runner_autoscaler as autoscaler
+        world = World()
+        holder = rf.AutoscalerTargetLease.for_target(PROJECT, "xbmc4lyfe/newznab-tmux", URI, client=world.client)
+        store = world.store()
+        world.server.put_raw(store.object_name, b"not json")  # malformed floor state
+        args = argparse.Namespace(project=PROJECT, target="xbmc4lyfe/newznab-tmux", org="swack-tools", once=True,
+                                  interval_seconds=300)
+        with patch.dict(os.environ, {rf.ENV_STATE_URI: URI}), \
+                patch.object(rf.AutoscalerTargetLease, "for_target", lambda *a, **k: holder):
+            with self.assertRaises(rf.FloorStateConflict):
+                autoscaler.acquire_floor_lease(args)
+        self.assertNotIn(store.lock_name, world.server.objects)  # not held for its time to live
+        self.assertIsNone(autoscaler._FLOOR_LEASE_GUARD)
+
+
+class GuardedCleanupTests(unittest.TestCase):
+    """The two cleanups that only checked inventory freshness now prove the floor lease before each delete."""
+
+    def setUp(self):
+        import test_launch_failover as tlf
+        self.harness = tlf.LaunchFailoverTests("test_failure_memory_survives_a_controller_restart")
+        self.harness.setUp()
+        self.addCleanup(self.harness.doCleanups)
+
+    def lost(self):
+        raise RuntimeError("Fleet mutation held: the runner floor lease was lost")
+
+    def deletes(self):
+        return [c for c in self.harness.cloud.commands if "delete" in c or "DELETE" in c]
+
+    def test_abandon_launch_disk_and_registration_cleanup(self):
+        from dataclasses import asdict
+        from lib import spot_runner_autoscaler as controller
+        from lib.runner_fleet import GceVm
+        name = "oxidex-runners-uswest4-a-abcd-x"
+        vm = GceVm(name, "us-west4-a", "PROVISIONING", "c4-standard-32", True)
+        for leftover in ("disk", "runner"):
+            with self.subTest(leftover=leftover):
+                self.harness.cloud.commands.clear()
+                self.harness.cloud.disks = {"runner-data-uswest4-a-abcd-x": []} if leftover == "disk" else {}
+                self.harness.cloud.runners = ([GitHubRunner(5, f"gha-{name}-1", "offline", False, ("spot",))]
+                                              if leftover == "runner" else [])
+                state = {"host_operation": {"kind": "launch", "vm": asdict(vm), "abandon": "deploy failed",
+                                            "started_at": 0, "data_disk_name": "runner-data-uswest4-a-abcd-x"},
+                         "runner_inventory_observed_at": time.time()}
+                with patch.object(controller, "_FLOOR_LEASE_GUARD", self.lost):
+                    with self.assertRaises(RuntimeError):
+                        controller.abandon_launch(self.harness.args, state, self.harness.path)
+                self.assertEqual(self.deletes(), [])
+                with patch.object(controller, "_FLOOR_LEASE_GUARD", None):
+                    controller.abandon_launch(self.harness.args, state, self.harness.path)
+                self.assertTrue(self.deletes())  # the same cleanup runs while the lease is held
+
+    def test_stale_registration_cleanup_after_a_delete(self):
+        from dataclasses import asdict
+        from lib import spot_runner_autoscaler as controller
+        from lib.runner_fleet import GceVm
+        name = "oxidex-runners-uswest4-a-abcd-y"
+        vm = GceVm(name, "us-west4-a", "RUNNING", "c4-standard-32", True, instance_id="77")
+        stale = [GitHubRunner(6, f"gha-{name}-1", "offline", False, ("spot",))]
+        state = {"host_operation": {"kind": "delete", "vm": asdict(vm), "runner_ids": [6]},
+                 "runner_inventory_observed_at": time.time()}
+        with patch.object(controller, "_FLOOR_LEASE_GUARD", self.lost):
+            with self.assertRaises(RuntimeError):
+                controller.reconcile_host_operation([], stale, self.harness.args, state, self.harness.path)
+        self.assertEqual(self.deletes(), [])
+        with patch.object(controller, "_FLOOR_LEASE_GUARD", None):
+            controller.reconcile_host_operation([], stale, self.harness.args, state, self.harness.path)
+        self.assertTrue(self.deletes())
+
+
+class LabelCaseTests(unittest.TestCase):
+    def test_labels_compare_without_case(self):
+        for text, message in (("o/r:secret=s,labels=Spot", "duplicates a label"),
+                              ("o/r:secret=s,labels=fast+FAST", "listed twice"),
+                              ("o/r:secret=s,labels=us-central1", "duplicates a label"),
+                              ("o/r:secret=s,labels=N2D-standard-4", "duplicates a label")):
+            with self.subTest(text=text), self.assertRaises(ValueError) as caught:
+                rf.parse_targets(text)
+            self.assertIn(message, str(caught.exception))
+        built = rf.FloorTarget("o/r", "s", labels=("SPOT", "Fast", "fast"))  # not through the parser
+        self.assertEqual(built.custom_labels("n2d-standard-4", "us-central1"),
+                         ("spot", "n2d-standard-4", "us-central1", "Fast"))
+        t = rf.parse_targets("o/r:secret=s,labels=Ubuntu-Latest")[0]
+        self.assertEqual(t.custom_labels("n2d-standard-4", "us-central1"),
+                         ("spot", "n2d-standard-4", "us-central1", "Ubuntu-Latest"))
+
+    def test_a_launch_finishes_when_github_reports_another_case(self):
+        world = World("xbmc4lyfe/newznab-tmux:secret=s,account=xbmc4lyfe,labels=Ubuntu-Latest")
+        world.tick()
+        op = world.store().record["operation"]
+        world.bootstrap(op["name"], labels=("SPOT", "n2d-standard-4", "us-central1", "ubuntu-latest"))
+        world.tick()
+        record = world.store().record
+        self.assertNotIn("operation", record)
+        self.assertFalse([e for e in world.log if e[1] == "set_labels"])  # equal without case: no rewrite
+
+
+class LateCreateTests(unittest.TestCase):
+    def late_world(self, runner_status=None):
+        world = World()
+        world.create_error = "deadline exceeded"
+        world.tick()
+        late = world.store().record["late_creates"][0]
+        # Meanwhile another floor host serves the target.
+        world.hosts.append(host(name="oxidex-runners-other", started=NOW))
+        world.runners["xbmc4lyfe/newznab-tmux"] = [runner("gha-oxidex-runners-other-1")]
+        world.hosts.append(rf.Host(late["name"], late["zone"], "RUNNING", "777", "n2d-standard-4", True,
+                                   target_label_value("xbmc4lyfe/newznab-tmux"), True, gce_time(NOW)))
+        if runner_status:
+            world.runners["xbmc4lyfe/newznab-tmux"].append(
+                runner(f"gha-{late['name']}-1", status=runner_status[0], busy=runner_status[1], runner_id=55))
+        return world, late
+
+    def test_an_excess_late_vm_is_retired_not_promoted(self):
+        world, late = self.late_world(("offline", False))
+        plan = rf.plan_target(world.config.target("xbmc4lyfe/newznab-tmux"), world.hosts,
+                              world.runners["xbmc4lyfe/newznab-tmux"], world.store().record, NOW)
+        self.assertEqual(plan.action, "retire_late")
+        world.tick()
+        kinds = [e[:2] for e in world.log]
+        self.assertLess(kinds.index(("github", "delete_runner")), kinds.index(("provider", "delete_instance")))
+        self.assertIn(("provider", "delete_instance", late["name"], "777"), world.log)
+        record = world.store().record
+        self.assertNotIn("operation", record)
+        self.assertEqual(record["late_creates"], [])
+        self.assertNotEqual((record.get("host") or {}).get("name"), late["name"])
+
+    def test_a_late_vm_whose_runner_is_online_or_busy_holds(self):
+        for status in (("online", False), ("offline", True)):
+            with self.subTest(status=status):
+                world, late = self.late_world(status)
+                world.tick()
+                self.assertFalse([e for e in world.log if e[1] in ("delete_instance", "delete_runner")])
+                entry = world.store().record["late_creates"][0]
+                self.assertEqual(entry["instance_id"], "777")  # pinned for every later check
+
+    def test_a_late_vm_recreated_under_the_name_is_left_alone(self):
+        world2, late2 = self.late_world(("online", False))
+        world2.tick()  # pins 777 and holds
+        world2.replace_host(late2["name"], instance_id="888")
+        # The new instance registered a runner under the same name: it must not be deregistered either.
+        world2.runners["xbmc4lyfe/newznab-tmux"] = [
+            runner(r.name, status="offline", runner_id=55) if r.runner_id == 55 else r
+            for r in world2.runners["xbmc4lyfe/newznab-tmux"]]
+        world2.tick()
+        self.assertFalse([e for e in world2.log if e[1] in ("delete_instance", "delete_runner")])
+        self.assertEqual(world2.store().record["late_creates"], [])
+
+    def test_without_another_serving_host_the_late_vm_is_adopted(self):
+        world = World()
+        world.create_error = "deadline exceeded"
+        world.tick()
+        late = world.store().record["late_creates"][0]
+        world.hosts.append(rf.Host(late["name"], late["zone"], "RUNNING", "777", "n2d-standard-4", True,
+                                   target_label_value("xbmc4lyfe/newznab-tmux"), True, gce_time(NOW)))
+        world.tick()
+        self.assertEqual(world.store().record["operation"]["instance_id"], "777")

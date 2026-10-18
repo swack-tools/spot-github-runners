@@ -85,7 +85,8 @@ def associated_runner_names(vm_name: str, machine_type: str, region: str,
     """
     shape = {machine_type, region} - {""}
     return sorted(r.name for r in runners if not r.name.startswith(f"{rf.RUNNER_PREFIX}-{rf.HOST_PREFIX}")
-                  and ((vm_name and vm_name in r.name) or (len(shape) == 2 and shape <= rf.custom_labels(r))))
+                  and ((vm_name and vm_name in r.name) or (len(shape) == 2 and rf.folded(shape) <=
+                                                            rf.folded(rf.custom_labels(r)))))
 
 
 def preflight(target: rf.FloorTarget, old: rf.Host | None, old_names: Sequence[str], runners: Sequence[GitHubRunner],
@@ -123,9 +124,10 @@ def preflight(target: rf.FloorTarget, old: rf.Host | None, old_names: Sequence[s
                                 "contain the VM name, and its labels lack the VM's machine type and region")
         else:
             out.old_runners.append(runner)
-    old_custom = set().union(*(rf.custom_labels(r) for r in out.old_runners)) if out.old_runners else set()
-    floor_static = {rf.BASE_LABEL, *target.labels}
-    shape = {old.machine_type, old.region} if old else set()
+    # Labels compare without case, as GitHub matches them.
+    old_custom = rf.folded(set().union(*(rf.custom_labels(r) for r in out.old_runners))) if out.old_runners else set()
+    floor_static = rf.folded({rf.BASE_LABEL, *target.labels})
+    shape = rf.folded({old.machine_type, old.region}) if old else set()
     missing = sorted(old_custom - floor_static - shape)
     if missing:
         out.problems.append(f"the managed floor host would not carry {', '.join(missing)}; add "
@@ -188,8 +190,9 @@ def managed_ready(own: dict, hosts: Sequence[rf.Host], runners: Sequence[GitHubR
         runner = by_name.get(name)
         if runner is None or not runner.online:
             return False, f"managed runner {name} is not online"
-        if not set(required) <= rf.custom_labels(runner):
-            return False, f"managed runner {name} lacks {', '.join(sorted(set(required) - rf.custom_labels(runner)))}"
+        lacking = rf.folded(required) - rf.folded(rf.custom_labels(runner))
+        if lacking:
+            return False, f"managed runner {name} lacks {', '.join(sorted(lacking))}"
     if not own.get("runner_names"):
         return False, "the managed floor host records no runners"
     return True, f"{host.describe()} is ready"
@@ -356,7 +359,7 @@ class Replacement:
         original = rep.get("original_labels") or {}
         for runner in self._old_runners(runners):
             labels = original.get(runner.name)
-            if labels and rf.custom_labels(runner) != set(labels):
+            if labels and rf.folded(rf.custom_labels(runner)) != rf.folded(labels):
                 self.github.set_labels(self.target.target, runner.runner_id, labels)
         rep.update(phase="aborted", aborted_at=self.clock())
         self.save()

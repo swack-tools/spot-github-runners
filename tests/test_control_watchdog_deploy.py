@@ -273,8 +273,8 @@ class ExecuteTests(unittest.TestCase):
             argv = list(argv)
             calls.append(argv)
             for arg in argv:
-                if arg.startswith("--condition-from-file="):
-                    files["condition"] = json.loads(Path(arg.split("=", 1)[1]).read_text())
+                if arg.startswith("--condition-from-file=") and "add-iam-policy-binding" in argv:
+                    files.setdefault("condition", json.loads(Path(arg.split("=", 1)[1]).read_text()))
             if argv[:3] == ["gcloud", "projects", "describe"]:
                 return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
             if "describe" in argv and "versions" in argv:
@@ -511,3 +511,84 @@ class FloorDeployTests(unittest.TestCase):
         source = Path(runner_manager.__file__).read_text()
         self.assertEqual(sorted(set(re.findall(r"ROOT\s*/\s*'([^']+)'", source))),
                          ["builder/docker-admission.py", "runner/job-started.sh"])
+
+
+class FloorRemovalTests(unittest.TestCase):
+    """Turning the floor off (or dropping a target's secret) removes the grants an earlier deploy made."""
+
+    def runner(self, labeled=("spot-floor-github-swackhamer", "spot-floor-github-old"), absent=()):
+        calls = []
+
+        def run(argv):
+            argv = list(argv)
+            calls.append(argv)
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
+            if "describe" in argv and "versions" in argv:
+                return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
+            if argv[:3] == ["gcloud", "secrets", "list"]:
+                return SimpleNamespace(returncode=0, stdout="".join(f"{n}\n" for n in labeled), stderr="")
+            if "remove-iam-policy-binding" in argv and any(a in argv for a in absent):
+                return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: Policy binding with the specified "
+                                       "principal, role, and condition not found!")
+            return SimpleNamespace(returncode=1 if "describe" in argv else 0, stdout="", stderr="")
+        return run, calls
+
+    def deploy(self, run, env):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}"], runner=run, env=env)
+        return code, err.getvalue()
+
+    def removed(self, calls):
+        return [c for c in calls if "remove-iam-policy-binding" in c or "--remove-labels=spot-runner-floor" in c]
+
+    def test_floor_off_removes_the_compute_binding_and_every_labeled_secret_grant(self):
+        # A labeled secret that also backs a service variable keeps its access.
+        run, calls = self.runner(labeled=("spot-floor-github-swackhamer", "spot-floor-github-old",
+                                          "spot-dashboard-control-secret"))
+        code, err = self.deploy(run, ENV)
+        self.assertEqual(code, 0, err)
+        compute = [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]]
+        self.assertEqual(len(compute), 1)
+        self.assertEqual(flag(compute[0], "role"), "roles/compute.instanceAdmin.v1")
+        removed = sorted(c[3] for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"])
+        self.assertEqual(removed, ["spot-floor-github-old", "spot-floor-github-swackhamer"])
+        self.assertTrue(all(flag(c, "role") == "roles/secretmanager.secretAccessor"
+                            for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"]))
+
+    def test_floor_on_keeps_current_secrets_and_removes_a_dropped_one(self):
+        run, calls = self.runner()
+        code, err = self.deploy(run, FLOOR_ENV)
+        self.assertEqual(code, 0, err)
+        removed = [c[3] for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"]]
+        self.assertEqual(removed, ["spot-floor-github-old"])  # swackhamer's secret is still configured
+        self.assertFalse([c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]])
+        labels = sorted(c[3] for c in calls if any(a.startswith("--update-labels=spot-runner-floor") for a in c))
+        self.assertEqual(labels, ["spot-floor-github-swackhamer", "spot-floor-github-xbmc4lyfe"])
+
+    def test_removal_is_idempotent(self):
+        run, calls = self.runner(absent=("spot-floor-github-old", "projects"))
+        self.assertEqual(self.deploy(run, ENV)[0], 0)
+        run, calls = self.runner(labeled=())
+        self.assertEqual(self.deploy(run, ENV)[0], 0)
+        self.assertFalse([c for c in calls if c[1:3] == ["secrets", "remove-iam-policy-binding"]])
+
+    def test_other_removal_failures_stop_the_deploy(self):
+        def run(argv):
+            if "remove-iam-policy-binding" in argv:
+                return SimpleNamespace(returncode=1, stdout="", stderr="PERMISSION_DENIED")
+            return self.runner()[0](argv)
+        code, err = self.deploy(run, ENV)
+        self.assertEqual(code, 1)
+        self.assertIn("PERMISSION_DENIED", err)
+
+    def test_the_dry_run_shows_the_removals_and_stays_valid_bash(self):
+        for env in (ENV, FLOOR_ENV):
+            with self.subTest(floor=env is FLOOR_ENV):
+                code, script, err = dry_run(f"--image={IMAGE}", env=env)
+                self.assertEqual(code, 0, err)
+                self.assertIn("labels.spot-runner-floor=token", script)
+                self.assertIn('"$name"', script)
+                self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
+                self.assertEqual("projects remove-iam-policy-binding" in script, env is ENV)

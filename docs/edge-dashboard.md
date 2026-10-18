@@ -784,7 +784,7 @@ The service references these secrets:
 | `CF_ACCESS_CLIENT_ID` | `spot-control-access-client-id` | New: the Access service token for the tunnel hostnames. |
 | `CF_ACCESS_CLIENT_SECRET` | `spot-control-access-client-secret` | New. |
 | `SPOT_DASHBOARD_IMAGE_TRACK_TOKEN` | `spot-control-watchdog-github-token` | New, only with image tracking. |
-| None: a file at `/secrets/runner-floor/<secret>/token` | One `secret=` of `SPOT_RUNNER_FLOOR_TARGETS` for each GitHub account | New, only with floor targets. Each account's secret is separate, and none may back another service variable. |
+| None: a file at `/secrets/runner-floor/<secret>/token` | One `secret=` of `SPOT_RUNNER_FLOOR_TARGETS` for each GitHub account | New, only with floor targets. Each account's secret is separate, and none may back another service variable. The deploy labels it `spot-runner-floor=token`, and removes the access again once no target names it. |
 
 `--secret ENV=SECRET` references another secret for a variable. The deploy never writes a secret value. It
 stops before any IAM change when a referenced secret has no enabled version.
@@ -905,9 +905,17 @@ The floor needs a watchdog image built from a commit that has `src/runner_floor.
 1. Set `SPOT_RUNNER_FLOOR_STATE_URI` to the same location in the environment of every autoscaler that manages
    a floor target, so that it holds the target's floor lease while it runs.
 
-To turn the floor off, remove `SPOT_RUNNER_FLOOR_TARGETS` and deploy again; then remove the
-`spot-runner-floor-hosts` binding with `gcloud projects remove-iam-policy-binding` and the same condition.
-Floor hosts that exist keep running until the autoscaler or an operator retires them.
+To turn the floor off, remove `SPOT_RUNNER_FLOOR_TARGETS`, preview the deploy with `--dry-run`, and deploy
+again. Every deploy removes the grants the floor no longer needs, and skips those already gone:
+
+- With no floor target, it removes the `spot-runner-floor-hosts` compute binding.
+- The deploy labels each floor token secret `spot-runner-floor=token` when it grants access to it. It then
+  removes the runtime account's `roles/secretmanager.secretAccessor` binding, and the label, from every
+  labeled secret that the service no longer references. That covers every former floor token secret,
+  including one that only left a target's `secret=`.
+
+Removing the floor never deletes a secret or a VM. Floor hosts that exist keep running until the autoscaler or
+an operator retires them.
 
 ### Migrate from the workstation state
 

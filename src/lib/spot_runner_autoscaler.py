@@ -741,6 +741,7 @@ def reconcile_host_operation(vms, runners, args, state, state_path):
     if stale:
         for runner in stale:
             try:
+                guard_inventory_fresh(state)  # inventory freshness and the floor lease, right before the delete
                 subprocess.run(["gh", "api", "-X", "DELETE",
                                 f"{target_api_prefix(operation.get('target') or _active_target(args))}/actions/runners/{runner.runner_id}"],
                                check=True, text=True, capture_output=True, timeout=60)
@@ -2939,11 +2940,13 @@ def abandon_launch(args: argparse.Namespace, state: dict, state_path: Path) -> b
         return False
     for disk in leftovers:
         if runner_inventory_stale(state):raise RuntimeError('Disk cleanup held: stale runner inventory')
+        guard_inventory_fresh(state)  # and the floor lease, right before the delete
         subprocess.run(["gcloud", "compute", "disks", "delete", disk["name"], f"--zone={vm.zone}",
                         f"--project={args.project}", "--quiet"],
                        check=True, text=True, capture_output=True, timeout=120)
         LOG.info("Deleted disk %s left by launch %s", disk["name"], vm.name)
     for runner in host_runners(vm, list_github_runners(target), [vm]):
+        guard_inventory_fresh(state)  # inventory freshness and the floor lease, right before the delete
         subprocess.run(["gh", "api", "-X", "DELETE", f"{target_api_prefix(target)}/actions/runners/{runner.runner_id}"],
                        check=True, text=True, capture_output=True, timeout=60)
     if host_runners(vm, list_github_runners(target), [vm]):
@@ -3149,7 +3152,7 @@ def acquire_floor_lease(args: argparse.Namespace):
     (the floor keeper, or a replacement command) holds the lease, else the held lease. Without --once it waits.
     """
     global _FLOOR_LEASE_GUARD, _FLOOR_LEASE_HOLDER
-    from .runner_floor import ENV_STATE_URI, AutoscalerTargetLease
+    from .runner_floor import ENV_STATE_URI, AutoscalerTargetLease, install_mutation_fence
 
     uri = str(os.environ.get(ENV_STATE_URI, '') or '').strip()
     if not uri:
@@ -3158,7 +3161,12 @@ def acquire_floor_lease(args: argparse.Namespace):
     holder = AutoscalerTargetLease.for_target(args.project, target, uri)
     while True:
         if holder.acquire():
-            pending = holder.pending_operation()
+            try:
+                pending = holder.pending_operation()
+            except BaseException:
+                # A read error or malformed floor state must not keep the lease for its whole time to live.
+                holder.release()
+                raise
             if not pending:
                 break
             # The keeper must finish its own launch (and remove its one-use registration token) first.
@@ -3171,16 +3179,26 @@ def acquire_floor_lease(args: argparse.Namespace):
         if args.once:
             return False
         time.sleep(args.interval_seconds)
-    holder.start()
-    _FLOOR_LEASE_GUARD = holder.guard
-    _FLOOR_LEASE_HOLDER = holder
-    LOG.info('Holding the runner floor lease of %s; the floor keeper skips this target while this controller runs',
-             target)
+    try:
+        holder.start()
+        _FLOOR_LEASE_GUARD = holder.guard
+        _FLOOR_LEASE_HOLDER = holder
+        # Every mutating child process (gcloud, gh, ssh, the deployment manager), whichever module starts it, proves
+        # the lease immediately before it starts: cleanups that check only inventory freshness are covered too.
+        install_mutation_fence(holder.guard)
+        LOG.info('Holding the runner floor lease of %s; the floor keeper skips this target while this controller '
+                 'runs', target)
+    except BaseException:
+        release_floor_lease(holder)
+        raise
     return holder
 
 
 def release_floor_lease(holder) -> None:
     global _FLOOR_LEASE_GUARD, _FLOOR_LEASE_HOLDER
+    from .runner_floor import install_mutation_fence
+
+    install_mutation_fence(None)
     _FLOOR_LEASE_GUARD = None
     _FLOOR_LEASE_HOLDER = None
     holder.release()

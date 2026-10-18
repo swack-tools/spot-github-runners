@@ -219,7 +219,7 @@ swack-tools:secret=spot-floor-github-<account>,account=<account>,group=<runner g
 | `secret` | Required. The Secret Manager secret that holds the GitHub token of the account that administers the target. It names a secret and never holds a token: the parser refuses a value that looks like one. Targets that one account administers share its secret. |
 | `account` | The GitHub account that `gh auth token --user` reads on a workstation, for `status` and `replace-unmanaged`. |
 | `group` | Organizations only. The runner group that the floor host's runner joins. The keeper requires a group with selected-repository access, and it refuses the Default group. Without `group`, the runner joins the Default group. Personal accounts support only repository runners, so a repository target has no group. |
-| `labels` | Extra scheduling labels joined with `+`, such as `ubuntu-latest`. Every floor runner also gets `spot`, its machine type, and its region. The keeper records the extra labels in the host metadata, so a later live patch keeps them. |
+| `labels` | Extra scheduling labels joined with `+`, such as `ubuntu-latest`. Every floor runner also gets `spot`, its machine type, and its region. The keeper records the extra labels in the host metadata, so a later live patch keeps them. Labels compare without case, as on GitHub: the parser refuses a label listed twice in another case, and one that repeats a label every runner gets. |
 | `ram` | The least RAM in GiB, from 4 to 32. The default is 16. |
 
 The configuration is an environment variable of the watchdog service, not an
@@ -320,7 +320,11 @@ that disappears during the bootstrap, ends the launch the same way. Each
 failure starts the backoff. A create that was given up can still land, for
 example after a call timed out. When its VM appears within an hour, the keeper
 adopts it and finishes or abandons it like any other launch, so its token
-never stays in the metadata.
+never stays in the metadata. If another host already serves the floor by then,
+the late VM is excess: the keeper records its instance ID, removes its runner
+registrations, and deletes it, but only while none of its runners is online or
+busy. Otherwise it holds and logs why, and after the hour it leaves the VM for
+the autoscaler or an operator.
 
 ### Coordinate with the autoscaler
 
@@ -355,6 +359,10 @@ check, because both controllers would otherwise replace one lost floor host:
   it until a minute after it expires, so the manager is gone before another
   controller may act. The controller's other provider calls time out within
   10 minutes.
+- Every child process that can change something, `gcloud` other than reads,
+  `gh` other than reads, `ssh`, and the deployment manager, proves the lease
+  immediately before it starts, whichever part of the controller starts it.
+  An unknown command counts as a change.
 - `--dry-run` takes no lease.
 
 An autoscaler without `SPOT_RUNNER_FLOOR_STATE_URI` doesn't coordinate. Two

@@ -44,6 +44,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -163,8 +164,12 @@ class FloorTarget:
         return "/" in self.name
 
     def custom_labels(self, machine_type: str, region: str) -> tuple[str, ...]:
-        """The custom labels runner_manager registers (runner label, machine type, region, then the extras)."""
-        return tuple(dict.fromkeys([BASE_LABEL, machine_type, region, *self.labels]))
+        """The custom labels runner_manager registers (runner label, machine type, region, then the extras), with
+        case-only duplicates dropped: GitHub compares labels without case."""
+        out: dict[str, str] = {}
+        for label in (BASE_LABEL, machine_type, region, *self.labels):
+            out.setdefault(label.casefold(), label)
+        return tuple(out.values())
 
     def owns(self, host: "Host") -> bool:
         return target_owns_vm_label(host.target_label or None, self.target)
@@ -228,10 +233,15 @@ def parse_targets(text: str | None) -> tuple[FloorTarget, ...]:
                 continue
             if not _LABEL_RE.match(label):
                 raise ValueError(f"floor target {name}: label {label!r} is not a valid runner label")
-            if label.lower() in {d.lower() for d in DEFAULT_RUNNER_LABELS}:
+            if label.casefold() in folded(DEFAULT_RUNNER_LABELS):
                 raise ValueError(f"floor target {name}: {label} is a built-in label GitHub sets itself")
-            if label not in labels:
-                labels.append(label)
+            if label.casefold() == BASE_LABEL.casefold() or _REGION_RE.match(label.casefold()) \
+                    or _looks_like_machine_type(label):
+                raise ValueError(f"floor target {name}: {label} duplicates a label every floor runner gets "
+                                 "(spot, its machine type, and its region)")
+            if label.casefold() in folded(labels):
+                raise ValueError(f"floor target {name}: label {label} is listed twice (labels ignore case)")
+            labels.append(label)
         ram = DEFAULT_MIN_RAM_GIB
         if "ram" in options:
             if not options["ram"].isdigit() or not 4 <= int(options["ram"]) <= MAX_RAM_GIB:
@@ -447,11 +457,24 @@ class GitHubClient:
         rows = data.get("labels") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             raise GitHubError("GitHub returned no labels")
-        return {row.get("name") for row in rows if isinstance(row, dict)} - DEFAULT_RUNNER_LABELS
+        defaults = folded(DEFAULT_RUNNER_LABELS)
+        return {row.get("name") for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str)
+                and row["name"].casefold() not in defaults}
+
+
+def folded(labels: Any) -> set[str]:
+    """Labels compared the way GitHub compares them: without case."""
+    return {str(label).casefold() for label in labels}
 
 
 def custom_labels(runner: GitHubRunner) -> set[str]:
-    return set(runner.labels) - DEFAULT_RUNNER_LABELS
+    defaults = folded(DEFAULT_RUNNER_LABELS)
+    return {label for label in runner.labels if label.casefold() not in defaults}
+
+
+def _looks_like_machine_type(label: str) -> bool:
+    from .machine_profiles import machine_profile
+    return machine_profile(label.casefold()) is not None
 
 
 # --------------------------------------------------------------------------------------------
@@ -730,7 +753,7 @@ def hard_deadline(seconds: float) -> Iterator[None]:
 
 LEASE_ACTIONS = frozenset({"launch", "restart", "confirm_create", "launch_failed", "finish_launch",
                            "abandon_launch", "launch_lost", "finish_restart", "fail_restart", "restart_lost",
-                           "adopt_late"})
+                           "adopt_late", "retire_late"})
 
 
 @dataclass(frozen=True)
@@ -778,14 +801,14 @@ def restart_problem(host: Host, runners: Sequence[GitHubRunner], record: Mapping
     if not names:
         return "its runner names are not recorded"
     by_name = _runners_by_name(runners)
-    wanted = set(own.get("labels") or [])
+    wanted = folded(own.get("labels") or [])
     for name in names:
         runner = by_name.get(name)
         if runner is None:
             return f"runner {name} is no longer registered"
         if runner.online or runner.busy:
             return f"runner {name} is online or busy while its host is stopped"
-        if not wanted or not wanted <= custom_labels(runner):
+        if not wanted or not wanted <= folded(custom_labels(runner)):
             return f"runner {name} lost its scheduling labels"
     return None
 
@@ -796,11 +819,18 @@ def plan_target(target: FloorTarget, hosts: Sequence[Host], runners: Sequence[Gi
     operation = record.get("operation")
     if isinstance(operation, dict) and operation:
         return _plan_operation(hosts, runners, operation, now)
+    own = managed_hosts(target, hosts)
     for late in record.get("late_creates") or []:
         vm = next((h for h in hosts if h.name == late.get("name") and h.zone == late.get("zone")), None)
         if vm is not None and now < float(late.get("until") or 0):
+            others = [h for h in own if h.name != vm.name and h.status in LIVE_STATUSES
+                      and host_serving(h, runners, now)]
+            if others:
+                # Another host already holds the floor: the late VM is excess, never a second floor host.
+                return Plan("retire_late", f"{vm.describe()} appeared after its create was given up, but "
+                                           f"{others[0].describe()} already serves the floor; retiring the excess VM",
+                            vm)
             return Plan("adopt_late", f"{vm.describe()} appeared after its create was given up; adopting it", vm)
-    own = managed_hosts(target, hosts)
     live = [h for h in own if h.status in LIVE_STATUSES]
     serving = [h for h in live if host_serving(h, runners, now)]
     if serving:
@@ -1267,6 +1297,45 @@ class FloorKeeper:
     def _do_confirm_create(self, plan: Plan, hosts: Sequence[Host]) -> str:
         return self._booting(plan.host)
 
+    def _do_retire_late(self, plan: Plan, hosts: Sequence[Host]) -> str:
+        """Delete an excess late VM with the keeper's own deletion rules: its own VM (pinned by instance ID), no
+        runner online or busy, its registrations removed first. Otherwise it holds, logged, and after the watch
+        window the VM is left for the autoscaler or an operator."""
+        vm = plan.host
+        entry = next(e for e in self.record.get("late_creates") or []
+                     if e.get("name") == vm.name and e.get("zone") == vm.zone)
+        if not entry.get("instance_id"):
+            entry["instance_id"] = vm.instance_id  # the identity every later check must match
+            self.save()
+        elif entry["instance_id"] != vm.instance_id:
+            self.record["late_creates"] = [e for e in self.record["late_creates"] if e is not entry]
+            self.save()
+            return self.note("late_create_left", f"{vm.name} is now instance {vm.instance_id}, not the "
+                                                 f"{entry['instance_id']} first seen; it isn't this keeper's to delete")
+        names = list((entry.get("operation") or {}).get("expected_runners") or expected_runner_names(vm.name))
+        runners = {r.name: r for r in self.github.list_runners(self.target.target)}
+        active = [n for n in names if n in runners and (runners[n].online or runners[n].busy)]
+        if active:
+            return self.note("late_create_held", f"excess {vm.describe()} can't be deleted safely: runner(s) "
+                                                 f"{', '.join(active)} are online or busy. It is retried until "
+                                                 "the watch ends, then left for the autoscaler or an operator")
+        for name in names:
+            if name in runners:
+                self.github.delete_runner(self.target.target, runners[name].runner_id)
+        fresh = self.provider.describe(vm.name, vm.zone)
+        self.record["late_creates"] = [e for e in self.record["late_creates"] if e is not entry]
+        if fresh is None:
+            self.save()
+            return self.note("late_create_gone", f"{vm.name} is gone")
+        if fresh.instance_id != entry["instance_id"]:
+            self.save()
+            return self.note("late_create_left", f"{vm.name} is now another instance; left alone")
+        if fresh.startup_script and fresh.status not in STOPPED_STATUSES:
+            self.provider.remove_startup_script(fresh)
+        self.provider.delete_instance(fresh)
+        self.save()
+        return self.note("late_create_retired", f"deleted excess {fresh.describe()}: {plan.reason}")
+
     def _do_adopt_late(self, plan: Plan, hosts: Sequence[Host]) -> str:
         entry = next(e for e in self.record.get("late_creates") or []
                      if e.get("name") == plan.host.name and e.get("zone") == plan.host.zone)
@@ -1335,9 +1404,9 @@ class FloorKeeper:
             runner = runners.get(name)
             if runner is None or not runner.online:
                 return self.note("finish_waits", f"runner {name} is no longer online")
-            if custom_labels(runner) != set(wanted):
+            if folded(custom_labels(runner)) != folded(wanted):
                 actual = self.github.set_labels(self.target.target, runner.runner_id, wanted)
-                if actual != set(wanted):
+                if folded(actual) != folded(wanted):
                     raise FloorError(f"runner {name} has labels {sorted(actual)}, expected {sorted(wanted)}")
         args = manager_args(operation["manager_argv"], self.target)
         self.provider.record_no_patch(args, vm.zone, vm.last_start)
@@ -1579,6 +1648,71 @@ def run_fenced(command: Sequence[str], *, timeout: float, holder: "AutoscalerTar
         if holder is not None:
             holder.unfence(process)
     return subprocess.CompletedProcess(list(command), process.returncode, out, err)
+
+
+# --------------------------------------------------------------------------------------------
+# Process-wide mutation fence (an audit hook), active while an autoscaler holds its target's floor lease
+# --------------------------------------------------------------------------------------------
+
+# Read-only gcloud verbs; every other gcloud command (and ssh, scp, the deployment manager, and any gh call that
+# isn't a plain GET) counts as a mutation. Unknown commands are mutations: the fence denies by default.
+GCLOUD_READ_VERBS = frozenset({"list", "describe", "get-serial-port-output", "print-access-token",
+                               "print-identity-token", "get-iam-policy", "get-guest-attributes"})
+_GH_BODY_FLAGS = ("--input", "-f", "-F", "--field", "--raw-field")
+_MUTATION_GUARD: Callable[[], None] | None = None
+_FENCE_HOOK_INSTALLED = False
+
+
+def is_mutating_command(argv: Sequence[Any] | str) -> bool:
+    """Whether a child process may change a provider: VMs, disks, metadata, labels, or runner registrations."""
+    import shlex
+
+    words = shlex.split(argv) if isinstance(argv, str) else [str(a) for a in argv or ()]
+    if not words:
+        return False
+    if any(w.endswith("spot_runner_manager.py") for w in words):
+        return True
+    base = os.path.basename(words[0])
+    if base in ("ssh", "scp"):
+        return True
+    positional = [w for w in words[1:] if not w.startswith("-")]
+    if base == "gcloud":
+        if any(w in ("ssh", "scp") for w in positional[:3]):
+            return True
+        return not any(w in GCLOUD_READ_VERBS for w in positional[:5])
+    if base == "gh":
+        if positional[:2] in (["auth", "token"], ["auth", "status"]):
+            return False
+        if positional[:1] != ["api"]:
+            return True
+        method = "GET"
+        for index, word in enumerate(words):
+            if word in ("-X", "--method") and index + 1 < len(words):
+                method = words[index + 1]
+            elif word.startswith("--method="):
+                method = word.split("=", 1)[1]
+            elif word.startswith("-X") and len(word) > 2:
+                method = word[2:]
+            elif word in _GH_BODY_FLAGS or word.startswith(("--field=", "--raw-field=", "--input=")):
+                return True  # gh api sends a body with POST unless told otherwise
+        return method.upper() != "GET"
+    return False
+
+
+def _fence_hook(event: str, args: tuple) -> None:
+    guard = _MUTATION_GUARD
+    if event == "subprocess.Popen" and guard is not None and is_mutating_command(args[1]):
+        guard()  # raises before the child exists
+
+
+def install_mutation_fence(guard: Callable[[], None] | None) -> None:
+    """While ``guard`` is set, every mutating child process this interpreter starts, from any module or thread,
+    first proves the floor lease (``guard`` raises when it can't). ``None`` turns the fence off."""
+    global _MUTATION_GUARD, _FENCE_HOOK_INSTALLED
+    if not _FENCE_HOOK_INSTALLED:
+        sys.addaudithook(_fence_hook)  # audit hooks can't be removed; the guard variable switches it
+        _FENCE_HOOK_INSTALLED = True
+    _MUTATION_GUARD = guard
 
 
 class AutoscalerTargetLease:

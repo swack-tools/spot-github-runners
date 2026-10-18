@@ -331,10 +331,27 @@ class Step:
     update: tuple[tuple[str, ...], ...] = ()
     require: tuple[tuple[tuple[str, ...], str], ...] = ()  # (command that must print ENABLED, what to do if not)
     files: Mapping[str, str] = field(default_factory=dict)  # name -> content, referenced as @FILE:<name>
+    # Removals that are done when the thing is already absent ("not found"), so every deploy can repeat them.
+    remove: tuple[tuple[str, ...], ...] = ()
+    # (list command printing one name per line, names to keep, commands run for every other name with the argument
+    # NAME_ARG replaced by it): removes what an earlier deploy granted and this one no longer needs.
+    prune: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, ...], ...]], ...] = ()
 
 
 def _c(*argv: str) -> tuple[str, ...]:
     return tuple(argv)
+
+
+NAME_ARG = "{name}"
+# Every floor token secret this deploy grants access to carries this label, so a later deploy can find the grants
+# it made and remove those it no longer needs, even after the secret names left SPOT_RUNNER_FLOOR_TARGETS.
+FLOOR_SECRET_LABEL = "spot-runner-floor"
+
+
+def floor_condition() -> dict[str, str]:
+    """The floor compute binding's condition; the same file adds it and, once the floor is off, removes it."""
+    return {"expression": FLOOR_CONDITION_EXPRESSION, "title": FLOOR_CONDITION_TITLE,
+            "description": "Runner floor hosts oxidex-runners-* and their runner-data disks"}
 
 
 def iam_bindings(config: DeployConfig) -> list[tuple[str, str, str, str]]:
@@ -436,17 +453,35 @@ def build_steps(config: DeployConfig) -> list[Step]:
     ]
     files = {"compute-condition.json": json.dumps(condition, indent=2)} if config.compute_condition else {}
     if config.floor_enabled and config.compute_condition:
-        files["floor-condition.json"] = json.dumps(
-            {"expression": FLOOR_CONDITION_EXPRESSION, "title": FLOOR_CONDITION_TITLE,
-             "description": "Runner floor hosts oxidex-runners-* and their runner-data disks"}, indent=2)
+        files["floor-condition.json"] = json.dumps(floor_condition(), indent=2)
         iam_runs.insert(1, _c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={runtime}",
                               f"--role={ROLE_COMPUTE}", "--condition-from-file=@FILE:floor-condition.json",
                               "--format=none"))
     iam_runs += [_c("gcloud", "secrets", "add-iam-policy-binding", secret, p, f"--member={runtime}",
                     f"--role={ROLE_SECRET}", "--format=none")
                  for secret in sorted(set(refs.values()) | set(mounts.values()))]
+    iam_runs += [_c("gcloud", "secrets", "update", secret, p, f"--update-labels={FLOOR_SECRET_LABEL}=token",
+                    "--format=none") for secret in sorted(set(mounts.values()))]
     steps.append(Step("Runtime service account IAM (narrowest resource for each role)", run=tuple(iam_runs),
                       files=files))
+    # Grants the runner floor no longer needs: the floor compute binding once no floor target is configured, and
+    # the accessor on every labeled floor token secret that the service no longer references.
+    removals: list[tuple[str, ...]] = []
+    removal_files: dict[str, str] = {}
+    if not config.floor_enabled and config.compute_condition:
+        removal_files["floor-condition.json"] = json.dumps(floor_condition(), indent=2)
+        removals.append(_c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
+                           f"--role={ROLE_COMPUTE}", "--condition-from-file=@FILE:floor-condition.json",
+                           "--format=none"))
+    keep = tuple(sorted(set(refs.values()) | set(mounts.values())))
+    prune = ((_c("gcloud", "secrets", "list", p, f"--filter=labels.{FLOOR_SECRET_LABEL}=token",
+                 "--format=value(name.basename())"), keep,
+              (_c("gcloud", "secrets", "remove-iam-policy-binding", NAME_ARG, p, f"--member={runtime}",
+                  f"--role={ROLE_SECRET}", "--format=none"),
+               _c("gcloud", "secrets", "update", NAME_ARG, p, f"--remove-labels={FLOOR_SECRET_LABEL}",
+                  "--format=none"))),)
+    steps.append(Step("Remove runner floor grants that are no longer configured (absent ones are skipped)",
+                      remove=tuple(removals), prune=prune, files=removal_files))
 
     owner = config.github_repo.split("/", 1)[0]
     workflow_ref = f"{config.github_repo}/{IMAGE_WORKFLOW}@refs/heads/main"
@@ -553,6 +588,13 @@ def render(config: DeployConfig, steps: Sequence[Step]) -> str:
             lines += [f"  {_shell(c)}" for c in step.create]
             lines.append("fi")
         lines += [_shell(c) for c in step.run]
+        lines += [f"{_shell(c)} 2>/dev/null || echo 'already absent'" for c in step.remove]
+        for listing, keep, commands in step.prune:
+            lines.append(f"for name in $({_shell(listing)}); do")
+            lines.append(f"  case ' {' '.join(keep)} ' in *\" $name \"*) continue ;; esac")
+            lines += [f"  {_shell(c).replace(shlex.quote(NAME_ARG), '"$name"')} 2>/dev/null || echo 'already absent'"
+                      for c in commands]
+            lines.append("done")
     if not config.image:
         lines += ["", "# The Cloud Run service and the scheduler need --image: build the watchdog image first (see the",
                   "# Control watchdog image workflow), then run this deploy again with --image=<digest>."]
@@ -604,6 +646,13 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
             if result.returncode != 0:
                 raise DeployError(f"{what} failed: {(result.stderr or '').strip()[:500]}")
 
+        def remove(argv: Sequence[str], files: Mapping[str, str], what: str) -> None:
+            command = materialize(argv, files)
+            out(f"+ {shlex.join(command)}")
+            result = runner(command)
+            if result.returncode != 0 and "not found" not in (result.stderr or "").lower():
+                raise DeployError(f"{what} failed: {(result.stderr or '').strip()[:500]}")
+
         for index, step in enumerate(steps, 1):
             out(f"# {index}. {step.title}")
             for command, hint in step.require:
@@ -618,6 +667,17 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
                     out("  exists")
             for command in step.run:
                 run(command, step.files, step.title)
+            for command in step.remove:
+                remove(command, step.files, step.title)
+            for listing, keep, commands in step.prune:
+                result = runner(materialize(listing, step.files))
+                if result.returncode != 0:
+                    raise DeployError(f"{step.title} failed: {(result.stderr or '').strip()[:500]}")
+                for name in sorted({line.strip() for line in (result.stdout or "").splitlines() if line.strip()}):
+                    if name in keep:
+                        continue
+                    for command in commands:
+                        remove(tuple(name if arg == NAME_ARG else arg for arg in command), step.files, step.title)
 
 
 # --------------------------------------------------------------------------------------------
