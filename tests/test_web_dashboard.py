@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -1003,7 +1004,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         install_fleet_fixture(self.store)
         # The fixture fleet stands in for a current live inventory (scaling holds without one); no refresh loop runs.
         self.store.fleet_source = lambda: []
-        self.store._fleet_status["fresh"] = True
+        self.store._fleet_status.update(fresh=True, last_success_epoch=time.time())
+        self.store.fleet_inventory_interval = 1e9  # The stand-in never ages during a test.
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -4300,9 +4302,12 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertAlmostEqual(rec["started_epoch"], self.now - 3 * 3600.0, delta=1.0)
         self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 4)
         self.assertEqual(self.store.state_version(), version_before + 1)
+        # The default state's sample OOM event is recent, so the next listing records its baseline once.
+        self.store.refresh_fleet_inventory()
+        version = self.store.state_version()
         # The same listing again is not a change: no new state version (and no KV publish).
         self.assertFalse(self.store.refresh_fleet_inventory())
-        self.assertEqual(self.store.state_version(), version_before + 1)
+        self.assertEqual(self.store.state_version(), version)
         status = self.store.fleet_inventory_status()
         self.assertEqual(status["observed_count"], 1)
         self.assertEqual(status["last_error"], "")
@@ -4442,6 +4447,7 @@ class FleetInventoryReconcileTests(unittest.TestCase):
     def test_unchanged_rates_write_nothing(self):
         self.fleet = [fleet_observation("1010", "oxidex-runners-price-1", "us-south1-a", now=self.now)]
         self.store.refresh_fleet_inventory()
+        self.store.refresh_fleet_inventory()  # Records the sample OOM event's baseline once.
         version = self.store.state_version()
         self.assertFalse(self.store.refresh_fleet_inventory())
         self.assertEqual(self.store.state_version(), version)
@@ -4572,6 +4578,17 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         from lib.dashboard_server import MAX_WINDOW_HOURS
 
         self.assertEqual(self.store.query_instances(window_hours=8760)["window_hours"], MAX_WINDOW_HOURS)
+
+    def test_unknown_region_pricing_is_incomplete_under_any_tax_setting(self):
+        self.fleet = [fleet_observation("5400", "builder-oxidex-far-1", "mars-central1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-far-1")
+        self.assertFalse(rec["pricing_complete"])
+        self.assertIn("outside the dashboard's catalog", rec["pricing_incomplete_reason"])
+        for include_taxes in (True, False):
+            with self.store._lock:
+                self.store.state["profiles"]["rust_builder"]["budget"]["include_taxes"] = include_taxes
+            self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), ["builder-oxidex-far-1"])
 
     def test_unknown_region_uses_neutral_tax(self):
         self.fleet = [fleet_observation("2200", "oxidex-runners-mars-1", "mars-central1-a", now=self.now)]
@@ -4809,7 +4826,10 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             self.store.get_overview()
             self.assertAlmostEqual(self._record("builder-oxidex-mixed-1")["pricing"]["disk_hourly_usd"],
                                    reconciled, delta=0.0001)
+            self.store.refresh_fleet_inventory()  # May record baselines on existing OOM events once.
             self.assertFalse(self.store.refresh_fleet_inventory())
+            self.assertAlmostEqual(self._record("builder-oxidex-mixed-1")["pricing"]["disk_hourly_usd"],
+                                   reconciled, delta=0.0001)
 
     def test_stop_and_resize_in_one_listing_ends_run_at_stop(self):
         running = fleet_observation("3600", "builder-oxidex-stopgrow-1", "us-south1-b", started_hours_ago=10.0,
@@ -5039,22 +5059,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(len(self.store.state["instances"]), 1)  # Rolled back.
         self.assertIn("No space left", self.store._inventory_stale_reason())
 
-    def test_builder_restart_does_not_consume_oom(self):
-        builder = fleet_observation("5100", "builder-oxidex-oom-1", "us-south1-b", started_hours_ago=5.0, now=self.now)
-        self.fleet = [builder]
-        self.store.refresh_fleet_inventory()
-        self.fleet = [dict(builder, status="TERMINATED", last_stop_epoch=self.now - 3600.0)]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b2", "instance_name": "builder-oxidex-oom-1", "role": "rust_builder"}]
-        self.fleet = [dict(builder, last_start_epoch=self.now - 60.0)]  # Same VM started again.
-        self.store.refresh_fleet_inventory()
-        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
-        self.fleet.append(fleet_observation("5101", "builder-oxidex-oom-2", "us-south1-b", now=self.now))
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
-
     def test_bootstrap_confirmation_alone_updates_record(self):
         provisioning = fleet_observation("5200", "oxidex-runners-boot-2", "us-south1-a", now=self.now)
         provisioning["runners_count_known"] = False
@@ -5066,35 +5070,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertTrue(self._record("oxidex-runners-boot-2")["runners_count_known"])
         self.assertEqual(self.store.state["scaling_telemetry"]["unknown_runner_count_hosts"], [])
 
-    def test_new_vm_beside_stopped_capacity_handles_oom(self):
-        running = fleet_observation("5300", "builder-oxidex-cap-1", "us-south1-b", now=self.now)
-        stopped = fleet_observation("5301", "builder-oxidex-cap-2", "us-south1-b", status="TERMINATED",
-                                    started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)
-        self.fleet = [running, stopped]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b3", "instance_name": "builder-oxidex-cap-1", "role": "rust_builder"}]
-        self.fleet = [running, stopped, fleet_observation("5302", "builder-oxidex-cap-3", "us-south1-b", now=self.now)]
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
-
-    def test_unknown_region_tax_holds_tax_inclusive_scale_ups(self):
-        self.fleet = [fleet_observation("5400", "builder-oxidex-far-1", "mars-central1-a", now=self.now)]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            budget = self.store.state["profiles"]["rust_builder"]["budget"]
-            budget["include_taxes"] = True
-            budget["override_regional_tax"] = False
-        self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), ["builder-oxidex-far-1"])
-        with self.store._lock:
-            budget["include_taxes"] = False
-        self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), [])
-        with self.store._lock:
-            budget["include_taxes"] = True
-            budget["override_regional_tax"] = True
-        self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), [])
-
     def test_new_runner_counts_for_oom_only_once_ready(self):
         base = fleet_observation("5500", "oxidex-runners-base-1", "us-south1-a", runners_count=1, now=self.now)
         self.fleet = [base]
@@ -5102,7 +5077,9 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         with self.store._lock:
             self.store.state["scaling_telemetry"]["journal_oom_events"] = [
                 {"id": "oom-r1", "instance_name": "oxidex-runners-base-1", "role": "cicd_runner",
-                 "baseline_runners": 1}]
+                 "baseline_runners": 1,
+                 "observed_at": datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime(
+                     "%Y-%m-%dT%H:%M:%SZ")}]
         booting = fleet_observation("5501", "oxidex-runners-new-1", "us-south1-a", runners_count=4, now=self.now)
         booting["runners_count_known"] = False
         self.fleet = [base, booting]
@@ -5113,31 +5090,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.store.refresh_fleet_inventory()
         self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
         self.assertFalse(self._record("oxidex-runners-new-1")["capacity_pending"])
-
-    def test_vm_seen_staging_first_still_counts_when_running(self):
-        builder = fleet_observation("5600", "builder-oxidex-old-1", "us-south1-b", now=self.now)
-        self.fleet = [builder]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b4", "instance_name": "builder-oxidex-old-1", "role": "rust_builder"}]
-        staging = fleet_observation("5601", "builder-oxidex-new-2", "us-south1-b", status="STAGING", now=self.now)
-        self.fleet = [builder, staging]
-        self.store.refresh_fleet_inventory()
-        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
-        self.fleet = [builder, dict(staging, status="RUNNING")]
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
-
-    def test_unknown_tax_checked_against_evaluated_budget(self):
-        self.fleet = [fleet_observation("5700", "builder-oxidex-far-2", "mars-central1-a", now=self.now)]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            self.store.state["profiles"]["rust_builder"]["budget"].update(include_taxes=False, override_regional_tax=False)
-            self.store.state["profiles"]["cicd_runner"]["budget"].update(include_taxes=True)
-            self.store.state["scaling"]["cicd_runner"]["shared_global_budget"] = True
-        self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), [])
-        self.assertEqual(self.store._incomplete_cost_hosts("cicd_runner"), ["builder-oxidex-far-2"])
 
     def test_tax_setting_change_reprices_inventory_in_same_save(self):
         self.fleet = [fleet_observation("5800", "builder-oxidex-taxnow-1", "us-south1-b", now=self.now)]
@@ -5181,7 +5133,9 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.store.refresh_fleet_inventory()
         rec = self._record("builder-oxidex-types-1")
         self.assertEqual((rec["boot_disk_type"], rec["data_disk_type"]), ("hyperdisk-balanced", "hyperdisk-balanced"))
-        self.assertTrue(rec["pricing_complete"])
+        # Kept for pricing, but unverified (a same-size disk may have a new type): scale-ups hold.
+        self.assertFalse(rec["pricing_complete"])
+        self.assertIn("disk types unknown", rec["pricing_incomplete_reason"])
         new = fleet_observation("6001", "builder-oxidex-types-2", "us-south1-b", now=self.now)
         self.fleet = [fallback, dict(new, boot_disk_type="pd-balanced", data_disk_type="pd-balanced",
                                      disk_types_known=False)]
@@ -5266,18 +5220,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not configured"):
             store.scale_region_instances({"region": "us-south1", "role": "cicd_runner", "target_instances": 1})
 
-    def test_builder_replacement_does_not_consume_oom(self):
-        old = fleet_observation("6500", "builder-oxidex-repl-1", "us-south1-b", now=self.now)
-        self.fleet = [old]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b5", "instance_name": "builder-oxidex-repl-1", "role": "rust_builder"}]
-        self.fleet = [dict(old, status="TERMINATED", last_stop_epoch=self.now - 60.0),
-                      fleet_observation("6501", "builder-oxidex-repl-2", "us-south1-b", now=self.now)]
-        self.store.refresh_fleet_inventory()
-        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
-
     def test_unrepresentable_disk_sources_are_not_templates(self):
         for i, flag in enumerate(("regional_disks", "unpriced_disk_performance")):
             obs = fleet_observation(f"660{i}", f"builder-oxidex-tpl-{i}", "us-south1-b", now=self.now)
@@ -5301,6 +5243,896 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cannot be fully priced"):
                 self.store.scale_region_instances({"region": "us-south1", "role": "cicd_runner", "target_instances": 2})
 
+    def test_unverified_disk_types_are_not_template_sources(self):
+        obs = fleet_observation("6800", "builder-oxidex-unver-1", "us-south1-b", now=self.now)
+        obs["disk_types_known"] = False
+        self.fleet = [obs]
+        self.store.refresh_fleet_inventory()
+        with self.assertRaisesRegex(ValueError, "not verified"):
+            self.store.create_vm_template_from_instance({"instance_name": "builder-oxidex-unver-1"})
+
+    def test_suspended_vm_stops_at_suspension_time(self):
+        obs = fleet_observation("6900", "builder-oxidex-susp-2", "us-south1-b", status="SUSPENDED",
+                                started_hours_ago=6.0, now=self.now)
+        obs["last_suspended_epoch"] = self.now - 2 * 3600.0
+        self.fleet = [obs]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-susp-2")
+        self.assertAlmostEqual(rec["stopped_epoch"], self.now - 2 * 3600.0, delta=1.0)
+        self.assertAlmostEqual(rec["runtime_hours"], 4.0, delta=0.02)
+
+    def test_pd_extreme_iops_is_unpriced(self):
+        from lib.fleet_inventory import _unpriced_performance
+
+        self.assertTrue(_unpriced_performance({"type": "pd-extreme", "provisionedIops": "20000"}))
+        self.assertFalse(_unpriced_performance({"type": "pd-ssd"}))
+
+    def test_instance_id_wins_over_reused_name(self):
+        first = fleet_observation("7100", "builder-oxidex-same", "us-south1-b", now=self.now)
+        second = fleet_observation("7101", "builder-oxidex-same", "us-south1-a", now=self.now)
+        self.fleet = [first, second]
+        self.store.refresh_fleet_inventory()
+        plan = self.store.delete_instance({"instance_id": "7101", "instance_name": "builder-oxidex-same"})
+        self.assertEqual(plan["instance"]["instance_id"], "7101")
+
+    def test_inventory_goes_stale_when_refreshes_stop_completing(self):
+        self.fleet = [fleet_observation("7300", "oxidex-runners-hang-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self.store._inventory_stale_reason(), "")
+        clock = time.time() + 4 * self.store.fleet_inventory_interval
+        with unittest.mock.patch.object(self.store, "_clock", return_value=clock):
+            self.assertIn("no complete listing", self.store._inventory_stale_reason())
+
+    def _runner_oom(self, event_id: str, host: str) -> None:
+        observed = datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": event_id, "instance_name": host, "role": "cicd_runner", "observed_at": observed}]
+
+    def _runner_oom_handled(self) -> bool:
+        return bool(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
+
+    def _runner(self, instance_id: str, name: str, **kwargs) -> dict:
+        return fleet_observation(instance_id, name, "us-south1-a", runners_count=4, now=self.now, **kwargs)
+
+    def test_first_listing_is_a_baseline_not_growth(self):
+        from lib.dashboard_server import FLEET_BASELINE_STATE_KEY
+
+        self._runner_oom("oom-r10", "oxidex-runners-a")
+        self.fleet = [self._runner("1900", "oxidex-runners-a")]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state.get(FLEET_BASELINE_STATE_KEY))
+        self.assertFalse(self._runner_oom_handled())
+        self.fleet.append(self._runner("1901", "oxidex-runners-b", started_hours_ago=0.005))  # Started after the OOM.
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_runner_restart_does_not_consume_oom(self):
+        host = self._runner("5100", "oxidex-runners-oom-1", started_hours_ago=5.0)
+        self.fleet = [host]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [dict(host, status="TERMINATED", last_stop_epoch=self.now - 3600.0)]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r11", "oxidex-runners-oom-1")
+        self.fleet = [dict(host, last_start_epoch=self.now - 60.0)]  # Same VM started again.
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self._runner_oom_handled())
+        self.fleet.append(self._runner("5101", "oxidex-runners-oom-2"))
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_new_vm_beside_stopped_capacity_handles_oom(self):
+        running = self._runner("5300", "oxidex-runners-cap-1")
+        stopped = self._runner("5301", "oxidex-runners-cap-2", status="TERMINATED", started_hours_ago=5.0,
+                               stopped_hours_ago=1.0)
+        self.fleet = [running, stopped]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r12", "oxidex-runners-cap-1")
+        self.store.refresh_fleet_inventory()
+        self.fleet = [running, stopped, self._runner("5302", "oxidex-runners-cap-3")]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_vm_seen_staging_first_still_counts_when_running(self):
+        base = self._runner("5600", "oxidex-runners-old-1")
+        self.fleet = [base]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r13", "oxidex-runners-old-1")
+        staging = self._runner("5601", "oxidex-runners-new-2", status="STAGING")
+        self.fleet = [base, staging]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self._runner_oom_handled())
+        self.fleet = [base, dict(staging, status="RUNNING")]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_runner_oom_keeps_event_baseline_across_polls(self):
+        old = self._runner("7200", "oxidex-runners-base-1")
+        self.fleet = [old]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r14", "oxidex-runners-base-1")
+        stopped_old = dict(old, status="TERMINATED", last_stop_epoch=self.now - 30.0)
+        self.fleet = [stopped_old]
+        self.store.refresh_fleet_inventory()  # Baseline recorded at the 4 slots running when first seen.
+        self.assertEqual(self.store.state["scaling_telemetry"]["journal_oom_events"][0]["baseline_runners"], 4)
+        replacement = self._runner("7201", "oxidex-runners-base-2")
+        self.fleet = [stopped_old, replacement]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self._runner_oom_handled())  # Back to 4 slots: no growth.
+        self.fleet = [stopped_old, replacement, self._runner("7202", "oxidex-runners-base-3")]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_pending_capacity_survives_replacement_until_net_growth(self):
+        old = self._runner("7000", "oxidex-runners-net-1")
+        self.fleet = [old]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r15", "oxidex-runners-net-1")
+        stopped_old = dict(old, status="TERMINATED", last_stop_epoch=self.now - 30.0)
+        new = self._runner("7001", "oxidex-runners-net-2", started_hours_ago=0.005)
+        self.fleet = [stopped_old, new]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self._runner_oom_handled())
+        self.assertTrue(self._record("oxidex-runners-net-2")["capacity_pending"])
+        self.fleet = [dict(old, last_start_epoch=time.time()), new]  # The old host starts again: net growth.
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_pending_capacity_kept_for_late_oom(self):
+        self.fleet = [self._runner("7400", "oxidex-runners-late-1")]
+        self.store.refresh_fleet_inventory()
+        self.fleet.append(self._runner("7401", "oxidex-runners-late-2", started_hours_ago=0.1))
+        self.store.refresh_fleet_inventory()
+        # No OOM yet, but the new host started inside the OOM lookback: it stays pending for a late report.
+        self.assertTrue(self._record("oxidex-runners-late-2")["capacity_pending"])
+
+    def test_builder_ooms_are_never_handled_from_inventory(self):
+        self.fleet = [fleet_observation("7500", "builder-oxidex-bo-1", "us-south1-b", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        observed = datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-b9", "instance_name": "builder-oxidex-bo-1", "role": "rust_builder",
+                 "observed_at": observed}]
+        self.fleet = self.fleet + [fleet_observation(f"750{i}", f"builder-oxidex-bo-{i}", "us-south1-b", now=self.now)
+                                   for i in (2, 3)]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
+
+    def test_unresolved_disk_source_is_unverified(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        obs = observe_fleet_items(
+            [{"id": "7600", "name": "builder-oxidex-race-1", "zone": "zones/us-south1-b", "status": "RUNNING",
+              "machineType": "machineTypes/n4-highcpu-16",
+              "disks": [{"boot": True, "diskSizeGb": "40", "source": "d/boot"},
+                        {"boot": False, "diskSizeGb": "500", "source": "d/new"}]}],
+            disk_types={"d/boot": {"type": "pd-balanced"}},
+            shapes={("us-south1-b", "n4-highcpu-16"): {"vcpu": 16, "ram_gib": 32.0}})
+        self.assertFalse(obs[0]["disk_types_known"])
+
+    def test_first_sight_bills_each_disk_from_its_creation(self):
+        from lib.dashboard_server import _pricing_rates, instance_usage
+
+        vm_created = self.now - 30 * 86400.0
+        data_created = self.now - 86400.0
+        obs = fleet_observation("7700", "builder-oxidex-attach-1", "us-south1-b", started_hours_ago=30 * 24.0,
+                                now=self.now)
+        obs.update(created_epoch=vm_created, disks_detail=[
+            {"type": "hyperdisk-balanced", "gb": 40, "created_epoch": vm_created},
+            {"type": "hyperdisk-balanced", "gb": 100, "created_epoch": data_created}])
+        self.fleet = [obs]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-attach-1")
+        self.assertEqual(len(rec["disk_segments"]), 1)
+        start, end, boot_rate = rec["disk_segments"][0]
+        self.assertAlmostEqual(start, vm_created, delta=1.0)
+        self.assertAlmostEqual(end, data_created, delta=1.0)
+        full_rate = _pricing_rates(rec["pricing"])[2]
+        self.assertLess(boot_rate, full_rate)
+        usage = instance_usage(rec, self.now, self.now - 744 * 3600.0)
+        expected_disk = (data_created - vm_created) / 3600.0 * boot_rate + 24.0 * full_rate
+        compute = usage["cost_all_in"] - expected_disk
+        self.assertAlmostEqual(compute, 30 * 24.0 * _pricing_rates(rec["pricing"])[0], delta=0.05)
+
+    def test_first_sight_without_disk_creation_times_does_not_backfill(self):
+        obs = fleet_observation("7800", "builder-oxidex-nobf-1", "us-south1-b", started_hours_ago=48.0, now=self.now)
+        obs["disks_detail"] = [{"type": "pd-balanced", "gb": 40, "created_epoch": None}]
+        self.fleet = [obs]
+        before = time.time()
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-nobf-1")
+        self.assertGreaterEqual(rec["disk_segment_start"], before - 1.0)
+
+    def test_delayed_oom_reconciled_on_unchanged_listing(self):
+        self.fleet = [self._runner("8000", "oxidex-runners-d-1")]
+        self.store.refresh_fleet_inventory()
+        new = self._runner("8001", "oxidex-runners-d-2", started_hours_ago=0.25)
+        self.fleet.append(new)
+        self.store.refresh_fleet_inventory()  # New capacity, no OOM yet: it stays pending (inside the lookback).
+        # The OOM is reported afterwards, timestamped before the new host started.
+        when = datetime.fromtimestamp(self.now - 1800.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-r20", "instance_name": "oxidex-runners-d-1", "role": "cicd_runner", "observed_at": when,
+                 "baseline_runners": 8}]  # As if the scaling evaluation had set it from the grown count.
+        self.assertTrue(self.store.refresh_fleet_inventory())  # Same listing: OOM state still reconciled.
+        event = self.store.state["scaling_telemetry"]["journal_oom_events"][0]
+        self.assertEqual(event["baseline_runners"], 4)
+        self.assertTrue(event.get("handled"))
+
+    def test_detached_fleet_disk_keeps_billing(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        created = "2026-10-10T00:00:00.000-07:00"
+        disks = observe_detached_disks({
+            "z/disks/builder-oxidex-x-cache": {"id": "91", "name": "builder-oxidex-x-cache", "zone": "z/us-south1-b",
+                                                "sizeGb": "100", "type": "hyperdisk-balanced",
+                                                "provisionedIops": "3000", "provisionedThroughput": "140",
+                                                "creationTimestamp": created},
+            "z/disks/builder-oxidex-y-cache": {"id": "92", "name": "builder-oxidex-y-cache", "zone": "z/us-south1-b",
+                                                "sizeGb": "100", "type": "hyperdisk-balanced", "users": ["vm"]},
+            "z/disks/other": {"id": "93", "name": "unrelated-disk", "zone": "z/us-south1-b", "sizeGb": "10"},
+        })
+        self.assertEqual([d["name"] for d in disks], ["builder-oxidex-x-cache"])
+        self.fleet = disks
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-x-cache")
+        self.assertEqual(rec["status"], "DETACHED")
+        self.assertEqual(rec["runtime_hours"], 0.0)
+        view = self.store.query_instances()
+        self.assertGreater(view["active_hourly_burn_usd"], 0.0)  # Storage still bills.
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_builder_instances"], 0)
+        self.fleet = []
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self._record("builder-oxidex-x-cache")["status"], "DELETED")
+
+    def test_legacy_runner_prefixes_are_listed(self):
+        from lib.fleet_inventory import FLEET_NAME_PREFIXES, fleet_role
+
+        for name in ("newznab-spot-runners-1", "spot-runners-2", "oxidex-spot-runners-3", "oxidex-runners-4"):
+            self.assertTrue(name.startswith(FLEET_NAME_PREFIXES))
+            self.assertEqual(fleet_role(name), "cicd_runner")
+        self.assertEqual(fleet_role("builder-oxidex-1"), "rust_builder")
+        self.assertIsNone(fleet_role("spot-control-a"))
+
+    def test_performance_billed_disk_candidates_are_incomplete(self):
+        common = dict(family="n2", vcpu=16, ram_gib=64.0, region="us-south1", boot_disk_type="pd-balanced",
+                      boot_disk_gb=40, data_disk_gb=500, machine_type="n2-standard-16", live_pricing={})
+        self.assertFalse(calculate_spot_pricing(**common, data_disk_type="hyperdisk-throughput")["complete"])
+        self.assertFalse(calculate_spot_pricing(**common, data_disk_type="pd-extreme")["complete"])
+        self.assertNotIn("complete", calculate_spot_pricing(**common, data_disk_type="pd-ssd"))
+
+    def test_cache_disk_handoff_is_not_billed_twice(self):
+        from lib.dashboard_server import instance_usage
+
+        created = self.now - 10 * 86400.0
+        cache = "projects/p/zones/us-south1-b/disks/builder-oxidex-h-cache"
+        vm = fleet_observation("8100", "builder-oxidex-h", "us-south1-b", started_hours_ago=240.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "hyperdisk-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-h"},
+            {"type": "hyperdisk-balanced", "gb": 100, "created_epoch": created, "source": cache}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        detached = {"instance_id": "disk-91", "name": "builder-oxidex-h-cache", "role": "rust_builder",
+                    "status": "DETACHED", "kind": "disk", "zone": "us-south1-b", "region": "us-south1",
+                    "machine_type": "", "cpu_platform": "", "vcpu": 0, "ram_gib": 0.0, "spot": True,
+                    "boot_disk_type": "hyperdisk-balanced", "boot_disk_gb": 0, "data_disk_type": "hyperdisk-balanced",
+                    "data_disk_gb": 100, "data_disks": {"hyperdisk-balanced": 100},
+                    "disks_detail": [{"type": "hyperdisk-balanced", "gb": 100, "created_epoch": created,
+                                      "source": cache}],
+                    "created_epoch": created, "last_start_epoch": created, "last_stop_epoch": created}
+        self.fleet = [detached]  # The VM is deleted; its cache disk stays.
+        handoff = time.time()
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-h-cache")
+        usage = instance_usage(rec, handoff + 3600.0)
+        self.assertLess(usage["disk_hours"], 1.1)  # Billed from the handoff, not from its creation 10 days ago.
+
+    def test_detached_disk_reprices_and_lists_without_fleet_vms(self):
+        from lib import compute_api
+        from lib.fleet_inventory import gce_fleet_source
+
+        async def listing(api, project, *, instance_fields=compute_api.INSTANCE_LIST_FIELDS):
+            return [], []
+
+        async def disks(api, project):
+            return {"z/disks/builder-oxidex-z-cache": {"type": "pd-balanced", "id": "95", "name": "builder-oxidex-z-cache",
+                                                       "zone": "z/us-south1-b", "sizeGb": "100"}}
+
+        with unittest.mock.patch.object(compute_api, "get_auth", return_value=compute_api.Auth("t", "p")), \
+                unittest.mock.patch.object(compute_api, "list_instances", listing), \
+                unittest.mock.patch.object(compute_api, "list_disk_types", disks):
+            observed = gce_fleet_source("p")()
+        self.assertEqual([o["name"] for o in observed], ["builder-oxidex-z-cache"])
+        self.fleet = observed
+        self.store.refresh_fleet_inventory()
+        before = self._record("builder-oxidex-z-cache")["pricing"]["tax_rate_percent"]
+        self.store.update_profile("rust_builder", {"budget": {"override_regional_tax": True, "tax_rate_percent": 21.0}})
+        self.assertNotEqual(before, 21.0)
+        self.assertEqual(self._record("builder-oxidex-z-cache")["pricing"]["tax_rate_percent"], 21.0)
+
+    def test_unknown_family_generic_rate_is_incomplete(self):
+        priced = calculate_spot_pricing(family="zz9", vcpu=8, ram_gib=32.0, region="us-south1",
+                                        boot_disk_type="pd-balanced", boot_disk_gb=40, data_disk_type="pd-balanced",
+                                        data_disk_gb=0, machine_type="zz9-standard-8", live_pricing={})
+        self.assertFalse(priced["complete"])
+        obs = fleet_observation("8200", "oxidex-runners-zz-1", "us-south1-a", machine_type="zz9-standard-8", vcpu=8,
+                                ram_gib=32.0, now=self.now)
+        self.fleet = [obs]
+        with unittest.mock.patch("lib.dashboard_models.fetch_live_spot_pricing", return_value={}):
+            self.store.refresh_fleet_inventory()
+        rec = self._record("oxidex-runners-zz-1")
+        self.assertFalse(rec["pricing_complete"])
+        self.assertIn("no known rate for the zz9", rec["pricing_incomplete_reason"])
+
+    def test_detached_disk_returning_restarts_billing(self):
+        from lib.dashboard_server import instance_usage
+        from lib.fleet_inventory import observe_detached_disks
+
+        created = datetime.fromtimestamp(self.now - 5 * 86400.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        detail = {"z/disks/builder-oxidex-r-cache": {"id": "96", "name": "builder-oxidex-r-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced",
+                                                     "creationTimestamp": created}}
+        detached = observe_detached_disks(detail)
+        self.fleet = detached
+        self.store.refresh_fleet_inventory()
+        self.fleet = []  # Attached to a VM (billed there) for a while.
+        self.store.refresh_fleet_inventory()
+        first_end = self._record("builder-oxidex-r-cache")["deleted_epoch"]
+        self.fleet = detached  # Detached again.
+        back = time.time()
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-r-cache")
+        self.assertEqual(rec["status"], "DETACHED")
+        self.assertGreaterEqual(rec["disk_segment_start"], back - 1.0)
+        self.assertAlmostEqual(rec["disk_segments"][-1][1], first_end, delta=1.0)
+        total = instance_usage(rec, back + 3600.0)["disk_hours"]
+        first = instance_usage(dict(rec, disk_segments=[], disk_segment_start=None, deleted_epoch=first_end,
+                                    status="DELETED"), back)["disk_hours"]
+        self.assertAlmostEqual(total, first + 1.0, delta=0.05)
+
+    def test_unlisted_disks_hold_scaling(self):
+        from lib.fleet_inventory import FleetListing
+
+        listing = FleetListing([fleet_observation("8300", "oxidex-runners-nd-1", "us-south1-a", now=self.now)])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        self.assertIn("disk listing is unavailable", self.store._inventory_stale_reason())
+
+    def test_held_projection_includes_retained_storage(self):
+        self.fleet = [fleet_observation("8400", "builder-oxidex-hp-1", "us-south1-b", now=self.now),
+                      fleet_observation("8401", "builder-oxidex-hp-2", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        held = self.store._held({"direction": "scale_up"}, "test", "rust_builder")
+        expected = sum(self.store._running_role_hourly_rates("rust_builder")) + self.store._stopped_disk_burn("rust_builder")
+        self.assertGreater(self.store._stopped_disk_burn("rust_builder"), 0.0)
+        self.assertAlmostEqual(held["projected_hourly_usd"], expected, delta=0.0001)
+
+    def test_pricing_trust_change_is_saved_with_same_rates(self):
+        self.fleet = [fleet_observation("8500", "oxidex-runners-trust-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.store.refresh_fleet_inventory()  # Settle one-time baselines.
+        from lib import dashboard_server
+        real = dashboard_server.calculate_spot_pricing
+
+        def untrusted(*args, **kwargs):
+            return {**real(*args, **kwargs), "complete": False, "family_rate_unknown": True}
+
+        with unittest.mock.patch.object(dashboard_server, "calculate_spot_pricing", side_effect=untrusted):
+            self.assertTrue(self.store.refresh_fleet_inventory())
+        self.assertFalse(self._record("oxidex-runners-trust-1")["pricing_complete"])
+        self.assertEqual(self._record("oxidex-runners-trust-1")["disk_segments"], [])  # Rates unchanged: no segment.
+
+    def test_reported_freshness_ages_out(self):
+        self.fleet = [fleet_observation("8600", "oxidex-runners-age-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.fleet_inventory_status()["fresh"])
+        clock = time.time() + 4 * self.store.fleet_inventory_interval
+        with unittest.mock.patch.object(self.store, "_clock", return_value=clock):
+            status = self.store.query_instances()["fleet_inventory"]
+        self.assertFalse(status["fresh"])
+        self.assertIn("no complete listing", status["stale_reason"])
+
+    def test_first_sight_uses_profile_tax_override(self):
+        with self.store._lock:
+            budget = self.store.state["profiles"]["rust_builder"]["budget"]
+            budget["override_regional_tax"] = True
+            budget["tax_rate_percent"] = 17.0
+        self.fleet = [fleet_observation("8700", "builder-oxidex-ovr-1", "us-south1-b", started_hours_ago=48.0,
+                                        now=self.now)]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-ovr-1")
+        self.assertEqual(rec["pricing"]["tax_rate_percent"], 17.0)
+        self.assertEqual(rec["prior_runs"], [])  # No repricing closed history at a provisional rate.
+        self.assertEqual(rec["disk_segments"], [])
+
+    def test_shared_stopped_burn_uses_evaluated_budget_flags(self):
+        self.fleet = [fleet_observation("8800", "builder-oxidex-sh-1", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling"]["rust_builder"]["include_disk_in_scale_budget"] = False
+            self.store.state["scaling"]["cicd_runner"]["include_disk_in_scale_budget"] = True
+        self.assertEqual(self.store._stopped_disk_burn("rust_builder"), 0.0)
+        shared = self.store._outside_burn("cicd_runner", shared=True, other_running_burn=0.0)
+        self.assertGreater(shared, 0.0)
+        self.assertAlmostEqual(shared, self.store._stopped_disk_burn("rust_builder", budget_role="cicd_runner"),
+                               delta=0.0001)
+
+    def test_host_running_before_oom_is_part_of_its_baseline(self):
+        self.fleet = [self._runner("8900", "oxidex-runners-pre-1")]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r30", "oxidex-runners-pre-1")
+        # First seen together with the OOM, but it had been running for hours: capacity that already existed.
+        self.fleet.append(self._runner("8901", "oxidex-runners-pre-2", started_hours_ago=3.0))
+        self.store.refresh_fleet_inventory()
+        event = self.store.state["scaling_telemetry"]["journal_oom_events"][0]
+        self.assertEqual(event["baseline_runners"], 8)
+        self.assertFalse(event.get("handled", False))
+
+    def test_unready_runner_slots_are_not_current_runners(self):
+        booting = self._runner("9000", "oxidex-runners-boot-9")
+        booting["runners_count_known"] = False
+        self.fleet = [self._runner("9001", "oxidex-runners-ok-9"), booting]
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self.store.state["scaling_telemetry"]["current_runners"], 4)
+
+    def test_builder_evaluation_cannot_consume_oom_from_count(self):
+        self.fleet = [fleet_observation(f"910{i}", f"builder-oxidex-ev-{i}", "us-south1-b", now=self.now)
+                      for i in range(2)]
+        self.store.refresh_fleet_inventory()
+        observed = datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-b10", "instance_name": "builder-oxidex-ev-0", "role": "rust_builder",
+                 "observed_at": observed, "baseline_instances": 1}]
+            self.store._sync_fleet_telemetry()
+        self.store.get_overview()
+        event = self.store.state["scaling_telemetry"]["journal_oom_events"][0]
+        self.assertFalse(event.get("handled", False))
+
+    def test_cross_role_running_burn_uses_evaluated_flags(self):
+        self.fleet = [fleet_observation("9200", "builder-oxidex-cr-1", "us-south1-b", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling"]["rust_builder"]["include_disk_in_scale_budget"] = False
+            self.store.state["scaling"]["cicd_runner"]["include_disk_in_scale_budget"] = True
+        own = sum(self.store._running_role_hourly_rates("rust_builder"))
+        evaluated = sum(self.store._running_role_hourly_rates("rust_builder", budget_role="cicd_runner"))
+        self.assertGreater(evaluated, own)
+
+    def test_resume_between_listings_ends_run_at_suspension(self):
+        vm = fleet_observation("9300", "builder-oxidex-sr-1", "us-south1-b", started_hours_ago=10.0, now=self.now)
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        # Suspended 6 hours ago and resumed an hour ago, between two listings.
+        self.fleet = [dict(vm, last_start_epoch=self.now - 3600.0, last_suspended_epoch=self.now - 6 * 3600.0)]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-sr-1")
+        self.assertAlmostEqual(rec["prior_runs"][-1][1], self.now - 6 * 3600.0, delta=1.0)
+        self.assertAlmostEqual(rec["runtime_hours"], 5.0, delta=0.05)
+
+    def test_disk_handoff_keys_by_disk_id(self):
+        from lib.dashboard_server import _disk_key
+
+        self.assertEqual(_disk_key({"id": "5", "source": "z/disks/a"}), "id:5")
+        self.assertEqual(_disk_key({"source": "z/disks/a"}), "z/disks/a")
+        created = self.now - 3 * 86400.0
+        old_disk = {"type": "pd-balanced", "gb": 100, "created_epoch": created, "source": "z/disks/cache", "id": "1"}
+        vm = fleet_observation("9400", "builder-oxidex-id-1", "us-south1-b", started_hours_ago=72.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[old_disk])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        self.fleet = []
+        self.store.refresh_fleet_inventory()
+        # A new disk reusing the name (new ID) on a new VM is billed from its own creation.
+        new_created = self.now - 86400.0
+        vm2 = fleet_observation("9401", "builder-oxidex-id-2", "us-south1-b", started_hours_ago=24.0, now=self.now)
+        vm2.update(created_epoch=new_created, disks_detail=[dict(old_disk, id="2", created_epoch=new_created)])
+        self.fleet = [vm2]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-id-2")
+        # Not treated as a handoff: billed from its own creation, not from this listing.
+        self.assertAlmostEqual(rec["disk_segment_start"], new_created, delta=1.0)
+
+    def test_detached_disk_kept_while_disks_unlisted(self):
+        from lib.fleet_inventory import FleetListing, observe_detached_disks
+
+        detail = {"z/disks/builder-oxidex-k-cache": {"id": "97", "name": "builder-oxidex-k-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced"}}
+        self.fleet = observe_detached_disks(detail)
+        self.store.refresh_fleet_inventory()
+        listing = FleetListing([])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self._record("builder-oxidex-k-cache")["status"], "DETACHED")
+
+    def test_repeated_denied_disk_listing_keeps_types(self):
+        known = fleet_observation("9500", "builder-oxidex-den-1", "us-south1-b", now=self.now)
+        self.fleet = [known]
+        self.store.refresh_fleet_inventory()
+        fallback = dict(known, boot_disk_type="pd-balanced", data_disk_type="pd-balanced", disk_types_known=False)
+        for _ in range(3):
+            self.fleet = [fallback]
+            self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-den-1")
+        self.assertEqual((rec["boot_disk_type"], rec["data_disk_type"]), ("hyperdisk-balanced", "hyperdisk-balanced"))
+        self.assertEqual(rec["disk_segments"], [])  # No false shape change.
+
+    def test_disk_ids_survive_outage_for_handoff(self):
+        from lib.dashboard_server import instance_usage
+        from lib.fleet_inventory import observe_detached_disks
+
+        created = self.now - 10 * 86400.0
+        cache = "projects/p/zones/us-south1-b/disks/builder-oxidex-o-cache"
+        vm = fleet_observation("9600", "builder-oxidex-o", "us-south1-b", started_hours_ago=240.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "pd-balanced", "gb": 100, "created_epoch": created, "source": cache, "id": "77"}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        outage = dict(vm, disk_types_known=False,
+                      disks_detail=[{"type": "pd-balanced", "gb": 100, "created_epoch": None, "source": cache, "id": ""}])
+        self.fleet = [outage]
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self._record("builder-oxidex-o")["disk_ids"], {cache: "77"})
+        stamp = datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.fleet = observe_detached_disks({cache: {"id": "77", "name": "builder-oxidex-o-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced",
+                                                     "creationTimestamp": stamp}})
+        handoff = time.time()
+        self.store.refresh_fleet_inventory()
+        usage = instance_usage(self._record("builder-oxidex-o-cache"), handoff + 3600.0)
+        self.assertLess(usage["disk_hours"], 1.1)
+
+    def test_detached_regional_disk_gets_region(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        disks = observe_detached_disks({"projects/p/regions/us-south1/disks/builder-oxidex-rg-cache": {
+            "id": "98", "name": "builder-oxidex-rg-cache", "region": "regions/us-south1", "sizeGb": "100",
+            "type": "pd-ssd", "regional": True}})
+        self.assertEqual((disks[0]["zone"], disks[0]["region"]), ("", "us-south1"))
+
+    def test_online_runner_kpi_counts_confirmed_slots(self):
+        booting = self._runner("9700", "oxidex-runners-kpi-1")
+        booting["runners_count_known"] = False
+        self.fleet = [self._runner("9701", "oxidex-runners-kpi-2"), booting]
+        self.store.refresh_fleet_inventory()
+        view = self.store.query_instances()
+        self.assertEqual(view["running_runner_slots"], 4)
+        self.assertEqual(view["unconfirmed_runner_hosts"], 1)
+
+    def test_template_action_hidden_for_unrepresentable_records(self):
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        self.assertIn("function canTemplate(inst)", DASHBOARD_HTML)
+        self.assertIn("inst.runner_limits_known !== false", DASHBOARD_HTML)
+        # Both template buttons (map inspector and instance table) are behind canTemplate.
+        self.assertEqual(DASHBOARD_HTML.count("${canTemplate(inst) ? `<button"), 2)
+        self.assertEqual(DASHBOARD_HTML.count("onclick=\"makeTemplateFromInstance("), 2)
+
+    def test_disk_still_attached_in_instance_listing_is_not_detached(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        detail = {"z/disks/builder-oxidex-a-cache": {"id": "99", "name": "builder-oxidex-a-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced"}}
+        self.assertEqual(observe_detached_disks(detail, frozenset({"z/disks/builder-oxidex-a-cache"})), [])
+        self.assertEqual(len(observe_detached_disks(detail)), 1)
+
+    def test_disk_record_is_not_a_template_source(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        self.fleet = observe_detached_disks({"z/disks/builder-oxidex-t-cache": {
+            "id": "100", "name": "builder-oxidex-t-cache", "zone": "z/us-south1-b", "sizeGb": "100",
+            "type": "pd-balanced"}})
+        self.store.refresh_fleet_inventory()
+        with self.assertRaisesRegex(ValueError, "is a disk, not a VM"):
+            self.store.create_vm_template_from_instance({"instance_name": "builder-oxidex-t-cache",
+                                                         "assign_to_profile": False})
+
+    def test_freshness_counts_from_completion(self):
+        self.fleet = [fleet_observation("9800", "oxidex-runners-slow-1", "us-south1-a", now=self.now)]
+        clock = [time.time()]
+
+        def slow_source():
+            clock[0] += 5 * self.store.fleet_inventory_interval  # The listing takes a long time.
+            return list(self.fleet)
+
+        self.store.fleet_source = slow_source
+        with unittest.mock.patch.object(self.store, "_clock", side_effect=lambda: clock[0]):
+            self.store.refresh_fleet_inventory()
+            self.assertEqual(self.store._inventory_stale_reason(), "")
+
+    def test_added_disk_billed_from_its_creation(self):
+        from lib.dashboard_server import instance_usage
+
+        created = self.now - 10 * 86400.0
+        boot = {"type": "pd-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-ad", "id": "1"}
+        vm = fleet_observation("9900", "builder-oxidex-add-1", "us-south1-b", started_hours_ago=240.0, now=self.now)
+        vm.update(created_epoch=created, data_disk_gb=0, data_disks={}, disks_detail=[boot])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        added_at = self.now - 2 * 86400.0
+        grown = dict(vm, data_disk_gb=500, data_disks={"pd-balanced": 500}, data_disk_type="pd-balanced",
+                     disks_detail=[boot, {"type": "pd-balanced", "gb": 500, "created_epoch": added_at,
+                                          "source": "z/data-ad", "id": "2"}])
+        self.fleet = [grown]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-add-1")
+        self.assertAlmostEqual(rec["disk_segment_start"], added_at, delta=1.0)
+        self.assertAlmostEqual(rec["disk_segments"][-1][1], added_at, delta=1.0)
+
+    def test_detached_rows_render_as_present_storage(self):
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        self.assertIn('inst.status === "DETACHED" ? \'<span style="color:#fcd34d;">Present (storage still billed)',
+                      DASHBOARD_HTML)
+
+    def test_two_added_disks_split_at_each_creation(self):
+        created = self.now - 10 * 86400.0
+        boot = {"type": "pd-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-2a", "id": "11"}
+        vm = fleet_observation("9910", "builder-oxidex-add-2", "us-south1-b", started_hours_ago=240.0, now=self.now)
+        vm.update(created_epoch=created, data_disk_gb=0, data_disks={}, disks_detail=[boot])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        first, second = self.now - 3 * 86400.0, self.now - 86400.0
+        grown = dict(vm, data_disk_gb=300, data_disks={"pd-balanced": 300}, data_disk_type="pd-balanced",
+                     disks_detail=[boot,
+                                   {"type": "pd-balanced", "gb": 100, "created_epoch": first, "source": "z/d1", "id": "12"},
+                                   {"type": "pd-balanced", "gb": 200, "created_epoch": second, "source": "z/d2", "id": "13"}])
+        self.fleet = [grown]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-add-2")
+        ends = [round(seg[1]) for seg in rec["disk_segments"]]
+        self.assertIn(round(first), ends)
+        self.assertIn(round(second), ends)
+        rates = [seg[2] for seg in rec["disk_segments"]]
+        self.assertLess(rates[-2], rates[-1])  # The step after the first added disk bills more.
+        self.assertAlmostEqual(rec["disk_segment_start"], second, delta=1.0)
+
+    def test_runner_burn_for_builder_budget_prices_added_runners(self):
+        self.fleet = [self._runner("9920", "oxidex-runners-bb-1")]
+        self.store.refresh_fleet_inventory()
+        running = sum(self.store._running_role_hourly_rates("cicd_runner", budget_role="rust_builder"))
+        unit = self.store._resolve_scaling_unit_hourly_usd("cicd_runner", None, budget_role="rust_builder")
+        burn = self.store._runner_burn_for_builder_budget({"desired_instances": 3, "current_instances": 1})
+        self.assertAlmostEqual(burn, running + 2 * unit, delta=0.0002)
+        held = self.store._runner_burn_for_builder_budget({"desired_instances": 1, "current_instances": 1,
+                                                           "projected_hourly_usd": 99.0})
+        self.assertAlmostEqual(held, running, delta=0.0002)  # Never the held projection with storage in it.
+
+    def test_vanished_builder_keeps_disk_liability_while_disks_unlisted(self):
+        from lib.dashboard_server import instance_usage
+        from lib.fleet_inventory import FleetListing, observe_detached_disks
+
+        created = self.now - 5 * 86400.0
+        cache = "projects/p/zones/us-south1-b/disks/builder-oxidex-lia-cache"
+        vm = fleet_observation("9930", "builder-oxidex-lia", "us-south1-b", started_hours_ago=120.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "pd-balanced", "gb": 100, "created_epoch": created, "source": cache, "id": "55"}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        listing = FleetListing([])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()  # The builder is gone while disks cannot be listed.
+        rec = self._record("builder-oxidex-lia")
+        self.assertEqual(rec["status"], "DELETED")
+        self.assertTrue(rec["disk_liability_pending"])
+        later = time.time() + 7200.0
+        self.assertGreater(instance_usage(rec, later)["disk_hours"], instance_usage(rec, time.time())["disk_hours"])
+        self.assertGreater(self.store._stopped_disk_burn("rust_builder"), 0.0)
+        stamp = datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.fleet = observe_detached_disks({cache: {"id": "55", "name": "builder-oxidex-lia-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced",
+                                                     "creationTimestamp": stamp}})
+        self.store.fleet_source = lambda: list(self.fleet)
+        resumed = time.time()
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-lia")
+        self.assertFalse(rec["disk_liability_pending"])
+        self.assertGreaterEqual(rec["disk_end_epoch"], resumed - 1.0)
+        detached = self._record("builder-oxidex-lia-cache")
+        self.assertGreaterEqual(detached["disk_segment_start"], resumed - 1.0)  # Takes over at the same moment.
+
+    def test_disk_used_by_vm_missing_from_snapshot_is_billed(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        detail = {"z/disks/builder-oxidex-sp-cache": {
+            "id": "101", "name": "builder-oxidex-sp-cache", "zone": "z/us-south1-b", "sizeGb": "100",
+            "type": "pd-balanced", "users": ["projects/p/zones/us-south1-b/instances/builder-oxidex-sp-2"]}}
+        # The replacement builder was created after the instance listing: bill the disk here for now.
+        self.assertEqual(len(observe_detached_disks(detail, frozenset(), frozenset({"builder-oxidex-sp-1"}))), 1)
+        # Its user is in the snapshot: that VM's record bills it.
+        self.assertEqual(observe_detached_disks(detail, frozenset(), frozenset({"builder-oxidex-sp-2"})), [])
+        other = {"z/disks/builder-oxidex-x-cache": dict(detail["z/disks/builder-oxidex-sp-cache"], id="102",
+                                                        name="builder-oxidex-x-cache",
+                                                        users=["projects/p/zones/z/instances/someone-else"])}
+        self.assertEqual(observe_detached_disks(other, frozenset(), frozenset()), [])
+
+    def test_vanished_builder_liability_covers_only_retained_disks(self):
+        from lib.dashboard_server import _pricing_rates
+        from lib.fleet_inventory import FleetListing
+
+        created = self.now - 5 * 86400.0
+        vm = fleet_observation("9940", "builder-oxidex-ret", "us-south1-b", started_hours_ago=120.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "hyperdisk-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-r", "id": "61",
+             "auto_delete": True},
+            {"type": "hyperdisk-balanced", "gb": 100, "created_epoch": created, "source": "z/cache-r", "id": "62",
+             "auto_delete": False}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        full = _pricing_rates(self._record("builder-oxidex-ret")["pricing"])[2]
+        listing = FleetListing([])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-ret")
+        self.assertTrue(rec["disk_liability_pending"])
+        self.assertTrue(rec["retained_only_pricing"])
+        retained = _pricing_rates(rec["pricing"])[2]
+        self.assertGreater(retained, 0.0)
+        self.assertLess(retained, full)
+        self.assertAlmostEqual(_pricing_rates(rec["pricing"])[0], 0.0, delta=0.001)  # No compute after deletion.
+        # Repriced while still pending (a tax override), at the retained-disk rate only.
+        self.store.update_profile("rust_builder", {"budget": {"override_regional_tax": True, "tax_rate_percent": 30.0}})
+        self.assertEqual(self._record("builder-oxidex-ret")["pricing"]["tax_rate_percent"], 30.0)
+
+    def test_build_evaluation_counts_projected_runner_additions(self):
+        from lib import dashboard_server
+
+        self.fleet = [self._runner("9950", "oxidex-runners-pb-1")]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["global_budget_enforced"] = True
+        captured = {}
+        real_builder = dashboard_server.evaluate_builder_scaling_decision
+
+        def ci_eval(*args, **kwargs):
+            return {"direction": "scale_up", "current_runners": 4, "desired_runners": 12, "current_instances": 1,
+                    "desired_instances": 3, "projected_hourly_usd": 0.0}
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return real_builder(*args, **kwargs)
+
+        with unittest.mock.patch.object(dashboard_server, "evaluate_scaling_decision", ci_eval), \
+                unittest.mock.patch.object(dashboard_server, "evaluate_builder_scaling_decision", spy):
+            self.store.record_rust_build({"build_id": "rb-proj-01", "cache_hits": 1, "cache_misses": 1})
+        running = sum(self.store._running_role_hourly_rates("cicd_runner", budget_role="rust_builder"))
+        unit = self.store._resolve_scaling_unit_hourly_usd("cicd_runner", None, budget_role="rust_builder")
+        self.assertAlmostEqual(captured["other_role_hourly_usd"], running + 2 * unit, delta=0.0005)
+
+    def test_multi_attached_disk_billed_once(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        shared = {"boot": False, "diskSizeGb": "500", "source": "z/disks/shared-ro"}
+        items = [{"id": f"6{i}", "name": f"oxidex-runners-ro-{i}", "zone": "zones/us-south1-a", "status": "RUNNING",
+                  "machineType": "machineTypes/n4-standard-16", "disks": [shared]} for i in range(2)]
+        obs = observe_fleet_items(items, disk_types={"z/disks/shared-ro": {"type": "pd-ssd", "id": "500"}},
+                                  shapes={("us-south1-a", "n4-standard-16"): {"vcpu": 16, "ram_gib": 64.0}})
+        self.assertEqual([o["data_disk_gb"] for o in obs], [500, 0])
+
+    def test_compaction_keeps_resolved_liability_interval(self):
+        from lib.dashboard_server import _bucket_window_costs, _compact_deleted_record, _live_instance_record
+
+        rec = _live_instance_record(fleet_observation("9960", "builder-oxidex-cl", "us-south1-b", started_hours_ago=10.0,
+                                                      now=self.now), project="p", now=self.now - 6 * 3600.0)
+        rec.update(status="DELETED", deleted_epoch=self.now - 6 * 3600.0, stopped_epoch=self.now - 6 * 3600.0,
+                   disk_end_epoch=self.now - 3600.0, disk_liability_pending=False)
+        buckets: dict = {}
+        _compact_deleted_record(rec, buckets, self.now)
+        disk_only = sum(v[1] - v[2] for k, v in buckets.items()
+                        if float(k.split("|")[1]) >= self.now - 6 * 3600.0)
+        self.assertGreater(disk_only, 0.0)  # Storage between deletion and resolution is kept.
+
+    def test_unknown_disk_type_rate_is_incomplete(self):
+        priced = calculate_spot_pricing(family="n2", vcpu=16, ram_gib=64.0, region="us-south1",
+                                        boot_disk_type="pd-balanced", boot_disk_gb=40, data_disk_type="pd-mystery",
+                                        data_disk_gb=100, machine_type="n2-standard-16", live_pricing={})
+        self.assertFalse(priced["complete"])
+        self.assertEqual(priced["disk_rate_unknown"], ["pd-mystery"])
+        obs = fleet_observation("9970", "oxidex-runners-dt-1", "us-south1-a", machine_type="n2-standard-16", now=self.now)
+        obs.update(data_disk_type="pd-mystery", data_disks={"pd-mystery": 100})
+        self.fleet = [obs]
+        with unittest.mock.patch("lib.dashboard_models.fetch_live_spot_pricing", return_value={}):
+            self.store.refresh_fleet_inventory()
+        rec = self._record("oxidex-runners-dt-1")
+        self.assertFalse(rec["pricing_complete"])
+        self.assertIn("pd-mystery", rec["pricing_incomplete_reason"])
+
+    def test_preserved_detached_record_retired_when_vm_attaches_it(self):
+        from lib.fleet_inventory import FleetListing, observe_detached_disks
+
+        cache = "z/disks/builder-oxidex-ra-cache"
+        self.fleet = observe_detached_disks({cache: {"id": "103", "name": "builder-oxidex-ra-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced"}})
+        self.store.refresh_fleet_inventory()
+        vm = fleet_observation("9980", "builder-oxidex-ra", "us-south1-b", started_hours_ago=0.1, now=self.now)
+        vm.update(disk_types_known=False, disks_detail=[{"type": "pd-balanced", "gb": 100, "created_epoch": None,
+                                                         "source": cache, "id": ""}])
+        listing = FleetListing([vm])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self._record("builder-oxidex-ra-cache")["status"], "DELETED")
+
+    def test_pending_liability_row_shows_storage_rate(self):
+        from lib.fleet_inventory import FleetListing
+
+        created = self.now - 5 * 86400.0
+        vm = fleet_observation("9990", "builder-oxidex-pr", "us-south1-b", started_hours_ago=120.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "pd-balanced", "gb": 100, "created_epoch": created, "source": "z/c-pr", "id": "71",
+             "auto_delete": False}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        listing = FleetListing([])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        row = next(r for r in self.store.query_instances()["instances"] if r["name"] == "builder-oxidex-pr")
+        self.assertGreater(row["active_hourly_usd"], 0.0)
+
+    def test_denied_listing_keeps_per_disk_details(self):
+        known = fleet_observation("9995", "builder-oxidex-pd-1", "us-south1-b", now=self.now)
+        known["disks_detail"] = [{"type": "hyperdisk-balanced", "gb": 100, "created_epoch": self.now - 86400.0,
+                                  "source": "z/c-pd", "id": "81", "auto_delete": False}]
+        self.fleet = [known]
+        self.store.refresh_fleet_inventory()
+        denied = dict(known, disk_types_known=False, boot_disk_type="pd-balanced", data_disk_type="pd-balanced",
+                      disks_detail=[{"type": "pd-balanced", "gb": 100, "created_epoch": None, "source": "z/c-pd",
+                                     "id": "", "auto_delete": False}])
+        self.fleet = [denied]
+        self.store.refresh_fleet_inventory()
+        detail = self._record("builder-oxidex-pd-1")["disks_detail"][0]
+        self.assertEqual((detail["type"], detail["id"]), ("hyperdisk-balanced", "81"))
+
+    def test_secondary_unknown_disk_type_makes_pricing_incomplete(self):
+        from lib.dashboard_server import _with_secondary_disks
+
+        base = calculate_spot_pricing(family="n2", vcpu=16, ram_gib=64.0, region="us-south1",
+                                      boot_disk_type="pd-balanced", boot_disk_gb=40, data_disk_type="pd-ssd",
+                                      data_disk_gb=100, machine_type="n2-standard-16", live_pricing={})
+        out = _with_secondary_disks(base, {"data_disk_type": "pd-ssd", "data_disks": {"pd-ssd": 100, "pd-odd": 50}},
+                                    region="us-south1", family="n2", project="p", live_pricing={})
+        self.assertFalse(out["complete"])
+        self.assertIn("pd-odd", out["disk_rate_unknown"])
+
+    def test_deferred_disk_history_backfilled_when_creation_known(self):
+        from lib.dashboard_server import instance_usage
+
+        created = self.now - 5 * 86400.0
+        first = fleet_observation("9996", "builder-oxidex-bf-1", "us-south1-b", started_hours_ago=120.0, now=self.now)
+        first["disks_detail"] = [{"type": "pd-balanced", "gb": 100, "created_epoch": None, "source": "z/bf", "id": ""}]
+        self.fleet = [first]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-bf-1")
+        self.assertIsNotNone(rec["disk_history_deferred_at"])
+        deferred_at = rec["disk_history_deferred_at"]
+        self.fleet = [dict(first, disks_detail=[{"type": "pd-balanced", "gb": 100, "created_epoch": created,
+                                                 "source": "z/bf", "id": "91"}])]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-bf-1")
+        self.assertIsNone(rec["disk_history_deferred_at"])
+        usage = instance_usage(rec, deferred_at)
+        self.assertAlmostEqual(usage["disk_hours"], (deferred_at - created) / 3600.0, delta=0.05)
+
+    def test_expired_oom_not_rewritten_by_growth(self):
+        old = datetime.fromtimestamp(time.time() - 5 * 3600.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.fleet = [self._runner("9997", "oxidex-runners-ex-1")]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-old", "instance_name": "oxidex-runners-ex-1", "role": "cicd_runner", "observed_at": old}]
+        self.fleet.append(self._runner("9998", "oxidex-runners-ex-2", started_hours_ago=0.01))
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]
@@ -5315,26 +6147,12 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(DashboardStore(fleet_source=lambda: []).fleet_inventory_status()["source"], "gce")
         self.assertEqual(DashboardStore().fleet_inventory_status()["source"], "none")
 
-    def test_first_listing_is_a_baseline_not_growth(self):
-        from lib.dashboard_server import FLEET_BASELINE_STATE_KEY
-
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b1", "instance_name": "builder-oxidex-a", "role": "rust_builder"}]
-        self.fleet = [fleet_observation("1900", "builder-oxidex-a", "us-south1-b", now=self.now)]
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state.get(FLEET_BASELINE_STATE_KEY))
-        event = self.store.state["scaling_telemetry"]["journal_oom_events"][0]
-        self.assertFalse(event.get("handled", False))
-        self.fleet.append(fleet_observation("1901", "builder-oxidex-b", "us-south1-b", now=self.now))
-        self.assertTrue(self.store.refresh_fleet_inventory())
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
-
     def test_empty_first_listing_still_records_baseline(self):
         from lib.dashboard_server import FLEET_BASELINE_STATE_KEY
 
         self.store.refresh_fleet_inventory()
         self.assertTrue(self.store.state.get(FLEET_BASELINE_STATE_KEY))
+        self.store.refresh_fleet_inventory()  # May record baselines on existing OOM events once.
         version = self.store.state_version()
         self.store.refresh_fleet_inventory()
         self.assertEqual(self.store.state_version(), version)

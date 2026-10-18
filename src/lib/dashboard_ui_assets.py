@@ -1959,7 +1959,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         ? fs.running_runner_slots
         : runningRunners.reduce((acc, i) => acc + i.runners_count, 0);
       const runningRunnerVms = fs.running_runner_vms !== undefined ? fs.running_runner_vms : runningRunners.length;
-      document.getElementById("kpi-runners-online").textContent = `${totalRunnerSlots} Runners (${runningRunnerVms} VMs)`;
+      const unconfirmed = fs.unconfirmed_runner_hosts || 0;
+      document.getElementById("kpi-runners-online").textContent = `${totalRunnerSlots} Runners (${runningRunnerVms} VMs)${unconfirmed ? ` · ${unconfirmed} host(s) not confirmed` : ""}`;
       const st = APP_STATE.scaling_telemetry;
       document.getElementById("kpi-runners-sub").textContent = `Min floor: ${APP_STATE.profiles.cicd_runner.min_runners} · ${st.queued_jobs} queued · ${st.jobs_ran_past_hour} runs in past 1h`;
 
@@ -2131,7 +2132,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               </div>
 
               <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
-                <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">🖥️ Create VM Template</button>
+                ${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">🖥️ Create VM Template</button>` : ""}
               </div>
             </div>
           `;
@@ -2172,6 +2173,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         ${instancesHtml}
       `;
+    }
+
+    // A VM template copies one shape: records whose per-runner limits or disks it cannot describe cannot be sources.
+    function canTemplate(inst) {
+      return inst.kind !== "disk" && inst.runner_limits_known !== false && inst.disk_types_known !== false
+        && !inst.regional_disks && !inst.unpriced_disk_performance && !(inst.local_ssd_gb > 0)
+        && Object.keys(inst.data_disks || {}).length <= 1;
     }
 
     async function scaleRegion(region, role, targetCount) {
@@ -2253,7 +2261,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const summary = document.getElementById("inst-window-summary");
       const fi = iv.fleet_inventory || APP_STATE.fleet_inventory || {};
       const inventoryNote = fi.source === "gce"
-        ? `Source: live Compute Engine inventory${fi.last_success_at ? ", last listed " + esc(formatLocalTime(fi.last_success_at)) : ", not listed yet"}${fi.last_error ? ' · <span style="color:#fda4af;">' + esc(fi.last_error) + "</span>" : ""}`
+        ? `Source: live Compute Engine inventory${fi.last_success_at ? ", last listed " + esc(formatLocalTime(fi.last_success_at)) : ", not listed yet"}${(fi.stale_reason || fi.last_error) ? ' · <span style="color:#fda4af;">' + esc(fi.stale_reason || fi.last_error) + "</span>" : ""}`
         : `Source: live Compute Engine inventory is not configured on this dashboard (set DASHBOARD_FLEET_INVENTORY=gce); no instances are shown`;
       summary.innerHTML = `${inventoryNote}<br>Showing <strong>${iv.instances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} stopped or deleted) · Total Window Spend: <strong class="mono" style="color:#34d399;">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
 
@@ -2298,7 +2306,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </td>
             <td style="font-size:11.5px;">
               <div><strong>Start:</strong> ${esc(formatLocalTime(inst.started_at))}</div>
-              <div><strong>End:</strong> ${inst.deleted_at ? esc(formatLocalTime(inst.deleted_at)) : inst.stopped_at ? 'Stopped ' + esc(formatLocalTime(inst.stopped_at)) : isRunning ? '<span style="color:#34d399;">Present (Running)</span>' : esc(inst.status)}</div>
+              <div><strong>End:</strong> ${inst.deleted_at ? esc(formatLocalTime(inst.deleted_at)) : inst.status === "DETACHED" ? '<span style="color:#fcd34d;">Present (storage still billed)</span>' : inst.stopped_at ? 'Stopped ' + esc(formatLocalTime(inst.stopped_at)) : isRunning ? '<span style="color:#34d399;">Present (Running)</span>' : esc(inst.status)}</div>
             </td>
             <td style="max-width:260px; font-size:11.5px; color:${isRunning ? '#a7f3d0' : '#fda4af'};">
               ${esc(inst.deletion_trigger)}
@@ -2306,7 +2314,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <td>
               <div style="display:flex; gap:5px; flex-wrap:wrap;">
                 <button class="btn btn-sm btn-secondary" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'SSH command')">📋 SSH</button>
-                <button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">Template</button>
+                ${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">Template</button>` : ""}
               </div>
             </td>
           </tr>

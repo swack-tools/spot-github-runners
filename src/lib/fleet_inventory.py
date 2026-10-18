@@ -13,13 +13,16 @@ import os
 import re
 from typing import Any, Callable, Mapping
 
-from .runner_fleet import (gce_metadata_items, gce_timestamp, patch_record_from_gce_item,
-                           runner_deployment_from_gce_item)
+from .runner_fleet import (RUNNER_HOST_NAME_PREFIXES, gce_metadata_items, gce_timestamp,
+                           patch_record_from_gce_item, runner_deployment_from_gce_item)
 
 ENV_FLEET_INVENTORY = "DASHBOARD_FLEET_INVENTORY"
 # Runner hosts (runner_manager) and dedicated Rust builders (render_builder_startup). Control VMs
 # (``spot-control-*``) and anything else in the project are never part of the fleet view.
-FLEET_NAME_PREFIXES = ("oxidex-runners-", "builder-")
+FLEET_NAME_PREFIXES = RUNNER_HOST_NAME_PREFIXES + ("builder-",)
+# Status of an inventory record for a fleet disk that no VM uses (for example a dedicated builder's cache disk,
+# created with auto-delete=no, after its VM was deleted): it bills storage until it is deleted.
+DETACHED_DISK_STATUS = "DETACHED"
 # Dedicated builders run one build container capped at 16 vCPU / 28 GiB (see AGENTS.md).
 BUILDER_CONTAINER_VCPU = 16
 BUILDER_CONTAINER_RAM_GIB = 28.0
@@ -39,6 +42,8 @@ def _disk_detail(disk_types: Mapping[str, Any], source: str) -> dict[str, Any]:
 def _unpriced_performance(detail: Mapping[str, Any]) -> bool:
     """True when a disk bills provisioned performance the dashboard does not price (or reports none to check)."""
     kind = str(detail.get("type", ""))
+    if kind == "pd-extreme":
+        return True  # Extreme PD bills its provisioned IOPS separately.
     if kind == "hyperdisk-throughput":
         return True  # Provisioned throughput is always billed separately.
     if kind.startswith("hyperdisk-"):
@@ -70,7 +75,7 @@ def fleet_role(name: str) -> str | None:
     """``cicd_runner`` or ``rust_builder`` for a fleet VM name, None for anything else."""
     if name.startswith("builder-"):
         return "rust_builder"
-    if name.startswith("oxidex-runners-"):
+    if name.startswith(RUNNER_HOST_NAME_PREFIXES):
         return "cicd_runner"
     return None
 
@@ -104,6 +109,9 @@ def observe_fleet_items(
     disk_types = disk_types or {}
     shapes = shapes or {}
     observed: list[dict[str, Any]] = []
+    # A persistent disk attached to several fleet VMs (read-only or multi-writer) is one disk: bill it once, on the
+    # first VM in the listing that has it.
+    billed_disks: set[str] = set()
     for item in items:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             continue
@@ -128,6 +136,10 @@ def observe_fleet_items(
         local_ssd_gb = 0
         unpriced_performance = False
         regional_disks = False
+        unresolved_disks = False
+        # Each persistent disk with its own creation time, so history before a later-attached disk is not billed
+        # at its rate.
+        disks_detail: list[dict[str, Any]] = []
         for disk in item.get("disks", []) if isinstance(item.get("disks"), list) else []:
             if not isinstance(disk, dict):
                 continue
@@ -138,9 +150,23 @@ def observe_fleet_items(
                 local_ssd_gb += size
                 continue
             detail = _disk_detail(disk_types, str(disk.get("source", "")))
+            identity = str(detail.get("id") or "") or str(disk.get("source", "") or "")
+            if identity and identity in billed_disks:
+                continue
+            if identity:
+                billed_disks.add(identity)
+            if disk_types_known and not detail.get("type"):
+                # The disk listing did not cover this attachment (for example a disk created between the two
+                # listings): its type is unknown, not the default.
+                unresolved_disks = True
             regional_disks = regional_disks or bool(detail.get("regional")) or "/regions/" in str(disk.get("source", ""))
             dtype = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
             unpriced_performance = unpriced_performance or (bool(detail) and _unpriced_performance(detail))
+            disks_detail.append({"type": dtype, "gb": size, "created_epoch": gce_epoch(detail.get("creationTimestamp")),
+                                 "source": str(disk.get("source", "") or ""), "id": str(detail.get("id", "") or ""),
+                                 # None when the listing did not say (older observations).
+                                 "auto_delete": disk.get("autoDelete") if isinstance(disk.get("autoDelete"), bool)
+                                 else None})
             if disk.get("boot"):
                 boot_disk_type, boot_disk_gb = dtype, size
             else:
@@ -193,7 +219,8 @@ def observe_fleet_items(
             "unpriced_disk_performance": unpriced_performance,
             "regional_disks": regional_disks,
             # False when disk types fell back to the default (no compute.disks.list): the record keeps known types.
-            "disk_types_known": disk_types_known,
+            "disk_types_known": disk_types_known and not unresolved_disks,
+            "disks_detail": disks_detail,
             "runners_count": runners_count,
             "runner_vcpu": runner_vcpu,
             "runner_ram_gib": runner_ram_gib,
@@ -205,6 +232,7 @@ def observe_fleet_items(
             "created_epoch": gce_epoch(item.get("creationTimestamp")),
             "last_start_epoch": gce_epoch(item.get("lastStartTimestamp")),
             "last_stop_epoch": gce_epoch(item.get("lastStopTimestamp")),
+            "last_suspended_epoch": gce_epoch(item.get("lastSuspendedTimestamp")),
             "patch_target": metadata.get("spot-runner-patch-target", ""),
         })
     return observed
@@ -213,6 +241,86 @@ def observe_fleet_items(
 def _permission_denied(exc: BaseException) -> bool:
     """True for a Compute Engine HTTP 403 (the service account lacks the permission)."""
     return "HTTP 403" in str(exc)
+
+
+class FleetListing(list):
+    """Fleet observations plus whether the project's disks could be listed (detached disks are counted only then)."""
+
+    disks_listed: bool = True
+
+
+def observe_detached_disks(disk_details: Mapping[str, Any],
+                           attached_sources: frozenset[str] = frozenset(),
+                           snapshot_names: frozenset[str] | None = None) -> list[dict[str, Any]]:
+    """Observations for fleet-named persistent disks that no VM uses (status ``DETACHED``, storage only).
+
+    An attached disk is billed through its VM's record; once no VM uses it (a builder cache disk outlives its
+    VM), it gets its own record, which bills until the disk is gone from the listing.
+    """
+    observed = []
+    for link, raw in disk_details.items():
+        detail = raw if isinstance(raw, Mapping) else {}
+        name = str(detail.get("name", "") or "")
+        role = fleet_role(name)
+        if role is None or not detail.get("id"):
+            continue
+        users = [str(u).rsplit("/", 1)[-1] for u in (detail.get("users") or [])]
+        if users and (snapshot_names is None or any(u in snapshot_names or fleet_role(u) is None for u in users)):
+            # Used by a VM in this instance snapshot (its record bills it), or by a VM outside the fleet.
+            continue
+        # Otherwise any user is a fleet VM the instance listing (taken just before) has not shown yet: bill the disk
+        # here for now, so no time is lost; that VM's record takes it over at the handoff.
+        if str(link) in attached_sources:
+            # The instance listing (taken just before) still shows it attached: its VM's record bills it.
+            continue
+        zone = str(detail.get("zone", "") or "").rsplit("/", 1)[-1]
+        region = zone.rsplit("-", 1)[0] if "-" in zone else zone
+        if not zone:
+            # A regional disk has a region, not a zone (also in its self-link: .../regions/<region>/disks/...).
+            region = str(detail.get("region", "") or "").rsplit("/", 1)[-1]
+            if not region and "/regions/" in str(link):
+                region = str(link).split("/regions/", 1)[1].split("/", 1)[0]
+        size_raw = str(detail.get("sizeGb", "") or "")
+        size = int(size_raw) if size_raw.isdigit() else 0
+        kind = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
+        created = gce_epoch(detail.get("creationTimestamp"))
+        observed.append({
+            "instance_id": f"disk-{detail['id']}",
+            "name": name,
+            "role": role,
+            "status": DETACHED_DISK_STATUS,
+            "kind": "disk",
+            "zone": zone,
+            "region": region,
+            "machine_type": "",
+            "cpu_platform": "",
+            "vcpu": 0,
+            "ram_gib": 0.0,
+            "specs_known": True,
+            "spot": True,
+            "boot_disk_type": kind,
+            "boot_disk_gb": 0,
+            "data_disk_type": kind,
+            "data_disk_gb": size,
+            "data_disks": {kind: size},
+            "local_ssd_gb": 0,
+            "unpriced_disk_performance": _unpriced_performance(detail),
+            "regional_disks": bool(detail.get("regional")),
+            "disk_types_known": True,
+            "disks_detail": [{"type": kind, "gb": size, "created_epoch": created, "source": str(link),
+                              "id": str(detail["id"])}],
+            "runners_count": 0,
+            "runners_count_known": True,
+            "runner_vcpu": 0,
+            "runner_ram_gib": 0.0,
+            "runner_limits_known": True,
+            "created_epoch": created,
+            "last_start_epoch": created,
+            "last_stop_epoch": created,
+            "last_suspended_epoch": None,
+            "source": str(link),
+        })
+    return observed
 
 
 def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
@@ -241,9 +349,9 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                 disk_types: dict[str, Any] = {}
                 types_known = True
                 try:
-                    if fleet_items:
-                        disk_types = await compute_api.list_disk_types(api, auth.project)
-                        disk_listing["ok_before"] = True
+                    # Always: a fleet disk can outlive the last fleet VM (a builder cache disk) and still bill.
+                    disk_types = await compute_api.list_disk_types(api, auth.project)
+                    disk_listing["ok_before"] = True
                 except Exception as exc:
                     if disk_listing["ok_before"] or not _permission_denied(exc):
                         # Transient (or after a restart, when this process has not listed disks yet but stored
@@ -266,8 +374,15 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                 if missing:
                     # Unknown RAM would price as free: fail the refresh (records stay as they were) instead.
                     raise RuntimeError(f"machine type capacity unavailable: {', '.join(missing[:5])}")
-                return observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache,
-                                           disk_types_known=types_known)
+                result = FleetListing(observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache,
+                                                          disk_types_known=types_known)
+                                      + (observe_detached_disks(disk_types, frozenset(
+                                          str(d.get("source", "")) for i in fleet_items
+                                          for d in (i.get("disks") or []) if isinstance(d, dict)),
+                                          frozenset(str(i.get("name", "")) for i in items if isinstance(i, dict)))
+                                         if types_known else []))
+                result.disks_listed = types_known
+                return result
             finally:
                 while not api.connections.empty():
                     _reader, writer = api.connections.get_nowait()
