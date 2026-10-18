@@ -7630,6 +7630,19 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         delivered = self.store.record_rust_build({"build_id": "rb-elapsed", "status": "DELIVERED"})["build"]
         self.assertGreaterEqual(delivered["total_duration_seconds"], 29.0)
 
+    def test_fractional_elapsed_time_then_completion_stays_consistent(self):
+        with unittest.mock.patch("lib.dashboard_server.time.time", return_value=1792330000.25):
+            self.store.record_rust_build({"build_id": "rb-frac", "status": "RUNNING",
+                                          "compile_duration_seconds": 30.5})
+        with unittest.mock.patch("lib.dashboard_server.time.time", return_value=1792330100.25):
+            done = self.store.record_rust_build({"build_id": "rb-frac", "status": "DELIVERED",
+                                                 "compile_duration_seconds": 60, "delivery_duration_seconds": 10})
+        self.assertEqual((done["build"]["compile_duration_seconds"], done["build"]["delivery_duration_seconds"]),
+                         (60.0, 10.0))
+        self.store.record_rust_build({"build_id": "rb-frac-fail", "status": "FAILED"})
+        failed = self.store.record_rust_build({"build_id": "rb-frac-fail", "compile_duration_seconds": 12.5})
+        self.assertEqual(failed["build"]["compile_duration_seconds"], 12.5)
+
     def test_blank_text_in_an_update_keeps_stored_values(self):
         self.store.record_rust_build({"build_id": "rb-blank", "status": "DELIVERED", "total_duration_seconds": 5.0,
                                       "project_name": "oxidex", "instance_name": "builder-oxidex-1",

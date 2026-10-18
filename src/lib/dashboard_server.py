@@ -6988,7 +6988,8 @@ class DashboardStore:
                 req_at = (
                     payload.get("requested_at")
                     or existing_build.get("requested_at")
-                    or _iso_seconds_ago(duration if duration is not None else 0, now_ts)
+                    # Whole seconds, like every inferred timestamp, so later durations stay consistent with it.
+                    or _iso_seconds_ago(0, now_ts - (duration if duration is not None else 0))
                 )
                 req_epoch = _iso_to_epoch(str(req_at))
                 if "finished_at" in payload:
@@ -6997,14 +6998,13 @@ class DashboardStore:
                     fin_at = existing_build.get("finished_at")
                 elif is_unsuccessful and duration is not None:
                     run_seconds = max(0.0, duration - delivery_sec)
-                    fin_epoch = req_epoch + run_seconds
-                    if fin_epoch > now_ts and not payload.get("requested_at"):
+                    if req_epoch + run_seconds > now_ts and not payload.get("requested_at"):
                         # The stored request time (often the first report's arrival) can't be right: the build
                         # ran for the reported time and ended by now, so it started that long before now.
-                        req_epoch = now_ts - run_seconds
+                        req_epoch = float(math.floor(now_ts - run_seconds))
                         req_at = _iso_seconds_ago(0, req_epoch)
-                        fin_epoch = now_ts
-                    fin_at = _iso_seconds_ago(0, fin_epoch)
+                    # Request time plus the exact reported run time (fractional seconds kept when reported).
+                    fin_at = _iso_seconds_ago(-run_seconds, req_epoch)
                 else:
                     fin_at = None
                 del_at = (
