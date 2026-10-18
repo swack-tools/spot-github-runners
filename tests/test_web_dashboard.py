@@ -5703,6 +5703,98 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         detached = self._record("builder-oxidex-lia-cache")
         self.assertGreaterEqual(detached["disk_segment_start"], resumed - 1.0)  # Takes over at the same moment.
 
+    def test_disk_used_by_vm_missing_from_snapshot_is_billed(self):
+        from lib.fleet_inventory import observe_detached_disks
+
+        detail = {"z/disks/builder-oxidex-sp-cache": {
+            "id": "101", "name": "builder-oxidex-sp-cache", "zone": "z/us-south1-b", "sizeGb": "100",
+            "type": "pd-balanced", "users": ["projects/p/zones/us-south1-b/instances/builder-oxidex-sp-2"]}}
+        # The replacement builder was created after the instance listing: bill the disk here for now.
+        self.assertEqual(len(observe_detached_disks(detail, frozenset(), frozenset({"builder-oxidex-sp-1"}))), 1)
+        # Its user is in the snapshot: that VM's record bills it.
+        self.assertEqual(observe_detached_disks(detail, frozenset(), frozenset({"builder-oxidex-sp-2"})), [])
+        other = {"z/disks/builder-oxidex-x-cache": dict(detail["z/disks/builder-oxidex-sp-cache"], id="102",
+                                                        name="builder-oxidex-x-cache",
+                                                        users=["projects/p/zones/z/instances/someone-else"])}
+        self.assertEqual(observe_detached_disks(other, frozenset(), frozenset()), [])
+
+    def test_vanished_builder_liability_covers_only_retained_disks(self):
+        from lib.dashboard_server import _pricing_rates
+        from lib.fleet_inventory import FleetListing
+
+        created = self.now - 5 * 86400.0
+        vm = fleet_observation("9940", "builder-oxidex-ret", "us-south1-b", started_hours_ago=120.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "hyperdisk-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-r", "id": "61",
+             "auto_delete": True},
+            {"type": "hyperdisk-balanced", "gb": 100, "created_epoch": created, "source": "z/cache-r", "id": "62",
+             "auto_delete": False}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        full = _pricing_rates(self._record("builder-oxidex-ret")["pricing"])[2]
+        listing = FleetListing([])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-ret")
+        self.assertTrue(rec["disk_liability_pending"])
+        self.assertTrue(rec["retained_only_pricing"])
+        retained = _pricing_rates(rec["pricing"])[2]
+        self.assertGreater(retained, 0.0)
+        self.assertLess(retained, full)
+        self.assertAlmostEqual(_pricing_rates(rec["pricing"])[0], 0.0, delta=0.001)  # No compute after deletion.
+        # Repriced while still pending (a tax override), at the retained-disk rate only.
+        self.store.update_profile("rust_builder", {"budget": {"override_regional_tax": True, "tax_rate_percent": 30.0}})
+        self.assertEqual(self._record("builder-oxidex-ret")["pricing"]["tax_rate_percent"], 30.0)
+
+    def test_build_evaluation_counts_projected_runner_additions(self):
+        from lib import dashboard_server
+
+        self.fleet = [self._runner("9950", "oxidex-runners-pb-1")]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["global_budget_enforced"] = True
+        captured = {}
+        real_builder = dashboard_server.evaluate_builder_scaling_decision
+
+        def ci_eval(*args, **kwargs):
+            return {"direction": "scale_up", "current_runners": 4, "desired_runners": 12, "current_instances": 1,
+                    "desired_instances": 3, "projected_hourly_usd": 0.0}
+
+        def spy(*args, **kwargs):
+            captured.update(kwargs)
+            return real_builder(*args, **kwargs)
+
+        with unittest.mock.patch.object(dashboard_server, "evaluate_scaling_decision", ci_eval), \
+                unittest.mock.patch.object(dashboard_server, "evaluate_builder_scaling_decision", spy):
+            self.store.record_rust_build({"build_id": "rb-proj-01", "cache_hits": 1, "cache_misses": 1})
+        running = sum(self.store._running_role_hourly_rates("cicd_runner", budget_role="rust_builder"))
+        unit = self.store._resolve_scaling_unit_hourly_usd("cicd_runner", None, budget_role="rust_builder")
+        self.assertAlmostEqual(captured["other_role_hourly_usd"], running + 2 * unit, delta=0.0005)
+
+    def test_multi_attached_disk_billed_once(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        shared = {"boot": False, "diskSizeGb": "500", "source": "z/disks/shared-ro"}
+        items = [{"id": f"6{i}", "name": f"oxidex-runners-ro-{i}", "zone": "zones/us-south1-a", "status": "RUNNING",
+                  "machineType": "machineTypes/n4-standard-16", "disks": [shared]} for i in range(2)]
+        obs = observe_fleet_items(items, disk_types={"z/disks/shared-ro": {"type": "pd-ssd", "id": "500"}},
+                                  shapes={("us-south1-a", "n4-standard-16"): {"vcpu": 16, "ram_gib": 64.0}})
+        self.assertEqual([o["data_disk_gb"] for o in obs], [500, 0])
+
+    def test_compaction_keeps_resolved_liability_interval(self):
+        from lib.dashboard_server import _bucket_window_costs, _compact_deleted_record, _live_instance_record
+
+        rec = _live_instance_record(fleet_observation("9960", "builder-oxidex-cl", "us-south1-b", started_hours_ago=10.0,
+                                                      now=self.now), project="p", now=self.now - 6 * 3600.0)
+        rec.update(status="DELETED", deleted_epoch=self.now - 6 * 3600.0, stopped_epoch=self.now - 6 * 3600.0,
+                   disk_end_epoch=self.now - 3600.0, disk_liability_pending=False)
+        buckets: dict = {}
+        _compact_deleted_record(rec, buckets, self.now)
+        disk_only = sum(v[1] - v[2] for k, v in buckets.items()
+                        if float(k.split("|")[1]) >= self.now - 6 * 3600.0)
+        self.assertGreater(disk_only, 0.0)  # Storage between deletion and resolution is kept.
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

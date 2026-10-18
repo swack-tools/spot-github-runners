@@ -368,12 +368,15 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - Spend covers each VM's attached disks while the VM exists. A fleet-named disk that no VM uses, such
   as a dedicated builder's cache disk (`auto-delete=no`) after its VM is deleted, gets its own
   `DETACHED` record that bills storage until the disk is deleted (shown as present storage). A disk the instance listing still shows
-  attached is billed only by its VM's record. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
+  attached is billed only by its VM's record, and a disk attached to a fleet VM that the instance listing
+  doesn't show yet is billed on its own until that VM appears. A disk attached to several fleet VMs is
+  billed once. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
   is billed by the new record only from the handoff, never again from its creation. Disks are matched
   by their immutable disk ID, so a new disk that reuses a name is billed from its own creation. While
   disks can't be listed, existing `DETACHED` records are kept, not marked deleted, and a builder that
-  disappears keeps billing its disk storage (`disk_liability_pending`) until a disk listing shows
-  whether its cache disk still exists. A disk that's
+  disappears keeps billing the storage of the disks that outlive it (auto-delete off, such as its cache
+  disk; all its disks when the listing didn't report auto-delete), `disk_liability_pending`, until a disk
+  listing shows whether they still exist. That storage is repriced like other records. A disk that's
   detached again keeps its earlier standalone interval and restarts billing at the new handoff.
 - Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
   scale-up plans are refused even when the listing is otherwise current. Grant the permission for

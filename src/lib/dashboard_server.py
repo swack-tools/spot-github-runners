@@ -876,6 +876,7 @@ def _live_instance_record(
         record["pricing"] = _with_secondary_disks(record["pricing"], obs, region=region,
                                                   family=record["family"], project=project)
     record["data_disks"] = obs.get("data_disks") or {}
+    record["disks_detail"] = [dict(d) for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
     # Disk identities: the immutable ID (kept from the previous record when this listing could not read it) and the
     # source URL as an alias, so a handoff is recognized by either.
     previous_ids = (previous or {}).get("disk_ids") or {}
@@ -1123,9 +1124,62 @@ def _live_instance_record(
     return record
 
 
-def _mark_instance_deleted(record: dict[str, Any], now: float, *, disks_pending: bool = False) -> dict[str, Any]:
+def _retained_disks(record: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The record's disks that outlive the VM (auto-delete off), or None when the listing gave no auto-delete
+    information (then all disks count, conservatively)."""
+    disks = record.get("disks_detail") or []
+    if not disks or any(not isinstance(d, dict) or d.get("auto_delete") is None for d in disks):
+        return None
+    return [d for d in disks if d.get("auto_delete") is False]
+
+
+def _retained_pricing(record: dict[str, Any], *, tax_rate_percent: float, project: str,
+                      live_pricing: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Pricing of only the disks a deleted VM leaves behind (no compute)."""
+    retained = _retained_disks(record) or []
+    family = str(record.get("family") or "")
+    region = str(record.get("region") or "")
+    priced = calculate_spot_pricing(
+        family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type="pd-balanced", boot_disk_gb=0,
+        data_disk_type="pd-balanced", data_disk_gb=0, tax_rate_percent=tax_rate_percent, machine_type=None,
+        live_pricing=live_pricing, project=project)
+    extra = sum(_single_disk_all_in(d, family=family, region=region, project=project, tax_rate_percent=tax_rate_percent)
+                / (1.0 + tax_rate_percent / 100.0) for d in retained)
+    return _with_extra_disks(priced, extra)
+
+
+def _mark_instance_deleted(record: dict[str, Any], now: float, *, disks_pending: bool = False,
+                           project: str = "homelab-424523") -> dict[str, Any]:
     """The record of a VM that is no longer in the Compute Engine inventory."""
     out = dict(record)
+    if disks_pending:
+        retained = _retained_disks(out)
+        if retained == []:
+            disks_pending = False  # Every disk was auto-deleted with the VM: nothing left to bill.
+        elif retained is not None:
+            # Only the disks that outlive the VM keep billing: close compute and the full disk rate here, and
+            # continue at the rate of the retained disks alone.
+            pricing = out.get("pricing") if isinstance(out.get("pricing"), dict) else {}
+            compute_all_in, compute_only, full_disk = _pricing_rates(pricing)
+            if out.get("status") == "RUNNING" or _instance_end_epoch(out) is None:
+                out["stopped_epoch"] = now
+            started = float(out.get("started_epoch") or now)
+            seg = out.get("compute_segment_start")
+            open_start = max(started, float(seg)) if _finite(seg) else started
+            run_end = min(_current_run_end(out, now), now)
+            if run_end > open_start:
+                out["prior_runs"] = list(out.get("prior_runs") or []) + [[open_start, run_end, compute_all_in,
+                                                                          compute_only]]
+            out["compute_segment_start"] = max(open_start, run_end)
+            disks = _disk_segments(out)
+            disk_open = max([float(out.get("disk_start_epoch") or now)] + [e for _s, e, _r in disks]
+                            + ([float(out["disk_segment_start"])] if _finite(out.get("disk_segment_start")) else []))
+            if now > disk_open:
+                out["disk_segments"] = [list(d) for d in disks] + [[disk_open, now, full_disk]]
+            out["disk_segment_start"] = now
+            out["retained_only_pricing"] = True
+            out["pricing"] = _retained_pricing(
+                out, tax_rate_percent=float(pricing.get("tax_rate_percent", 0.0) or 0.0), project=project)
     if out.get("status") == "RUNNING" or _instance_end_epoch(out) is None:
         # It ran until it disappeared (between two listings; the observation time bounds it).
         out["stopped_epoch"] = now
@@ -1180,10 +1234,12 @@ def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[floa
                     + ([float(record["disk_segment_start"])] if _finite(record.get("disk_segment_start")) else []))
     for s0, e0, r0 in disks:
         _add_to_buckets(buckets, prefix, s0, e0, r0, 0.0, compute=False)
-    if usage_end > disk_open:
-        _add_to_buckets(buckets, prefix, disk_open, usage_end, cur_disk, 0.0, compute=False)
+    # Disks bill until their own end (a resolved liability can end after the VM was deleted).
+    disk_end = float(record["disk_end_epoch"]) if _finite(record.get("disk_end_epoch")) else usage_end
+    if disk_end > disk_open:
+        _add_to_buckets(buckets, prefix, disk_open, disk_end, cur_disk, 0.0, compute=False)
     own = _rebucket(record.get("folded_cost_buckets") or {}, "", _record_bucket_span(record), _BUCKET_SECONDS,
-                    until=usage_end)
+                    until=max(usage_end, disk_end))
     for key, value in own.items():
         bucket = buckets.setdefault(f"{prefix}{key}", [0.0, 0.0, 0.0])
         for i in range(3):
@@ -1331,7 +1387,7 @@ def reconcile_instance_records(
             # whether it still exists, so its storage keeps billing here until a disk listing resolves it.
             pending = (not disks_listed and record.get("role") == "rust_builder"
                        and str(record.get("kind") or "vm") != "disk")
-            records.append(_mark_instance_deleted(record, now, disks_pending=pending))
+            records.append(_mark_instance_deleted(record, now, disks_pending=pending, project=project))
     for instance_id, obs in by_id.items():
         if instance_id not in seen:
             records.append(_live_instance_record(obs, project=project, now=now, known_disk_sources=known_disks,
@@ -3934,7 +3990,8 @@ class DashboardStore:
             inst
             for inst in (self.state.get("instances", []) if records is None else records)
             if isinstance(inst, dict)
-            and (is_live_instance_record(inst) and inst.get("status") != "DELETED" if live
+            and (is_live_instance_record(inst)
+                 and (inst.get("status") != "DELETED" or bool(inst.get("disk_liability_pending"))) if live
                  else inst.get("status") == "RUNNING" and not is_live_instance_record(inst))
             and inst.get("region")
             # Disk-only records (DETACHED) have no machine type but still reprice their storage.
@@ -3975,6 +4032,17 @@ class DashboardStore:
             )
             old_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else None
             old_completeness = (inst.get("pricing_complete"), inst.get("pricing_incomplete_reason"))
+            if inst.get("retained_only_pricing"):
+                # A deleted builder still billing its cache disk: reprice that disk alone (compute is closed).
+                new_pricing = _retained_pricing(inst, tax_rate_percent=tax_rate_pct, project=self.project,
+                                                live_pricing=shared_live_pricing)
+                if old_pricing is not None and _pricing_rates(old_pricing) != _pricing_rates(new_pricing):
+                    _close_open_segments(inst, old_pricing, self._clock())
+                    repriced = True
+                elif old_pricing != new_pricing:
+                    repriced = True
+                inst["pricing"] = new_pricing
+                continue
             inst["pricing"] = calculate_spot_pricing(
                 family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
                 vcpu=int(inst.get("vcpu", 16)),
@@ -6227,7 +6295,21 @@ class DashboardStore:
                     "rust_builder",
                     shared=bool(self.state["scaling"]["rust_builder"].get("shared_global_budget")
                                 or self.state.get("global_budget_enforced")),
-                    other_running_burn=sum(self._running_role_hourly_rates("cicd_runner", budget_role="rust_builder")),
+                    other_running_burn=self._runner_burn_for_builder_budget(self._fail_closed_evaluation(
+                        # The CI evaluation (on a copy, so this read changes no OOM state): runner VMs it would add
+                        # count against the shared budget too, as on the overview.
+                        evaluate_scaling_decision(
+                            self.state["scaling"]["cicd_runner"],
+                            copy.deepcopy(self.state["scaling_telemetry"]),
+                            per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("cicd_runner"),
+                            max_instances=int(self.state["profiles"]["cicd_runner"].get("max_instances", 8)),
+                            other_role_hourly_usd=self._outside_burn(
+                                "cicd_runner",
+                                shared=self._role_shares_budget("cicd_runner"),
+                                other_running_burn=sum(self._running_role_hourly_rates(
+                                    "rust_builder", budget_role="cicd_runner")),
+                            ),
+                        ), "cicd_runner")),
                 ),
             ), "rust_builder")
             return {
