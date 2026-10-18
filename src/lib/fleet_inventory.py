@@ -54,6 +54,28 @@ def _unpriced_performance(detail: Mapping[str, Any]) -> bool:
             return True  # Unknown provisioned performance: never assume it is free.
     return False
 
+
+def _disk_billing_metadata(detail: Mapping[str, Any], source: str, *,
+                           disk_types_known: bool, ambiguous_roles: list[str]) -> dict[str, Any]:
+    """Physical disk evidence, independent of which attachment carries its charge."""
+    return {
+        "storage_billing_ambiguous_roles": list(ambiguous_roles),
+        "unpriced_disk_performance": _unpriced_performance(detail),
+        "regional": bool(detail.get("regional")) or "/regions/" in source,
+        "disk_types_known": bool(disk_types_known and detail.get("type")),
+        **{key: detail[key] for key in ("provisionedIops", "provisionedThroughput") if key in detail},
+    }
+
+
+def builder_shape_compatible(record: Mapping[str, Any]) -> bool:
+    """Whether physical capacity matches a dedicated builder; container limits are checked separately.
+
+    Templates can omit specs_known; an explicit False means the capacity is unverified.
+    """
+    return (record.get("specs_known") is not False and record.get("machine_type") == "n4-highcpu-16"
+            and record.get("vcpu") == 16 and record.get("ram_gib") == 32.0)
+
+
 _MACHINE_VCPU_RE = re.compile(r"-(\d+)$")
 
 
@@ -119,6 +141,7 @@ def observe_fleet_items(
     attachment_counts: dict[str, int] = {}
     disk_participants: dict[str, list[tuple[tuple[str, str], str]]] = {}
     disk_roles: dict[str, set[str]] = {}
+    disk_user_roles: dict[str, set[str]] = {}
     for vm in fleet_items:
         for disk in vm.get("disks") or []:
             if (isinstance(disk, dict) and disk.get("source")
@@ -129,6 +152,12 @@ def observe_fleet_items(
                 attachment_counts[identity] = attachment_counts.get(identity, 0) + 1
                 disk_participants.setdefault(identity, []).append(((str(vm["id"]), vm["name"]),
                                                                     fleet_role(vm["name"])))
+                # The disk listing is later than the VM snapshot. Its users can establish cross-role sharing
+                # even when the other VM or its attachment is absent from that snapshot.
+                for user in detail.get("users") or []:
+                    user_role = fleet_role(str(user).rstrip("/").rsplit("/", 1)[-1])
+                    if user_role:
+                        disk_user_roles.setdefault(identity, set()).add(user_role)
                 # Catalog name and source identify the actual disk. deviceName is only an attachment alias;
                 # disk labels are not in the API projection and cannot establish ownership here.
                 disk_name = str(detail.get("name") or source.rstrip("/").rsplit("/", 1)[-1])
@@ -137,15 +166,17 @@ def observe_fleet_items(
                 if named_role:
                     disk_roles.setdefault(identity, set()).add(named_role)
     billing_owners: dict[str, tuple[str, str]] = {}
-    ambiguous_disks: set[str] = set()
+    ambiguous_disks: dict[str, set[str]] = {}
     for identity, participants in disk_participants.items():
         candidates = participants
-        if len({role for _, role in participants}) > 1:
+        participating_roles = {role for _, role in participants} | disk_user_roles.get(identity, set())
+        if len(participating_roles) > 1:
             named_roles = disk_roles.get(identity, set())
             candidates = [p for p in participants if p[1] in named_roles] if len(named_roles) == 1 else []
             if not candidates:
-                # Keep fleet burn deduplicated, but every participant must fail closed for role storage budgets.
-                ambiguous_disks.add(identity)
+                # Keep fleet burn deduplicated. Persist all affected roles on the visible carrier(s), including
+                # when the named role has no attachment yet and therefore cannot own the numerical charge.
+                ambiguous_disks[identity] = participating_roles
                 candidates = participants
         billing_owners[identity] = candidates[0][0]
     for item in fleet_items:
@@ -171,10 +202,6 @@ def observe_fleet_items(
         data_disk_type, data_disk_gb = DEFAULT_DISK_TYPE, 0
         data_disks: dict[str, int] = {}
         local_ssd_gb = 0
-        unpriced_performance = False
-        regional_disks = False
-        unresolved_disks = False
-        storage_billing_ambiguous = False
         # Each persistent disk with its own creation time, so history before a later-attached disk is not billed
         # at its rate.
         disks_detail: list[dict[str, Any]] = []
@@ -195,16 +222,12 @@ def observe_fleet_items(
                 or billing_owners.get(identity, (str(item["id"]), name)) != (str(item["id"]), name))
             if identity and not shared_elsewhere:
                 billed_disks.add(identity)
-            storage_billing_ambiguous = storage_billing_ambiguous or identity in ambiguous_disks
-            if disk_types_known and not detail.get("type"):
-                # The disk listing did not cover this attachment (for example a disk created between the two
-                # listings): its type is unknown, not the default.
-                unresolved_disks = True
-            regional_disks = regional_disks or bool(detail.get("regional")) or "/regions/" in str(disk.get("source", ""))
             dtype = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
-            unpriced_performance = unpriced_performance or (bool(detail) and _unpriced_performance(detail))
             disks_detail.append({"type": dtype, "gb": size, "created_epoch": gce_epoch(detail.get("creationTimestamp")),
                                  "source": str(disk.get("source", "") or ""), "id": str(detail.get("id", "") or ""),
+                                 **_disk_billing_metadata(detail, str(disk.get("source", "") or ""),
+                                     disk_types_known=disk_types_known,
+                                     ambiguous_roles=sorted(ambiguous_disks.get(identity, ()))),
                                  # None when the listing did not say (older observations).
                                  "boot": bool(disk.get("boot")),
                                  "billing_owner": not shared_elsewhere,
@@ -223,14 +246,19 @@ def observe_fleet_items(
                 data_disk_gb += size
                 if not shared_elsewhere:
                     data_disks[dtype] = data_disks.get(dtype, 0) + size
+        # Physical evidence remains on every attachment. Only owned or ambiguously attributed disks affect
+        # this VM's billing trust; a private disk never inherits another disk's cross-role uncertainty.
+        billing_details = [d for d in disks_detail if d["billing_owner"] or d["storage_billing_ambiguous_roles"]]
+        storage_billing_ambiguous_roles = sorted({role for d in billing_details
+                                                  for role in d["storage_billing_ambiguous_roles"]})
         scheduling = item.get("scheduling") if isinstance(item.get("scheduling"), dict) else {}
         spot = (str(scheduling.get("provisioningModel", "")).upper() == "SPOT"
                 or bool(scheduling.get("preemptible", False)))
         deployment = runner_deployment_from_gce_item(item)
         metadata = gce_metadata_items(item)
         if role == "rust_builder":
-            runner_limits_known = bool(specs_known and machine_type == "n4-highcpu-16"
-                                       and vcpu == 16 and ram_gib == 32.0)
+            runner_limits_known = builder_shape_compatible({"specs_known": specs_known, "machine_type": machine_type,
+                                                            "vcpu": vcpu, "ram_gib": ram_gib})
             runners_count = 1 if runner_limits_known else 0
             runner_vcpu = BUILDER_CONTAINER_VCPU if runner_limits_known else 0
             runner_ram_gib = BUILDER_CONTAINER_RAM_GIB if runner_limits_known else 0.0
@@ -270,12 +298,13 @@ def observe_fleet_items(
             "data_disks": data_disks,
             "data_disks_attached_gb": data_disk_gb,
             "shared_attachments": shared_attachments,
-            "storage_billing_ambiguous": storage_billing_ambiguous,
+            "storage_billing_ambiguous": bool(storage_billing_ambiguous_roles),
+            "storage_billing_ambiguous_roles": storage_billing_ambiguous_roles,
             "local_ssd_gb": local_ssd_gb,
-            "unpriced_disk_performance": unpriced_performance,
-            "regional_disks": regional_disks,
-            # False when disk types fell back to the default (no compute.disks.list): the record keeps known types.
-            "disk_types_known": disk_types_known and not unresolved_disks,
+            "unpriced_disk_performance": any(d["unpriced_disk_performance"] for d in billing_details),
+            "regional_disks": any(d["regional"] for d in billing_details),
+            # Unknown physical types stay on each detail; only relevant disks can make billing incomplete.
+            "disk_types_known": all(d["disk_types_known"] for d in billing_details),
             "disks_detail": disks_detail,
             "runners_count": runners_count,
             "runner_vcpu": runner_vcpu,
@@ -309,7 +338,8 @@ class FleetListing(list):
 def observe_detached_disks(disk_details: Mapping[str, Any],
                            attached_sources: frozenset[str] = frozenset(),
                            snapshot_names: frozenset[str] | None = None, *,
-                           tracked_roles: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+                           tracked_roles: Mapping[str, str] | None = None,
+                           tracked_ambiguities: Mapping[str, list[str]] | None = None) -> list[dict[str, Any]]:
     """Observations for fleet-named persistent disks that no VM uses (status ``DETACHED``, storage only).
 
     An attached disk is billed through its VM's record; once no VM uses it (a builder cache disk outlives its
@@ -321,7 +351,17 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
         name = str(detail.get("name", "") or "")
         users = [str(u).rstrip("/").rsplit("/", 1)[-1] for u in (detail.get("users") or [])]
         user_roles = sorted({fleet_role(user) for user in users if fleet_role(user) is not None})
-        named_role = ("cicd_runner" if name == "runner-data" or name.startswith("runner-data-") else fleet_role(name))
+        disk_name = name or str(link).rstrip("/").rsplit("/", 1)[-1]
+        named_role = ("cicd_runner" if disk_name == "runner-data" or disk_name.startswith("runner-data-")
+                      else fleet_role(disk_name))
+        # A later disk listing can show users in both roles before either attachment reaches the VM snapshot.
+        # Keep one numerical carrier, but flag both role budgets via this disk record when attribution is unknown.
+        ambiguous_roles = user_roles if len(user_roles) > 1 and named_role not in user_roles else []
+        if not user_roles and named_role is None:
+            # Detaching is not evidence of a workload role. Keep the previous physical disk's unresolved roles
+            # until its current users or an explicit disk name resolve them; never match a reused name by URL.
+            ambiguous_roles = sorted(set((tracked_ambiguities or {}).get("id:" + str(detail.get("id", "")), [])))
+        storage_billing_ambiguous = len(ambiguous_roles) > 1
         role = (named_role if named_role in user_roles else user_roles[0]) if user_roles else (
             named_role or (tracked_roles or {}).get("id:" + str(detail.get("id", ""))))
         if role is None or not detail.get("id"):
@@ -346,6 +386,8 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
         size = int(size_raw) if size_raw.isdigit() else 0
         kind = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
         created = gce_epoch(detail.get("creationTimestamp"))
+        disk_metadata = _disk_billing_metadata(detail, str(link), disk_types_known=True,
+                                              ambiguous_roles=ambiguous_roles if storage_billing_ambiguous else [])
         observed.append({
             "instance_id": f"disk-{detail['id']}",
             "name": name,
@@ -365,12 +407,14 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
             "data_disk_type": kind,
             "data_disk_gb": size,
             "data_disks": {kind: size},
+            "storage_billing_ambiguous": bool(disk_metadata["storage_billing_ambiguous_roles"]),
+            "storage_billing_ambiguous_roles": list(disk_metadata["storage_billing_ambiguous_roles"]),
             "local_ssd_gb": 0,
-            "unpriced_disk_performance": _unpriced_performance(detail),
-            "regional_disks": bool(detail.get("regional")),
-            "disk_types_known": True,
+            "unpriced_disk_performance": disk_metadata["unpriced_disk_performance"],
+            "regional_disks": disk_metadata["regional"],
+            "disk_types_known": disk_metadata["disk_types_known"],
             "disks_detail": [{"type": kind, "gb": size, "created_epoch": created, "source": str(link),
-                              "id": str(detail["id"])}],
+                              "id": str(detail["id"]), **disk_metadata}],
             "runners_count": 0,
             "runners_count_known": True,
             "runner_vcpu": 0,
@@ -391,7 +435,6 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
     It raises when any zone is unreachable: a partial listing must never make a VM look deleted.
     """
     shape_cache: dict[tuple[str, str], dict[str, Any]] = {}
-    disk_listing = {"ok_before": False}
 
     def source() -> list[dict[str, Any]]:
         import asyncio
@@ -413,14 +456,12 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                 try:
                     # Always: a fleet disk can outlive the last fleet VM (a builder cache disk) and still bill.
                     disk_types = await compute_api.list_disk_types(api, auth.project)
-                    disk_listing["ok_before"] = True
                 except Exception as exc:
-                    if disk_listing["ok_before"] or not _permission_denied(exc):
-                        # Transient (or after a restart, when this process has not listed disks yet but stored
-                        # records may hold real types): fail the whole listing so known types are not replaced.
+                    if not _permission_denied(exc):
+                        # Transient failures still reject the whole refresh rather than publishing a partial view.
                         raise RuntimeError(f"disk listing failed: {type(exc).__name__}: {exc}") from exc
-                    # No compute.disks.list (HTTP 403): disk types fall back to the default, flagged as unknown so
-                    # stored types are kept and new records are not priced as complete.
+                    # Permission can be revoked after a successful listing. Keep the current VM snapshot;
+                    # unknown disk types and the absent catalog let reconciliation preserve earlier evidence.
                     types_known = False
                 wanted = {(str(i.get("zone", "")).rsplit("/", 1)[-1], str(i.get("machineType", "")).rsplit("/", 1)[-1])
                           for i in fleet_items}

@@ -1340,8 +1340,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             {
                 "min_instances": 2,
                 "max_instances": 5,
-                "runner_vcpu": 24,
-                "runner_ram_gib": 48,
+                "runner_vcpu": 8,
+                "runner_ram_gib": 16,
                 "use_vm_template": False,
                 "budget": {
                     "max_hourly_usd": 2.25,
@@ -1357,10 +1357,10 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(b_sc["max_scale_up_daily_usd"], 18.00)
         self.assertEqual(b_sc["max_scale_up_monthly_usd"], 120.00)
         self.assertFalse(b_sc["include_disk_in_scale_budget"])
-        self.assertEqual(b_sc["container_vcpu"], 24)
-        self.assertEqual(b_sc["builder_vcpu"], 24)
-        self.assertEqual(b_sc["container_ram_gib"], 48.0)
-        self.assertEqual(b_sc["builder_ram_gib"], 48.0)
+        self.assertEqual(b_sc["container_vcpu"], 8)
+        self.assertEqual(b_sc["builder_vcpu"], 8)
+        self.assertEqual(b_sc["container_ram_gib"], 16.0)
+        self.assertEqual(b_sc["builder_ram_gib"], 16.0)
 
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._post(
@@ -5025,9 +5025,14 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                                                       started_hours_ago=1.0, now=self.now), project="p", now=self.now)
         rec["prior_runs"] = [[self.now - (100 - i) * 3600.0, self.now - (100 - i) * 3600.0 + 1800.0] for i in range(60)]
         before = instance_usage(rec, self.now, self.now - 744 * 3600.0)
-        with unittest.mock.patch.object(dashboard_server, "MAX_INSTANCE_STATE_BYTES", 3_000):
+        # Leave bounded serialization headroom: wall-clock fractional digits must not decide whether
+        # the fully compacted fixture fits. The original detail must still exceed this exact budget.
+        compact = dashboard_server._coarsen_record_buckets(dashboard_server._fold_record_detail(rec, 0))
+        budget = dashboard_server._serialized_size([[compact], [], {}]) + 128
+        self.assertGreater(dashboard_server._serialized_size([[rec], [], {}]), budget)
+        with unittest.mock.patch.object(dashboard_server, "MAX_INSTANCE_STATE_BYTES", budget):
             live, _gone = dashboard_server._fit_size_budget([rec], [], {}, self.now)
-            self.assertLessEqual(dashboard_server._serialized_size([live, [], {}]), 3_000)
+            self.assertLessEqual(dashboard_server._serialized_size([live, [], {}]), budget)
         self.assertLessEqual(len(live[0]["prior_runs"]), dashboard_server.MIN_DETAILED_SEGMENTS)
         after = instance_usage(live[0], self.now, self.now - 744 * 3600.0)
         self.assertAlmostEqual(after["compute_hours"], before["compute_hours"], delta=0.01)
@@ -5931,8 +5936,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             self.assertEqual(self.store._inventory_stale_reason(), "")
 
     def test_added_disk_billed_from_its_creation(self):
-        from lib.dashboard_server import instance_usage
-
         created = self.now - 10 * 86400.0
         boot = {"type": "pd-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-ad", "id": "1"}
         vm = fleet_observation("9900", "builder-oxidex-add-1", "us-south1-b", started_hours_ago=240.0, now=self.now)
@@ -6431,7 +6434,18 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                     rows, _ = reconcile_instance_records(rows, observations, project="p", now=self.now - hours * 3600,
                                                          disks_listed=verified)
                     if hours == 2:
-                        self.assertTrue(any(r.get("unpaid_disk_details") for r in rows))
+                        if carrier_deleted:
+                            # The detached owner now supplies its real type/ID at the denied handoff. A missing
+                            # VM carries a priced retained liability instead of inventing new unpriced debt.
+                            carrier = next(r for r in rows if r["instance_id"] == "a")
+                            self.assertTrue(carrier["disk_liability_pending"])
+                            self.assertEqual(carrier["disks_detail"][0]["type"], real["type"])
+                            self.assertEqual(carrier["disks_detail"][0]["id"], real["id"])
+                            expected_rate = _single_disk_all_in(real, family=carrier["family"], region=carrier["region"],
+                                project="p", tax_rate_percent=0)
+                            self.assertAlmostEqual(carrier["pricing"]["disk_hourly_usd"], expected_rate, delta=0.0001)
+                        else:
+                            self.assertTrue(any(r.get("unpaid_disk_details") for r in rows))
                 rate = _single_disk_all_in(real, family="n4", region="us-south1", project="p",
                                            tax_rate_percent=rows[0]["pricing"]["tax_rate_percent"])
                 self.assertAlmostEqual(sum(instance_usage(r, self.now)["cost_all_in"] for r in rows), 10 * rate, delta=0.001)
@@ -6670,7 +6684,7 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(observed, observe_fleet_items(list(reversed(items)), **args))
 
     def test_compaction_keeps_resolved_liability_interval(self):
-        from lib.dashboard_server import _bucket_window_costs, _compact_deleted_record, _live_instance_record
+        from lib.dashboard_server import _compact_deleted_record, _live_instance_record
 
         rec = _live_instance_record(fleet_observation("9960", "builder-oxidex-cl", "us-south1-b", started_hours_ago=10.0,
                                                       now=self.now), project="p", now=self.now - 6 * 3600.0)

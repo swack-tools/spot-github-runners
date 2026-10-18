@@ -42,11 +42,12 @@ class DashboardComponentPricingTests(unittest.TestCase):
         self.assertEqual(self.store._inventory_stale_reason(), "")
         return self.store.state["instances"]
 
-    def assert_budget_mode(self, role, *, storage, complete):
+    def assert_budget_mode(self, role, *, storage, complete, expected_hosts=None):
         self.store.state["profiles"][role]["budget"].update(include_disk_costs=storage, include_taxes=False)
         self.store.state["scaling"][role]["include_disk_in_scale_budget"] = storage
         incomplete = self.store._incomplete_cost_hosts(role)
-        self.assertEqual(incomplete, [] if complete else [self.observation(role)["name"]])
+        self.assertEqual(incomplete, [] if complete else
+                         (expected_hosts if expected_hosts is not None else [self.observation(role)["name"]]))
         evaluation = self.store._fail_closed_evaluation(
             {"direction": "scale_up", "current_runners": 1, "desired_runners": 2,
              "current_instances": 1, "desired_instances": 2}, role)
@@ -57,7 +58,14 @@ class DashboardComponentPricingTests(unittest.TestCase):
     def assert_storage_only(self, changes, *, history=False):
         for role in ("rust_builder", "cicd_runner"):
             with self.subTest(role=role, changes=changes):
-                record = self.install([self.observation(role, **changes)])[0]
+                if history:
+                    # The earlier run was observed and priced before the suspension.
+                    self.install([self.observation(role)])
+                    self.store.fleet_source = lambda: [self.observation(role, **changes)]
+                    self.store.refresh_fleet_inventory()
+                    record = self.store.state["instances"][0]
+                else:
+                    record = self.install([self.observation(role, **changes)])[0]
                 compute_reasons, storage_reasons = _pricing_component_reasons(record)
                 self.assertEqual(compute_reasons, [])
                 if not history:
@@ -101,15 +109,21 @@ class DashboardComponentPricingTests(unittest.TestCase):
                                   "last_start_epoch": self.now - 3600}, history=True)
 
     def test_shared_role_ambiguity_is_consumed_as_storage_only_for_both_roles(self):
-        observations = [self.observation(role, storage_billing_ambiguous=True)
-                        for role in ("rust_builder", "cicd_runner")]
+        observations = [self.observation(role, storage_billing_ambiguous=True,
+            data_disk_gb=100, data_disk_type="pd-balanced", data_disks_attached_gb=100,
+            data_disks={"pd-balanced": 100} if role == "rust_builder" else {},
+            disks_detail=[{"id": "shared", "source": "z/custom-shared", "type": "pd-balanced", "gb": 100,
+                "created_epoch": self.now - 36000, "billing_owner": role == "rust_builder", "boot": False,
+                "auto_delete": False, "storage_billing_ambiguous_roles": ["cicd_runner", "rust_builder"]}])
+            for role in ("rust_builder", "cicd_runner")]
         records = self.install(observations)
         for record in records:
             self.assertTrue(record["storage_billing_ambiguous"])
             self.assertEqual(_pricing_component_reasons(record)[0], [])
             self.assertTrue(_pricing_component_reasons(record)[1])
             for storage in (False, True):
-                self.assert_budget_mode(record["role"], storage=storage, complete=not storage)
+                self.assert_budget_mode(record["role"], storage=storage, complete=not storage,
+                                        expected_hosts=[r["name"] for r in records])
         for storage in (False, True):
             view = self.store.query_instances(include_disk_and_tax=storage)
             self.assertEqual(len(view["instances"]), 2)
