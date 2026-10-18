@@ -373,10 +373,11 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   billed once. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
   is billed by the new record only from the handoff, never again from its creation. Disks are matched
   by their immutable disk ID, so a new disk that reuses a name is billed from its own creation. While
-  disks can't be listed, existing `DETACHED` records are kept, not marked deleted, and a builder that
+  disks can't be listed, existing `DETACHED` records are kept, not marked deleted, unless a listed VM
+  shows the disk attached (its record takes it over), and a builder that
   disappears keeps billing the storage of the disks that outlive it (auto-delete off, such as its cache
   disk; all its disks when the listing didn't report auto-delete), `disk_liability_pending`, until a disk
-  listing shows whether they still exist. That storage is repriced like other records. A disk that's
+  listing shows whether they still exist; its row shows that storage rate. That storage is repriced like other records. A disk that's
   detached again keeps its earlier standalone interval and restarts billing at the new handoff.
 - Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
   scale-up plans are refused even when the listing is otherwise current. Grant the permission for
@@ -404,7 +405,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `SUSPENDED` VM, whose preserved memory Compute Engine also bills, for a VM with Local SSD (counted
   as `local_ssd_gb`, not as a persistent data disk), for a VM with a regional (replicated) persistent
   disk or an Extreme Persistent Disk (`pd-extreme`, whose provisioned IOPS bill separately), for a custom or extended machine shape, which predefined rates don't price, for a machine family
-  without a known rate (when no live price was found), and for a VM whose
+  without a known rate (when no live price was found), for a disk type without a live or static rate, and for a VM whose
   Hyperdisk bills provisioned IOPS or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
   no reported performance), the record is marked
   `pricing_complete: false`. Under a shared budget, the other role's VMs and disks, including runner VMs the CI evaluation would add,

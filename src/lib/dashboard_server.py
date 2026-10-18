@@ -714,6 +714,8 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
         reasons.append("regional (replicated) persistent disk, priced here only at the zonal rate")
     if record.get("disk_types_known") is False:
         reasons.append("disk types unknown (no compute.disks.list), priced at the default type")
+    if pricing.get("disk_rate_unknown"):
+        reasons.append(f"no known rate for disk type(s) {', '.join(pricing['disk_rate_unknown'])}")
     if pricing.get("family_rate_unknown"):
         reasons.append(f"no known rate for the {record.get('family') or 'unknown'} machine family")
     if pricing.get("complete") is False and custom:
@@ -1354,6 +1356,10 @@ def reconcile_instance_records(
             by_id[str(obs["instance_id"])] = obs
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
+    # Disks the observed VMs have attached (IDs and sources), so a detached record can be retired at the handoff.
+    observed_disk_keys = {key for obs in observed if isinstance(obs, dict) and obs.get("kind") != "disk"
+                          for d in obs.get("disks_detail") or [] if isinstance(d, dict)
+                          for key in (_disk_key(d), str(d.get("source") or "")) if key}
     # Disks some stored record already bills (or billed): a new record that takes one over starts it at the handoff.
     known_disks = frozenset(src for r in existing if is_live_instance_record(r) for src in (r.get("disk_sources") or []))
     for record in existing:
@@ -1369,8 +1375,12 @@ def reconcile_instance_records(
                 obs, project=project, now=now, previous=record, tax_overrides=tax_overrides,
                 known_disk_sources=known_disks - frozenset(record.get("disk_sources") or [])))
         elif not disks_listed and record.get("kind") == "disk" and record.get("status") != "DELETED":
-            # The disk listing is unavailable: a detached disk is not seen, not gone. Keep it (still billing).
-            records.append(record)
+            if set(record.get("disk_sources") or []) & observed_disk_keys:
+                # Even without the disk listing, a listed VM shows this disk attached: its record takes it over.
+                records.append(_mark_instance_deleted(record, now))
+            else:
+                # The disk listing is unavailable: a detached disk is not seen, not gone. Keep it (still billing).
+                records.append(record)
         elif record.get("status") == "DELETED" and record.get("disk_liability_pending"):
             if disks_listed:
                 # The disk listing is back: the cache disk is either listed on its own now (its DETACHED record
@@ -4302,7 +4312,12 @@ class DashboardStore:
                     live_total_cost_compute_only_usd = round(usage["cost_compute"], 2)
                     lifetime_cost = (live_total_cost_usd if include_disk_and_tax
                                      else live_total_cost_compute_only_usd)
-                    if inst["status"] == "DELETED":
+                    if inst["status"] == "DELETED" and inst.get("disk_liability_pending"):
+                        # Gone, but its retained disks may still bill: show that storage rate until resolved.
+                        hourly_rate = round(_stopped_disk_hourly(pricing) if include_disk_and_tax else 0.0, 4)
+                        daily_rate = round(hourly_rate * 24.0, 2)
+                        monthly_rate = round(hourly_rate * 24.0 * 365.0 / 12.0, 2)
+                    elif inst["status"] == "DELETED":
                         # Gone with its disks: no current rate (its history keeps its costs).
                         hourly_rate, daily_rate, monthly_rate = 0.0, 0.0, 0.0
                     elif inst["status"] in GCE_STOPPED_STATUSES:

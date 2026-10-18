@@ -2001,6 +2001,13 @@ def calculate_spot_pricing(
         result["complete"] = False
     if performance_billed:
         result["complete"] = False
+    # A disk type with neither a live rate nor a static one is priced at a generic fallback, which is not a price.
+    unknown_disk = [kind for kind, gb, live in ((boot_disk_type, boot_disk_gb, live_boot_disk),
+                                               (data_disk_type, data_disk_gb, live_data_disk))
+                    if gb and live is None and kind not in DISK_MONTHLY_RATES_USD_PER_GIB]
+    if unknown_disk:
+        result["complete"] = False
+        result["disk_rate_unknown"] = sorted(set(unknown_disk))
     if pricing_source == "catalog_baseline" and vcpu and family not in SERIES_SPOT_BASE_RATES:
         # No machine, component, or family rate: the generic per-vCPU/GiB fallback is not a trusted price.
         result["complete"] = False

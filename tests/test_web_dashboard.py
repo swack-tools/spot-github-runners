@@ -5795,6 +5795,54 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                         if float(k.split("|")[1]) >= self.now - 6 * 3600.0)
         self.assertGreater(disk_only, 0.0)  # Storage between deletion and resolution is kept.
 
+    def test_unknown_disk_type_rate_is_incomplete(self):
+        priced = calculate_spot_pricing(family="n2", vcpu=16, ram_gib=64.0, region="us-south1",
+                                        boot_disk_type="pd-balanced", boot_disk_gb=40, data_disk_type="pd-mystery",
+                                        data_disk_gb=100, machine_type="n2-standard-16", live_pricing={})
+        self.assertFalse(priced["complete"])
+        self.assertEqual(priced["disk_rate_unknown"], ["pd-mystery"])
+        obs = fleet_observation("9970", "oxidex-runners-dt-1", "us-south1-a", machine_type="n2-standard-16", now=self.now)
+        obs.update(data_disk_type="pd-mystery", data_disks={"pd-mystery": 100})
+        self.fleet = [obs]
+        with unittest.mock.patch("lib.dashboard_models.fetch_live_spot_pricing", return_value={}):
+            self.store.refresh_fleet_inventory()
+        rec = self._record("oxidex-runners-dt-1")
+        self.assertFalse(rec["pricing_complete"])
+        self.assertIn("pd-mystery", rec["pricing_incomplete_reason"])
+
+    def test_preserved_detached_record_retired_when_vm_attaches_it(self):
+        from lib.fleet_inventory import FleetListing, observe_detached_disks
+
+        cache = "z/disks/builder-oxidex-ra-cache"
+        self.fleet = observe_detached_disks({cache: {"id": "103", "name": "builder-oxidex-ra-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced"}})
+        self.store.refresh_fleet_inventory()
+        vm = fleet_observation("9980", "builder-oxidex-ra", "us-south1-b", started_hours_ago=0.1, now=self.now)
+        vm.update(disk_types_known=False, disks_detail=[{"type": "pd-balanced", "gb": 100, "created_epoch": None,
+                                                         "source": cache, "id": ""}])
+        listing = FleetListing([vm])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self._record("builder-oxidex-ra-cache")["status"], "DELETED")
+
+    def test_pending_liability_row_shows_storage_rate(self):
+        from lib.fleet_inventory import FleetListing
+
+        created = self.now - 5 * 86400.0
+        vm = fleet_observation("9990", "builder-oxidex-pr", "us-south1-b", started_hours_ago=120.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "pd-balanced", "gb": 100, "created_epoch": created, "source": "z/c-pr", "id": "71",
+             "auto_delete": False}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        listing = FleetListing([])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()
+        row = next(r for r in self.store.query_instances()["instances"] if r["name"] == "builder-oxidex-pr")
+        self.assertGreater(row["active_hourly_usd"], 0.0)
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]
