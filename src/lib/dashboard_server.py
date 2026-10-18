@@ -809,6 +809,18 @@ def _live_instance_record(
             if now > disk_open:
                 disk_segments.append((disk_open, now, prev_disk_all_in))
             disk_segment_start = now
+    if stopped_epoch is not None:
+        # A stop reported late: intervals of this run closed (for example at a price change) after the real stop
+        # end at the stop instead.
+        trimmed = []
+        for s0, e0, ca, co in prior_runs:
+            if s0 >= started_epoch and e0 > stopped_epoch:
+                if s0 >= stopped_epoch:
+                    continue
+                e0 = stopped_epoch
+            trimmed.append((s0, e0, ca, co))
+        prior_runs = trimmed
+        compute_segment_start = min(compute_segment_start, max(started_epoch, stopped_epoch))
     # Prune by time only (every accepted window is inside the retention period); keep lifetime totals.
     cutoff = now - DELETED_INSTANCE_RETENTION_SECONDS
     pruned_hours = float(previous.get("pruned_compute_hours") or 0.0) if previous is not None else 0.0
@@ -2010,6 +2022,8 @@ class DashboardStore:
                 self.state.get("instances", []), observed, project=self.project, now=self._clock(),
                 compacted=compacted)
             changed = changed or compacted != (self.state.get(COMPACTED_COSTS_STATE_KEY) or {})
+            # Current prices and tax settings, applied here (and so persisted) rather than on reads.
+            changed = self._refresh_instances_pricing(records, live=True) or changed
             # The first successful listing (after an upgrade, a migration, or enabling the inventory) is the
             # baseline: the fleet it finds already existed, so it is not growth that handles an OOM event.
             baselined = bool(self.state.get(FLEET_BASELINE_STATE_KEY))
@@ -3446,22 +3460,26 @@ class DashboardStore:
         if bump:
             self._mark_kv_dirty()
 
-    def _refresh_instances_pricing(self) -> None:
+    def _refresh_instances_pricing(self, records: list[Any] | None = None, *, live: bool = False) -> bool:
         """Recompute active instance pricing using current live/catalog machine rates while preserving historical rates on deleted instances.
 
-        Stopped inventory VMs are refreshed too: their disks keep billing at the current (tax) rates.
+        Reads (``live=False``) reprice only records that did not come from the inventory. Inventory records
+        (``live=True``, stopped ones included: their disks keep billing at current tax rates) are repriced only
+        by the inventory reconcile, which persists the change: a rate change first closes the open intervals at
+        the old rates, so it must be durable. Returns True when an inventory record's rates changed.
         """
         running_insts = [
             inst
-            for inst in self.state.get("instances", [])
+            for inst in (self.state.get("instances", []) if records is None else records)
             if isinstance(inst, dict)
-            and (inst.get("status") == "RUNNING"
-                 or (is_live_instance_record(inst) and inst.get("status") != "DELETED"))
+            and (is_live_instance_record(inst) and inst.get("status") != "DELETED" if live
+                 else inst.get("status") == "RUNNING" and not is_live_instance_record(inst))
             and inst.get("region")
             and inst.get("machine_type")
         ]
+        repriced = False
         if not running_insts:
-            return
+            return repriced
         active_regions = sorted({str(inst["region"]) for inst in running_insts})
         active_mtypes = sorted({str(inst["machine_type"]) for inst in running_insts})
         shared_live_pricing = fetch_live_spot_pricing(
@@ -3518,7 +3536,9 @@ class DashboardStore:
                 _mark_pricing_completeness(inst)
                 if old_pricing is not None and _pricing_rates(old_pricing) != _pricing_rates(inst["pricing"]):
                     # New rates apply from now on: time already billed keeps the rates it had.
-                    _close_open_segments(inst, old_pricing, time.time())
+                    _close_open_segments(inst, old_pricing, self._clock())
+                    repriced = True
+        return repriced
 
     def get_overview(
         self,

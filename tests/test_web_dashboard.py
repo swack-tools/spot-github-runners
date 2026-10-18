@@ -45,7 +45,10 @@ from lib.rust_build_telemetry import (
 
 
 def fleet_fixture_records(project: str = "homelab-424523", ref_now: float | None = None) -> list[dict]:
-    """Inventory-shaped instance records for tests (the dashboard itself no longer seeds any)."""
+    """Instance records for the HTTP and scaling tests, installed in memory (the dashboard itself seeds none).
+
+    They are not inventory records, so they take the legacy pricing paths those tests cover; a reload drops them.
+    """
     ref_now = time.time() if ref_now is None else ref_now
     records = [
         # Active instance in South Africa (matches the user's exact world map example)
@@ -310,8 +313,6 @@ def fleet_fixture_records(project: str = "homelab-424523", ref_now: float | None
             now_epoch=ref_now,
         ),
     ]
-    for record in records:
-        record[INSTANCE_SOURCE_KEY] = INSTANCE_SOURCE_GCE
     return records
 
 
@@ -4204,12 +4205,31 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not recorded"):
             self.store.create_vm_template_from_instance({"instance_name": "oxidex-runners-tier-1"})
 
-    def test_unchanged_shape_reuses_pricing(self):
+    def test_unchanged_rates_write_nothing(self):
         self.fleet = [fleet_observation("1010", "oxidex-runners-price-1", "us-south1-a", now=self.now)]
         self.store.refresh_fleet_inventory()
-        with unittest.mock.patch("lib.dashboard_server.calculate_spot_pricing") as pricing:
-            self.assertFalse(self.store.refresh_fleet_inventory())
-        pricing.assert_not_called()
+        version = self.store.state_version()
+        self.assertFalse(self.store.refresh_fleet_inventory())
+        self.assertEqual(self.store.state_version(), version)
+        self.assertEqual(self._record("oxidex-runners-price-1")["disk_segments"], [])
+
+    def test_delayed_stop_trims_repriced_segment(self):
+        running = fleet_observation("1011", "builder-oxidex-late-1", "us-south1-b", started_hours_ago=10.0,
+                                    now=self.now)
+        self.fleet = [running]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            budget = self.store.state["profiles"]["rust_builder"]["budget"]
+            budget["override_regional_tax"] = True
+            budget["tax_rate_percent"] = 30.0
+        self.store.refresh_fleet_inventory()  # Repriced while still RUNNING: a run segment closes at "now".
+        self.assertEqual(len(self._record("builder-oxidex-late-1")["prior_runs"]), 1)
+        # The next listing reports it stopped 3 hours ago (for example after an inventory outage).
+        self.fleet = [dict(running, status="TERMINATED", last_stop_epoch=self.now - 3 * 3600.0)]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-late-1")
+        self.assertTrue(all(run[1] <= self.now - 3 * 3600.0 + 1.0 for run in rec["prior_runs"]))
+        self.assertAlmostEqual(rec["runtime_hours"], 7.0, delta=0.05)
 
     def test_stopped_vm_shows_gce_status_and_stops_accruing(self):
         self.fleet = [fleet_observation("1002", "builder-oxidex-eu-1", "europe-west4-a", started_hours_ago=5.0,
@@ -4363,7 +4383,9 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             budget = self.store.state["profiles"]["rust_builder"]["budget"]
             budget["override_regional_tax"] = True
             budget["tax_rate_percent"] = 20.0
-        self.store.get_overview()
+        self.store.get_overview()  # Reads never reprice inventory records ...
+        self.assertNotEqual(self._record("builder-oxidex-tax-1")["pricing"]["tax_rate_percent"], 20.0)
+        self.assertTrue(self.store.refresh_fleet_inventory())  # ... the persisted reconcile does.
         self.assertEqual(self._record("builder-oxidex-tax-1")["pricing"]["tax_rate_percent"], 20.0)
 
     def test_build_record_evaluation_counts_shared_runner_burn(self):
@@ -4727,7 +4749,12 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             budget = self.store.state["profiles"]["rust_builder"]["budget"]
             budget["override_regional_tax"] = True
             budget["tax_rate_percent"] = 40.0
-        self.store.get_overview()
+        version = self.store.state_version()
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        self.assertEqual(self.store.state_version(), version + 1)
+        saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+        saved_rec = next(i for i in saved["instances"] if i["name"] == "builder-oxidex-reprice-1")
+        self.assertEqual(len(saved_rec["disk_segments"]), 1)  # The rate boundary is durable.
         rec = self._record("builder-oxidex-reprice-1")
         self.assertEqual(rec["pricing"]["tax_rate_percent"], 40.0)
         self.assertEqual(len(rec["disk_segments"]), 1)

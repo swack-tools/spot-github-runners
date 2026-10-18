@@ -344,7 +344,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
   that disk-only rate, and a deleted VM's row shows no current rate. When a VM starts again, its earlier running intervals stay in its runtime and
   window spend. When its machine type or disks change, or its prices change, the time before the change
-  keeps the earlier rates. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
+  keeps the earlier rates. A stop that's reported late ends the run at the reported stop time. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
   toward the runner and builder telemetry, but the disks of stopped VMs count against the scaling
   budgets. Hiding deleted instances doesn't hide stopped VMs, because they still exist. The listing
   carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.
@@ -366,8 +366,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
   plans are refused.
 - A VM in a region outside the dashboard's region catalog is priced with no tax, marked
-  `tax_rate_known: false`, rather than with another region's default tax. Stopped VMs are repriced
-  with running ones, so a tax override also applies to their disks.
+  `tax_rate_known: false`, rather than with another region's default tax. Each inventory refresh,
+  not a page read, reprices the listed VMs, stopped ones included, so a tax override also applies to
+  their disks, and the rate change is saved with the state.
 - A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, for a
   `SUSPENDED` VM, whose preserved memory Compute Engine also bills, and for a VM with Local SSD (counted
   as `local_ssd_gb`, not as a persistent data disk), the record is marked
