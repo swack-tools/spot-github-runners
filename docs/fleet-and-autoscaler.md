@@ -219,7 +219,7 @@ swack-tools:secret=spot-floor-github-<account>,account=<account>,group=<runner g
 | `secret` | Required. The Secret Manager secret that holds the GitHub token of the account that administers the target. It names a secret and never holds a token: the parser refuses a value that looks like one. Targets that one account administers share its secret. |
 | `account` | The GitHub account that `gh auth token --user` reads on a workstation, for `status` and `replace-unmanaged`. |
 | `group` | Organizations only. The runner group that the floor host's runner joins. The keeper requires a group with selected-repository access, and it refuses the Default group. Without `group`, the runner joins the Default group. Personal accounts support only repository runners, so a repository target has no group. |
-| `labels` | Extra scheduling labels joined with `+`, such as `ubuntu-latest`. Every floor runner also gets `spot`, its machine type, and its region. The keeper records the extra labels in the host metadata, so a later live patch keeps them. Labels compare without case, as on GitHub: the parser refuses a label listed twice in another case, and one that repeats a label every runner gets. |
+| `labels` | Extra scheduling labels joined with `+`, such as `ubuntu-latest`. Every floor runner also gets `spot`, its machine type, and its region. The keeper records the extra labels in the host metadata, so a later live patch keeps them. Labels compare without case, as on GitHub: the parser refuses a label listed twice in another case, and one that repeats a label every runner gets. At most 16 extra labels, the most the host metadata records. |
 | `ram` | The least RAM in GiB, from 4 to 32. The default is 16. |
 
 The configuration is an environment variable of the watchdog service, not an
@@ -314,8 +314,9 @@ A launch spans several ticks, so no tick waits for a bootstrap:
 
 A launch that has no runner online 30 minutes after the create is abandoned,
 unless its runner is running a job: the keeper deletes that VM, only if the
-VM still has the recorded instance ID, and removes the launch's own offline
-registrations. A VM that never appears within 20 minutes of the create, or one
+VM still has the recorded instance ID and a fresh runner list, read right
+before the delete, shows no runner of it online or busy. Then it removes the
+launch's own offline registrations. A VM that never appears within 20 minutes of the create, or one
 that disappears during the bootstrap, ends the launch the same way. Each
 failure starts the backoff. A create that was given up can still land, for
 example after a call timed out. When its VM appears within an hour, the keeper
@@ -347,7 +348,13 @@ check, because both controllers would otherwise replace one lost floor host:
 - At start-up, the autoscaler waits for the lease, checking at each interval.
   It also waits while the keeper has a launch or start in progress on the
   target, so that the keeper can finish it and remove its registration token.
-  With `--once`, it logs why and exits instead.
+  With `--once`, it logs why and exits instead. A running keeper ends every
+  such operation by its own deadline. Once that deadline has passed by 15
+  minutes, for example because the target left `SPOT_RUNNER_FLOOR_TARGETS`, the
+  floor is off, or the watchdog is paused, the autoscaler stops waiting. It
+  treats the host as an ordinary managed host, removes a leftover registration
+  token from the recorded instance, and changes nothing else: it deletes
+  nothing and leaves the floor record to the keeper.
 - Every fleet mutation first proves that the lease is still held. When it
   can't, for example after a workstation slept past the lease, the mutation is
   held and the controller exits with status 75 at its next check, so a restart
@@ -438,7 +445,12 @@ skips the target, and saves each phase before it acts, so a rerun resumes:
    counts as deleted. Then it waits until the VM is gone.
 
 A rerun with the same `--instance` resumes the recorded phase, even after the
-old runners or the old VM are gone. Before every drain step, the command checks
+old runners or the old VM are gone. It refuses instead when the target's
+`labels=` no longer includes a label that the old runners carry. If the old VM
+disappears during the drain while its registrations remain, the command
+confirms with a fresh read that the VM is gone, then removes each registration
+that is offline and idle on a fresh read. It holds while any of them is online
+or busy. Before every drain step, the command checks
 the managed host again. If the managed host loses a runner before any old
 runner is deregistered, the command releases the cordon, then restores the old
 runners' labels, and stops. Until the release is confirmed, the old runners

@@ -985,7 +985,8 @@ class AutoscalerLeaseTests(unittest.TestCase):
         store = world.store()
         lease = world.lease(store.lock_name)
         self.assertTrue(lease.acquire())
-        store.record["operation"] = {"kind": "launch", "phase": "booting", "name": "oxidex-runners-n"}
+        store.record["operation"] = {"kind": "launch", "phase": "booting", "name": "oxidex-runners-n",
+                                     "started_at": time.time(), "created_at": time.time()}
         store.save(lease)
         lease.release()
         holder = rf.AutoscalerTargetLease.for_target(PROJECT, "xbmc4lyfe/newznab-tmux", URI, client=world.client)
@@ -1503,3 +1504,152 @@ class LateCreateTests(unittest.TestCase):
                                    target_label_value("xbmc4lyfe/newznab-tmux"), True, gce_time(NOW)))
         world.tick()
         self.assertEqual(world.store().record["operation"]["instance_id"], "777")
+
+
+
+class Round6Tests(unittest.TestCase):
+    def test_abandon_rereads_github_immediately_before_the_delete(self):
+        world = World()
+        world.tick()
+        op = world.store().record["operation"]
+        world.replace_host(op["name"], status="RUNNING")
+        world.clock[0] += rf.LAUNCH_DEADLINE_SECONDS + 1
+        name = op["expected_runners"][0]
+        world.runners["xbmc4lyfe/newznab-tmux"] = [runner(name, status="offline", runner_id=77)]
+        original = world.provider.remove_startup_script
+
+        def came_online(h):
+            original(h)  # meanwhile the runner registers and takes a job
+            world.runners["xbmc4lyfe/newznab-tmux"] = [runner(name, busy=True, runner_id=77)]
+        world.provider.remove_startup_script = came_online
+        world.tick()
+        self.assertFalse([e for e in world.log if e[1] == "delete_instance"])
+        self.assertIn("operation", world.store().record)
+
+    def test_retire_late_rereads_github_immediately_before_the_delete(self):
+        world, late = LateCreateTests().late_world(("offline", False))
+        original = world.provider.remove_startup_script
+
+        def came_online(h):
+            original(h)
+            world.runners["xbmc4lyfe/newznab-tmux"].append(runner(f"gha-{late['name']}-1", runner_id=56))
+        world.provider.remove_startup_script = came_online
+        world.tick()
+        self.assertFalse([e for e in world.log if e[1] == "delete_instance"])
+        self.assertTrue(world.store().record["late_creates"])  # still watched
+
+    def test_the_extra_label_limit_matches_the_metadata_record(self):
+        from lib.runner_fleet import MAX_EXTRA_RUNNER_LABELS, runner_deployment_from_gce_item
+        self.assertEqual(MAX_EXTRA_RUNNER_LABELS, 16)
+        at_limit = "+".join(f"l{i}" for i in range(16))
+        self.assertEqual(len(rf.parse_targets(f"o/r:secret=s,labels={at_limit}")[0].labels), 16)
+        with self.assertRaises(ValueError) as caught:
+            rf.parse_targets(f"o/r:secret=s,labels={at_limit}+l16")
+        self.assertIn("at most 16", str(caught.exception))
+        # Case-only duplicates are refused before counting, never counted twice or silently dropped.
+        with self.assertRaises(ValueError):
+            rf.parse_targets(f"o/r:secret=s,labels={at_limit}+L0")
+        item = {"metadata": {"items": [{"key": "spot-runner-extra-labels", "value": at_limit}]}}
+        self.assertEqual(len(runner_deployment_from_gce_item(item)["runner_extra_labels"]), 16)
+        from lib import runner_manager
+        args = SimpleNamespace(extra_runner_labels=tuple(f"l{i}" for i in range(17)), target="o/r", runner_prefix="gha",
+                               runner_count=1, runner_label="spot", region="us-central1", heavy_runner_pool=None,
+                               org="swack-tools", runner_group_id=None)
+        with self.assertRaises(RuntimeError):
+            runner_manager.runner_patch_record(args, None)
+
+    def test_terminal_events_are_in_the_saved_history(self):
+        world = World()
+        world.tick()
+        op = world.store().record["operation"]
+        world.bootstrap(op["name"])
+        world.tick()
+        events = [row["event"] for row in world.store().record["history"]]
+        self.assertEqual(events[-1], "ready")
+        world = World()
+        world.create_error = "ZONE_RESOURCE_POOL_EXHAUSTED"
+        world.tick()
+        self.assertEqual(world.store().record["history"][-1]["event"], "launch_failed")
+        world = World()
+        world.groups[("swack-tools", 10)] = {"id": 10, "name": "Default", "visibility": "all", "default": True}
+        world.tick(only=("swack-tools",))
+        self.assertEqual(world.store("swack-tools").record["history"][-1]["event"], "launch_held")
+
+
+class OrphanedOperationTests(unittest.TestCase):
+    def test_deadlines(self):
+        self.assertEqual(rf.operation_deadline({"kind": "launch", "phase": "creating", "started_at": 100}),
+                         100 + rf.CREATE_CONFIRM_SECONDS + rf.ORPHAN_GRACE_SECONDS)
+        self.assertEqual(rf.operation_deadline({"kind": "launch", "phase": "booting", "started_at": 50,
+                                                "created_at": 100}),
+                         100 + rf.LAUNCH_DEADLINE_SECONDS + rf.ORPHAN_GRACE_SECONDS)
+        self.assertEqual(rf.operation_deadline({"kind": "restart", "started_at": 100}),
+                         100 + rf.RESTART_DEADLINE_SECONDS + rf.ORPHAN_GRACE_SECONDS)
+        # A running keeper ends every operation well before that: the grace is several ticks.
+        from lib import control_watchdog_deploy as deploy
+        self.assertGreaterEqual(rf.ORPHAN_GRACE_SECONDS, 5 * 180)
+        self.assertEqual(deploy.DEFAULT_SCHEDULE, "*/3 * * * *")
+
+    def store_op(self, world, operation):
+        store = world.store()
+        lease = world.lease(store.lock_name)
+        self.assertTrue(lease.acquire())
+        store.record["operation"] = operation
+        store.save(lease)
+        lease.release()
+
+    def test_a_target_removed_mid_launch_doesnt_block_the_autoscaler_forever(self):
+        from lib import spot_runner_autoscaler as autoscaler
+        world = World()
+        started = time.time() - rf.LAUNCH_DEADLINE_SECONDS - rf.ORPHAN_GRACE_SECONDS - 1
+        operation = {"kind": "launch", "phase": "booting", "name": "oxidex-runners-n", "zone": "us-central1-a",
+                     "instance_id": "500", "started_at": started, "created_at": started}
+        self.store_op(world, operation)
+        holder = rf.AutoscalerTargetLease.for_target(PROJECT, "xbmc4lyfe/newznab-tmux", URI, client=world.client)
+        scrubbed = []
+        args = argparse.Namespace(project=PROJECT, target="xbmc4lyfe/newznab-tmux", org="swack-tools", once=True,
+                                  interval_seconds=300)
+        with patch.dict(os.environ, {rf.ENV_STATE_URI: URI}), \
+                patch.object(rf.AutoscalerTargetLease, "for_target", lambda *a, **k: holder), \
+                patch.object(rf, "scrub_orphaned_token", lambda project, op: scrubbed.append(op) or "scrubbed"):
+            held = autoscaler.acquire_floor_lease(args)
+        try:
+            self.assertIs(held, holder)  # it went ahead instead of waiting
+            self.assertEqual(scrubbed[0]["instance_id"], "500")
+        finally:
+            autoscaler.release_floor_lease(held)
+        # The floor record is the keeper's: the autoscaler changed nothing in it.
+        self.assertEqual(world.store().record["operation"], operation)
+
+    def test_a_live_operation_still_waits(self):
+        world = World()
+        self.store_op(world, {"kind": "restart", "name": "x", "started_at": time.time()})
+        holder = rf.AutoscalerTargetLease.for_target(PROJECT, "xbmc4lyfe/newznab-tmux", URI, client=world.client)
+        self.assertIsNotNone(holder.pending_operation())
+        self.assertIsNone(holder.orphaned)
+        self.assertIsNone(holder.pending_operation(now=time.time() + rf.RESTART_DEADLINE_SECONDS
+                                                   + rf.ORPHAN_GRACE_SECONDS + 1))
+        self.assertIsNotNone(holder.orphaned)
+
+    def test_the_scrub_touches_only_the_recorded_instance_and_deletes_nothing(self):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append(argv)
+            if "describe" in argv:
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"id": instance, "metadata": {"items": [{"key": "startup-script"}]}}), stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        op = {"kind": "launch", "name": "oxidex-runners-n", "zone": "us-central1-a", "instance_id": "500"}
+        instance = "500"
+        self.assertIn("removed", rf.scrub_orphaned_token(PROJECT, op, run=run))
+        self.assertEqual(calls[-1][:4], ["gcloud", "compute", "instances", "remove-metadata"])
+        self.assertIn("--keys=startup-script", calls[-1])
+        calls.clear()
+        instance = "999"
+        self.assertIn("another instance", rf.scrub_orphaned_token(PROJECT, op, run=run))
+        self.assertEqual(len(calls), 1)
+        calls.clear()
+        self.assertIn("no confirmed instance", rf.scrub_orphaned_token(PROJECT, dict(op, instance_id=""), run=run))
+        self.assertEqual(calls, [])
+        self.assertFalse([c for c in calls if "delete" in c])

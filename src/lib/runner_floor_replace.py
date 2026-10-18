@@ -313,6 +313,36 @@ class Replacement:
         names = set(self.rep["old_runner_names"])
         return [r for r in runners if r.name in names]
 
+    def _remove_stale_registrations(self, leftover: Sequence[GitHubRunner]) -> int | None:
+        """The old VM vanished (for example during its drain) and left registrations behind: nothing deregisters
+        them any more, so they would hold the deletion phase forever. A fresh describe must confirm the VM absent;
+        then each offline, idle one is removed after a fresh read. An online or busy one holds instead."""
+        if self.inventory.describe(self.rep["old"]["name"], self.rep["old"]["zone"]) is not None:
+            self.say(f"{self.rep['old']['name']} is visible again; waiting for its runners to disappear")
+            return None
+        in_use = [r.name for r in leftover if r.online or r.busy]
+        if in_use:
+            self.say(f"holding: {', '.join(in_use)} still report online or busy although "
+                     f"{self.rep['old']['name']} is gone; no registration is removed until they're offline and idle")
+            return None
+        for runner in leftover:
+            fresh = self.github.get_runner(self.target.target, runner.runner_id)
+            if fresh is None:
+                continue
+            if fresh.get("name") != runner.name or fresh.get("busy") is not False or fresh.get("status") != "offline":
+                self.say(f"holding: {runner.name} is not offline and idle on a fresh read")
+                return None
+            self.rep["deregistering"] = runner.name  # settled by reconcile_pending if the delete's result is lost
+            self.save()
+            self.lease.ensure()
+            self.github.delete_runner(self.target.target, runner.runner_id)
+            self.rep["deregistered"] = sorted(set(self.rep.get("deregistered") or []) | {runner.name})
+            self.rep.pop("deregistering", None)
+            self.save()
+        self.say(f"removed the stale registrations of the vanished {self.rep['old']['name']}: "
+                 f"{', '.join(r.name for r in leftover)}")
+        return None
+
     def _hold_for_managed(self, phase: str, why: str) -> None:
         """The old runners are (partly) gone, so the old host can't be restored, and the managed host isn't ready:
         keep the old VM, return to ensure_managed (which waits for, or re-provisions, the managed floor host), then
@@ -465,6 +495,8 @@ class Replacement:
             return None
         if phase == "deleting":
             leftover = self._old_runners(runners)
+            if leftover and old is None:
+                return self._remove_stale_registrations(leftover)
             if leftover:
                 self.say(f"waiting for {', '.join(r.name for r in leftover)} to disappear from GitHub")
                 return None
@@ -553,6 +585,13 @@ def run_replace(args: argparse.Namespace, config: rf.FloorConfig) -> int:
         # deleted, which a fresh preflight would refuse.
         print(json.dumps({"target": target.name, "resume": {k: v for k, v in recorded.items()
                                                              if k != "original_labels"}}, indent=2, sort_keys=True))
+        # The configuration may have changed since the replacement started: a managed host can only ever carry the
+        # target's current labels, so a required label that left labels= would make the resume wait forever.
+        lost = sorted(rf.folded(recorded.get("required_labels") or []) - rf.folded({rf.BASE_LABEL, *target.labels}))
+        if lost and recorded.get("phase") in ("ensure_managed", "verified", "draining"):
+            print(f"Refused: {target.name} no longer has labels {', '.join(lost)} in {rf.ENV_TARGETS}, which the "
+                  "old runners carry and the managed host must too; restore them, then rerun")
+            return 1
         if not args.apply:
             print(f"Preview only; nothing changed. Rerun with --apply to resume phase {recorded.get('phase')}.")
             return 0

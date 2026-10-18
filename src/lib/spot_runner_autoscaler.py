@@ -3188,6 +3188,12 @@ def acquire_floor_lease(args: argparse.Namespace):
         install_mutation_fence(holder.guard)
         LOG.info('Holding the runner floor lease of %s; the floor keeper skips this target while this controller '
                  'runs', target)
+        if holder.orphaned:
+            # Nobody finished that floor operation: its host is an ordinary managed host now. Only its leftover
+            # one-use token is removed; nothing is deleted.
+            from .runner_floor import scrub_orphaned_token
+            LOG.warning('Orphaned runner floor operation on %s: %s', target,
+                        scrub_orphaned_token(args.project, holder.orphaned))
     except BaseException:
         release_floor_lease(holder)
         raise

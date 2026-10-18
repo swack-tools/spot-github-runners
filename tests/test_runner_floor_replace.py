@@ -441,6 +441,63 @@ class DeleteGuardTests(unittest.TestCase):
         self.assertEqual(world.store_.record["replacement"]["phase"], "done")
 
 
+class VanishedVmTests(unittest.TestCase):
+    def vanished(self, runners):
+        world = ReplaceWorld()
+        rep = world.replacement()
+        world.bring_managed_online(rep)
+        world.store_.record["replacement"]["phase"] = "draining"
+        world.hosts = [h for h in world.hosts if h.name != OLD]  # gone during its drain
+        world.runners[TARGET] = runners + [r for r in world.runners[TARGET] if r.name.startswith("gha-")]
+        self.assertIsNone(rep.step())  # draining -> deleting
+        self.assertEqual(world.store_.record["replacement"]["phase"], "deleting")
+        return world, rep
+
+    def test_stale_offline_registrations_are_removed_and_the_replacement_finishes(self):
+        offline = [GitHubRunner(r.runner_id, r.name, "offline", False, r.labels) for r in old_runners()]
+        world, rep = self.vanished(offline)
+        self.assertIsNone(rep.step())
+        self.assertEqual(sorted(e[2] for e in world.log if e[1] == "delete_runner"), [101, 102, 103, 104])
+        self.assertEqual(len(world.store_.record["replacement"]["deregistered"]), 4)
+        self.assertEqual(rep.step(), 0)
+        self.assertEqual(world.store_.record["replacement"]["phase"], "done")
+
+    def test_an_online_or_busy_registration_holds(self):
+        for status, busy in (("online", False), ("offline", True)):
+            with self.subTest(status=status, busy=busy):
+                # The last runner is the one in use: no earlier one may be removed either.
+                runners = [GitHubRunner(r.runner_id, r.name, status if r.runner_id == 104 else "offline",
+                                        busy and r.runner_id == 104, r.labels) for r in old_runners()]
+                world, rep = self.vanished(runners)
+                for _ in range(3):
+                    self.assertIsNone(rep.step())
+                self.assertFalse([e for e in world.log if e[1] == "delete_runner"])
+                self.assertIn("holding", world.out[-1])
+
+    def test_a_registration_that_turns_busy_on_the_fresh_read_holds(self):
+        offline = [GitHubRunner(r.runner_id, r.name, "offline", False, r.labels) for r in old_runners()]
+        world, rep = self.vanished(offline)
+        world.github.get_runner = lambda t, runner_id: {"id": runner_id, "name": f"newznab-asia-{runner_id - 100}",
+                                                        "busy": True, "status": "online"}
+        self.assertIsNone(rep.step())
+        self.assertFalse([e for e in world.log if e[1] == "delete_runner"])
+
+    def test_the_vm_must_be_confirmed_absent_by_a_fresh_describe(self):
+        offline = [GitHubRunner(r.runner_id, r.name, "offline", False, r.labels) for r in old_runners()]
+        world, rep = self.vanished(offline)
+        described = world.provider.describe
+        calls = []
+
+        def describe(name, zone):
+            calls.append(name)
+            if name == OLD and calls.count(OLD) >= 2:
+                return old_host()  # it reappears for the confirming read
+            return described(name, zone)
+        world.provider.describe = describe
+        self.assertIsNone(rep.step())
+        self.assertFalse([e for e in world.log if e[1] == "delete_runner"])
+
+
 class CordonIntentTests(unittest.TestCase):
     def test_the_intent_is_saved_before_the_cordon_call_and_an_ambiguous_result_is_released(self):
         world = ReplaceWorld()
@@ -574,6 +631,31 @@ class PendingDeregistrationTests(unittest.TestCase):
             self.assertEqual(rp.run_replace(args, world.config), 0)
         self.assertIn("resume phase aborted", out.getvalue())
         self.assertNotIn("Refused", out.getvalue())
+
+
+class ConfigChangeTests(unittest.TestCase):
+    def test_a_resume_after_a_required_label_left_the_config_refuses_instead_of_waiting(self):
+        world = ReplaceWorld()  # recorded with required labels spot and ubuntu-latest
+        world.store_.record["replacement"]["phase"] = "ensure_managed"
+        world.store_.save(world.lease_)
+        world.lease_.release()
+        changed = World("xbmc4lyfe/newznab-tmux:secret=spot-floor-github-xbmc4lyfe,account=xbmc4lyfe").config
+        args = argparse.Namespace(project=PROJECT, target=TARGET, instance=OLD, zone="asia-east2-a",
+                                  old_runner=[], accept_dropped_labels=True, label_strip_drain=False,
+                                  github_user="", apply=True, max_wait_seconds=1, poll_seconds=1)
+
+        class Tokens:
+            def __init__(self, *a, **k):
+                pass
+
+            def __call__(self, target):
+                return "gho_x"
+        out = io.StringIO()
+        with patch.object(rf, "TokenSource", Tokens), patch.object(rf, "GitHubClient", lambda token, **k: world.github), \
+                patch.object(rf, "ComputeInventory", lambda project: world.provider), \
+                patch.object(rp, "GcsClient", lambda bucket: world.client), redirect_stdout(out):
+            self.assertEqual(rp.run_replace(args, changed), 1)
+        self.assertIn("no longer has labels ubuntu-latest", out.getvalue())
 
 
 class ResumeTests(unittest.TestCase):

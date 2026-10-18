@@ -57,7 +57,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from .gcs_control_state import (AccessToken, GcsAmbiguous, GcsClient, GcsError, GcsLease, GcsPreconditionFailed,
                                 LeaseLost, StateLocation, parse_state_uri)
 from .https_transport import Transport, TransportError, https_request
-from .runner_fleet import GitHubRunner
+from .runner_fleet import MAX_EXTRA_RUNNER_LABELS, GitHubRunner
 from .runner_labels import DEFAULT_RUNNER_LABELS
 from .target_config import TargetConfig, resolve_target, target_label_value, target_owns_vm_label
 
@@ -108,6 +108,10 @@ LAUNCH_MIN_SECONDS = 300
 STEP_MIN_SECONDS = 120
 CREATE_MIN_SECONDS = 180         # the disk and VM create, checked again right before the intent is saved
 LATE_CREATE_WATCH_SECONDS = 3600 # a create that failed visibly can still land; its VM is adopted for this long
+# An operation a running keeper always ends (finishes or abandons) by its own deadline. Past it plus this grace (five
+# ticks), nothing is managing it (its target left SPOT_RUNNER_FLOOR_TARGETS, the floor is off, or the watchdog is
+# paused), and an autoscaler stops waiting for it.
+ORPHAN_GRACE_SECONDS = 900
 TARGET_MIN_SECONDS = 30
 GCLOUD_TIMEOUT_SECONDS = 600
 DEADLINE_MARGIN_SECONDS = 20
@@ -242,6 +246,9 @@ def parse_targets(text: str | None) -> tuple[FloorTarget, ...]:
             if label.casefold() in folded(labels):
                 raise ValueError(f"floor target {name}: label {label} is listed twice (labels ignore case)")
             labels.append(label)
+        if len(labels) > MAX_EXTRA_RUNNER_LABELS:  # counted after the case-insensitive duplicate check above
+            raise ValueError(f"floor target {name}: at most {MAX_EXTRA_RUNNER_LABELS} extra labels, the most a host's "
+                             f"metadata records for later label syncs; {len(labels)} given")
         ram = DEFAULT_MIN_RAM_GIB
         if "ram" in options:
             if not options["ram"].isdigit() or not 4 <= int(options["ram"]) <= MAX_RAM_GIB:
@@ -1184,6 +1191,12 @@ class FloorKeeper:
         self.record["updated_at"] = self.clock()
         self._save()
 
+    def _saved(self, event: str, detail: str) -> str:
+        """Record a terminal event in the history, then save: the event is part of the write that ends the step."""
+        text = self.note(event, detail)
+        self.save()
+        return text
+
     def note(self, event: str, detail: str) -> str:
         history = self.record.setdefault("history", [])
         history.append({"at": self.clock(), "event": event, "detail": detail[:500]})
@@ -1227,8 +1240,7 @@ class FloorKeeper:
                              occupied_regions=sorted({h.region for h in others}))
         if offer is None:
             self._record_failure(None)
-            self.save()
-            return self.note("launch_held", f"no 4-vCPU Spot offer with at least {self.target.min_ram_gib} GiB costs "
+            return self._saved("launch_held", f"no 4-vCPU Spot offer with at least {self.target.min_ram_gib} GiB costs "
                                             f"less than ${self.config.max_daily_usd}/day in "
                                             f"{', '.join(self.config.regions)} outside failed zones")
         suffix = launch_name_suffix(offer.region, offer.zone, self.target.name)
@@ -1240,17 +1252,17 @@ class FloorKeeper:
             self.provider.preflight(args, offer.zone)
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             self._record_failure(offer.zone)
-            self.save()
-            return self.note("launch_held", f"{offer.machine_type} in {offer.zone} failed the price and quota "
+            return self._saved("launch_held", f"{offer.machine_type} in {offer.zone} failed the price and quota "
                                             f"preflight: {exc}")
         group_name = ""
         if self.target.group_id and not self.target.is_repo:
             group = self.github.runner_group(self.target.name, self.target.group_id)
             if group.get("visibility") != "selected" or group.get("default"):
+                why = (f"runner group {self.target.group_id} of {self.target.name} must be a selected-repository "
+                       "group, not the Default group or one open to all repositories")
                 self._record_failure(None)
-                self.save()
-                raise FloorError(f"runner group {self.target.group_id} of {self.target.name} must be a "
-                                 "selected-repository group, not the Default group or one open to all repositories")
+                self._saved("launch_held", why)
+                raise FloorError(why)
             group_name = group["name"]
         # Pricing and the preflight took time: the create itself must still fit, or nothing is saved or created.
         self.deadline.require(CREATE_MIN_SECONDS, f"the floor host create for {self.target.name}")
@@ -1291,8 +1303,7 @@ class FloorKeeper:
         operation = self.record["operation"]
         operation.update(phase="booting", instance_id=vm.instance_id,
                          created_at=operation.get("created_at") or self.clock())
-        self.save()
-        return self.note("booting", f"{vm.describe()} created as instance {vm.instance_id}; waiting for its runners")
+        return self._saved("booting", f"{vm.describe()} created as instance {vm.instance_id}; waiting for its runners")
 
     def _do_confirm_create(self, plan: Plan, hosts: Sequence[Host]) -> str:
         return self._booting(plan.host)
@@ -1309,8 +1320,7 @@ class FloorKeeper:
             self.save()
         elif entry["instance_id"] != vm.instance_id:
             self.record["late_creates"] = [e for e in self.record["late_creates"] if e is not entry]
-            self.save()
-            return self.note("late_create_left", f"{vm.name} is now instance {vm.instance_id}, not the "
+            return self._saved("late_create_left", f"{vm.name} is now instance {vm.instance_id}, not the "
                                                  f"{entry['instance_id']} first seen; it isn't this keeper's to delete")
         names = list((entry.get("operation") or {}).get("expected_runners") or expected_runner_names(vm.name))
         runners = {r.name: r for r in self.github.list_runners(self.target.target)}
@@ -1323,18 +1333,19 @@ class FloorKeeper:
             if name in runners:
                 self.github.delete_runner(self.target.target, runners[name].runner_id)
         fresh = self.provider.describe(vm.name, vm.zone)
-        self.record["late_creates"] = [e for e in self.record["late_creates"] if e is not entry]
-        if fresh is None:
-            self.save()
-            return self.note("late_create_gone", f"{vm.name} is gone")
-        if fresh.instance_id != entry["instance_id"]:
-            self.save()
-            return self.note("late_create_left", f"{vm.name} is now another instance; left alone")
+        if fresh is None or fresh.instance_id != entry["instance_id"]:
+            self.record["late_creates"] = [e for e in self.record["late_creates"] if e is not entry]
+            return self._saved("late_create_gone" if fresh is None else "late_create_left",
+                               f"{vm.name} is gone" if fresh is None else f"{vm.name} is now another instance; "
+                                                                           "left alone")
         if fresh.startup_script and fresh.status not in STOPPED_STATUSES:
             self.provider.remove_startup_script(fresh)
+        in_use = self._runners_in_use(names)  # GitHub again, immediately before the delete
+        if in_use:
+            return self.note("late_create_held", f"{in_use} on {fresh.name} right before its delete; holding")
         self.provider.delete_instance(fresh)
-        self.save()
-        return self.note("late_create_retired", f"deleted excess {fresh.describe()}: {plan.reason}")
+        self.record["late_creates"] = [e for e in self.record["late_creates"] if e is not entry]
+        return self._saved("late_create_retired", f"deleted excess {fresh.describe()}: {plan.reason}")
 
     def _do_adopt_late(self, plan: Plan, hosts: Sequence[Host]) -> str:
         entry = next(e for e in self.record.get("late_creates") or []
@@ -1378,8 +1389,7 @@ class FloorKeeper:
                         self.target.name, exc)
         self.record.pop("operation", None)
         self._record_failure(zone if zone_failure else None)
-        self.save()
-        return self.note("launch_failed", why)
+        return self._saved("launch_failed", why)
 
     def _do_launch_failed(self, plan: Plan, hosts: Sequence[Host]) -> str:
         return self._launch_failed(plan.reason)
@@ -1417,27 +1427,36 @@ class FloorKeeper:
         self.record.pop("operation", None)
         self.record["failures"] = 0
         self.record["next_attempt_at"] = 0
-        self.save()
-        return self.note("ready", f"{vm.describe()} serves {self.target.name} with "
+        return self._saved("ready", f"{vm.describe()} serves {self.target.name} with "
                                   f"{len(operation['expected_runners'])} runner(s)")
+
+    def _runners_in_use(self, names: Sequence[str]) -> str | None:
+        """A fresh GitHub read: why the named runners forbid a delete (one runs a job or is online), or None."""
+        runners = {r.name: r for r in self.github.list_runners(self.target.target)}
+        busy = [n for n in names if n in runners and runners[n].busy]
+        if busy:
+            return f"runner(s) {', '.join(busy)} run a job"
+        online = [n for n in names if n in runners and runners[n].online]
+        if online:
+            return f"runner(s) {', '.join(online)} came online"
+        return None
 
     def _do_abandon_launch(self, plan: Plan, hosts: Sequence[Host]) -> str:
         operation = self.record["operation"]
         names = operation.get("expected_runners") or []
-        runners = {r.name: r for r in self.github.list_runners(self.target.target)}
-        busy = [n for n in names if n in runners and runners[n].busy]
-        if busy:
-            return self.note("abandon_waits", f"runner(s) {', '.join(busy)} of {operation['name']} run a job")
-        online = [n for n in names if n in runners and runners[n].online]
-        if online:
-            return self.note("abandon_waits", f"runner(s) {', '.join(online)} of {operation['name']} came online; "
-                                              "the next tick finishes the launch")
+        in_use = self._runners_in_use(names)
+        if in_use:
+            return self.note("abandon_waits", f"{in_use} on {operation['name']}; the next tick finishes or waits")
         vm = self.provider.describe(operation["name"], operation["zone"])
         if vm is not None:
             if vm.instance_id != operation.get("instance_id"):
                 return self._launch_failed(f"{plan.reason}; {vm.name} is now another instance, left alone")
             if vm.startup_script and vm.status not in STOPPED_STATUSES:
                 self.provider.remove_startup_script(vm)
+            # GitHub again, immediately before the delete: a runner may have come online meanwhile.
+            in_use = self._runners_in_use(names)
+            if in_use:
+                return self.note("abandon_waits", f"{in_use} on {vm.name} right before its delete; holding")
             self.provider.delete_instance(vm)
         self._cleanup_registrations(names)
         return self._launch_failed(f"abandoned: {plan.reason}")
@@ -1463,21 +1482,18 @@ class FloorKeeper:
     def _do_finish_restart(self, plan: Plan, hosts: Sequence[Host]) -> str:
         self.record.pop("operation", None)
         self.record["failures"] = 0
-        self.save()
-        return self.note("ready", plan.reason)
+        return self._saved("ready", plan.reason)
 
     def _do_fail_restart(self, plan: Plan, hosts: Sequence[Host]) -> str:
         operation = self.record.pop("operation", None) or {}
         failed = [i for i in self.record.get("restart_failed") or [] if i != operation.get("instance_id")]
         self.record["restart_failed"] = (failed + [operation.get("instance_id")])[-HISTORY_LIMIT:]
         self._record_failure(None)
-        self.save()
-        return self.note("restart_failed", plan.reason)
+        return self._saved("restart_failed", plan.reason)
 
     def _do_restart_lost(self, plan: Plan, hosts: Sequence[Host]) -> str:
         self.record.pop("operation", None)
-        self.save()
-        return self.note("restart_lost", plan.reason)
+        return self._saved("restart_lost", plan.reason)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1603,6 +1619,54 @@ def status_report(config: FloorConfig, services: Services) -> list[dict[str, Any
 # --------------------------------------------------------------------------------------------
 # The operator autoscaler's per-target lease (opt-in: SPOT_RUNNER_FLOOR_STATE_URI in its environment)
 # --------------------------------------------------------------------------------------------
+
+def operation_deadline(operation: Mapping[str, Any]) -> float:
+    """When a running keeper has certainly finished or abandoned ``operation``, plus ORPHAN_GRACE_SECONDS."""
+    def at(key: str) -> float:
+        try:
+            return float(operation.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    if operation.get("kind") == "restart":
+        end = at("started_at") + RESTART_DEADLINE_SECONDS
+    elif operation.get("phase") == "creating":
+        end = at("started_at") + CREATE_CONFIRM_SECONDS
+    else:
+        end = (at("created_at") or at("started_at")) + LAUNCH_DEADLINE_SECONDS
+    return end + ORPHAN_GRACE_SECONDS
+
+
+def operation_orphaned(operation: Mapping[str, Any], now: float) -> bool:
+    return now >= operation_deadline(operation)
+
+
+def scrub_orphaned_token(project: str, operation: Mapping[str, Any],
+                         run: Callable[..., Any] = subprocess.run) -> str:
+    """Remove the one-use registration token from an orphaned launch's VM: only the recorded instance, only the
+    startup-script metadata key. Deletes nothing, never raises (the token also expires an hour after its creation)."""
+    name, zone, instance_id = (str(operation.get(k) or "") for k in ("name", "zone", "instance_id"))
+    if operation.get("kind") != "launch" or not (name and zone and instance_id):
+        return "nothing to scrub: no confirmed instance"
+    try:
+        found = run(["gcloud", "compute", "instances", "describe", name, f"--zone={zone}", f"--project={project}",
+                     "--format=json(id,metadata.items[].key)"], check=False, capture_output=True, text=True,
+                    timeout=60)
+        if found.returncode != 0:
+            return f"{name} is not readable or gone; nothing scrubbed"
+        item = json.loads(found.stdout or "{}")
+        if str(item.get("id") or "") != instance_id:
+            return f"{name} is now another instance; left alone"
+        keys = {row.get("key") for row in (item.get("metadata") or {}).get("items") or [] if isinstance(row, dict)}
+        if "startup-script" not in keys:
+            return f"{name} carries no startup-script"
+        removed = run(["gcloud", "compute", "instances", "remove-metadata", name, f"--zone={zone}",
+                       f"--project={project}", "--keys=startup-script", "--quiet"], check=False, capture_output=True,
+                      text=True, timeout=120)
+        return (f"removed the leftover registration token from {name}" if removed.returncode == 0
+                else f"could not remove the token from {name}: {(removed.stderr or '').strip()[:200]}")
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return f"could not check {name}: {type(exc).__name__}"
+
 
 def kill_process_group(pid: int, *, grace: float = 2.0, killpg: Callable[[int, int], None] = os.killpg,
                        sleep: Callable[[float], None] = time.sleep,
@@ -1740,6 +1804,7 @@ class AutoscalerTargetLease:
         self._thread: threading.Thread | None = None
         self.lost: BaseException | None = None
         self._children: set[Any] = set()
+        self.orphaned: dict | None = None
 
     @classmethod
     def for_target(cls, project: str, target: str, uri: str, *, client: GcsClient | None = None) -> \
@@ -1794,12 +1859,21 @@ class AutoscalerTargetLease:
                 LOG.error("%s", exc)
                 return
 
-    def pending_operation(self) -> dict | None:
-        """The floor keeper's launch or start in progress on this target, if any (read without the lease)."""
+    def pending_operation(self, now: float | None = None) -> dict | None:
+        """The floor keeper's launch or start in progress on this target, if any. An orphaned one (see
+        ``operation_orphaned``) doesn't count: it is kept in ``orphaned`` and the autoscaler goes ahead."""
         record = TargetStore(self.lease.client, self.location, self.project,
                              FloorTarget(self.target, secret="-")).load()
         operation = record.get("operation")
-        return operation if isinstance(operation, dict) and operation else None
+        if not isinstance(operation, dict) or not operation:
+            return None
+        if operation_orphaned(operation, time.time() if now is None else now):
+            self.orphaned = operation
+            LOG.warning("Runner floor %s of %s on %s passed its deadline with nobody managing it (its target left "
+                        "the floor, the floor is off, or the watchdog is paused); the autoscaler manages that host as "
+                        "a normal managed host", operation.get("kind"), operation.get("name"), self.target)
+            return None
+        return operation
 
     def start(self) -> None:
         self._stop.clear()

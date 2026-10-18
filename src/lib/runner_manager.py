@@ -41,6 +41,7 @@ from .runner_fleet import (
     RUNNER_HEAVY_POOL_METADATA_KEY,
     RUNNER_LABEL_METADATA_KEY,
     RUNNER_EXTRA_LABELS_METADATA_KEY,
+    MAX_EXTRA_RUNNER_LABELS,
     RUNNER_GROUP_METADATA_KEY,
     RUNNER_PREFIX_METADATA_KEY,
     RUNNER_REGION_METADATA_KEY,
@@ -486,6 +487,9 @@ def runner_patch_record(args: argparse.Namespace, patch: RunnerPatch | None) -> 
     if re.fullmatch(r"[a-z0-9-]{1,40}", region):
         plain[RUNNER_REGION_METADATA_KEY] = region
     extra_labels = [str(label) for label in getattr(args, "extra_runner_labels", ()) or ()]
+    if len(extra_labels) > MAX_EXTRA_RUNNER_LABELS:
+        raise RuntimeError(f"At most {MAX_EXTRA_RUNNER_LABELS} extra runner labels can be recorded; "
+                           f"{len(extra_labels)} were requested")
     if extra_labels and all(re.fullmatch(r"[A-Za-z0-9._-]{1,64}", label) for label in extra_labels):
         plain[RUNNER_EXTRA_LABELS_METADATA_KEY] = "+".join(extra_labels)
     heavy = getattr(args, "heavy_runner_pool", None)
