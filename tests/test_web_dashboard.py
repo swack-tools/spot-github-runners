@@ -7737,6 +7737,19 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         self.assertEqual((updated["cache_hits"], updated["cache_misses"], updated["total_crates"]), (8, 3, 11))
         self.assertEqual(updated["reported_crate_counts"], ["cache_hits", "cache_misses"])
 
+    def test_derived_crate_count_follows_changed_inputs(self):
+        base = {"build_id": "rb-rederive", "status": "DELIVERED", "total_duration_seconds": 30.0}
+        first = self.store.record_rust_build({**base, "cache_hits": 8, "total_crates": 10})["build"]
+        self.assertEqual(first["cache_misses"], 2)
+        updated = self.store.record_rust_build({"build_id": "rb-rederive", "total_crates": 12})["build"]
+        self.assertEqual((updated["cache_hits"], updated["cache_misses"], updated["total_crates"]), (8, 4, 12))
+
+    def test_numeric_string_shape_echo_keeps_benchmark(self):
+        self.store.record_rust_build({"build_id": "rb-str", "status": "DELIVERED", "total_duration_seconds": 10.0,
+                                      "instance_benchmark_score": 3000, "vcpu": 16, "cpu_time_seconds": 1.0})
+        echoed = self.store.record_rust_build({"build_id": "rb-str", "vcpu": "16"})["build"]
+        self.assertEqual(echoed["instance_benchmark_score"], 3000)
+
     def test_summary_counts_reported_zero_crate_builds(self):
         self.store.record_rust_build({"build_id": "rb-zero", "status": "DELIVERED", "total_duration_seconds": 5.0,
                                       "cache_hits": 0, "total_crates": 0})

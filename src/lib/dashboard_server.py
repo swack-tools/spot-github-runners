@@ -7868,7 +7868,14 @@ class DashboardStore:
             # An explicit benchmark score stands in for the host shape. A stored score is kept only while the
             # report leaves the shape alone, so a changed shape is scored again.
             shape_keys = ("cpu_platform", "vcpu", "machine_type")
-            shape_changed = any(given(k) is not None and given(k) != existing_build.get(k) for k in shape_keys)
+            def shape_value(value: Any) -> Any:
+                """A shape value in comparable form: vCPU counts as integers, names stripped."""
+                text = str(value).strip()
+                return int(text) if text.isdigit() else text
+
+            shape_changed = any(given(k) is not None and (existing_build.get(k) is None
+                                                          or shape_value(given(k)) != shape_value(existing_build[k]))
+                                for k in shape_keys)
             benchmark_score = (given("instance_benchmark_score")
                                if given("instance_benchmark_score") is not None
                                else (None if shape_changed else existing_build.get("instance_benchmark_score")))
@@ -7985,10 +7992,12 @@ def _merged_crate_counts(
     before reported counts were tracked treats every stored count as reported). A count nobody reported stays None.
     """
     reported = {k: payload[k] for k in CRATE_COUNT_KEYS if payload.get(k) is not None}
-    kept = {k: stored[k] for k in CRATE_COUNT_KEYS if k not in reported and stored.get(k) is not None}
     stored_reported = stored.get(REPORTED_CRATE_COUNTS_KEY)
     if not isinstance(stored_reported, list):
-        stored_reported = list(kept)
+        stored_reported = [k for k in CRATE_COUNT_KEYS if stored.get(k) is not None]
+    # A stored count derived from others is derived again whenever this report changes any count.
+    kept = {k: stored[k] for k in CRATE_COUNT_KEYS
+            if k not in reported and stored.get(k) is not None and (not reported or k in stored_reported)}
 
     def counts(values: dict[str, Any]) -> tuple[int | None, int | None, int | None, list[str]]:
         hits, misses, total = _crate_counts(*(values.get(k) for k in CRATE_COUNT_KEYS))
