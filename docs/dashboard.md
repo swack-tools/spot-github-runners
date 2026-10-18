@@ -39,7 +39,7 @@ Open `http://127.0.0.1:8787`. The server doesn't read the `.env` file, so export
 | `--port` | `8787` | HTTP port. |
 | `--project` | A project ID that the repository owner uses | Project ID for pricing lookups and the project label. Always pass your own project ID. |
 | `--org` | `swack-tools` | GitHub organization. Sets the default configuration repository. |
-| `--auth-token` | None | Bearer token for HTTP requests. Also read from `DASHBOARD_AUTH_TOKEN`. |
+| `--auth-token` | None | Legacy bearer token, honored only from a direct loopback client. Also read from `DASHBOARD_AUTH_TOKEN`. |
 | `--tls-certfile`, `--tls-keyfile` | None | PEM certificate and key for HTTPS. Also read from `DASHBOARD_TLS_CERTFILE` and `DASHBOARD_TLS_KEYFILE`. You must pass both or neither. |
 | `--allow-insecure-non-loopback` | Off | Allows plain HTTP on a non-loopback host behind a trusted TLS-terminating proxy. Also read from `DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK`. |
 | `--controlled-targets` | None | Comma-separated organizations and `owner/repo` targets that signed-in users must administer. Overrides `DASHBOARD_CONTROLLED_TARGETS`. |

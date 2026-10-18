@@ -289,7 +289,7 @@ operation. See [Fleet and autoscaler](fleet-and-autoscaler.md) for the policies.
 | --- | --- | --- | --- |
 | `--org` | String | `swack-tools` | GitHub organization. |
 | `--target` | `owner/repo` or organization | Value of `--org` | Target repository or organization. |
-| `--make-before-break`, `--no-make-before-break` | Flag pair | Off | Run zero-downtime make-before-break rotation on price spikes. A controller with `--target` always rotates this way, whatever this flag says. The `tiered` mode skips price rotation. |
+| `--make-before-break`, `--no-make-before-break` | Flag pair | Off | Run zero-downtime make-before-break rotation on price spikes. A controller with `--target` always rotates this way, whatever this flag says. The flag has no effect in `tiered` mode, which replaces an overpriced host through its own guarded tier price replacement. |
 | `--github-user` | String | None | Use an existing `gh` account for this process without saving its credential. |
 | `--project` | String | Owner's project | GCP project. |
 | `--minimum-runners` | Integer | `1` | Online runner floor for the `resource` and `legacy` modes. Must be at least 1. The `tiered` mode ignores it. |
@@ -424,7 +424,7 @@ durability.
 | `--port` | Integer | `8787` | HTTP port. |
 | `--project` | String | Owner's project | GCP project ID. |
 | `--org` | String | `swack-tools` | GitHub organization. |
-| `--auth-token` | String | `DASHBOARD_AUTH_TOKEN` | Bearer token that HTTP requests must present. Needed for a non-loopback host unless GitHub OAuth 2.0 is configured. |
+| `--auth-token` | String | `DASHBOARD_AUTH_TOKEN` | Legacy bearer token. The dashboard accepts it only from a direct loopback client with no forwarding headers, such as an SSH-forwarded connection. Binding a non-loopback address requires it or GitHub OAuth 2.0, but direct non-loopback clients can authenticate only with OAuth 2.0. |
 | `--tls-certfile` | Path | `DASHBOARD_TLS_CERTFILE` | PEM TLS certificate. Pair it with `--tls-keyfile`. |
 | `--tls-keyfile` | Path | `DASHBOARD_TLS_KEYFILE` | PEM TLS private key. |
 | `--allow-insecure-non-loopback` | Flag | `DASHBOARD_ALLOW_INSECURE_NON_LOOPBACK` set to `1`, `true`, `yes`, or `on` | Allow plaintext HTTP on a non-loopback host behind a trusted TLS-terminating proxy. |

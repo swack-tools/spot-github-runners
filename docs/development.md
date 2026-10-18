@@ -103,9 +103,10 @@ change the documentation. On pushes to `main` that change the documentation it a
 `github-pages` environment. In the repository settings, set **Pages** > **Source** to **GitHub Actions** once.
 
 !!! warning "The site is public"
-    A GitHub Pages site can be readable by anyone, even when the repository is private. Don't put project IDs,
-    account or namespace IDs, tunnel details, tokens, or internal hostnames in the documentation. Use
-    placeholders such as `YOUR_PROJECT`.
+    A GitHub Pages site can be readable by anyone, even when the repository is private. Describing the
+    architecture, including the edge and tunnel design, is fine. Don't put deployment identifiers in the
+    documentation: project, account, namespace, runner group, or tunnel IDs, internal hostnames, tokens, or
+    secret values. Use placeholders such as `YOUR_PROJECT`.
 
 ## Git and review workflow
 
