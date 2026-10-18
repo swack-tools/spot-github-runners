@@ -4844,7 +4844,9 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         with self.store._lock:
             self.store.state["scaling_telemetry"]["journal_oom_events"] = [
                 {"id": "oom-r1", "instance_name": "oxidex-runners-base-1", "role": "cicd_runner",
-                 "baseline_runners": 1}]
+                 "baseline_runners": 1,
+                 "observed_at": datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime(
+                     "%Y-%m-%dT%H:%M:%SZ")}]
         booting = fleet_observation("5501", "oxidex-runners-new-1", "us-south1-a", runners_count=4, now=self.now)
         booting["runners_count_known"] = False
         self.fleet = [base, booting]
@@ -5842,6 +5844,61 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.store.refresh_fleet_inventory()
         row = next(r for r in self.store.query_instances()["instances"] if r["name"] == "builder-oxidex-pr")
         self.assertGreater(row["active_hourly_usd"], 0.0)
+
+    def test_denied_listing_keeps_per_disk_details(self):
+        known = fleet_observation("9995", "builder-oxidex-pd-1", "us-south1-b", now=self.now)
+        known["disks_detail"] = [{"type": "hyperdisk-balanced", "gb": 100, "created_epoch": self.now - 86400.0,
+                                  "source": "z/c-pd", "id": "81", "auto_delete": False}]
+        self.fleet = [known]
+        self.store.refresh_fleet_inventory()
+        denied = dict(known, disk_types_known=False, boot_disk_type="pd-balanced", data_disk_type="pd-balanced",
+                      disks_detail=[{"type": "pd-balanced", "gb": 100, "created_epoch": None, "source": "z/c-pd",
+                                     "id": "", "auto_delete": False}])
+        self.fleet = [denied]
+        self.store.refresh_fleet_inventory()
+        detail = self._record("builder-oxidex-pd-1")["disks_detail"][0]
+        self.assertEqual((detail["type"], detail["id"]), ("hyperdisk-balanced", "81"))
+
+    def test_secondary_unknown_disk_type_makes_pricing_incomplete(self):
+        from lib.dashboard_server import _with_secondary_disks
+
+        base = calculate_spot_pricing(family="n2", vcpu=16, ram_gib=64.0, region="us-south1",
+                                      boot_disk_type="pd-balanced", boot_disk_gb=40, data_disk_type="pd-ssd",
+                                      data_disk_gb=100, machine_type="n2-standard-16", live_pricing={})
+        out = _with_secondary_disks(base, {"data_disk_type": "pd-ssd", "data_disks": {"pd-ssd": 100, "pd-odd": 50}},
+                                    region="us-south1", family="n2", project="p", live_pricing={})
+        self.assertFalse(out["complete"])
+        self.assertIn("pd-odd", out["disk_rate_unknown"])
+
+    def test_deferred_disk_history_backfilled_when_creation_known(self):
+        from lib.dashboard_server import instance_usage
+
+        created = self.now - 5 * 86400.0
+        first = fleet_observation("9996", "builder-oxidex-bf-1", "us-south1-b", started_hours_ago=120.0, now=self.now)
+        first["disks_detail"] = [{"type": "pd-balanced", "gb": 100, "created_epoch": None, "source": "z/bf", "id": ""}]
+        self.fleet = [first]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-bf-1")
+        self.assertIsNotNone(rec["disk_history_deferred_at"])
+        deferred_at = rec["disk_history_deferred_at"]
+        self.fleet = [dict(first, disks_detail=[{"type": "pd-balanced", "gb": 100, "created_epoch": created,
+                                                 "source": "z/bf", "id": "91"}])]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-bf-1")
+        self.assertIsNone(rec["disk_history_deferred_at"])
+        usage = instance_usage(rec, deferred_at)
+        self.assertAlmostEqual(usage["disk_hours"], (deferred_at - created) / 3600.0, delta=0.05)
+
+    def test_expired_oom_not_rewritten_by_growth(self):
+        old = datetime.fromtimestamp(time.time() - 5 * 3600.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.fleet = [self._runner("9997", "oxidex-runners-ex-1")]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-old", "instance_name": "oxidex-runners-ex-1", "role": "cicd_runner", "observed_at": old}]
+        self.fleet.append(self._runner("9998", "oxidex-runners-ex-2", started_hours_ago=0.01))
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",

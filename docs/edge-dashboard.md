@@ -343,7 +343,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   so known disk types are never replaced by the default. An attached disk the listing doesn't cover is
   treated as an unknown type. On a VM's first listing, each disk is billed from its own creation time,
   so a disk attached later isn't billed back to the VM's creation; when a creation time is missing, disk
-  history starts at that listing. A machine type whose capacity can't
+  history starts at that listing, and the earlier time is billed once a later listing reports every
+  creation time. A machine type whose capacity can't
   be read also fails the refresh, so no VM is priced without its memory.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A suspended VM's compute ends at its

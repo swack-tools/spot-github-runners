@@ -682,14 +682,23 @@ def _with_secondary_disks(
     """``pricing`` (which covers the boot disk and the primary data-disk type) plus every other data-disk type,
     each at its own rate. ``disks`` is an observation or record with ``data_disks`` / ``data_disk_type``."""
     extra = 0.0
+    unknown: set[str] = set()
     for disk_type, disk_gb in _secondary_data_disks(disks):
-        extra += float(calculate_spot_pricing(
+        priced = calculate_spot_pricing(
             family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type=disk_type,
             boot_disk_gb=0, data_disk_type=disk_type, data_disk_gb=disk_gb,
             tax_rate_percent=float(pricing.get("tax_rate_percent", 0.0) or 0.0),
             machine_type=None, live_pricing=live_pricing, project=project,
-        ).get("disk_hourly_usd", 0.0) or 0.0)
-    return _with_extra_disks(pricing, extra)
+        )
+        extra += float(priced.get("disk_hourly_usd", 0.0) or 0.0)
+        if priced.get("complete") is False:
+            unknown.update(priced.get("disk_rate_unknown") or [disk_type])
+    out = _with_extra_disks(pricing, extra)
+    if unknown:
+        # A secondary disk type without a trusted rate leaves the whole price incomplete.
+        out = {**out, "complete": False,
+               "disk_rate_unknown": sorted(set(out.get("disk_rate_unknown") or []) | unknown)}
+    return out
 
 
 def _stopped_disk_hourly(pricing: dict[str, Any], *, include_tax: bool = True) -> float:
@@ -819,6 +828,19 @@ def _live_instance_record(
                 obs["data_disks"] = previous.get("data_disks") or obs.get("data_disks")
                 obs["unpriced_disk_performance"] = bool(previous.get("unpriced_disk_performance"))
                 obs["regional_disks"] = bool(previous.get("regional_disks"))
+            # Per attachment too: same source and size keeps its stored type, ID, creation, and auto-delete.
+            known = {str(d.get("source")): d for d in previous.get("disks_detail") or []
+                     if isinstance(d, dict) and d.get("source")}
+            merged = []
+            for d in obs.get("disks_detail") or []:
+                if not isinstance(d, dict):
+                    continue
+                old = known.get(str(d.get("source") or ""))
+                if old is not None and int(old.get("gb") or 0) == int(d.get("gb") or 0):
+                    d = {**d, **{k: old.get(k) for k in ("type", "id", "created_epoch", "auto_delete")
+                                 if old.get(k) not in (None, "")}}
+                merged.append(d)
+            obs["disks_detail"] = merged
             # Still unverified: a same-size disk may have been replaced by another type, so pricing stays incomplete.
     status = str(obs.get("status") or "UNKNOWN").upper()
     started = obs.get("last_start_epoch") or obs.get("created_epoch")
@@ -948,12 +970,37 @@ def _live_instance_record(
                 disk_segments.append((open_from, float(ended), _pricing_rates(previous["pricing"])[2]))
         revived_at = now
     initial_disk_segment_start: float | None = None
+    deferred_at = (previous or {}).get("disk_history_deferred_at")
+    if previous is not None and _finite(deferred_at):
+        # Disk history was deferred (first seen without disk creation times). Once every attachment has a creation
+        # time, bill the deferred interval per disk from its creation (disks another record billed excepted).
+        disks_now = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
+        if disks_now and all(_finite(d.get("created_epoch")) for d in disks_now):
+            backfill = [dict(d, created_epoch=float(deferred_at)) if _disk_known(d, known_disk_sources) else d
+                        for d in disks_now]
+            segments, open_from = _initial_disk_history(
+                dict(obs, disks_detail=backfill), region=region,
+                family=str(obs.get("machine_type") or "").split("-", 1)[0], project=project,
+                tax_rate_percent=float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0), now=float(deferred_at))
+            if _finite(open_from) and float(deferred_at) > float(open_from):
+                tax_pct = float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0)
+                full = sum(_single_disk_all_in(d, family=record["family"], region=region, project=project,
+                                               tax_rate_percent=tax_pct) for d in backfill)
+                segments = segments + [(float(open_from), float(deferred_at), full)]
+            disk_segments_backfill = segments
+        else:
+            disk_segments_backfill = None
+    else:
+        disk_segments_backfill = None
     if previous is None:
         # First sight of this VM: bill earlier disk time per disk from each disk's own creation, never a later-
         # attached disk back to the VM's creation; with any creation time unknown, start disk history now.
         disk_segments, initial_disk_segment_start = _initial_disk_history(
             obs, region=region, family=str(obs.get("machine_type") or "").split("-", 1)[0], project=project,
             tax_rate_percent=float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0), now=now)
+    if disk_segments_backfill:
+        disk_segments = list(disk_segments_backfill) + disk_segments
+        disk_start = min([disk_start] + [seg[0] for seg in disk_segments_backfill])
     compute_segment_start = started_epoch
     if previous is not None and _finite(previous.get("compute_segment_start")) \
             and float(previous.get("started_epoch") or 0.0) == started_epoch:
@@ -1091,6 +1138,11 @@ def _live_instance_record(
         "pruned_compute_hours": round(pruned_hours, 4),
         "pruned_cost_usd": [round(pruned_all_in, 6), round(pruned_compute, 6)],
         "disk_start_epoch": disk_start,
+        "disk_history_deferred_at": (
+            None if disk_segments_backfill is not None
+            else float(initial_disk_segment_start) if previous is None and initial_disk_segment_start is not None
+            and not all(_finite(d.get("created_epoch")) for d in obs.get("disks_detail") or [] if isinstance(d, dict))
+            else (previous or {}).get("disk_history_deferred_at")),
     })
     usage = instance_usage(record, now)
     runtime_hours = round(usage["compute_hours"], 2)
@@ -2358,6 +2410,7 @@ class DashboardStore:
                 current_runners=current_slots,
                 step_runners=max(1, int(pol.get("scale_up_step_runners", 2))),
                 max_runners=max(int(prof.get("min_runners", 1)), int(pol.get("max_runners", 24))),
+                recent_within=lookback_seconds,
             )
         # New capacity stays pending through the OOM lookback (an OOM reported late can still be answered by it)
         # and while an OOM it could still satisfy is active; after that it is ordinary capacity.
@@ -4675,8 +4728,13 @@ class DashboardStore:
         current_runners: int | None = None,
         step_runners: int | None = None,
         max_runners: int | None = None,
+        recent_within: float | None = None,
     ) -> None:
-        """Mark active/unhandled OOM events as handled/acknowledged so a single OOM does not repeatedly trigger scale-ups."""
+        """Mark active/unhandled OOM events as handled/acknowledged so a single OOM does not repeatedly trigger scale-ups.
+
+        With ``recent_within`` (seconds), only events still active (unhandled, inside that lookback) are touched, so
+        expired incidents are never rewritten as handled."""
+        lookback_now = self._clock()
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         telem = self.state.setdefault("scaling_telemetry", {})
 
@@ -4700,6 +4758,8 @@ class DashboardStore:
                     continue
                 if event_id and str(run.get("id", "")) != event_id and str(run.get("run_id", "")) != event_id:
                     continue
+                if recent_within is not None and not _is_recent_unhandled_oom(run, lookback_now, recent_within):
+                    continue
                 if not _runner_oom_satisfied(run):
                     continue
                 run["handled"] = True
@@ -4717,6 +4777,8 @@ class DashboardStore:
             if role == "cicd_runner" and is_builder:
                 continue
             if role == "rust_builder" and not is_builder:
+                continue
+            if recent_within is not None and not _is_recent_unhandled_oom(evt, lookback_now, recent_within):
                 continue
             if not is_builder and not _runner_oom_satisfied(evt):
                 continue
