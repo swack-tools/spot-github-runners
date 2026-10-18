@@ -3417,8 +3417,9 @@ class DashboardStore:
                 if _is_transitional(inst) and inst.get("role") == role]
 
     def _held(self, evaluation: dict[str, Any], reason: str, role: str) -> dict[str, Any]:
-        # A held recommendation projects the fleet it keeps, so a shared budget does not reserve a rejected change.
-        projected = round(sum(self._running_role_hourly_rates(role)), 4)
+        # A held recommendation projects the fleet it keeps: its running VMs plus the storage its stopped VMs and
+        # detached disks keep billing. The other role's burn under a shared budget is already taken off the cap.
+        projected = round(sum(self._running_role_hourly_rates(role)) + self._stopped_disk_burn(role), 4)
         return {
             **evaluation,
             "direction": "hold",
@@ -3831,6 +3832,7 @@ class DashboardStore:
                 )
             )
             old_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else None
+            old_completeness = (inst.get("pricing_complete"), inst.get("pricing_incomplete_reason"))
             inst["pricing"] = calculate_spot_pricing(
                 family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
                 vcpu=int(inst.get("vcpu", 16)),
@@ -3857,6 +3859,10 @@ class DashboardStore:
                 if old_pricing is not None and _pricing_rates(old_pricing) != _pricing_rates(inst["pricing"]):
                     # New rates apply from now on: time already billed keeps the rates it had.
                     _close_open_segments(inst, old_pricing, self._clock())
+                    repriced = True
+                elif old_pricing != inst["pricing"] or old_completeness != (
+                        inst.get("pricing_complete"), inst.get("pricing_incomplete_reason")):
+                    # Same rates, but the price's source or trust changed: save it (budgets rely on completeness).
                     repriced = True
         return repriced
 

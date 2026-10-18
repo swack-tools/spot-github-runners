@@ -5366,6 +5366,31 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.store.refresh_fleet_inventory()
         self.assertIn("disk listing is unavailable", self.store._inventory_stale_reason())
 
+    def test_held_projection_includes_retained_storage(self):
+        self.fleet = [fleet_observation("8400", "builder-oxidex-hp-1", "us-south1-b", now=self.now),
+                      fleet_observation("8401", "builder-oxidex-hp-2", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        held = self.store._held({"direction": "scale_up"}, "test", "rust_builder")
+        expected = sum(self.store._running_role_hourly_rates("rust_builder")) + self.store._stopped_disk_burn("rust_builder")
+        self.assertGreater(self.store._stopped_disk_burn("rust_builder"), 0.0)
+        self.assertAlmostEqual(held["projected_hourly_usd"], expected, delta=0.0001)
+
+    def test_pricing_trust_change_is_saved_with_same_rates(self):
+        self.fleet = [fleet_observation("8500", "oxidex-runners-trust-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.store.refresh_fleet_inventory()  # Settle one-time baselines.
+        from lib import dashboard_server
+        real = dashboard_server.calculate_spot_pricing
+
+        def untrusted(*args, **kwargs):
+            return {**real(*args, **kwargs), "complete": False, "family_rate_unknown": True}
+
+        with unittest.mock.patch.object(dashboard_server, "calculate_spot_pricing", side_effect=untrusted):
+            self.assertTrue(self.store.refresh_fleet_inventory())
+        self.assertFalse(self._record("oxidex-runners-trust-1")["pricing_complete"])
+        self.assertEqual(self._record("oxidex-runners-trust-1")["disk_segments"], [])  # Rates unchanged: no segment.
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

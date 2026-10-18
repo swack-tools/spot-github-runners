@@ -421,7 +421,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   Builder OOM events are never handled from the inventory: a builder has no service account, so its
   instance record can't show that its build container started. Acknowledge them with `POST /api/scaling`
   and `acknowledge_oom_id` (or `acknowledge_all_ooms`).
-  A held recommendation projects the cost of the fleet it keeps. A listing that changes nothing writes
+  A held recommendation projects the cost of the fleet it keeps, including the storage its stopped VMs
+  and detached disks still bill. A listing that changes nothing writes
   nothing, so a quiet fleet doesn't publish a new snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
   empty, the instances tab says that the inventory isn't configured, and scaling recommendations hold
