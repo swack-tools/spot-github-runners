@@ -7627,9 +7627,14 @@ class DashboardStore:
             )
             # A build still in progress keeps its reported stage durations across partial updates; once it
             # finishes, its final timing replaces them. (An active build's total is its compile time, re-derived.)
+            # A stage duration derived from stored timestamps is not carried as a constraint: it is derived
+            # again, so a corrected request or finish time recomputes it.
             keep_stage_durations = not was_non_delivered or (
                 is_unfinished and prev_status_norm in UNFINISHED_BUILD_STATUSES
-                and not payload.get("finished_at") and not payload.get("delivered_at"))
+                and not payload.get("finished_at") and not payload.get("delivered_at")
+                and (not payload.get("requested_at")
+                     or str(payload["requested_at"]) == str(existing_build.get("requested_at")))
+                and not existing_build.get("finished_at"))
             raw_delivery = (
                 payload.get("delivery_duration_seconds")
                 if "delivery_duration_seconds" in payload

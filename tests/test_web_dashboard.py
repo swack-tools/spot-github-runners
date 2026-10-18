@@ -7634,6 +7634,13 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         update = self.store.record_rust_build({"build_id": "rb-fin", "finished_at": finished_at})["build"]
         self.assertEqual(update["compile_duration_seconds"], 60.0)
 
+    def test_corrected_request_time_recomputes_derived_compile_time(self):
+        self.store.record_rust_build({"build_id": "rb-correct", "status": "RUNNING",
+                                      "requested_at": "2026-10-18T18:00:00Z", "finished_at": "2026-10-18T18:01:00Z"})
+        fixed = self.store.record_rust_build({"build_id": "rb-correct",
+                                              "requested_at": "2026-10-18T17:59:50Z"})["build"]
+        self.assertEqual(fixed["compile_duration_seconds"], 70.0)
+
     def test_unknown_failure_timing_survives_metadata_updates(self):
         self.store.record_rust_build({"build_id": "rb-fail-meta", "status": "FAILED"})
         with unittest.mock.patch("lib.dashboard_server.time.time", return_value=time.time() + 300):
