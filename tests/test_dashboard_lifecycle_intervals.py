@@ -76,7 +76,7 @@ class LifecycleIntervalTests(unittest.TestCase):
                 self.assertFalse(running["lifetime_cost_complete"])
                 self.assertIn("prior_compute", running["unpriced_history_intervals"])
                 self.assertEqual(running["unpriced_history_intervals"]["prior_compute"],
-                                 [self.now - 5 * 3600, self.now - 2 * 3600])
+                                 [[self.now - 5 * 3600, self.now - 2 * 3600]])
                 self.assertFalse(running["lifetime_cost_complete"])
                 self.assertTrue(_unpriced_history_in_window(running, self.now - 24 * 3600, self.now))
                 self.assertFalse(_unpriced_history_in_window(running, self.now - 1800, self.now))
