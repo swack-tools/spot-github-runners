@@ -7837,8 +7837,10 @@ class DashboardStore:
                     fin_at = payload["finished_at"]
                 elif delivery_sec is not None:
                     fin_at = _iso_at_epoch(del_epoch - delivery_sec)
-                elif known_compile is not None and payload.get("requested_at"):
-                    fin_at = _iso_at_epoch(_iso_to_epoch(str(payload["requested_at"])) + max(0.0, known_compile))
+                elif known_compile is not None and (payload.get("requested_at") or existing_build.get("requested_at")):
+                    fin_at = _iso_at_epoch(_iso_to_epoch(str(payload.get("requested_at")
+                                                             or existing_build["requested_at"]))
+                                           + max(0.0, known_compile))
                 else:
                     fin_at = None  # not reported: the compile/delivery split stays unknown
                 fin_epoch = _iso_to_epoch(str(fin_at)) if fin_at else None

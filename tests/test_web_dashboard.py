@@ -7685,6 +7685,15 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         self.assertLessEqual(_iso_to_epoch(build["finished_at"]), _iso_to_epoch(build["delivered_at"]))
         self.assertAlmostEqual(build["delivery_duration_seconds"], 0.24, delta=0.01)
 
+    def test_completion_uses_stored_request_time(self):
+        self.store.record_rust_build({"build_id": "rb-stored-req", "status": "RUNNING",
+                                      "requested_at": "2026-10-18T18:00:00Z"})
+        done = self.store.record_rust_build({"build_id": "rb-stored-req", "status": "DELIVERED",
+                                             "delivered_at": "2026-10-18T18:01:10Z",
+                                             "compile_duration_seconds": 60})["build"]
+        self.assertEqual((done["requested_at"], done["finished_at"]), ("2026-10-18T18:00:00Z", "2026-10-18T18:01:00Z"))
+        self.assertEqual(done["delivery_duration_seconds"], 10.0)
+
     def test_failure_with_delivery_field_keeps_compile_time(self):
         build = self.store.record_rust_build({"build_id": "rb-del", "status": "OOM_KILLED",
                                               "compile_duration_seconds": 30, "delivery_duration_seconds": 5})["build"]
