@@ -949,6 +949,7 @@ class RustBuildTelemetryTests(unittest.TestCase):
         enriched = enrich_rust_build_record(
             {
                 "build_id": "rb-test-1",
+                "status": "DELIVERED",
                 "project_name": "oxidex",
                 "requested_at": "2026-10-15T00:00:00Z",
                 "finished_at": "2026-10-15T00:01:40Z",
@@ -978,6 +979,7 @@ class RustBuildTelemetryTests(unittest.TestCase):
             enrich_rust_build_record(
                 {
                     "build_id": "rb-bad-order",
+                    "status": "DELIVERED",
                     "requested_at": "2026-10-15T00:05:00Z",
                     "finished_at": "2026-10-15T00:01:00Z",
                     "delivered_at": "2026-10-15T00:02:00Z",
@@ -1247,7 +1249,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(sc_res["evaluation"]["desired_instances"], 2)
         self.store.record_rust_build({
             "build_id": "rb-project-override-01", "instance_name": "builder-oxidex-1", "zone": "us-south1-b",
-            "status": "DELIVERED", "cache_hits": 10, "cache_misses": 2,
+            "status": "DELIVERED", "total_duration_seconds": 60.0, "cache_hits": 10, "cache_misses": 2,
         })
 
         # Reload store from existing state_file with a new project & org
@@ -1275,9 +1277,16 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         rb_res = self._post(
             "/api/rust-builds",
             {
+                "status": "DELIVERED",
+                "compile_duration_seconds": 80.0,
+                "delivery_duration_seconds": 5.0,
                 "project_name": "oxidex",
                 "origin_ip": "185.220.101.44",
-                "instance_name": "builder-oxidex-turin-01",
+                "instance_name": "builder-oxidex-1",
+                "zone": "us-south1-b",
+                "machine_type": "n4-highcpu-16",
+                "vcpu": 16,
+                "cpu_platform": "Intel Emerald Rapids",
                 "cache_hits": 410,
                 "total_crates": 430,
                 "peak_ram_gib": 23.1,
@@ -1357,7 +1366,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         before_count = self._get("/api/rust-builds")["total_builds"]
         b1 = self._post(
             "/api/rust-builds",
-            {"build_id": "rb-idempotent-01", "cache_hits": 10, "cache_misses": 2},
+            {"build_id": "rb-idempotent-01", "status": "DELIVERED", "total_duration_seconds": 30.0,
+             "cache_hits": 10, "cache_misses": 2},
         )
         self.assertEqual(b1["build"]["total_crates"], 12)
         self.assertEqual(b1["build"]["cache_hit_rate_percent"], 83.3)
@@ -1665,10 +1675,10 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertIsNone(q_build["finished_at"])
         self.assertIsNone(q_build["delivered_at"])
         self.assertEqual(q_build["total_duration_seconds"], 0.0)
-        self.assertEqual(q_build["total_crates"], 0)
-        self.assertEqual(q_build["cpu_time_seconds"], 0.0)
-        self.assertEqual(q_build["cpu_points"], 0.0)
-        self.assertEqual(q_build["peak_ram_gib"], 0.0)
+        self.assertIsNone(q_build["total_crates"])
+        self.assertIsNone(q_build["cpu_time_seconds"])
+        self.assertIsNone(q_build["cpu_points"])
+        self.assertIsNone(q_build["peak_ram_gib"])
         summary_after = self._get("/api/rust-builds")
         self.assertEqual(summary_after["total_builds"], summary_before["total_builds"] + 1)
         self.assertEqual(summary_after["completed_builds"], summary_before["completed_builds"])
@@ -2530,8 +2540,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         self.assertEqual(failed_resp["status"], "FAILED")
         self.assertEqual(failed_resp["compile_duration_seconds"], 0.0)
         self.assertEqual(failed_resp["delivery_duration_seconds"], 0.0)
-        self.assertEqual(failed_resp["cache_hits"], 0)
-        self.assertEqual(failed_resp["peak_ram_gib"], 0.0)
+        self.assertIsNone(failed_resp["cache_hits"])
+        self.assertIsNone(failed_resp["peak_ram_gib"])
         self.assertIsNone(failed_resp["delivered_at"])
 
         with self.assertRaises(urllib.error.HTTPError) as ctx_bad_status:
@@ -3307,9 +3317,12 @@ class DashboardServerIntegrationTests(unittest.TestCase):
                 "status": "DELIVERED",
             },
         )["build"]
-        self.assertEqual(completed_nocpu["cpu_time_seconds"], 0.0)
-        self.assertEqual(completed_nocpu["cpu_points"], 0.0)
-        self.assertEqual(completed_nocpu["peak_ram_gib"], 0.0)
+        # Unreported CPU time and memory stay unreported (None), never 0 or an estimate.
+        self.assertIsNone(completed_nocpu["cpu_time_seconds"])
+        self.assertIsNone(completed_nocpu["cpu_points"])
+        self.assertIsNone(completed_nocpu["peak_ram_gib"])
+        self.assertIsNone(completed_nocpu["finished_at"])
+        self.assertIsNone(completed_nocpu["compile_duration_seconds"])
 
         # 4. Standard runner cloud-init reuses existing .runner state on persistent disk without unconditional config.sh
         self.assertIn('if [[ ! -x "${state_dir}/run.sh" ]]; then tar -xzf /tmp/actions-runner.tar.gz -C "${state_dir}"; fi', DEFAULT_RUNNER_CLOUD_INIT)
@@ -4702,7 +4715,8 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             return real(*args, **kwargs)
 
         with unittest.mock.patch.object(dashboard_server, "evaluate_builder_scaling_decision", spy):
-            self.store.record_rust_build({"build_id": "rb-shared-01", "cache_hits": 1, "cache_misses": 1})
+            self.store.record_rust_build({"build_id": "rb-shared-01", "status": "DELIVERED",
+                                          "total_duration_seconds": 30.0, "cache_hits": 1, "cache_misses": 1})
         runner_burn = sum(self.store._running_role_hourly_rates("cicd_runner"))
         self.assertGreater(runner_burn, 0.0)
         self.assertAlmostEqual(captured["other_role_hourly_usd"], runner_burn, delta=0.0002)
@@ -6052,7 +6066,8 @@ class FleetInventoryReconcileTests(unittest.TestCase):
 
         with unittest.mock.patch.object(dashboard_server, "evaluate_scaling_decision", ci_eval), \
                 unittest.mock.patch.object(dashboard_server, "evaluate_builder_scaling_decision", spy):
-            self.store.record_rust_build({"build_id": "rb-proj-01", "cache_hits": 1, "cache_misses": 1})
+            self.store.record_rust_build({"build_id": "rb-proj-01", "status": "DELIVERED",
+                                          "total_duration_seconds": 30.0, "cache_hits": 1, "cache_misses": 1})
         running = sum(self.store._running_role_hourly_rates("cicd_runner", budget_role="rust_builder"))
         unit = self.store._resolve_scaling_unit_hourly_usd("cicd_runner", None, budget_role="rust_builder")
         self.assertAlmostEqual(captured["other_role_hourly_usd"], running + 2 * unit, delta=0.0005)
@@ -6893,6 +6908,89 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
             state = {"scaling_telemetry": dict(counters)}
             self.assertEqual(drop_seeded_demo_telemetry(state), 0)
             self.assertEqual(state["scaling_telemetry"], counters)
+
+
+class RustBuildReportedFieldsTests(unittest.TestCase):
+    """A recorded Rust build holds only what was reported; nothing stands in for a missing figure."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        from lib.dashboard_server import DashboardStore
+
+        self.store = DashboardStore(state_path=Path(self.tmp.name) / "dashboard-state.json")
+        self.addCleanup(self.store.close)
+
+    def test_sparse_delivered_build_leaves_unreported_fields_empty(self):
+        build = self.store.record_rust_build({"build_id": "rb-sparse", "status": "DELIVERED",
+                                              "total_duration_seconds": 42.0})["build"]
+        for key in ("project_name", "profile", "target_triple", "commit_sha", "instance_name", "zone", "region",
+                    "machine_type", "vcpu", "cpu_platform", "instance_benchmark_score", "ssh_command", "origin_ip",
+                    "cache_hits", "cache_misses", "total_crates", "cache_hit_rate_percent", "peak_ram_gib",
+                    "ram_headroom_gib", "cpu_time_seconds", "cpu_points", "finished_at",
+                    "compile_duration_seconds", "delivery_duration_seconds"):
+            self.assertIsNone(build[key], key)
+        self.assertEqual(build["total_duration_seconds"], 42.0)
+        self.assertEqual(build["network_security"]["badge_text"], "Origin Not Reported")
+        self.assertFalse(build["network_security"]["is_vpn"] or build["network_security"]["is_tor"])
+        summary = self.store.get_rust_builds_summary()
+        self.assertEqual((summary["completed_builds"], summary["total_cache_hits"], summary["max_peak_ram_gib"],
+                          summary["total_cpu_points"], summary["average_duration_seconds"]), (1, 0, 0.0, 0.0, 42.0))
+
+    def test_reported_host_and_usage_are_used(self):
+        build = self.store.record_rust_build({
+            "build_id": "rb-full", "status": "DELIVERED", "compile_duration_seconds": 100.0,
+            "delivery_duration_seconds": 10.0, "instance_name": "builder-oxidex-1", "zone": "us-south1-b",
+            "machine_type": "n4-highcpu-16", "vcpu": 16, "cpu_platform": "Intel Emerald Rapids",
+            "cpu_time_seconds": 800.0, "peak_ram_gib": 20.0, "cache_hits": 9, "total_crates": 10,
+        })["build"]
+        self.assertEqual((build["compile_duration_seconds"], build["delivery_duration_seconds"]), (100.0, 10.0))
+        self.assertEqual(build["region"], "us-south1")
+        self.assertEqual(build["cache_misses"], 1)
+        self.assertEqual(build["ram_headroom_gib"], 8.0)
+        self.assertGreater(build["instance_benchmark_score"], 0)
+        self.assertEqual(build["cpu_points"], round(800.0 * build["instance_benchmark_score"], 2))
+        self.assertIn("builder-oxidex-1", build["ssh_command"])
+        # A later partial update keeps the reported host.
+        updated = self.store.record_rust_build({"build_id": "rb-full", "peak_ram_gib": 21.0})["build"]
+        self.assertEqual((updated["instance_name"], updated["vcpu"], updated["peak_ram_gib"]),
+                         ("builder-oxidex-1", 16, 21.0))
+
+    def test_unknown_status_or_timing_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "needs a status"):
+            self.store.record_rust_build({"build_id": "rb-no-status", "total_duration_seconds": 5.0})
+        for payload in ({"status": "DELIVERED"}, {"status": "DELIVERED", "compile_duration_seconds": 50.0}):
+            with self.assertRaisesRegex(ValueError, "needs its timing"):
+                self.store.record_rust_build({"build_id": "rb-no-timing", **payload})
+        self.assertEqual(self.store.state["rust_builds"], [])
+
+    def test_crate_counts_are_derived_only_from_reported_counts(self):
+        only_hits = self.store.record_rust_build({"build_id": "rb-hits", "status": "QUEUED", "cache_hits": 5})
+        self.assertEqual((only_hits["build"]["cache_hits"], only_hits["build"]["cache_misses"],
+                          only_hits["build"]["total_crates"], only_hits["build"]["cache_hit_rate_percent"]),
+                         (5, None, None, None))
+        derived = self.store.record_rust_build({"build_id": "rb-derived", "status": "QUEUED", "cache_misses": 2,
+                                                "total_crates": 8})["build"]
+        self.assertEqual((derived["cache_hits"], derived["cache_hit_rate_percent"]), (6, 75.0))
+        with self.assertRaisesRegex(ValueError, "exceeds total_crates"):
+            self.store.record_rust_build({"build_id": "rb-bad", "status": "QUEUED", "cache_hits": 9,
+                                          "total_crates": 8})
+
+    def test_no_invented_build_defaults_remain(self):
+        import inspect
+
+        from lib import dashboard_server, rust_build_telemetry
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        sources = (inspect.getsource(dashboard_server.DashboardStore.record_rust_build),
+                   inspect.getsource(rust_build_telemetry.enrich_rust_build_record))
+        for fabricated in ("builder-oxidex-turin-01", "us-south1-b", "c4d-highcpu-16", "AMD Turin", "af7c14f8cb2c",
+                           "185.159.157.42", "73.162.44.19", "x86_64-unknown-linux-gnu", "87.0", "380", "18.4",
+                           "8.5", "* 0.2"):
+            for source in sources:
+                self.assertNotIn(fabricated, source)
+        for fabricated in ("185.159.157.88", "builder-oxidex-turin-01", "88.5"):
+            self.assertNotIn(fabricated, DASHBOARD_HTML)
 
 
 class AddGithubOomRunTests(unittest.TestCase):

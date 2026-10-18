@@ -521,6 +521,28 @@ state unchanged.
   it's shown but never triggers a fleet scale-up.
 - The dashboard's own form sends only what you enter in it.
 
+### Recording a build
+
+`POST /api/rust-builds` records a build, or merges a partial update into the build with the same
+`build_id`. The dashboard stores only reported values: a field that neither this report nor the stored
+build carries stays `null`, and the page shows it as not reported. It never fills in a builder, zone,
+machine type, commit, origin IP, crate count, memory peak, CPU time, or duration.
+
+- A new build needs a `status`. An update without one keeps the stored status.
+- A completed build, such as `DELIVERED`, needs enough timing to place it. `delivered_at` defaults to
+  when the report arrives. The request time comes from `requested_at`, from `total_duration_seconds`, or
+  from both `compile_duration_seconds` and `delivery_duration_seconds`. Without one of these the request
+  fails with HTTP 400.
+- When no report gives a finish time, `finished_at` and the compile and delivery durations stay `null`.
+  The dashboard doesn't split the total between compiling and delivery.
+- `cache_hits`, `cache_misses`, and `total_crates` are stored as reported. A missing count is derived only
+  when the other two are present.
+- The benchmark score needs `cpu_platform`, `vcpu`, and `machine_type`, or an explicit
+  `instance_benchmark_score`. CPU points need the benchmark score and `cpu_time_seconds`.
+- Without `origin_ip` the build has no network classification and shows the origin as not reported.
+- `container_ram_cap_gib` defaults to 28, the dedicated builder container's memory cap.
+- The dashboard's own form sends only what you enter in it.
+
 ## Machine shape templates
 
 The VM templates `tpl-runner-n4-std16`, `tpl-runner-za-n2-16`, and `tpl-builder-c4d-16` are preset

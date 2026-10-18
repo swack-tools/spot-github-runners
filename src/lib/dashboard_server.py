@@ -107,11 +107,20 @@ from .rust_build_telemetry import (
     SUCCESSFUL_BUILD_STATUSES,
     UNFINISHED_BUILD_STATUSES,
     UNSUCCESSFUL_BUILD_STATUSES,
+    _crate_counts,
     _finite_float,
     _finite_int,
     _iso_to_epoch,
     classify_ip_and_network,
     enrich_rust_build_record,
+)
+
+# A completed build is stored only with its own timing: requested and delivered times (reported, derived from
+# reported durations, or the report's arrival for delivery) and a finish time only when one is known. Nothing
+# stands in for a missing figure.
+UNKNOWN_BUILD_TIMING_MESSAGE = (
+    "A completed Rust build needs its timing: report requested_at, total_duration_seconds, or both "
+    "compile_duration_seconds and delivery_duration_seconds (delivered_at defaults to when the report arrives)"
 )
 
 MAX_JSON_BODY_BYTES = 262_144
@@ -3674,9 +3683,9 @@ class DashboardStore:
             if name:
                 inst["ssh_command"] = format_gcloud_ssh_command(name, zone, self.project)
         for build in self.state.get("rust_builds", []):
-            inst_name = str(build.get("instance_name", ""))
-            zone = str(build.get("zone", "us-south1-b"))
-            if inst_name:
+            inst_name = str(build.get("instance_name") or "")
+            zone = str(build.get("zone") or "")
+            if inst_name and zone:
                 build["ssh_command"] = format_gcloud_ssh_command(inst_name, zone, self.project)
 
     def _resolve_template_runners_per_instance(self) -> int:
@@ -6174,12 +6183,18 @@ class DashboardStore:
                 if completed_count
                 else 0.0
             )
-            total_hits = sum(b["cache_hits"] for b in completed_builds)
-            total_crates = sum(b["total_crates"] for b in completed_builds)
+            # Aggregates cover only the builds that reported each figure (unreported figures are None).
+            with_crates = [b for b in completed_builds
+                           if b.get("cache_hits") is not None and b.get("total_crates") is not None]
+            total_hits = sum(b["cache_hits"] for b in with_crates)
+            total_crates = sum(b["total_crates"] for b in with_crates)
             overall_hit_rate = round((total_hits / total_crates * 100.0) if total_crates else 0.0, 1)
-            max_peak_ram = max((b["peak_ram_gib"] for b in completed_builds), default=0.0)
-            total_cpu_time = round(sum(b["cpu_time_seconds"] for b in completed_builds), 2)
-            total_cpu_points = round(sum(b["cpu_points"] for b in completed_builds), 2)
+            max_peak_ram = max((b["peak_ram_gib"] for b in completed_builds if b.get("peak_ram_gib") is not None),
+                               default=0.0)
+            total_cpu_time = round(sum(b["cpu_time_seconds"] for b in completed_builds
+                                       if b.get("cpu_time_seconds") is not None), 2)
+            total_cpu_points = round(sum(b["cpu_points"] for b in completed_builds
+                                         if b.get("cpu_points") is not None), 2)
             vpn_or_tor_count = sum(
                 1 for b in builds if b["network_security"]["is_vpn"] or b["network_security"]["is_tor"]
             )
@@ -6219,7 +6234,9 @@ class DashboardStore:
                 else {}
             )
 
-            status_str = str(payload.get("status", existing_build.get("status", "DELIVERED")))
+            if payload.get("status") is None and not existing_build.get("status"):
+                raise ValueError("A new Rust build needs a status")
+            status_str = str(payload["status"] if payload.get("status") is not None else existing_build["status"])
             norm_status = status_str.strip().upper()
             if norm_status not in ALLOWED_BUILD_STATUSES:
                 raise ValueError(f"Unsupported Rust build status: {status_str!r}")
@@ -6307,7 +6324,7 @@ class DashboardStore:
                     elif explicit_compile is not None:
                         delivery_sec = max(0.0, duration - min(explicit_compile, duration))
                     else:
-                        delivery_sec = min(8.0, round(duration * 0.2, 2))
+                        delivery_sec = None
                 elif (
                     was_non_delivered
                     and req_matches_existing
@@ -6331,46 +6348,22 @@ class DashboardStore:
                         fin_ep = _iso_to_epoch(str(payload["finished_at"]))
                         delivery_sec = min(duration, max(0.0, round(completion_epoch - fin_ep, 2)))
                     else:
-                        delivery_sec = min(8.0, round(duration * 0.2, 2))
+                        delivery_sec = None
                 else:
-                    delivery_sec = explicit_delivery if explicit_delivery is not None else 8.0
-                    c_sec = explicit_compile if explicit_compile is not None else 87.0
-                    duration = c_sec + delivery_sec
+                    delivery_sec = explicit_delivery
+                    duration = (explicit_compile + explicit_delivery
+                                if explicit_compile is not None and explicit_delivery is not None else None)
+            # The compile time, as reported or derived from reported figures (None when it is not known).
+            known_compile = (
+                explicit_compile if explicit_compile is not None
+                else (duration - delivery_sec if duration is not None and delivery_sec is not None else None)
+            )
 
-            has_hits = payload.get("cache_hits") is not None
-            has_misses = payload.get("cache_misses") is not None
-            has_total = payload.get("total_crates") is not None
-            has_existing_crates = bool(existing_build)
-            if has_hits:
-                cache_hits = _finite_int(payload["cache_hits"], "cache_hits", min_val=0)
-            elif has_total and has_misses:
-                cache_hits = max(
-                    0,
-                    _finite_int(payload["total_crates"], "total_crates", min_val=0)
-                    - _finite_int(payload["cache_misses"], "cache_misses", min_val=0),
-                )
-            elif has_existing_crates:
-                cache_hits = _finite_int(existing_build.get("cache_hits", 0), "cache_hits", min_val=0)
-            else:
-                cache_hits = 0 if is_non_delivered else 380
-
-            if has_misses:
-                cache_misses = _finite_int(payload["cache_misses"], "cache_misses", min_val=0)
-            elif has_total:
-                cache_misses = max(
-                    0, _finite_int(payload["total_crates"], "total_crates", min_val=0) - cache_hits
-                )
-            elif has_existing_crates:
-                cache_misses = _finite_int(existing_build.get("cache_misses", 0), "cache_misses", min_val=0)
-            else:
-                cache_misses = 0 if is_non_delivered else 25
-
-            if has_total:
-                total_crates = _finite_int(payload["total_crates"], "total_crates", min_val=0)
-            elif has_existing_crates and not (has_hits or has_misses):
-                total_crates = _finite_int(existing_build.get("total_crates", 0), "total_crates", min_val=0)
-            else:
-                total_crates = cache_hits + cache_misses
+            # Crate counts come from this report when it carries any, else from the stored build; a count nobody
+            # reported stays None (derived only from the other two).
+            crate_keys = ("cache_hits", "cache_misses", "total_crates")
+            crate_source = payload if any(payload.get(k) is not None for k in crate_keys) else existing_build
+            cache_hits, cache_misses, total_crates = _crate_counts(*(crate_source.get(k) for k in crate_keys))
 
             if is_non_delivered:
                 req_at = (
@@ -6408,8 +6401,10 @@ class DashboardStore:
                     del_at = _iso_seconds_ago(0, del_epoch)
                 if payload.get("finished_at"):
                     fin_at = str(payload["finished_at"])
-                else:
+                elif delivery_sec is not None:
                     fin_at = _iso_seconds_ago(0, max(req_epoch, del_epoch - delivery_sec))
+                else:
+                    fin_at = None  # not reported: the compile/delivery split stays unknown
             elif (payload.get("requested_at") or existing_build.get("requested_at")) and not payload.get("delivered_at"):
                 req_at = str(payload.get("requested_at") or existing_build["requested_at"])
                 req_epoch = _iso_to_epoch(req_at)
@@ -6423,9 +6418,12 @@ class DashboardStore:
                 ):
                     fin_at = str(existing_build["finished_at"])
                     fin_epoch = _iso_to_epoch(fin_at)
-                else:
-                    fin_epoch = req_epoch + max(0.0, duration - delivery_sec)
+                elif known_compile is not None:
+                    fin_epoch = req_epoch + max(0.0, known_compile)
                     fin_at = _iso_seconds_ago(0, fin_epoch)
+                else:
+                    fin_epoch = None
+                    fin_at = None  # not reported: the compile/delivery split stays unknown
                 if (
                     existing_build.get("delivered_at")
                     and not payload.get("requested_at")
@@ -6434,47 +6432,43 @@ class DashboardStore:
                 ):
                     del_at = str(existing_build["delivered_at"])
                 else:
-                    del_epoch = (
-                        (req_epoch + duration)
-                        if explicit_total is not None
-                        else (fin_epoch + delivery_sec)
-                    )
+                    if explicit_total is not None:
+                        del_epoch = req_epoch + duration
+                    elif delivery_sec is not None and fin_epoch is not None:
+                        del_epoch = fin_epoch + delivery_sec
+                    else:
+                        del_epoch = now_ts  # delivered when reported
                     del_at = _iso_seconds_ago(0, del_epoch)
             else:
                 del_at = payload.get("delivered_at") or _iso_seconds_ago(0, now_ts)
                 del_epoch = _iso_to_epoch(str(del_at))
-                fin_at = payload.get("finished_at") or _iso_seconds_ago(delivery_sec, del_epoch)
-                fin_epoch = _iso_to_epoch(str(fin_at))
-                req_at = payload.get("requested_at") or _iso_seconds_ago(
-                    max(0.0, duration - delivery_sec), fin_epoch
-                )
+                if payload.get("finished_at"):
+                    fin_at = payload["finished_at"]
+                elif delivery_sec is not None:
+                    fin_at = _iso_seconds_ago(delivery_sec, del_epoch)
+                else:
+                    fin_at = None  # not reported: the compile/delivery split stays unknown
+                fin_epoch = _iso_to_epoch(str(fin_at)) if fin_at else None
+                if payload.get("requested_at"):
+                    req_at = payload["requested_at"]
+                elif known_compile is not None and fin_epoch is not None:
+                    req_at = _iso_seconds_ago(max(0.0, known_compile), fin_epoch)
+                elif duration is not None:
+                    req_at = _iso_seconds_ago(max(0.0, duration), del_epoch)
+                else:
+                    raise ValueError(UNKNOWN_BUILD_TIMING_MESSAGE)
 
-            existing_peak_ram = existing_build.get("peak_ram_gib")
-            default_peak_ram = (
-                existing_peak_ram
-                if existing_peak_ram is not None
-                else 0.0
-            )
-            existing_cpu_time = existing_build.get("cpu_time_seconds")
-            default_cpu_time = (
-                existing_cpu_time
-                if existing_cpu_time is not None
-                else 0.0
-            )
+            def reported(key: str) -> Any:
+                """This report's value, else the stored build's; None when neither reported it."""
+                value = payload.get(key)
+                return value if value is not None else existing_build.get(key)
 
             raw = {
                 "build_id": incoming_build_id or f"rb-{uuid.uuid4().hex[:8]}",
-                "project_name": payload.get(
-                    "project_name", existing_build.get("project_name", "oxidex")
-                ),
-                "profile": payload.get("profile", existing_build.get("profile", "release")),
-                "target_triple": payload.get(
-                    "target_triple",
-                    existing_build.get("target_triple", "x86_64-unknown-linux-gnu"),
-                ),
-                "commit_sha": payload.get(
-                    "commit_sha", existing_build.get("commit_sha", "af7c14f8cb2c")
-                ),
+                "project_name": reported("project_name"),
+                "profile": reported("profile"),
+                "target_triple": reported("target_triple"),
+                "commit_sha": reported("commit_sha"),
                 "status": status_str,
                 "requested_at": req_at,
                 "finished_at": fin_at,
@@ -6495,31 +6489,18 @@ class DashboardStore:
                 "cache_hits": cache_hits,
                 "cache_misses": cache_misses,
                 "total_crates": total_crates,
-                "instance_name": payload.get(
-                    "instance_name",
-                    existing_build.get("instance_name", "builder-oxidex-turin-01"),
-                ),
-                "zone": payload.get("zone", existing_build.get("zone", "us-south1-b")),
-                "machine_type": payload.get(
-                    "machine_type", existing_build.get("machine_type", "c4d-highcpu-16")
-                ),
-                "vcpu": _finite_int(
-                    payload.get("vcpu", existing_build.get("vcpu", 16)), "vcpu", min_val=1
-                ),
-                "cpu_platform": payload.get(
-                    "cpu_platform", existing_build.get("cpu_platform", "AMD Turin")
-                ),
-                "origin_ip": payload.get(
-                    "origin_ip", existing_build.get("origin_ip", "185.159.157.42")
-                ),
+                "instance_name": reported("instance_name"),
+                "zone": reported("zone"),
+                "machine_type": reported("machine_type"),
+                "vcpu": reported("vcpu"),
+                "cpu_platform": reported("cpu_platform"),
+                "origin_ip": reported("origin_ip"),
                 "origin_hostname": (
                     payload.get("origin_hostname")
                     if "origin_hostname" in payload
                     else existing_build.get("origin_hostname")
                 ),
-                "peak_ram_gib": _finite_float(
-                    payload.get("peak_ram_gib", default_peak_ram), "peak_ram_gib", min_val=0.0
-                ),
+                "peak_ram_gib": reported("peak_ram_gib"),
                 "container_ram_cap_gib": _finite_float(
                     payload.get(
                         "container_ram_cap_gib",
@@ -6528,11 +6509,7 @@ class DashboardStore:
                     "container_ram_cap_gib",
                     min_val=0.1,
                 ),
-                "cpu_time_seconds": _finite_float(
-                    payload.get("cpu_time_seconds", default_cpu_time),
-                    "cpu_time_seconds",
-                    min_val=0.0,
-                ),
+                "cpu_time_seconds": reported("cpu_time_seconds"),
             }
             _assert_finite_json_tree(payload, "payload")
             enriched = enrich_rust_build_record(raw, project=self.project)
