@@ -135,6 +135,23 @@ class PricingHistoryTests(unittest.TestCase):
             {"complete": False, "disk_rate_unknown": ["unsupported-cache"]}, 0, 0, 0, 3600)
         self.assertFalse(recovered.get("unpriced_history_intervals"))
 
+    def test_debt_recovery_preserves_unrelated_attachment_or_performance_uncertainty(self):
+        from lib.dashboard_server import _remember_incomplete_pricing
+
+        boot = {"id": "boot", "source": "z/boot", "type": "pd-balanced", "gb": 40}
+        pending = {"source": "z/new", "type": "pd-balanced", "gb": 100, "billing_deferred_since": 0.0}
+        for flag in ("changed_identity", "unpriced_disk_performance", "regional_disks", "local_ssd_gb"):
+            with self.subTest(flag=flag):
+                previous = {"pricing_complete": False, "disk_types_known": False,
+                            "deferred_disk_sources": [pending["source"]], "disks_detail": [boot, pending]}
+                current = {"disk_types_known": True, "disks_detail": [dict(boot), dict(pending)]}
+                if flag == "changed_identity":
+                    current["disks_detail"][0]["id"] = "replacement-boot"
+                else:
+                    previous[flag] = 1
+                _remember_incomplete_pricing(current, previous, {}, 0, 0, 0, 3600)
+                self.assertEqual(current["unpriced_history_intervals"]["fallback_storage"], [0, 3600])
+
     def test_retirement_keeps_unsupported_boot_history_when_cache_rate_is_complete(self):
         obs = self.observation(boot_disk_type="unsupported-boot", boot_disk_gb=40)
         boot = dict(obs["disks_detail"][0], source="z/boot", id="boot", type="unsupported-boot", gb=40,

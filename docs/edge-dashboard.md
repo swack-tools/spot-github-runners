@@ -373,6 +373,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   still don't fit is refused, and the inventory reads as stale. Window totals still include it to within an hour, though a search filter
   can't match folded records. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
+  Template creation and deletion plans require `instance_id` when a name matches more than one zonal
+  or historical record. A supplied ID takes priority over the name and never falls back to another VM.
 - Spend covers each VM's attached disks while the VM exists. A fleet-named disk that no VM uses, such
   as a dedicated builder's cache disk (`auto-delete=no`) after its VM is deleted, gets its own
   `DETACHED` record that bills storage until the disk is deleted (shown as present storage). A disk the instance listing still shows
@@ -389,8 +391,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   listing shows whether they still exist; its row shows that storage rate. That storage is repriced like other records. A disk that's
   detached again keeps its earlier standalone interval and restarts billing at the new handoff.
 - Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
-  scale-up plans are refused even when the listing is otherwise current. Grant the permission for
-  scaling to work. For a disk newly attached during this outage, the dashboard defers its cost rather
+  regional scale plans are refused even when the listing is otherwise current. Grant the permission for
+  scaling to work. For a disk newly attached or resized during this outage, the dashboard defers its cost rather
   than assigning a fallback rate. Once disk metadata is available, it fills that disk's history from
   its creation or known handoff time at the verified rate, preserving observed size-change boundaries.
   Deferred intervals follow a disk when its billing owner changes and survive detachment until metadata
@@ -448,7 +450,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `fleet_inventory` field reports the last successful listing and the last error. Until the next
   complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false and
   `fleet_inventory.stale_reason` says why: the rows
-  stay visible, but scaling recommendations hold and scale-up plans are refused. A listing that can't be
+  stay visible, but scaling recommendations hold and all regional scale plans are refused, including scale-down plans. A listing that can't be
   saved, for example on a full disk, also leaves the inventory stale, and so does a refresh that hasn't
   completed for three refresh intervals (6 minutes), for example a hung API connection.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
@@ -473,7 +475,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   nothing, so a quiet fleet doesn't publish a new snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
   empty, the instances tab says that the inventory isn't configured, and scaling recommendations hold
-  and scale-up plans are refused, because the real fleet is unknown. Inventory records loaded from
+  and regional scale plans are refused, because the real fleet is unknown. Inventory records loaded from
   a state file or snapshot are dropped too, since nothing would keep them current, and so is the
   baseline: a later re-enabled inventory starts a new one.
 - On load, from the state file, a KV snapshot, or a handover import, the dashboard drops every instance
