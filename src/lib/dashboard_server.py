@@ -514,8 +514,10 @@ def _record_bucket_span(record: dict[str, Any] | None) -> float:
     return float(span) if _finite(span) and span > 0 else _BUCKET_SECONDS
 
 
-def _rebucket(buckets: dict[str, list[float]], prefix: str, from_span: float, to_span: float) -> dict[str, list[float]]:
-    """Buckets re-keyed to ``to_span``: merged when coarser, spread evenly when finer."""
+def _rebucket(buckets: dict[str, list[float]], prefix: str, from_span: float, to_span: float,
+              until: float | None = None) -> dict[str, list[float]]:
+    """Buckets re-keyed to ``to_span``: merged when coarser, spread evenly when finer (over the part of each
+    bucket before ``until``, so a day that was still in progress keeps its cost in its elapsed hours)."""
     out: dict[str, list[float]] = {}
     for key, value in buckets.items():
         if not str(key).startswith(prefix):
@@ -529,7 +531,8 @@ def _rebucket(buckets: dict[str, list[float]], prefix: str, from_span: float, to
             for i in range(3):
                 target[i] += float(value[i])
         else:
-            parts = max(1, int(round(from_span / to_span)))
+            span_end = start + from_span if until is None else min(start + from_span, until)
+            parts = max(1, int(math.ceil(max(0.0, span_end - start) / to_span)))
             for n in range(parts):
                 target = out.setdefault(f"{prefix}{int(start + n * to_span)}", [0.0, 0.0, 0.0])
                 for i in range(3):
@@ -689,10 +692,18 @@ def _stopped_disk_hourly(pricing: dict[str, Any], *, include_tax: bool = True) -
 def _mark_pricing_completeness(record: dict[str, Any]) -> None:
     """Flag inventory records whose recorded cost is known to be too low (budgets fail closed on them)."""
     reasons = []
-    if (record.get("pricing") or {}).get("complete") is False:
+    pricing = record.get("pricing") or {}
+    custom = "custom" in str(record.get("machine_type", "")) or str(record.get("machine_type", "")).endswith("-ext")
+    if pricing.get("complete") is False and not custom:
         reasons.append("no on-demand rate for this standard (non-Spot) VM")
     if record.get("status") == "SUSPENDED":
         reasons.append("suspended: Compute Engine also bills the preserved memory, which is not priced here")
+    if record.get("regional_disks"):
+        reasons.append("regional (replicated) persistent disk, priced here only at the zonal rate")
+    if record.get("disk_types_known") is False:
+        reasons.append("disk types unknown (no compute.disks.list), priced at the default type")
+    if pricing.get("complete") is False and custom:
+        reasons.append("custom or extended machine shape, which predefined rates do not price")
     if record.get("unpriced_disk_performance"):
         reasons.append("Hyperdisk provisioned IOPS or throughput above the included baseline, not priced here")
     if int(record.get("local_ssd_gb") or 0) > 0:
@@ -726,6 +737,19 @@ def _live_instance_record(
     previous: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A dashboard instance record for one Compute Engine observation (see fleet_inventory.observe_fleet_items)."""
+    if obs.get("disk_types_known") is False:
+        obs = dict(obs)
+        if previous is not None and previous.get("disk_types_known") is not False:
+            # This listing could not read disk types: keep the stored ones where the disks are unchanged in size.
+            if int(previous.get("boot_disk_gb") or 0) == int(obs.get("boot_disk_gb") or 0):
+                obs["boot_disk_type"] = previous.get("boot_disk_type") or obs.get("boot_disk_type")
+            if int(previous.get("data_disk_gb") or 0) == int(obs.get("data_disk_gb") or 0):
+                obs["data_disk_type"] = previous.get("data_disk_type") or obs.get("data_disk_type")
+                obs["data_disks"] = previous.get("data_disks") or obs.get("data_disks")
+                obs["unpriced_disk_performance"] = bool(previous.get("unpriced_disk_performance"))
+                obs["regional_disks"] = bool(previous.get("regional_disks"))
+                if int(previous.get("boot_disk_gb") or 0) == int(obs.get("boot_disk_gb") or 0):
+                    obs["disk_types_known"] = True
     status = str(obs.get("status") or "UNKNOWN").upper()
     started = obs.get("last_start_epoch") or obs.get("created_epoch")
     if not isinstance(started, (int, float)) and previous is not None:
@@ -737,7 +761,8 @@ def _live_instance_record(
     region_known = any(r["region"] == region for r in REGIONS_CATALOG)
     provisioning = "spot" if obs.get("spot", True) else "ondemand"
     shape_keys = ("spot", "region", "machine_type", "vcpu", "ram_gib", "boot_disk_type", "boot_disk_gb",
-                  "data_disk_type", "data_disk_gb", "data_disks", "local_ssd_gb", "unpriced_disk_performance")
+                  "data_disk_type", "data_disk_gb", "data_disks", "local_ssd_gb", "unpriced_disk_performance",
+                  "regional_disks")
     reuse_pricing = (
         previous.get("pricing")
         if previous is not None and isinstance(previous.get("pricing"), dict)
@@ -785,6 +810,8 @@ def _live_instance_record(
     record["capacity_pending"] = bool(previous.get("capacity_pending")) if previous is not None else True
     record["local_ssd_gb"] = int(obs.get("local_ssd_gb") or 0)
     record["unpriced_disk_performance"] = bool(obs.get("unpriced_disk_performance"))
+    record["regional_disks"] = bool(obs.get("regional_disks"))
+    record["disk_types_known"] = obs.get("disk_types_known") is not False
     # The record shows the total data-disk size (pricing already covers each type).
     record["data_disk_gb"] = int(obs.get("data_disk_gb") or 0)
     if not region_known:
@@ -831,6 +858,16 @@ def _live_instance_record(
                 stop = obs.get("last_stop_epoch")
                 prev_end = stop if _finite(stop) and prev_start <= stop <= started_epoch else started_epoch
             prev_end = min(float(prev_end), started_epoch)
+            # Intervals of that run closed after its real stop (for example at a price change while the listing
+            # still said RUNNING) end at the stop.
+            trimmed = []
+            for s0, e0, ca, co in prior_runs:
+                if s0 >= prev_start and e0 > prev_end:
+                    if s0 >= prev_end:
+                        continue
+                    e0 = prev_end
+                trimmed.append((s0, e0, ca, co))
+            prior_runs = trimmed
             if prev_end > prev_open:
                 prior_runs.append((prev_open, prev_end, prev_compute_all_in, prev_compute_only))
         elif reuse_pricing is None:
@@ -1008,7 +1045,8 @@ def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[floa
         _add_to_buckets(buckets, prefix, s0, e0, r0, 0.0, compute=False)
     if usage_end > disk_open:
         _add_to_buckets(buckets, prefix, disk_open, usage_end, cur_disk, 0.0, compute=False)
-    own = _rebucket(record.get("folded_cost_buckets") or {}, "", _record_bucket_span(record), _BUCKET_SECONDS)
+    own = _rebucket(record.get("folded_cost_buckets") or {}, "", _record_bucket_span(record), _BUCKET_SECONDS,
+                    until=usage_end)
     for key, value in own.items():
         bucket = buckets.setdefault(f"{prefix}{key}", [0.0, 0.0, 0.0])
         for i in range(3):
@@ -2040,7 +2078,10 @@ class DashboardStore:
 
         previous_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(previous, "cicd_runner"))
         added_slots = sum(int(r.get("runners_count", 0) or 0) for r in new_running("cicd_runner"))
-        current_slots = previous_slots + added_slots
+        # Gate on new capacity, but judge the OOM target against the ready capacity actually running now (a host
+        # that stopped in the same listing does not count).
+        current_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(current, "cicd_runner")
+                            if r.get("runners_count_known") is not False)
         if added_slots > 0:
             pol = self.state.get("scaling", {}).get("cicd_runner", {})
             prof = self.state.get("profiles", {}).get("cicd_runner", {})
@@ -3212,8 +3253,9 @@ class DashboardStore:
         return [str(inst.get("name")) for inst in self.state.get("instances", [])
                 if _is_transitional(inst) and inst.get("role") == role]
 
-    @staticmethod
-    def _held(evaluation: dict[str, Any], reason: str) -> dict[str, Any]:
+    def _held(self, evaluation: dict[str, Any], reason: str, role: str) -> dict[str, Any]:
+        # A held recommendation projects the fleet it keeps, so a shared budget does not reserve a rejected change.
+        projected = round(sum(self._running_role_hourly_rates(role)), 4)
         return {
             **evaluation,
             "direction": "hold",
@@ -3222,6 +3264,9 @@ class DashboardStore:
             "scale_up_reasons": [],
             "scale_down_reasons": [],
             "hold_reason": reason,
+            "projected_hourly_usd": projected,
+            "projected_daily_usd": round(projected * 24.0, 2),
+            "projected_monthly_usd": round(projected * 24.0 * 365.0 / 12.0, 2),
         }
 
     def _inventory_stale_reason(self) -> str:
@@ -3240,20 +3285,20 @@ class DashboardStore:
         or an understated fleet cost (scale-ups, whose budget check would pass on the low figure)."""
         stale = self._inventory_stale_reason()
         if stale:
-            return self._held(evaluation, stale)
+            return self._held(evaluation, stale, role)
         if role == "cicd_runner":
             unknown = self.state.get("scaling_telemetry", {}).get("unknown_runner_count_hosts") or []
             if unknown:
                 return self._held(evaluation, f"Runner count not recorded on {len(unknown)} running host(s) "
-                                              f"({', '.join(unknown[:5])}); slot totals are unknown")
+                                              f"({', '.join(unknown[:5])}); slot totals are unknown", role)
         pending = self._transitional_hosts(role)
         if pending and evaluation.get("direction") == "scale_up":
             return self._held(evaluation, f"{len(pending)} VM(s) ({', '.join(pending[:5])}) are starting, stopping, "
-                                          "or repairing; their capacity is not settled yet")
+                                          "or repairing; their capacity is not settled yet", role)
         incomplete = self._incomplete_cost_hosts(role)
         if incomplete and evaluation.get("direction") == "scale_up":
             return self._held(evaluation, f"Cost of {len(incomplete)} VM(s) ({', '.join(incomplete[:5])}) is not fully "
-                                          "priced, so the scale-up budget check cannot be trusted")
+                                          "priced, so the scale-up budget check cannot be trusted", role)
         return evaluation
 
     def _stopped_disk_burn(self, role: str) -> float:

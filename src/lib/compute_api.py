@@ -371,6 +371,8 @@ async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, dict]:
                 if isinstance(disk, dict) and disk.get("selfLink"):
                     types[str(disk["selfLink"])] = {
                         "type": str(disk.get("type", "")).rsplit("/", 1)[-1],
+                        # Regional (replicated) disks bill differently from zonal ones of the same type.
+                        "regional": "/regions/" in str(disk.get("selfLink", "")) or "/regions/" in str(disk.get("type", "")),
                         **{k: disk[k] for k in ("provisionedIops", "provisionedThroughput") if k in disk},
                     }
         token = data.get("nextPageToken")

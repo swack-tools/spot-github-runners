@@ -90,8 +90,9 @@ def _vcpu_from_machine_type(machine_type: str) -> int:
 def observe_fleet_items(
     items: list[dict],
     *,
-    disk_types: Mapping[str, str] | None = None,
+    disk_types: Mapping[str, Any] | None = None,
     shapes: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+    disk_types_known: bool = True,
 ) -> list[dict[str, Any]]:
     """Normalize a Compute Engine aggregated instance listing into fleet observations.
 
@@ -126,6 +127,7 @@ def observe_fleet_items(
         data_disks: dict[str, int] = {}
         local_ssd_gb = 0
         unpriced_performance = False
+        regional_disks = False
         for disk in item.get("disks", []) if isinstance(item.get("disks"), list) else []:
             if not isinstance(disk, dict):
                 continue
@@ -136,6 +138,7 @@ def observe_fleet_items(
                 local_ssd_gb += size
                 continue
             detail = _disk_detail(disk_types, str(disk.get("source", "")))
+            regional_disks = regional_disks or bool(detail.get("regional")) or "/regions/" in str(disk.get("source", ""))
             dtype = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
             unpriced_performance = unpriced_performance or (bool(detail) and _unpriced_performance(detail))
             if disk.get("boot"):
@@ -188,6 +191,9 @@ def observe_fleet_items(
             "data_disks": data_disks,
             "local_ssd_gb": local_ssd_gb,
             "unpriced_disk_performance": unpriced_performance,
+            "regional_disks": regional_disks,
+            # False when disk types fell back to the default (no compute.disks.list): the record keeps known types.
+            "disk_types_known": disk_types_known,
             "runners_count": runners_count,
             "runner_vcpu": runner_vcpu,
             "runner_ram_gib": runner_ram_gib,
@@ -232,7 +238,8 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                     raise RuntimeError(f"zones unreachable: {', '.join(unreachables[:5])}")
                 fleet_items = [i for i in items if isinstance(i, dict)
                                and str(i.get("name", "")).startswith(FLEET_NAME_PREFIXES)]
-                disk_types: dict[str, str] = {}
+                disk_types: dict[str, Any] = {}
+                types_known = True
                 try:
                     if fleet_items:
                         disk_types = await compute_api.list_disk_types(api, auth.project)
@@ -242,7 +249,9 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                         # Transient (or after a restart, when this process has not listed disks yet but stored
                         # records may hold real types): fail the whole listing so known types are not replaced.
                         raise RuntimeError(f"disk listing failed: {type(exc).__name__}: {exc}") from exc
-                    # No compute.disks.list (HTTP 403): disk types fall back to the default.
+                    # No compute.disks.list (HTTP 403): disk types fall back to the default, flagged as unknown so
+                    # stored types are kept and new records are not priced as complete.
+                    types_known = False
                 wanted = {(str(i.get("zone", "")).rsplit("/", 1)[-1], str(i.get("machineType", "")).rsplit("/", 1)[-1])
                           for i in fleet_items}
                 for zone, machine_type in wanted - shape_cache.keys():
@@ -257,7 +266,8 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                 if missing:
                     # Unknown RAM would price as free: fail the refresh (records stay as they were) instead.
                     raise RuntimeError(f"machine type capacity unavailable: {', '.join(missing[:5])}")
-                return observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache)
+                return observe_fleet_items(fleet_items, disk_types=disk_types, shapes=shape_cache,
+                                           disk_types_known=types_known)
             finally:
                 while not api.connections.empty():
                     _reader, writer = api.connections.get_nowait()

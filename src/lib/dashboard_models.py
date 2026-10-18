@@ -1988,11 +1988,15 @@ def calculate_spot_pricing(
         "total_daily_usd": _money(total_daily),
         "total_monthly_usd": _money(total_monthly),
     }
+    custom_shape = bool(machine_type) and ("custom" in machine_type or machine_type.endswith("-ext"))
     if on_demand:
         result["provisioning"] = "ondemand"
-        result["complete"] = pricing_source == "gcp_billing_catalog"
+        result["complete"] = pricing_source == "gcp_billing_catalog" and not custom_shape
         if not result["complete"]:
             result["pricing_source"] = "spot_baseline_for_on_demand_vm"
+    if custom_shape and pricing_source != "gcp_capacity_history":
+        # Custom and extended shapes bill their own SKUs; predefined series rates do not price them.
+        result["complete"] = False
     return result
 
 
