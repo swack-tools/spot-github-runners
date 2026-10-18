@@ -338,7 +338,10 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
   (HTTP 403) a VM keeps the types stored from an earlier listing and a new VM shows `pd-balanced`,
   but both are marked unverified and incompletely priced, and neither can be a template source. Any other failed or partial disk listing fails the whole refresh,
-  so known disk types are never replaced by the default. A machine type whose capacity can't
+  so known disk types are never replaced by the default. An attached disk the listing doesn't cover is
+  treated as an unknown type. On a VM's first listing, each disk is billed from its own creation time,
+  so a disk attached later isn't billed back to the VM's creation; when a creation time is missing, disk
+  history starts at that listing. A machine type whose capacity can't
   be read also fails the refresh, so no VM is priced without its memory.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A suspended VM's compute ends at its
@@ -400,16 +403,16 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
   inactive makes no Compute Engine calls and keeps the records the active slot last published.
 - The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
-  already existed, so they don't mark OOM events handled. Only later growth beyond the capacity that
-  already existed does: a VM first listed after the baseline adds capacity once, when it's `RUNNING`
-  and, for a runner host, has confirmed its bootstrap. A stopped VM that starts again adds none. The
-  OOM target is then checked against the ready runner slots actually running after the listing, so
-  replacing a host with one of the same size handles nothing. Each builder OOM event keeps the number of
-  builders running when the inventory first saw it (`baseline_builders`), and a new builder handles it
-  only once more builders than that are running. New capacity stays pending while an active OOM event
-  it could still satisfy remains, so a later net increase still handles it. A held recommendation projects the cost
-  of the fleet it keeps. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
-  snapshot.
+  already existed, so they don't mark OOM events handled. A runner OOM event keeps the ready runner slots
+  running when a listing first saw it (`baseline_runners`), and it's handled only when a runner host
+  first listed after the baseline is `RUNNING` with its bootstrap confirmed and the ready slots reach
+  the event's target. A restart of existing capacity, or a same-size replacement, handles nothing. New
+  capacity stays pending through the OOM lookback, so an OOM reported late can still be answered by it.
+  Builder OOM events are never handled from the inventory: a builder has no service account, so its
+  instance record can't show that its build container started. Acknowledge them with `POST /api/scaling`
+  and `acknowledge_oom_id` (or `acknowledge_all_ooms`).
+  A held recommendation projects the cost of the fleet it keeps. A listing that changes nothing writes
+  nothing, so a quiet fleet doesn't publish a new snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
   empty, the instances tab says that the inventory isn't configured, and scaling recommendations hold
   and scale-up plans are refused, because the real fleet is unknown. Inventory records loaded from

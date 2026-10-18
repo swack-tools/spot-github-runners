@@ -358,7 +358,8 @@ async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, dict]:
     query = {
         "maxResults": "500",
         "returnPartialSuccess": "true",
-        "fields": "nextPageToken,unreachables,items/*/disks(selfLink,type,provisionedIops,provisionedThroughput)",
+        "fields": ("nextPageToken,unreachables,"
+                   "items/*/disks(selfLink,type,provisionedIops,provisionedThroughput,creationTimestamp)"),
     }
     types: dict[str, dict] = {}
     while True:
@@ -373,7 +374,8 @@ async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, dict]:
                         "type": str(disk.get("type", "")).rsplit("/", 1)[-1],
                         # Regional (replicated) disks bill differently from zonal ones of the same type.
                         "regional": "/regions/" in str(disk.get("selfLink", "")) or "/regions/" in str(disk.get("type", "")),
-                        **{k: disk[k] for k in ("provisionedIops", "provisionedThroughput") if k in disk},
+                        **{k: disk[k] for k in ("provisionedIops", "provisionedThroughput", "creationTimestamp")
+                           if k in disk},
                     }
         token = data.get("nextPageToken")
         if not token:

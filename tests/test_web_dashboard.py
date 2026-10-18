@@ -4819,22 +4819,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(len(self.store.state["instances"]), 1)  # Rolled back.
         self.assertIn("No space left", self.store._inventory_stale_reason())
 
-    def test_builder_restart_does_not_consume_oom(self):
-        builder = fleet_observation("5100", "builder-oxidex-oom-1", "us-south1-b", started_hours_ago=5.0, now=self.now)
-        self.fleet = [builder]
-        self.store.refresh_fleet_inventory()
-        self.fleet = [dict(builder, status="TERMINATED", last_stop_epoch=self.now - 3600.0)]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b2", "instance_name": "builder-oxidex-oom-1", "role": "rust_builder"}]
-        self.fleet = [dict(builder, last_start_epoch=self.now - 60.0)]  # Same VM started again.
-        self.store.refresh_fleet_inventory()
-        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
-        self.fleet.append(fleet_observation("5101", "builder-oxidex-oom-2", "us-south1-b", now=self.now))
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
-
     def test_bootstrap_confirmation_alone_updates_record(self):
         provisioning = fleet_observation("5200", "oxidex-runners-boot-2", "us-south1-a", now=self.now)
         provisioning["runners_count_known"] = False
@@ -4845,19 +4829,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertTrue(self.store.refresh_fleet_inventory())
         self.assertTrue(self._record("oxidex-runners-boot-2")["runners_count_known"])
         self.assertEqual(self.store.state["scaling_telemetry"]["unknown_runner_count_hosts"], [])
-
-    def test_new_vm_beside_stopped_capacity_handles_oom(self):
-        running = fleet_observation("5300", "builder-oxidex-cap-1", "us-south1-b", now=self.now)
-        stopped = fleet_observation("5301", "builder-oxidex-cap-2", "us-south1-b", status="TERMINATED",
-                                    started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)
-        self.fleet = [running, stopped]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b3", "instance_name": "builder-oxidex-cap-1", "role": "rust_builder"}]
-        self.fleet = [running, stopped, fleet_observation("5302", "builder-oxidex-cap-3", "us-south1-b", now=self.now)]
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
 
     def test_new_runner_counts_for_oom_only_once_ready(self):
         base = fleet_observation("5500", "oxidex-runners-base-1", "us-south1-a", runners_count=1, now=self.now)
@@ -4877,21 +4848,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.store.refresh_fleet_inventory()
         self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
         self.assertFalse(self._record("oxidex-runners-new-1")["capacity_pending"])
-
-    def test_vm_seen_staging_first_still_counts_when_running(self):
-        builder = fleet_observation("5600", "builder-oxidex-old-1", "us-south1-b", now=self.now)
-        self.fleet = [builder]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b4", "instance_name": "builder-oxidex-old-1", "role": "rust_builder"}]
-        staging = fleet_observation("5601", "builder-oxidex-new-2", "us-south1-b", status="STAGING", now=self.now)
-        self.fleet = [builder, staging]
-        self.store.refresh_fleet_inventory()
-        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
-        self.fleet = [builder, dict(staging, status="RUNNING")]
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
 
     def test_tax_setting_change_reprices_inventory_in_same_save(self):
         self.fleet = [fleet_observation("5800", "builder-oxidex-taxnow-1", "us-south1-b", now=self.now)]
@@ -5022,18 +4978,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not configured"):
             store.scale_region_instances({"region": "us-south1", "role": "cicd_runner", "target_instances": 1})
 
-    def test_builder_replacement_does_not_consume_oom(self):
-        old = fleet_observation("6500", "builder-oxidex-repl-1", "us-south1-b", now=self.now)
-        self.fleet = [old]
-        self.store.refresh_fleet_inventory()
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b5", "instance_name": "builder-oxidex-repl-1", "role": "rust_builder"}]
-        self.fleet = [dict(old, status="TERMINATED", last_stop_epoch=self.now - 60.0),
-                      fleet_observation("6501", "builder-oxidex-repl-2", "us-south1-b", now=self.now)]
-        self.store.refresh_fleet_inventory()
-        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
-
     def test_unrepresentable_disk_sources_are_not_templates(self):
         for i, flag in enumerate(("regional_disks", "unpriced_disk_performance")):
             obs = fleet_observation(f"660{i}", f"builder-oxidex-tpl-{i}", "us-south1-b", now=self.now)
@@ -5081,26 +5025,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertTrue(_unpriced_performance({"type": "pd-extreme", "provisionedIops": "20000"}))
         self.assertFalse(_unpriced_performance({"type": "pd-ssd"}))
 
-    def test_pending_capacity_survives_replacement_until_net_growth(self):
-        old = fleet_observation("7000", "builder-oxidex-net-1", "us-south1-b", now=self.now)
-        self.fleet = [old]
-        self.store.refresh_fleet_inventory()
-        observed = datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b6", "instance_name": "builder-oxidex-net-1", "role": "rust_builder",
-                 "observed_at": observed}]
-        stopped_old = dict(old, status="TERMINATED", last_stop_epoch=self.now - 30.0)
-        new = fleet_observation("7001", "builder-oxidex-net-2", "us-south1-b", now=self.now)
-        self.fleet = [stopped_old, new]
-        self.store.refresh_fleet_inventory()
-        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
-        self.assertTrue(self._record("builder-oxidex-net-2")["capacity_pending"])
-        self.fleet = [dict(old, last_start_epoch=time.time()), new]  # The old builder starts again: net growth.
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
-        self.assertFalse(self._record("builder-oxidex-net-2")["capacity_pending"])
-
     def test_instance_id_wins_over_reused_name(self):
         first = fleet_observation("7100", "builder-oxidex-same", "us-south1-b", now=self.now)
         second = fleet_observation("7101", "builder-oxidex-same", "us-south1-a", now=self.now)
@@ -5109,27 +5033,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         plan = self.store.delete_instance({"instance_id": "7101", "instance_name": "builder-oxidex-same"})
         self.assertEqual(plan["instance"]["instance_id"], "7101")
 
-    def test_builder_oom_keeps_event_baseline_across_polls(self):
-        old = fleet_observation("7200", "builder-oxidex-base-1", "us-south1-b", now=self.now)
-        self.fleet = [old]
-        self.store.refresh_fleet_inventory()
-        observed = datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b7", "instance_name": "builder-oxidex-base-1", "role": "rust_builder",
-                 "observed_at": observed}]
-        self.fleet = [dict(old, status="TERMINATED", last_stop_epoch=self.now - 30.0)]
-        self.store.refresh_fleet_inventory()  # Stopped: baseline stays at the 1 builder running at the event.
-        replacement = fleet_observation("7201", "builder-oxidex-base-2", "us-south1-b", now=self.now)
-        self.fleet = [dict(old, status="TERMINATED", last_stop_epoch=self.now - 30.0), replacement]
-        self.store.refresh_fleet_inventory()
-        event = self.store.state["scaling_telemetry"]["journal_oom_events"][0]
-        self.assertEqual(event["baseline_builders"], 1)
-        self.assertFalse(event.get("handled", False))
-        self.fleet = [replacement, fleet_observation("7202", "builder-oxidex-base-3", "us-south1-b", now=self.now)]
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
-
     def test_inventory_goes_stale_when_refreshes_stop_completing(self):
         self.fleet = [fleet_observation("7300", "oxidex-runners-hang-1", "us-south1-a", now=self.now)]
         self.store.refresh_fleet_inventory()
@@ -5137,6 +5040,167 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         clock = time.time() + 4 * self.store.fleet_inventory_interval
         with unittest.mock.patch.object(self.store, "_clock", return_value=clock):
             self.assertIn("no complete listing", self.store._inventory_stale_reason())
+
+    def _runner_oom(self, event_id: str, host: str) -> None:
+        observed = datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": event_id, "instance_name": host, "role": "cicd_runner", "observed_at": observed}]
+
+    def _runner_oom_handled(self) -> bool:
+        return bool(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
+
+    def _runner(self, instance_id: str, name: str, **kwargs) -> dict:
+        return fleet_observation(instance_id, name, "us-south1-a", runners_count=4, now=self.now, **kwargs)
+
+    def test_first_listing_is_a_baseline_not_growth(self):
+        from lib.dashboard_server import FLEET_BASELINE_STATE_KEY
+
+        self._runner_oom("oom-r10", "oxidex-runners-a")
+        self.fleet = [self._runner("1900", "oxidex-runners-a")]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state.get(FLEET_BASELINE_STATE_KEY))
+        self.assertFalse(self._runner_oom_handled())
+        self.fleet.append(self._runner("1901", "oxidex-runners-b"))
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_runner_restart_does_not_consume_oom(self):
+        host = self._runner("5100", "oxidex-runners-oom-1", started_hours_ago=5.0)
+        self.fleet = [host]
+        self.store.refresh_fleet_inventory()
+        self.fleet = [dict(host, status="TERMINATED", last_stop_epoch=self.now - 3600.0)]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r11", "oxidex-runners-oom-1")
+        self.fleet = [dict(host, last_start_epoch=self.now - 60.0)]  # Same VM started again.
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self._runner_oom_handled())
+        self.fleet.append(self._runner("5101", "oxidex-runners-oom-2"))
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_new_vm_beside_stopped_capacity_handles_oom(self):
+        running = self._runner("5300", "oxidex-runners-cap-1")
+        stopped = self._runner("5301", "oxidex-runners-cap-2", status="TERMINATED", started_hours_ago=5.0,
+                               stopped_hours_ago=1.0)
+        self.fleet = [running, stopped]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r12", "oxidex-runners-cap-1")
+        self.store.refresh_fleet_inventory()
+        self.fleet = [running, stopped, self._runner("5302", "oxidex-runners-cap-3")]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_vm_seen_staging_first_still_counts_when_running(self):
+        base = self._runner("5600", "oxidex-runners-old-1")
+        self.fleet = [base]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r13", "oxidex-runners-old-1")
+        staging = self._runner("5601", "oxidex-runners-new-2", status="STAGING")
+        self.fleet = [base, staging]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self._runner_oom_handled())
+        self.fleet = [base, dict(staging, status="RUNNING")]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_runner_oom_keeps_event_baseline_across_polls(self):
+        old = self._runner("7200", "oxidex-runners-base-1")
+        self.fleet = [old]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r14", "oxidex-runners-base-1")
+        stopped_old = dict(old, status="TERMINATED", last_stop_epoch=self.now - 30.0)
+        self.fleet = [stopped_old]
+        self.store.refresh_fleet_inventory()  # Baseline recorded at the 4 slots running when first seen.
+        self.assertEqual(self.store.state["scaling_telemetry"]["journal_oom_events"][0]["baseline_runners"], 4)
+        replacement = self._runner("7201", "oxidex-runners-base-2")
+        self.fleet = [stopped_old, replacement]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self._runner_oom_handled())  # Back to 4 slots: no growth.
+        self.fleet = [stopped_old, replacement, self._runner("7202", "oxidex-runners-base-3")]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_pending_capacity_survives_replacement_until_net_growth(self):
+        old = self._runner("7000", "oxidex-runners-net-1")
+        self.fleet = [old]
+        self.store.refresh_fleet_inventory()
+        self._runner_oom("oom-r15", "oxidex-runners-net-1")
+        stopped_old = dict(old, status="TERMINATED", last_stop_epoch=self.now - 30.0)
+        new = self._runner("7001", "oxidex-runners-net-2")
+        self.fleet = [stopped_old, new]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self._runner_oom_handled())
+        self.assertTrue(self._record("oxidex-runners-net-2")["capacity_pending"])
+        self.fleet = [dict(old, last_start_epoch=time.time()), new]  # The old host starts again: net growth.
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self._runner_oom_handled())
+
+    def test_pending_capacity_kept_for_late_oom(self):
+        self.fleet = [self._runner("7400", "oxidex-runners-late-1")]
+        self.store.refresh_fleet_inventory()
+        self.fleet.append(self._runner("7401", "oxidex-runners-late-2", started_hours_ago=0.1))
+        self.store.refresh_fleet_inventory()
+        # No OOM yet, but the new host started inside the OOM lookback: it stays pending for a late report.
+        self.assertTrue(self._record("oxidex-runners-late-2")["capacity_pending"])
+
+    def test_builder_ooms_are_never_handled_from_inventory(self):
+        self.fleet = [fleet_observation("7500", "builder-oxidex-bo-1", "us-south1-b", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        observed = datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-b9", "instance_name": "builder-oxidex-bo-1", "role": "rust_builder",
+                 "observed_at": observed}]
+        self.fleet = self.fleet + [fleet_observation(f"750{i}", f"builder-oxidex-bo-{i}", "us-south1-b", now=self.now)
+                                   for i in (2, 3)]
+        self.store.refresh_fleet_inventory()
+        self.assertFalse(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled", False))
+
+    def test_unresolved_disk_source_is_unverified(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        obs = observe_fleet_items(
+            [{"id": "7600", "name": "builder-oxidex-race-1", "zone": "zones/us-south1-b", "status": "RUNNING",
+              "machineType": "machineTypes/n4-highcpu-16",
+              "disks": [{"boot": True, "diskSizeGb": "40", "source": "d/boot"},
+                        {"boot": False, "diskSizeGb": "500", "source": "d/new"}]}],
+            disk_types={"d/boot": {"type": "pd-balanced"}},
+            shapes={("us-south1-b", "n4-highcpu-16"): {"vcpu": 16, "ram_gib": 32.0}})
+        self.assertFalse(obs[0]["disk_types_known"])
+
+    def test_first_sight_bills_each_disk_from_its_creation(self):
+        from lib.dashboard_server import _pricing_rates, instance_usage
+
+        vm_created = self.now - 30 * 86400.0
+        data_created = self.now - 86400.0
+        obs = fleet_observation("7700", "builder-oxidex-attach-1", "us-south1-b", started_hours_ago=30 * 24.0,
+                                now=self.now)
+        obs.update(created_epoch=vm_created, disks_detail=[
+            {"type": "hyperdisk-balanced", "gb": 40, "created_epoch": vm_created},
+            {"type": "hyperdisk-balanced", "gb": 100, "created_epoch": data_created}])
+        self.fleet = [obs]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-attach-1")
+        self.assertEqual(len(rec["disk_segments"]), 1)
+        start, end, boot_rate = rec["disk_segments"][0]
+        self.assertAlmostEqual(start, vm_created, delta=1.0)
+        self.assertAlmostEqual(end, data_created, delta=1.0)
+        full_rate = _pricing_rates(rec["pricing"])[2]
+        self.assertLess(boot_rate, full_rate)
+        usage = instance_usage(rec, self.now, self.now - 744 * 3600.0)
+        expected_disk = (data_created - vm_created) / 3600.0 * boot_rate + 24.0 * full_rate
+        compute = usage["cost_all_in"] - expected_disk
+        self.assertAlmostEqual(compute, 30 * 24.0 * _pricing_rates(rec["pricing"])[0], delta=0.05)
+
+    def test_first_sight_without_disk_creation_times_does_not_backfill(self):
+        obs = fleet_observation("7800", "builder-oxidex-nobf-1", "us-south1-b", started_hours_ago=48.0, now=self.now)
+        obs["disks_detail"] = [{"type": "pd-balanced", "gb": 40, "created_epoch": None}]
+        self.fleet = [obs]
+        before = time.time()
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-nobf-1")
+        self.assertGreaterEqual(rec["disk_segment_start"], before - 1.0)
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
@@ -5151,21 +5215,6 @@ class FleetInventoryReconcileTests(unittest.TestCase):
 
         self.assertEqual(DashboardStore(fleet_source=lambda: []).fleet_inventory_status()["source"], "gce")
         self.assertEqual(DashboardStore().fleet_inventory_status()["source"], "none")
-
-    def test_first_listing_is_a_baseline_not_growth(self):
-        from lib.dashboard_server import FLEET_BASELINE_STATE_KEY
-
-        with self.store._lock:
-            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
-                {"id": "oom-b1", "instance_name": "builder-oxidex-a", "role": "rust_builder"}]
-        self.fleet = [fleet_observation("1900", "builder-oxidex-a", "us-south1-b", now=self.now)]
-        self.store.refresh_fleet_inventory()
-        self.assertTrue(self.store.state.get(FLEET_BASELINE_STATE_KEY))
-        event = self.store.state["scaling_telemetry"]["journal_oom_events"][0]
-        self.assertFalse(event.get("handled", False))
-        self.fleet.append(fleet_observation("1901", "builder-oxidex-b", "us-south1-b", now=self.now))
-        self.assertTrue(self.store.refresh_fleet_inventory())
-        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
 
     def test_empty_first_listing_still_records_baseline(self):
         from lib.dashboard_server import FLEET_BASELINE_STATE_KEY

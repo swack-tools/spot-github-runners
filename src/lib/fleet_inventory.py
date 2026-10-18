@@ -130,6 +130,10 @@ def observe_fleet_items(
         local_ssd_gb = 0
         unpriced_performance = False
         regional_disks = False
+        unresolved_disks = False
+        # Each persistent disk with its own creation time, so history before a later-attached disk is not billed
+        # at its rate.
+        disks_detail: list[dict[str, Any]] = []
         for disk in item.get("disks", []) if isinstance(item.get("disks"), list) else []:
             if not isinstance(disk, dict):
                 continue
@@ -140,9 +144,14 @@ def observe_fleet_items(
                 local_ssd_gb += size
                 continue
             detail = _disk_detail(disk_types, str(disk.get("source", "")))
+            if disk_types_known and not detail.get("type"):
+                # The disk listing did not cover this attachment (for example a disk created between the two
+                # listings): its type is unknown, not the default.
+                unresolved_disks = True
             regional_disks = regional_disks or bool(detail.get("regional")) or "/regions/" in str(disk.get("source", ""))
             dtype = str(detail.get("type") or "") or DEFAULT_DISK_TYPE
             unpriced_performance = unpriced_performance or (bool(detail) and _unpriced_performance(detail))
+            disks_detail.append({"type": dtype, "gb": size, "created_epoch": gce_epoch(detail.get("creationTimestamp"))})
             if disk.get("boot"):
                 boot_disk_type, boot_disk_gb = dtype, size
             else:
@@ -195,7 +204,8 @@ def observe_fleet_items(
             "unpriced_disk_performance": unpriced_performance,
             "regional_disks": regional_disks,
             # False when disk types fell back to the default (no compute.disks.list): the record keeps known types.
-            "disk_types_known": disk_types_known,
+            "disk_types_known": disk_types_known and not unresolved_disks,
+            "disks_detail": disks_detail,
             "runners_count": runners_count,
             "runner_vcpu": runner_vcpu,
             "runner_ram_gib": runner_ram_gib,

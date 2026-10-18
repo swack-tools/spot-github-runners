@@ -734,6 +734,37 @@ def _is_transitional(inst: Any) -> bool:
             and inst.get("status") not in ("RUNNING", "DELETED"))
 
 
+def _initial_disk_history(
+    obs: dict[str, Any], *, region: str, family: str, project: str, tax_rate_percent: float, now: float,
+) -> tuple[list[tuple[float, float, float]], float | None]:
+    """(closed disk segments, open segment start) for a VM seen for the first time.
+
+    Between successive disk creation times the rate is that of the disks that existed then; the open segment (at
+    the record's full disk rate) starts at the newest disk's creation. Without every creation time, nothing is
+    backfilled: the open segment starts now.
+    """
+    disks = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
+    if not disks:
+        return [], None  # No per-disk evidence (older observations): the VM's creation bounds disk history.
+    if not all(_finite(d.get("created_epoch")) for d in disks):
+        return [], now
+    tax = 1.0 + tax_rate_percent / 100.0
+
+    def disk_all_in(d: dict[str, Any]) -> float:
+        priced = calculate_spot_pricing(
+            family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type=str(d.get("type") or "pd-balanced"),
+            boot_disk_gb=int(d.get("gb") or 0), data_disk_type=str(d.get("type") or "pd-balanced"), data_disk_gb=0,
+            tax_rate_percent=tax_rate_percent, machine_type=None, project=project)
+        return float(priced.get("disk_hourly_usd", 0.0) or 0.0) * tax
+
+    times = sorted({min(float(d["created_epoch"]), now) for d in disks})
+    segments = []
+    for start, end in zip(times, times[1:]):
+        rate = sum(disk_all_in(d) for d in disks if float(d["created_epoch"]) <= start)
+        segments.append((start, end, rate))
+    return segments, times[-1]
+
+
 def _live_instance_record(
     obs: dict[str, Any],
     *,
@@ -843,12 +874,20 @@ def _live_instance_record(
     disk_start = min(float(created), started_epoch) if _finite(created) else started_epoch
     prior_runs = _prior_runs(previous)
     disk_segments = _disk_segments(previous)
+    initial_disk_segment_start: float | None = None
+    if previous is None:
+        # First sight of this VM: bill earlier disk time per disk from each disk's own creation, never a later-
+        # attached disk back to the VM's creation; with any creation time unknown, start disk history now.
+        disk_segments, initial_disk_segment_start = _initial_disk_history(
+            obs, region=region, family=str(obs.get("machine_type") or "").split("-", 1)[0], project=project,
+            tax_rate_percent=float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0), now=now)
     compute_segment_start = started_epoch
     if previous is not None and _finite(previous.get("compute_segment_start")) \
             and float(previous.get("started_epoch") or 0.0) == started_epoch:
         # Same run: keep the boundary of an earlier rate change, or that time would be counted twice.
         compute_segment_start = max(started_epoch, float(previous["compute_segment_start"]))
-    disk_segment_start = previous.get("disk_segment_start") if previous is not None else None
+    disk_segment_start = (previous.get("disk_segment_start") if previous is not None
+                          else initial_disk_segment_start)
     if previous is not None and isinstance(previous.get("pricing"), dict):
         prev_compute_all_in, prev_compute_only, prev_disk_all_in = _pricing_rates(previous["pricing"])
         prev_start = float(previous.get("started_epoch") or started_epoch)
@@ -2068,25 +2107,31 @@ class DashboardStore:
             self._stop_event.wait(self.fleet_inventory_interval)
 
     def _consume_ooms_for_fleet_growth(self, previous: list[Any], current: list[dict[str, Any]]) -> None:
-        """Mark OOM events handled once the live fleet actually grew (runner slots, or builder VMs)."""
+        """Mark runner OOM events handled once the live fleet gained ready runner capacity.
 
-        def running(records: list[Any], role: str) -> list[dict[str, Any]]:
-            return [r for r in records if isinstance(r, dict) and r.get("status") == "RUNNING" and r.get("role") == role]
+        Builder OOM events are never handled from the inventory: a dedicated builder runs without a service
+        account, so nothing in its instance record shows that its build container came up. They stay active until
+        an operator acknowledges them.
+        """
 
-        # Only VMs first seen after the baseline add capacity (capacity_pending), and only once they are ready:
-        # RUNNING, and for runner hosts with a bootstrap confirmed in this boot. Each counts once; a restart of
-        # capacity that already existed adds none.
-        def new_running(role: str) -> list[dict[str, Any]]:
-            return [r for r in running(current, role) if r.get("capacity_pending")
-                    and (role != "cicd_runner" or r.get("runners_count_known") is not False)]
+        def ready_slots(records: list[Any]) -> int:
+            return sum(int(r.get("runners_count", 0) or 0) for r in records
+                       if isinstance(r, dict) and r.get("status") == "RUNNING" and r.get("role") == "cicd_runner"
+                       and r.get("runners_count_known") is not False)
 
-        previous_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(previous, "cicd_runner"))
-        added_slots = sum(int(r.get("runners_count", 0) or 0) for r in new_running("cicd_runner"))
-        # Gate on new capacity, but judge the OOM target against the ready capacity actually running now (a host
-        # that stopped in the same listing does not count).
-        current_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(current, "cicd_runner")
-                            if r.get("runners_count_known") is not False)
-        if added_slots > 0:
+        previous_slots = ready_slots(previous)
+        current_slots = ready_slots(current)
+        # Each runner OOM event keeps the ready slots from when the reconcile first saw it, so capacity that only
+        # comes back (a restart, or a replacement in this or a later listing) never reads as growth.
+        for evt in self._runner_oom_events():
+            if not isinstance(evt.get("baseline_runners"), int):
+                evt["baseline_runners"] = previous_slots
+        # Only VMs first seen after the baseline add capacity (capacity_pending), and only once ready: RUNNING with
+        # a bootstrap confirmed in this boot. A restart of capacity that already existed adds none.
+        new_ready = [r for r in current if isinstance(r, dict) and r.get("capacity_pending")
+                     and r.get("status") == "RUNNING" and r.get("role") == "cicd_runner"
+                     and r.get("runners_count_known") is not False]
+        if new_ready:
             pol = self.state.get("scaling", {}).get("cicd_runner", {})
             prof = self.state.get("profiles", {}).get("cicd_runner", {})
             self._consume_active_oom_events(
@@ -2096,31 +2141,26 @@ class DashboardStore:
                 step_runners=max(1, int(pol.get("scale_up_step_runners", 2))),
                 max_runners=max(int(prof.get("min_runners", 1)), int(pol.get("max_runners", 24))),
             )
-        new_builders = new_running("rust_builder")
-        # Builders have one fixed shape. Each builder OOM event keeps the running builder count from when the
-        # reconcile first saw it (baseline_builders); a new builder handles it only once the running count exceeds
-        # that baseline, so a replacement that only restores capacity (in one listing or across several) does not.
-        running_builders = len(running(current, "rust_builder"))
-        previous_builders = len(running(previous, "rust_builder"))
-        for evt in self._builder_oom_events():
-            if not isinstance(evt.get("baseline_builders"), int):
-                evt["baseline_builders"] = previous_builders
-            if new_builders and running_builders > int(evt["baseline_builders"]) and evt.get("id"):
-                self._consume_active_oom_events(role="rust_builder", event_id=str(evt["id"]))
-        # New capacity stays pending while an OOM it could still satisfy is active (for example after a replacement
-        # with no net growth, until a later restart makes it net growth); with none active it is just capacity.
-        for role, records in (("cicd_runner", new_running("cicd_runner")), ("rust_builder", new_builders)):
-            if not self._active_oom_events(role):
-                for record in records:
+        # New capacity stays pending through the OOM lookback (an OOM reported late can still be answered by it)
+        # and while an OOM it could still satisfy is active; after that it is ordinary capacity.
+        cfg = {**default_scaling_config()["cicd_runner"], **(self.state.get("scaling", {}).get("cicd_runner") or {})}
+        lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60) or 60) * 60.0)
+        now = self._clock()
+        if not self._active_oom_events("cicd_runner"):
+            for record in new_ready:
+                if now - float(record.get("started_epoch") or now) > lookback_seconds:
                     record["capacity_pending"] = False
+        for record in current:
+            if isinstance(record, dict) and record.get("role") == "rust_builder":
+                record["capacity_pending"] = False
 
-    def _builder_oom_events(self) -> list[dict[str, Any]]:
-        """Unhandled builder OOM events (journal events on builders and builder journal events)."""
+    def _runner_oom_events(self) -> list[dict[str, Any]]:
+        """Unhandled runner OOM events (GitHub OOM runs and journal events on runner hosts)."""
         telem = self.state.get("scaling_telemetry", {})
-        events = [evt for evt in (telem.get("journal_oom_events") or []) if isinstance(evt, dict)
-                  and (str(evt.get("role", "")).strip().lower() == "rust_builder"
-                       or str(evt.get("instance_name", "")).strip().lower().startswith("builder-"))]
-        events += [evt for evt in (telem.get("builder_journal_oom_events") or []) if isinstance(evt, dict)]
+        events = [evt for evt in (telem.get("github_oom_runs") or []) if isinstance(evt, dict)]
+        events += [evt for evt in (telem.get("journal_oom_events") or []) if isinstance(evt, dict)
+                   and str(evt.get("role", "")).strip().lower() != "rust_builder"
+                   and not str(evt.get("instance_name", "")).strip().lower().startswith("builder-")]
         return [evt for evt in events if not evt.get("handled")]
 
     def _active_oom_events(self, role: str) -> bool:
