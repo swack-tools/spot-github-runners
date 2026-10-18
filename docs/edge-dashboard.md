@@ -336,7 +336,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `oxidex-runners-` (runner hosts) or `builder-` (dedicated builders). Control VMs and other VMs aren't
   listed. The control VM's service account needs `compute.instances.list` and
   `compute.machineTypes.get`. With `compute.disks.list` the records also show disk types; without it
-  (HTTP 403) they show `pd-balanced`. Any other failed or partial disk listing fails the whole refresh,
+  (HTTP 403) a VM keeps the types stored from an earlier listing, and a new VM shows `pd-balanced`
+  with its pricing marked incomplete. Any other failed or partial disk listing fails the whole refresh,
   so known disk types are never replaced by the default. A machine type whose capacity can't
   be read also fails the refresh, so no VM is priced without its memory.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
@@ -364,19 +365,23 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host. A VM with data disks of several types can't be a template
   source or the shape of a scale plan, since those hold one data-disk type. Neither can a VM with
-  Local SSD, which templates don't describe. When a running host has no recorded runner count, or
+  Local SSD, regional disks, or provisioned Hyperdisk performance, which templates don't describe. A
+  scale-up plan whose new VMs can't be fully priced is refused. When a running host has no recorded runner count, or
   hasn't confirmed its bootstrap in its current boot (an applied patch record for this boot with
   nothing pending), the runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
   plans are refused.
 - A VM in a region outside the dashboard's region catalog is priced with no tax, marked
-  `tax_rate_known: false`, rather than with another region's default tax. When its role's budget
-  includes taxes without a tax override, that unknown tax holds scale-ups like other unpriced costs. Each inventory refresh,
-  not a page read, reprices the listed VMs, stopped ones included, so a tax override also applies to
+  `tax_rate_known: false`, rather than with another region's default tax. When the budget being
+  checked or the VM's own budget includes taxes, without a tax override on the VM's profile, that
+  unknown tax holds scale-ups like other unpriced costs. Each inventory refresh,
+  and each budget or profile change, reprices the listed VMs, stopped ones included, but a page read
+  doesn't, so a tax override also applies to
   their disks, and the rate change is saved with the state.
 - A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, for a
   `SUSPENDED` VM, whose preserved memory Compute Engine also bills, for a VM with Local SSD (counted
-  as `local_ssd_gb`, not as a persistent data disk), and for a VM whose Hyperdisk bills provisioned IOPS
-  or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
+  as `local_ssd_gb`, not as a persistent data disk), for a VM with a regional (replicated) persistent
+  disk, for a custom or extended machine shape, which predefined rates don't price, and for a VM whose
+  Hyperdisk bills provisioned IOPS or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
   no reported performance), the record is marked
   `pricing_complete: false`. While the role's fleet (both roles under a shared budget) has such a VM,
   scale-up recommendations hold and scale-up plans are refused, because their budget check would pass
@@ -393,11 +398,16 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   inactive makes no Compute Engine calls and keeps the records the active slot last published.
 - The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
   already existed, so they don't mark OOM events handled. Only later growth beyond the capacity that
-  already existed does: only running VMs with a new instance ID add capacity, so a stopped VM that
-  starts again adds none. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
+  already existed does: a VM first listed after the baseline adds capacity once, when it's `RUNNING`
+  and, for a runner host, has confirmed its bootstrap. A stopped VM that starts again adds none. The
+  OOM target is then checked against the ready runner slots actually running after the listing, so
+  replacing a host with one of the same size handles nothing. A new builder handles builder OOM events
+  only when the number of running builders grew. A held recommendation projects the cost
+  of the fleet it keeps. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
   snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
-  empty and the instances tab says that the inventory isn't configured. Inventory records loaded from
+  empty, the instances tab says that the inventory isn't configured, and scaling recommendations hold
+  and scale-up plans are refused, because the real fleet is unknown. Inventory records loaded from
   a state file or snapshot are dropped too, since nothing would keep them current, and so is the
   baseline: a later re-enabled inventory starts a new one.
 - On load, from the state file, a KV snapshot, or a handover import, the dashboard drops every instance
