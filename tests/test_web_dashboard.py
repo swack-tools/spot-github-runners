@@ -776,7 +776,8 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         install_fleet_fixture(self.store)
         # The fixture fleet stands in for a current live inventory (scaling holds without one); no refresh loop runs.
         self.store.fleet_source = lambda: []
-        self.store._fleet_status["fresh"] = True
+        self.store._fleet_status.update(fresh=True, last_success_epoch=time.time())
+        self.store.fleet_inventory_interval = 1e9  # The stand-in never ages during a test.
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -5107,6 +5108,35 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.store.refresh_fleet_inventory()
         plan = self.store.delete_instance({"instance_id": "7101", "instance_name": "builder-oxidex-same"})
         self.assertEqual(plan["instance"]["instance_id"], "7101")
+
+    def test_builder_oom_keeps_event_baseline_across_polls(self):
+        old = fleet_observation("7200", "builder-oxidex-base-1", "us-south1-b", now=self.now)
+        self.fleet = [old]
+        self.store.refresh_fleet_inventory()
+        observed = datetime.fromtimestamp(time.time() - 60.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-b7", "instance_name": "builder-oxidex-base-1", "role": "rust_builder",
+                 "observed_at": observed}]
+        self.fleet = [dict(old, status="TERMINATED", last_stop_epoch=self.now - 30.0)]
+        self.store.refresh_fleet_inventory()  # Stopped: baseline stays at the 1 builder running at the event.
+        replacement = fleet_observation("7201", "builder-oxidex-base-2", "us-south1-b", now=self.now)
+        self.fleet = [dict(old, status="TERMINATED", last_stop_epoch=self.now - 30.0), replacement]
+        self.store.refresh_fleet_inventory()
+        event = self.store.state["scaling_telemetry"]["journal_oom_events"][0]
+        self.assertEqual(event["baseline_builders"], 1)
+        self.assertFalse(event.get("handled", False))
+        self.fleet = [replacement, fleet_observation("7202", "builder-oxidex-base-3", "us-south1-b", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
+
+    def test_inventory_goes_stale_when_refreshes_stop_completing(self):
+        self.fleet = [fleet_observation("7300", "oxidex-runners-hang-1", "us-south1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self.store._inventory_stale_reason(), "")
+        clock = time.time() + 4 * self.store.fleet_inventory_interval
+        with unittest.mock.patch.object(self.store, "_clock", return_value=clock):
+            self.assertIn("no complete listing", self.store._inventory_stale_reason())
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",

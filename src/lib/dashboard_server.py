@@ -382,6 +382,8 @@ def _build_instance_record(
 INSTANCE_SOURCE_KEY = "inventory_source"
 INSTANCE_SOURCE_GCE = "gce"
 FLEET_INVENTORY_INTERVAL_SECONDS = 120.0
+# The inventory counts as stale when no listing has completed for this many refresh intervals.
+FLEET_INVENTORY_MAX_AGE_INTERVALS = 3
 # When the first successful inventory listing was applied (the baseline later growth is measured against).
 FLEET_BASELINE_STATE_KEY = "fleet_inventory_baseline_at"
 # Deleted VMs stay in the history this long (the longest cost window the dashboard offers is 30 days).
@@ -2095,16 +2097,31 @@ class DashboardStore:
                 max_runners=max(int(prof.get("min_runners", 1)), int(pol.get("max_runners", 24))),
             )
         new_builders = new_running("rust_builder")
-        # Builders have one fixed shape: a new one handles builder OOMs only when the running count actually grew
-        # (a replacement for a builder that stopped in the same listing adds nothing).
-        if new_builders and len(running(current, "rust_builder")) > len(running(previous, "rust_builder")):
-            self._consume_active_oom_events(role="rust_builder")
+        # Builders have one fixed shape. Each builder OOM event keeps the running builder count from when the
+        # reconcile first saw it (baseline_builders); a new builder handles it only once the running count exceeds
+        # that baseline, so a replacement that only restores capacity (in one listing or across several) does not.
+        running_builders = len(running(current, "rust_builder"))
+        previous_builders = len(running(previous, "rust_builder"))
+        for evt in self._builder_oom_events():
+            if not isinstance(evt.get("baseline_builders"), int):
+                evt["baseline_builders"] = previous_builders
+            if new_builders and running_builders > int(evt["baseline_builders"]) and evt.get("id"):
+                self._consume_active_oom_events(role="rust_builder", event_id=str(evt["id"]))
         # New capacity stays pending while an OOM it could still satisfy is active (for example after a replacement
         # with no net growth, until a later restart makes it net growth); with none active it is just capacity.
         for role, records in (("cicd_runner", new_running("cicd_runner")), ("rust_builder", new_builders)):
             if not self._active_oom_events(role):
                 for record in records:
                     record["capacity_pending"] = False
+
+    def _builder_oom_events(self) -> list[dict[str, Any]]:
+        """Unhandled builder OOM events (journal events on builders and builder journal events)."""
+        telem = self.state.get("scaling_telemetry", {})
+        events = [evt for evt in (telem.get("journal_oom_events") or []) if isinstance(evt, dict)
+                  and (str(evt.get("role", "")).strip().lower() == "rust_builder"
+                       or str(evt.get("instance_name", "")).strip().lower().startswith("builder-"))]
+        events += [evt for evt in (telem.get("builder_journal_oom_events") or []) if isinstance(evt, dict)]
+        return [evt for evt in events if not evt.get("handled")]
 
     def _active_oom_events(self, role: str) -> bool:
         """True while an OOM event of the role is active for scaling: unhandled and inside the policy's lookback
@@ -2215,7 +2232,8 @@ class DashboardStore:
             LOG.warning("Dashboard fleet inventory could not be applied: %s: %s", type(exc).__name__, exc)
             return False
         with self._lock:
-            self._fleet_status.update({"last_success_at": _iso_epoch(now), "observed_count": len(observed),
+            self._fleet_status.update({"last_success_at": _iso_epoch(now), "last_success_epoch": now,
+                                       "observed_count": len(observed),
                                        "fresh": True,
                                        "last_error": ""})
             if body.get("changed"):
@@ -3308,9 +3326,14 @@ class DashboardStore:
                     "fleet and its burn are unknown")
         with self._lock:
             status = dict(self._fleet_status)
-        if status.get("fresh"):
+        last_success = status.get("last_success_epoch")
+        max_age = FLEET_INVENTORY_MAX_AGE_INTERVALS * self.fleet_inventory_interval
+        if status.get("fresh") and _finite(last_success) and self._clock() - float(last_success) <= max_age:
             return ""
         detail = status.get("last_error") or "no complete listing yet"
+        if status.get("fresh"):
+            # A refresh that never returns (for example a hung API connection) must not keep old counts trusted.
+            detail = f"no complete listing for more than {int(max_age)} seconds"
         return f"The live inventory is not current ({detail}); fleet counts and burn may be out of date"
 
     def _fail_closed_evaluation(self, evaluation: dict[str, Any], role: str) -> dict[str, Any]:

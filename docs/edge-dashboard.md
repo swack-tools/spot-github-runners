@@ -395,7 +395,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `fleet_inventory` field reports the last successful listing and the last error. Until the next
   complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false: the rows
   stay visible, but scaling recommendations hold and scale-up plans are refused. A listing that can't be
-  saved, for example on a full disk, also leaves the inventory stale.
+  saved, for example on a full disk, also leaves the inventory stale, and so does a refresh that hasn't
+  completed for three refresh intervals (6 minutes), for example a hung API connection.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
   inactive makes no Compute Engine calls and keeps the records the active slot last published.
 - The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
@@ -403,8 +404,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   already existed does: a VM first listed after the baseline adds capacity once, when it's `RUNNING`
   and, for a runner host, has confirmed its bootstrap. A stopped VM that starts again adds none. The
   OOM target is then checked against the ready runner slots actually running after the listing, so
-  replacing a host with one of the same size handles nothing. A new builder handles builder OOM events
-  only when the number of running builders grew. New capacity stays pending while an active OOM event
+  replacing a host with one of the same size handles nothing. Each builder OOM event keeps the number of
+  builders running when the inventory first saw it (`baseline_builders`), and a new builder handles it
+  only once more builders than that are running. New capacity stays pending while an active OOM event
   it could still satisfy remains, so a later net increase still handles it. A held recommendation projects the cost
   of the fleet it keeps. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
   snapshot.
