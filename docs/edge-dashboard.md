@@ -484,6 +484,9 @@ machine shapes, so they don't name a source VM. A template created from a listed
   removes exactly these preset and source pairs and logs how many it removed.
 - It then marks the state with `demo_template_source_migration`, so this runs once. Later loads keep
   every template's source as stored.
+- Cleanup uses the telemetry migration's pending commit path. The active slot saves a new state version
+  before publishing to KV, including when only template sources changed. A standby waits until active,
+  and a pending commit survives a restart.
 
 ## State durability
 

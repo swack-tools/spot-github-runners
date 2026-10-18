@@ -2001,6 +2001,8 @@ class DashboardStore:
             dropped_sources = drop_seeded_template_sources(base)
             base[DEMO_TEMPLATE_SOURCE_MIGRATION_KEY] = DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION
             if dropped_sources:
+                # Template-only cleanup must also replace equal-version KV snapshots via the active writer.
+                base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
                 LOG.warning("Removed the nonexistent source instance from %d preset VM template(s)", dropped_sources)
         previous = getattr(self, "state", None)
         self.state = base
@@ -2017,7 +2019,7 @@ class DashboardStore:
                         dropped_seeds)
 
     def commit_demo_telemetry_migration(self) -> bool:
-        """Persist a load that dropped seeded demo telemetry as a new state_version; True when it did.
+        """Persist seeded telemetry or template-source cleanup as a new state_version; True when it did.
 
         The drop changes content without a version, so a slot holding the seeded copy at the same version would
         look caught up (to a rollback, or to KV, which never takes different content at an equal version). The
