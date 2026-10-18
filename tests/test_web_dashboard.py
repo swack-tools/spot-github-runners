@@ -6503,7 +6503,10 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         resumed = time.time()
         self.store.refresh_fleet_inventory()
         detached = self._record("builder-oxidex-so-cache")
-        self.assertLess(instance_usage(detached, resumed + 3600.0)["disk_hours"], 1.1)  # Handoff, not creation.
+        # The first denied listing billed no fabricated rate. Recovery now supplies the previously unpaid
+        # creation-to-observation interval, exactly once, on the physical disk's new billing record.
+        self.assertAlmostEqual(instance_usage(detached, resumed + 3600.0)["disk_hours"],
+                               (resumed + 3600.0 - created) / 3600.0, delta=0.05)
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
@@ -6617,6 +6620,31 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(builder["status"], "TERMINATED")
         self.assertEqual((builder["vcpu"], builder["specs_known"]), (16, False))
         self.assertIsNotNone(builder["last_stop_epoch"])
+
+    def test_builder_capacity_requires_verified_fixed_host_shape(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        for machine, vcpu, ram, verified in (("n4-highcpu-8", 8, 16.0, True),
+                ("n4-highcpu-16", 16, 28.0, True), ("n4-highcpu-16", 8, 32.0, True),
+                ("n4-highcpu-16", 16, 32.0, False),
+                ("n4-highcpu-16", 16, 32.0, True)):
+            valid = machine == "n4-highcpu-16" and vcpu == 16 and ram == 32.0 and verified
+            with self.subTest(machine=machine, ram=ram, verified=verified):
+                item = {"id": "shape-check", "name": "builder-shape-check", "zone": "zones/us-south1-b",
+                        "status": "RUNNING", "machineType": "types/" + machine}
+                shapes = {("us-south1-b", machine): {"vcpu": vcpu, "ram_gib": ram}} if verified else {}
+                observation = observe_fleet_items([item], shapes=shapes)[0]
+                self.assertEqual(observation["runner_limits_known"], valid)
+                self.assertEqual(observation["runners_count_known"], valid)
+                self.assertEqual((observation["runners_count"], observation["runner_vcpu"],
+                                  observation["runner_ram_gib"]), (1, 16, 28.0) if valid else (0, 0, 0.0))
+                self.fleet = [observation]
+                self.store.refresh_fleet_inventory()
+                self.assertEqual(self.store.state["scaling_telemetry"]["current_builder_instances"], int(valid))
+                if not valid:
+                    with self.assertRaisesRegex(ValueError, "Per-runner limits"):
+                        self.store.create_vm_template_from_instance({"instance_id": "shape-check",
+                                                                    "assign_to_profile": False})
 
     def test_custom_machine_type_vcpu_fallback(self):
         from lib.fleet_inventory import observe_fleet_items

@@ -876,7 +876,8 @@ def _initial_disk_history(
              if isinstance(d, dict) and d.get("billing_owner") is not False
              and not _finite(d.get("billing_deferred_since"))]
     if not disks:
-        return [], None  # No per-disk evidence (older observations): the VM's creation bounds disk history.
+        # Deferred attachments start no known billing interval before this observation.
+        return ([], now) if obs.get("disks_detail") else ([], None)
     if not all(_finite(d.get("created_epoch")) for d in disks):
         return [], now
     def sizes(disk: dict[str, Any]) -> list[list[float]]:
@@ -955,8 +956,7 @@ def _live_instance_record(
     deferred_disks = []
     recovered_disks = []
     initial_recoveries: dict[str, dict[str, Any]] = {}
-    if previous is not None or any(_finite(d.get("billing_deferred_since"))
-                                   for d in obs.get("disks_detail") or [] if isinstance(d, dict)):
+    if obs.get("disks_detail"):
         prior_details = {str(d.get("source")): d for d in (previous or {}).get("disks_detail") or []
                          if isinstance(d, dict) and d.get("source")}
         details = []
@@ -968,10 +968,16 @@ def _live_instance_record(
             if old is not None and not _same_disk(old, disk):
                 old = None
             deferred = (old or {}).get("billing_deferred_since", disk.get("billing_deferred_since"))
-            if (previous is not None and not _finite(deferred) and old is None and obs.get("disk_types_known") is False
-                    and not _finite(disk.get("created_epoch"))):
+            if (not _finite(deferred) and old is None and not _finite(disk.get("created_epoch"))
+                    and obs.get("disk_types_known") is False
+                    and (previous is not None or not _disk_known(disk, known_disk_sources))
+                    and (previous is not None or not any(_finite(d.get("created_epoch"))
+                         for d in obs.get("disks_detail") or [] if isinstance(d, dict)))):
                 deferred = now
             if _finite(deferred) and disk.get("billing_owner") is not False:
+                for key in ("billing_initial_history", "billing_history_credits"):
+                    if key in (old or {}):
+                        disk[key] = copy.deepcopy(old[key])
                 sizes = copy.deepcopy((old or {}).get("billing_deferred_sizes")
                                       or disk.get("billing_deferred_sizes")
                                       or [[float(deferred), int((old or disk).get("gb") or 0)]])
@@ -982,6 +988,8 @@ def _live_instance_record(
                     disk.pop("billing_deferred_since", None)
                     sizes = disk.pop("billing_deferred_sizes")
                     recovered = dict(disk, billing_deferred_since=float(deferred), recovered_sizes=sizes)
+                    disk.pop("billing_initial_history", None)
+                    disk.pop("billing_history_credits", None)
                     if previous is not None:
                         recovered_disks.append(recovered)
                     else:
@@ -1131,7 +1139,8 @@ def _live_instance_record(
         # starts here at the handoff, not again at its creation.
         handed_off = [dict(d, created_epoch=max(float(d.get("created_epoch") or now),
                           float(initial_recoveries.get(str(d.get("source")), {}).get("billing_deferred_since", now))))
-                      if _disk_known(d, known_disk_sources) else d
+                      if _disk_known(d, known_disk_sources)
+                      and not initial_recoveries.get(str(d.get("source")), {}).get("billing_initial_history") else d
                       for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
         if handed_off:
             obs = dict(obs, disks_detail=handed_off)
@@ -1273,7 +1282,8 @@ def _live_instance_record(
         disk_segment_start = now
     for disk in recovered_disks:
         start = min(now, float(disk["created_epoch"]))
-        if _disk_known(disk, known_disk_sources | _billed_record_disk_keys(previous or {})):
+        if not disk.get("billing_initial_history") and _disk_known(
+                disk, known_disk_sources | _billed_record_disk_keys(previous or {})):
             start = max(start, float(disk["billing_deferred_since"]))
         if start < now:
             history_disk = {key: value for key, value in disk.items() if key not in ("billing_deferred_since", "billing_deferred_sizes")}
@@ -1286,7 +1296,14 @@ def _live_instance_record(
                                           tax_rate_percent=float(record["pricing"].get("tax_rate_percent") or 0.0))
                 disk_segments.append((float(open_from), now, rate))
             disk_start = min(disk_start, start)
-    if recovered_disks or disk_segments_backfill is not None:
+    history_credits = [credit for disk in recovered_disks + list(initial_recoveries.values())
+                       for credit in disk.get("billing_history_credits") or []]
+    if history_credits:
+        if previous is None and _finite(initial_disk_segment_start) and initial_disk_segment_start < now:
+            disk_segments.append((float(initial_disk_segment_start), now, _pricing_rates(record["pricing"])[2]))
+            disk_segment_start = now
+        disk_segments.extend((float(start), float(end), -float(rate)) for start, end, rate in history_credits)
+    if recovered_disks or disk_segments_backfill is not None or history_credits:
         # Backfill adds a per-disk rate to aggregate history. Combine overlaps into disjoint intervals so storage
         # hours remain elapsed time rather than counting the same time once per attachment.
         boundaries = sorted({t for start, end, _rate in disk_segments for t in (start, end)})
@@ -1407,6 +1424,10 @@ def _live_instance_record(
         record["workload_summary"] = (
             f"{count} GitHub runner(s) recorded at provisioning" if count
             else "Runner host (runner count not recorded in instance metadata)"
+        )
+    elif role == "rust_builder" and obs.get("runner_limits_known") is False:
+        record["workload_summary"] = (
+            "Builder host (fixed n4-highcpu-16 / 16 vCPU / 32 GiB host shape is not verified; container limits unknown)"
         )
     return record
 
@@ -1619,6 +1640,51 @@ def _fit_size_budget(live: list[dict[str, Any]], gone: list[dict[str, Any]], com
     return live, gone
 
 
+def _portable_initial_disk_history(record: dict[str, Any], now: float, project: str) -> dict[str, Any]:
+    """Move legacy unverified initial history onto disks, retaining credits for fallback costs already billed."""
+    deferred_at = record.get("disk_history_deferred_at")
+    if not _finite(deferred_at) or record.get("disk_types_known") is not False:
+        return record
+    details = [d for d in record.get("disks_detail") or [] if isinstance(d, dict)]
+    sources = record.get("disk_history_deferred_sources")
+    pending = [d for d in details if d.get("billing_owner") is not False
+               and (not isinstance(sources, list) or str(d.get("source")) in sources)
+               and not _finite(d.get("billing_deferred_since"))]
+    if not pending:
+        return record
+    out = copy.deepcopy(record)
+    pricing = out.get("pricing") or {}
+    tax = float(pricing.get("tax_rate_percent") or 0.0)
+    rates = {str(d.get("source")): _single_disk_all_in(d, family=str(record.get("family") or ""),
+             region=str(record.get("region") or ""), project=project, tax_rate_percent=tax)
+             for d in details if d.get("billing_owner") is not False
+             and not _finite(d.get("billing_deferred_since"))}
+    total = sum(rates.values())
+    # Close the legacy fallback interval before removing its open rate. Its recorded charges stay on the old
+    # carrier; recovery adds the authoritative full history less these credits, including in window queries.
+    end = now if out.get("disk_liability_pending") else min(now, float(
+        out.get("disk_end_epoch") or out.get("deleted_epoch") or now))
+    _close_open_segments(out, pricing, end)
+    segments = _disk_segments(out)
+    pending_sources = {str(d.get("source")) for d in pending}
+    for disk in out.get("disks_detail") or []:
+        source = str(disk.get("source"))
+        if source not in pending_sources or disk.get("billing_owner") is False:
+            continue
+        disk.update(billing_deferred_since=float(deferred_at), billing_initial_history=True,
+                    billing_deferred_sizes=[[float(deferred_at), int(disk.get("gb") or 0)]],
+                    billing_history_credits=[[max(start, float(deferred_at)), finish,
+                        rate * rates.get(source, 0.0) / total]
+                        for start, finish, rate in segments if finish > float(deferred_at) and total > 0])
+    share = sum(rates[s] for s in pending_sources) / total if total > 0 else 0.0
+    out["pricing"] = _with_extra_disks(pricing, -float(pricing.get("disk_hourly_usd") or 0.0) * share)
+    out["deferred_disk_sources"] = sorted(set(out.get("deferred_disk_sources") or []) | pending_sources)
+    remaining = set(sources or []) - pending_sources
+    out["disk_history_deferred_sources"] = sorted(remaining)
+    out["disk_history_deferred_at"] = deferred_at if remaining else None
+    return out
+
+
 def reconcile_instance_records(
     existing: list[Any],
     observed: list[dict[str, Any]],
@@ -1637,6 +1703,8 @@ def reconcile_instance_records(
     records older than the retention window, and records that did not come from the inventory, are dropped.
     ``observed`` must be the complete listing: a partial one would mark the missing VMs deleted.
     """
+    existing = [_portable_initial_disk_history(r, now, project) if is_live_instance_record(r) else r
+                for r in existing]
     # A not-yet-priced disk can change billing owners while disk listing is unavailable. Carry its unpaid
     # interval with the physical attachment rather than losing it when the former owner becomes a non-owner.
     deferred_entries = []
@@ -1683,6 +1751,11 @@ def reconcile_instance_records(
         known_ids = {str(obs.get("instance_id")) for obs in observed if isinstance(obs, dict)}
         observed = list(observed) + [obs for obs in recovered if obs["instance_id"] not in known_ids
                                    and "id:" + obs["instance_id"].removeprefix("disk-") in tracked_roles]
+    trusted_disks = [d for r in existing if is_live_instance_record(r)
+                     and r.get("status") != "DELETED" and r.get("kind") != "disk"
+                     for d in r.get("disks_detail") or [] if isinstance(d, dict)
+                     and not _finite(d.get("billing_deferred_since"))
+                     and (r.get("disk_types_known") is not False or d.get("id"))]
     normalized = []
     for obs in observed:
         if not isinstance(obs, dict):
@@ -1692,13 +1765,35 @@ def reconcile_instance_records(
         for disk in obs.get("disks_detail") or []:
             if not isinstance(disk, dict):
                 continue
+            if obs.get("disk_types_known") is False:
+                trusted = next((d for d in trusted_disks if _same_disk(disk, d)
+                                and int(d.get("gb") or 0) == int(disk.get("gb") or 0)), None)
+                if trusted is not None:
+                    disk = {**disk, **{k: trusted[k] for k in ("type", "id", "created_epoch")
+                                      if trusted.get(k) not in (None, "")}}
             candidates = [d for d in deferred_details if _same_disk(disk, d)]
             if candidates and disk.get("billing_owner") is not False:
                 earliest = min(candidates, key=lambda d: float(d["billing_deferred_since"]))
                 disk = dict(disk, billing_deferred_since=float(earliest["billing_deferred_since"]),
                             billing_deferred_sizes=copy.deepcopy(earliest.get("billing_deferred_sizes")
                                 or [[float(earliest["billing_deferred_since"]), int(earliest.get("gb") or 0)]]))
+                for key in ("billing_initial_history", "billing_history_credits"):
+                    if key in earliest:
+                        disk = dict(disk, **{key: copy.deepcopy(earliest[key])})
             details.append(disk)
+        if obs.get("disk_types_known") is False and details and all("boot" in d for d in details):
+            billed_data: dict[str, int] = {}
+            boot = 0
+            for disk in details:
+                if disk.get("billing_owner") is False:
+                    continue
+                if disk.get("boot"):
+                    boot += int(disk.get("gb") or 0)
+                    obs = dict(obs, boot_disk_type=disk.get("type"))
+                else:
+                    kind = str(disk.get("type") or "pd-balanced")
+                    billed_data[kind] = billed_data.get(kind, 0) + int(disk.get("gb") or 0)
+            obs = dict(obs, data_disks=billed_data, boot_disk_billed_gb=boot)
         normalized.append(dict(obs, disks_detail=details))
     observed = normalized
     owners = [d for obs in observed if isinstance(obs, dict) for d in obs.get("disks_detail") or []
@@ -1825,6 +1920,17 @@ def reconcile_instance_records(
                     unpriced_lifetime_history=bool(record.get("unpriced_lifetime_history"))
                         or str(record.get("instance_id")) in expired_carriers) for record in records]
     for record in records:
+        if record.get("status") == "DELETED":
+            # The receiving owner consumed this debt. Do not leave a false lifetime hold on the old carrier,
+            # or replay its initial-history credits if that record is revived later.
+            record["disks_detail"] = [
+                {k: v for k, v in dict(d, billing_owner=False).items()
+                 if k not in ("billing_deferred_since", "billing_deferred_sizes", "billing_initial_history",
+                              "billing_history_credits")}
+                if _finite(d.get("billing_deferred_since")) and any(_same_disk(d, owner) for owner in owners)
+                else d for d in record.get("disks_detail") or []]
+            record["deferred_disk_sources"] = [str(d.get("source")) for d in record.get("disks_detail") or []
+                                               if _finite(d.get("billing_deferred_since"))]
         _mark_pricing_completeness(record)
     # Live VMs first (newest start first), then deleted history (newest deletion first), bounded in size.
     live = sorted((r for r in records if r.get("status") != "DELETED"),
@@ -4160,6 +4266,7 @@ class DashboardStore:
             inst
             for inst in self.state.get("instances", [])
             if inst.get("status") == "RUNNING" and inst.get("role") == "rust_builder"
+            and inst.get("runner_limits_known") is not False
         ]
         telem = self.state.setdefault("scaling_telemetry", {})
         # Ready runner slots only: a host whose bootstrap is unconfirmed has registered nothing yet.

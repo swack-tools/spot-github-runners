@@ -399,6 +399,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   missing before its unresolved history can expire. Once that confirmed absence is outside the 31-day
   window, it no longer holds current budgets; `lifetime_cost_complete` stays false if the old amount
   couldn't be recovered. A newer disk with the same source name cannot resolve the old uncertainty.
+- A builder name identifies the host's role, but its fixed build capacity is counted only after the
+  machine inventory verifies `n4-highcpu-16`, 16 vCPUs, and 32 GiB of host RAM. Other shapes and unknown
+  capacities have no known container limits and can't be copied into a VM template.
 - Instance metadata records how many runners a host registered, but not the per-runner limits, which
   depend on the tier and admission. Runner host records show those limits as not recorded, and a VM
   template can't copy them from such a host; the dashboard hides the template action for such records.
