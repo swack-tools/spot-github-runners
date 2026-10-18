@@ -589,7 +589,7 @@ def _is_seeded_build(record: dict[str, Any]) -> bool:
                                           for k in ("requested_at", "finished_at", "delivered_at"))
     except (KeyError, TypeError, ValueError):
         return False
-    return (round(finished - requested), round(delivered - finished)) == SEEDED_RUST_BUILD_GAPS[build_id]
+    return (finished - requested, delivered - finished) == SEEDED_RUST_BUILD_GAPS[build_id]
 
 
 def _seed_fields_match(record: dict[str, Any], fingerprint: dict[str, Any]) -> bool:

@@ -6576,9 +6576,13 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
 
         seed = seeded_demo_telemetry()["rust_builds"][0]
         later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        fractional_finish = datetime.fromtimestamp(
+            datetime.fromisoformat(seed["finished_at"].replace("Z", "+00:00")).timestamp() + 0.2,
+            timezone.utc,
+        ).isoformat()
         # record_rust_build merges a partial update into the seeded row: every field it omits stays as seeded.
         for update in ({"status": "FAILED"}, {"cache_hits": 413}, {"project_name": "oxidex-cli"},
-                       {"delivered_at": later}, {"peak_ram_gib": 22}):
+                       {"delivered_at": later}, {"finished_at": fractional_finish}, {"peak_ram_gib": 22}):
             with self.subTest(update=update):
                 state = {"rust_builds": [dict(seed, **update)]}
                 self.assertEqual(drop_seeded_demo_telemetry(state), 0)
