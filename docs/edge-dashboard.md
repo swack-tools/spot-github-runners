@@ -388,7 +388,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
 - The delete and regional scale controls, `POST /api/instances/delete` and
   `POST /api/instances/scale-region`, are plans only. They check the request against budgets and caps
   and report what would launch or retire. The budget projection includes the disks of stopped VMs.
-  They don't change the instance list or any VM. The autoscaler
+  They don't change the instance list or any VM, and they run like reads: each request is computed
+  from the current state, and an `Idempotency-Key` stores nothing. The autoscaler
   (`src/spot_runner_autoscaler.py`) drains and retires runner hosts, `src/spot_runner_manager.py`
   provisions them, and `src/render_builder_startup.py` renders a dedicated builder.
 

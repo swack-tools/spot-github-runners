@@ -147,7 +147,9 @@ KV_STALE_REFUSAL_BACKOFF_SECONDS = 30.0
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # POST endpoints that compute a response without changing dashboard state; they skip idempotency storage.
 NON_MUTATING_POST_PATHS = frozenset({"/api/qualify", "/api/cloud-init/parse", "/api/ip-intel",
-                                     "/api/patches/validate", "/api/patches/preview"})
+                                     "/api/patches/validate", "/api/patches/preview",
+                                     # Plan-only lifecycle endpoints: recomputed from current state, never stored.
+                                     "/api/instances/delete", "/api/instances/scale-region"})
 # POST endpoints whose side effect is outside dashboard state (a GitHub pull request, live runner hosts): they
 # need an Idempotency-Key and run through DashboardStore.run_external.
 EXTERNAL_MUTATION_PATHS = frozenset({"/api/patches/save", "/api/patches/hot-patch"})
@@ -557,6 +559,28 @@ def _secondary_data_disks(obs: dict[str, Any]) -> list[tuple[str, int]]:
     return [(str(t), int(gb)) for t, gb in sorted(by_type.items()) if t != primary and int(gb or 0) > 0]
 
 
+def _with_secondary_disks(
+    pricing: dict[str, Any],
+    disks: dict[str, Any],
+    *,
+    region: str,
+    family: str,
+    project: str,
+    live_pricing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """``pricing`` (which covers the boot disk and the primary data-disk type) plus every other data-disk type,
+    each at its own rate. ``disks`` is an observation or record with ``data_disks`` / ``data_disk_type``."""
+    extra = 0.0
+    for disk_type, disk_gb in _secondary_data_disks(disks):
+        extra += float(calculate_spot_pricing(
+            family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type=disk_type,
+            boot_disk_gb=0, data_disk_type=disk_type, data_disk_gb=disk_gb,
+            tax_rate_percent=float(pricing.get("tax_rate_percent", 0.0) or 0.0),
+            machine_type=None, live_pricing=live_pricing, project=project,
+        ).get("disk_hourly_usd", 0.0) or 0.0)
+    return _with_extra_disks(pricing, extra)
+
+
 def _stopped_disk_hourly(pricing: dict[str, Any], *, include_tax: bool = True) -> float:
     """Hourly USD a stopped VM still bills for its attached disks."""
     disk = float(pricing.get("disk_hourly_usd", 0.0) or 0.0)
@@ -651,15 +675,8 @@ def _live_instance_record(
     )
     if reuse_pricing is None:
         # Data disks of other types than the first are priced at their own rates.
-        extra = 0.0
-        for disk_type, disk_gb in _secondary_data_disks(obs):
-            extra += float(calculate_spot_pricing(
-                family=record["family"], vcpu=0, ram_gib=0.0, region=region, boot_disk_type=disk_type,
-                boot_disk_gb=0, data_disk_type=disk_type, data_disk_gb=disk_gb,
-                tax_rate_percent=float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0),
-                machine_type=None, project=project,
-            ).get("disk_hourly_usd", 0.0) or 0.0)
-        record["pricing"] = _with_extra_disks(record["pricing"], extra)
+        record["pricing"] = _with_secondary_disks(record["pricing"], obs, region=region,
+                                                  family=record["family"], project=project)
     record["data_disks"] = obs.get("data_disks") or {}
     # The record shows the total data-disk size (pricing already covers each type).
     record["data_disk_gb"] = int(obs.get("data_disk_gb") or 0)
@@ -708,6 +725,9 @@ def _live_instance_record(
         elif reuse_pricing is None:
             # Same run, new shape or disks: bill the run so far, and the disks so far, at the earlier rates.
             freeze_end = min(_current_run_end(previous, now), now)
+            if stopped_epoch is not None:
+                # Stopped and changed in one listing: compute ended at the reported stop, not at this refresh.
+                freeze_end = min(freeze_end, stopped_epoch)
             if freeze_end > prev_open:
                 prior_runs.append((prev_open, freeze_end, prev_compute_all_in, prev_compute_only))
             compute_segment_start = max(prev_open, freeze_end)
@@ -3262,7 +3282,8 @@ class DashboardStore:
                 boot_disk_type=str(inst.get("boot_disk_type", "hyperdisk-balanced")),
                 boot_disk_gb=int(inst.get("boot_disk_gb", 40)),
                 data_disk_type=str(inst.get("data_disk_type", "hyperdisk-balanced")),
-                data_disk_gb=int(inst.get("data_disk_gb", 100)),
+                data_disk_gb=_primary_data_disk_gb(inst) if is_live_instance_record(inst)
+                else int(inst.get("data_disk_gb", 100)),
                 tax_rate_percent=tax_rate_pct,
                 machine_type=str(inst["machine_type"]),
                 live_pricing=shared_live_pricing,
@@ -3270,6 +3291,11 @@ class DashboardStore:
                 provisioning="ondemand" if inst.get("spot") is False else "spot",
             )
             if is_live_instance_record(inst):
+                # Keep each data-disk type at its own rate, as the inventory reconcile priced it.
+                inst["pricing"] = _with_secondary_disks(
+                    inst["pricing"], inst, region=str(inst["region"]),
+                    family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
+                    project=self.project, live_pricing=shared_live_pricing)
                 _mark_pricing_completeness(inst)
 
     def get_overview(

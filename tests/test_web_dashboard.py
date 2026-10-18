@@ -798,6 +798,20 @@ class DashboardServerIntegrationTests(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def test_plan_only_lifecycle_posts_do_not_store_state(self):
+        version = self.store.state_version()
+        for path, payload in (("/api/instances/scale-region",
+                               {"region": "us-south1", "role": "cicd_runner", "target_instances": 0}),
+                              ("/api/instances/delete", {"instance_name": "oxidex-runners-dallas-01"})):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}{path}", data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Idempotency-Key": f"plan-{path.rsplit('/', 1)[-1]}-01"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.assertFalse(json.loads(resp.read().decode("utf-8"))["applied"])
+        self.assertEqual(self.store.state_version(), version)
+        self.assertFalse(self.store.state.get("idempotency"))
+
     def test_index_html_and_overview_endpoints(self):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=10) as resp:
             html = resp.read().decode("utf-8")
@@ -4517,6 +4531,33 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertAlmostEqual(usage["cost_all_in"], expected, delta=0.001)
         # A repeat listing of the new shape does not freeze again.
         self.assertFalse(self.store.refresh_fleet_inventory())
+
+    def test_refresh_keeps_per_type_disk_pricing(self):
+        obs = fleet_observation("3500", "builder-oxidex-mixed-1", "us-south1-b", now=self.now)
+        obs.update({"data_disk_type": "pd-ssd", "data_disk_gb": 600, "data_disks": {"pd-ssd": 100, "pd-standard": 500}})
+        self.fleet = [obs]
+        with unittest.mock.patch("lib.dashboard_models.fetch_live_spot_pricing", return_value={}):
+            self.store.refresh_fleet_inventory()
+            reconciled = self._record("builder-oxidex-mixed-1")["pricing"]["disk_hourly_usd"]
+            self.store.get_overview()
+            self.assertAlmostEqual(self._record("builder-oxidex-mixed-1")["pricing"]["disk_hourly_usd"],
+                                   reconciled, delta=0.0001)
+            self.assertFalse(self.store.refresh_fleet_inventory())
+
+    def test_stop_and_resize_in_one_listing_ends_run_at_stop(self):
+        running = fleet_observation("3600", "builder-oxidex-stopgrow-1", "us-south1-b", started_hours_ago=10.0,
+                                    now=self.now)
+        self.fleet = [running]
+        self.store.refresh_fleet_inventory()
+        stopped = fleet_observation("3600", "builder-oxidex-stopgrow-1", "us-south1-b", status="TERMINATED",
+                                    started_hours_ago=10.0, stopped_hours_ago=5.0, now=self.now)
+        stopped["data_disk_gb"] = 2000
+        self.fleet = [stopped]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-stopgrow-1")
+        self.assertEqual(len(rec["prior_runs"]), 1)
+        self.assertAlmostEqual(rec["prior_runs"][0][1], self.now - 5 * 3600.0, delta=1.0)
+        self.assertAlmostEqual(rec["runtime_hours"], 5.0, delta=0.02)
 
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
