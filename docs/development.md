@@ -106,7 +106,8 @@ change the documentation. On pushes to `main` that change the documentation it a
     A GitHub Pages site can be readable by anyone, even when the repository is private. Describing the
     architecture, including the edge and tunnel design, is fine. Don't put deployment identifiers in the
     documentation: project, account, namespace, runner group, or tunnel IDs, internal hostnames, tokens, or
-    secret values. Use placeholders such as `YOUR_PROJECT`.
+    secret values. Resource names fixed in the code, such as the `spot-control-a` and `spot-control-b` slots,
+    may appear. Use placeholders such as `YOUR_PROJECT`.
 
 ## Git and review workflow
 
