@@ -5477,11 +5477,37 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         from lib.dashboard_server import drop_seeded_demo_telemetry
 
         state = {"rust_builds": [], "scaling_telemetry": {"github_oom_runs": [
-            {"id": "gh-oom-38601924810", "run_id": 38601924810},
-            {"id": "gh-oom-38596411473", "run_id": 38596411473},
+            {"id": "gh-oom-38601924810", "run_id": 38601924810, "job_id": 116012948102},
+            {"id": "gh-oom-38596411473", "run_id": 38596411473, "job_id": 115964282184},
         ]}}
         self.assertEqual(drop_seeded_demo_telemetry(state), 2)
         self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [])
+
+    def test_seed_ids_with_other_fields_are_real_reports(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        seeds = seeded_demo_telemetry()
+        build = dict(seeds["rust_builds"][0], commit_sha="0123456789ab")  # a real report merged into the seed row
+        run = dict(seeds["scaling_telemetry"]["github_oom_runs"][0], job_id=1)
+        event = dict(seeds["scaling_telemetry"]["journal_oom_events"][0], pid=1)
+        state = {"rust_builds": [build],
+                 "scaling_telemetry": {"github_oom_runs": [run], "journal_oom_events": [event]}}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+        self.assertEqual(state["rust_builds"], [build])
+        self.assertEqual(state["scaling_telemetry"]["github_oom_runs"], [run])
+        self.assertEqual(state["scaling_telemetry"]["journal_oom_events"], [event])
+
+    def test_newer_migration_marker_is_kept_and_not_rerun(self):
+        from lib.dashboard_server import DashboardStore
+
+        raw = self._seeded_raw_state()
+        raw["demo_telemetry_migration"] = 2  # written by a later version, for example before a rollback
+        self.state_file.write_text(json.dumps(raw), encoding="utf-8")
+        reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        self.assertEqual(reloaded.state["demo_telemetry_migration"], 2)
+        self.assertEqual(len(reloaded.state["rust_builds"]), 6)
+        self.assertEqual(reloaded.state["scaling_telemetry"]["queued_jobs"], 3)
 
     def test_migrated_state_keeps_reported_telemetry_that_matches_a_seed(self):
         from lib.dashboard_server import DashboardStore

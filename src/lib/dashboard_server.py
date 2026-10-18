@@ -400,22 +400,56 @@ LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
 #
 # Earlier versions seeded demo Rust builds, GitHub CI failure runs, a journal OOM event, and job counters into the
 # default state, which then persisted to the state file and the Cloudflare KV snapshot and showed as real. Loading
-# a state without the migration marker (one written by such a version) drops these exact records (matched by id,
-# across all seeded versions) and resets the counters when they still hold the seeded values. The default state
-# carries the marker, so later loads never touch telemetry reported after the migration.
+# a state without the migration marker (one written by such a version) drops these exact records and resets the
+# counters when they still hold the seeded values. A record matches only when its id and the stable fields every
+# seeded version gave it all match, so a real report merged into a seeded row survives. The default state carries
+# the marker, so later loads never touch telemetry reported after the migration. The active slot then commits the
+# migrated state as a new state_version (DashboardStore.commit_demo_telemetry_migration).
 DEMO_TELEMETRY_MIGRATION_KEY = "demo_telemetry_migration"
 DEMO_TELEMETRY_MIGRATION_VERSION = 1
-SEEDED_RUST_BUILD_IDS = frozenset({f"rb-20261015-00{n}" for n in range(1, 6)})
-SEEDED_GITHUB_CI_RUN_IDS = frozenset({
-    "gh-oom-37192272062",
-    "gh-oom-37192994059",
-    "gh-timeout-38596411473",
-    # Ids of the same seeds in older versions, before they were rewritten on load.
-    "gh-oom-38596411473",
-    "gh-oom-38601924810",
-})
-SEEDED_JOURNAL_OOM_EVENTS = frozenset({("oom-journal-01", "oxidex-runners-dallas-01")})
+# build_id -> (commit_sha, instance_name, origin_ip)
+SEEDED_RUST_BUILDS = {
+    "rb-20261015-001": ("af7c14f8cb2c", "builder-oxidex-turin-01", "185.159.157.42"),
+    "rb-20261015-002": ("ce4af62b32cc", "builder-oxidex-eu-01", "185.220.101.34"),
+    "rb-20261015-003": ("f20f9f9b780f", "builder-oxidex-turin-01", "73.162.44.19"),
+    "rb-20261015-004": ("e3c84b8190aa", "builder-oxidex-eu-01", "193.138.218.77"),
+    "rb-20261015-005": ("3317b1b902ef", "builder-oxidex-turin-01", "24.28.119.82"),
+}
+# id -> (run_id, job_id)
+SEEDED_GITHUB_CI_RUNS = {
+    "gh-oom-37192272062": (37192272062, 111407847874),
+    "gh-oom-37192994059": (37192994059, 111409747367),
+    "gh-timeout-38596411473": (38596411473, 115964282184),
+    # The same seeds in older versions, before they were rewritten on load.
+    "gh-oom-38596411473": (38596411473, 115964282184),
+    "gh-oom-38601924810": (38601924810, 116012948102),
+}
+# id -> (instance_name, pid)
+SEEDED_JOURNAL_OOM_EVENTS = {"oom-journal-01": ("oxidex-runners-dallas-01", 18492)}
 SEEDED_JOB_COUNTERS = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
+
+
+def demo_telemetry_migrated(state: dict[str, Any]) -> bool:
+    """True when ``state`` was written by a version that no longer seeds demo telemetry (any marker >= 1)."""
+    marker = state.get(DEMO_TELEMETRY_MIGRATION_KEY)
+    return (isinstance(marker, int) and not isinstance(marker, bool)
+            and marker >= DEMO_TELEMETRY_MIGRATION_VERSION)
+
+
+def _is_seeded_build(record: dict[str, Any]) -> bool:
+    fingerprint = SEEDED_RUST_BUILDS.get(record.get("build_id"))
+    return fingerprint is not None and (
+        record.get("commit_sha"), record.get("instance_name"), record.get("origin_ip")) == fingerprint
+
+
+def _is_seeded_ci_run(record: dict[str, Any]) -> bool:
+    fingerprint = SEEDED_GITHUB_CI_RUNS.get(record.get("id"))
+    return fingerprint is not None and (record.get("run_id"), record.get("job_id")) == fingerprint
+
+
+def _is_seeded_journal_oom(record: dict[str, Any]) -> bool:
+    fingerprint = SEEDED_JOURNAL_OOM_EVENTS.get(record.get("id"))
+    return fingerprint is not None and (record.get("instance_name"), record.get("pid")) == fingerprint
 
 
 def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
@@ -423,16 +457,16 @@ def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
     dropped = 0
     builds = state.get("rust_builds")
     if isinstance(builds, list):
-        kept = [b for b in builds if not (isinstance(b, dict) and b.get("build_id") in SEEDED_RUST_BUILD_IDS)]
+        kept = [b for b in builds if not (isinstance(b, dict) and _is_seeded_build(b))]
         dropped += len(builds) - len(kept)
         state["rust_builds"] = kept
     telem = state.get("scaling_telemetry")
     if not isinstance(telem, dict):
         return dropped
     for key, is_seed in (
-        ("github_oom_runs", lambda r: r.get("id") in SEEDED_GITHUB_CI_RUN_IDS),
-        ("journal_oom_events", lambda e: (e.get("id"), e.get("instance_name")) in SEEDED_JOURNAL_OOM_EVENTS),
-        ("builder_journal_oom_events", lambda e: (e.get("id"), e.get("instance_name")) in SEEDED_JOURNAL_OOM_EVENTS),
+        ("github_oom_runs", _is_seeded_ci_run),
+        ("journal_oom_events", _is_seeded_journal_oom),
+        ("builder_journal_oom_events", _is_seeded_journal_oom),
     ):
         records = telem.get(key)
         if isinstance(records, list):
@@ -1521,6 +1555,8 @@ class DashboardStore:
             self.frozen = True
             LOG.warning("Dashboard starts frozen: freeze marker %s is present", self.freeze_marker_path)
         self.loaded_from_file = False
+        # Set by _apply_loaded_state when a load dropped seeded demo telemetry (see commit_demo_telemetry_migration).
+        self._demo_migration_uncommitted = False
         self.controlled_targets_error = ""
         # Set when the state file was unreadable: the store must recover from a verified snapshot first.
         self.recovery_pending = False
@@ -1833,13 +1869,10 @@ class DashboardStore:
                             len(instances) - len(kept))
             base["instances"] = kept
         dropped_seeds = 0
-        if loaded.get(DEMO_TELEMETRY_MIGRATION_KEY) != DEMO_TELEMETRY_MIGRATION_VERSION:
-            # A state written before the migration: drop its seeds once (base already carries the marker).
+        if not demo_telemetry_migrated(loaded):
+            # A state written before the migration: drop its seeds once (a newer marker is kept as it is).
             dropped_seeds = drop_seeded_demo_telemetry(base)
             base[DEMO_TELEMETRY_MIGRATION_KEY] = DEMO_TELEMETRY_MIGRATION_VERSION
-        if dropped_seeds:
-            LOG.warning("Dropped %d seeded demo telemetry record(s) and counter(s) from the dashboard state",
-                        dropped_seeds)
         previous = getattr(self, "state", None)
         self.state = base
         try:
@@ -1850,6 +1883,43 @@ class DashboardStore:
             if previous is not None:
                 self.state = previous
             raise ValueError(f"invalid dashboard state: {type(exc).__name__}: {exc}") from exc
+        # The loaded state_version now names content without the seeds; commit_demo_telemetry_migration publishes
+        # it as a new version once this slot accepts changes.
+        self._demo_migration_uncommitted = dropped_seeds > 0
+        if dropped_seeds:
+            LOG.warning("Dropped %d seeded demo telemetry record(s) and counter(s) from the dashboard state",
+                        dropped_seeds)
+
+    def commit_demo_telemetry_migration(self) -> bool:
+        """Persist a load that dropped seeded demo telemetry as a new state_version; True when it did.
+
+        The drop changes content without a version, so a slot holding the seeded copy at the same version would
+        look caught up (to a rollback, or to KV, which never takes different content at an equal version). The
+        commit goes through the same gates as every change, so only the active, hydrated, reconciled, unfrozen
+        slot advances the version; elsewhere it waits (a standby that bumped could shadow the active slot's next
+        change), and a handover import replaces the state, and this flag with it, anyway.
+        """
+        if not self._demo_migration_uncommitted:
+            return False
+
+        def apply() -> tuple[int, Any]:
+            if not self._demo_migration_uncommitted:
+                return 200, {"changed": False}
+            self._persist()
+            self._demo_migration_uncommitted = False
+            return 200, {"changed": True}
+
+        try:
+            _status, body, _replayed = self.run_request(None, "POST", "/internal/demo-telemetry-migration", apply)
+        except DashboardFrozenError:
+            return False
+        except OSError as exc:
+            LOG.warning("Could not commit the demo telemetry migration: %s", exc)
+            return False
+        if body.get("changed"):
+            LOG.warning("Committed the demo telemetry migration as state_version %d", self.state_version())
+            return True
+        return False
 
     def state_version(self) -> int:
         version = self.state.get("state_version", 0)
@@ -1859,6 +1929,7 @@ class DashboardStore:
         """Hydrate (in a background thread when KV is configured), start KV write-behind and the inventory loop."""
         if self.kv is None:
             self.hydrate()
+            self.commit_demo_telemetry_migration()
         else:
             thread = threading.Thread(target=self._background_main, name="dashboard-kv-sync", daemon=True)
             self._threads.append(thread)
@@ -2480,6 +2551,8 @@ class DashboardStore:
         if self.hydrated and self.kv_writer and not self._writer_synced and not self.sync_with_kv_as_writer():
             self._kv_next_attempt_at = now + KV_RETRY_BACKOFF_SECONDS
             return False
+        if self.hydrated and not self.frozen and self.kv_writer:
+            self.commit_demo_telemetry_migration()
         if not (self.hydrated and not self.frozen and self.kv_writer and self._kv_dirty):
             return False
         quiet = now - self._kv_dirty_last_at >= KV_WRITE_DEBOUNCE_SECONDS

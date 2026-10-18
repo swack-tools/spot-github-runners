@@ -423,15 +423,22 @@ GitHub CI failure runs, journal OOM events, or job counters.
 - When the dashboard loads a state that an earlier version wrote, from the state file, a KV snapshot, or
   a handover import, it drops the demo records that version seeded and logs how many it dropped. It
   then marks the state with `demo_telemetry_migration`, so this runs once and later loads keep every
-  reported record and counter. It matches the exact seeded IDs:
-  - The Rust builds `rb-20261015-001` through `rb-20261015-005`, on `builder-oxidex-turin-01` and
-    `builder-oxidex-eu-01`.
+  reported record and counter. A state with a marker of 1 or higher, including one a later version
+  wrote, is left as it is.
+- A record is dropped only when its ID and the fields that every seeded version gave it all match, so a
+  real report merged into a seeded row stays:
+  - The Rust builds `rb-20261015-001` through `rb-20261015-005`, matched with their commit SHA, builder
+    (`builder-oxidex-turin-01` or `builder-oxidex-eu-01`), and origin IP.
   - The GitHub CI runs `gh-oom-37192272062`, `gh-oom-37192994059`, and `gh-timeout-38596411473`, and
-    the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`.
-  - The journal OOM event `oom-journal-01` on `oxidex-runners-dallas-01`.
-- The migration also resets the job counters to 0 when all three still hold the seeded values, 14 jobs in the
-  past hour, 7 provisioned, and 3 queued. Any other combination stays as reported.
-- A reported record that only shares a run ID with a seed stays as reported.
+    the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`, matched with their
+    run and job IDs.
+  - The journal OOM event `oom-journal-01`, matched with `oxidex-runners-dallas-01` and its process ID.
+- The migration also resets the job counters to 0 when all three still hold the seeded values, 14 jobs in
+  the past hour, 7 provisioned, and 3 queued. Any other combination stays as reported.
+- The drop keeps the loaded `state_version`. The active slot then commits the migrated state as the next
+  `state_version` through the same checks as any change, and publishes it to KV. A standby slot waits, so
+  its copy never shadows the active slot's next change. A rollback then sees the migrated version as newer
+  than the old slot's copy and carries it back.
 
 ## State durability
 
