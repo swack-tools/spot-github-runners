@@ -5955,14 +5955,48 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             "type": "pd-balanced", "users": ["projects/p/zones/us-south1-b/instances/builder-oxidex-sp-2"]}}
         # The replacement builder was created after the instance listing: bill the disk here for now.
         self.assertEqual(len(observe_detached_disks(detail, frozenset(), frozenset({"us-south1-b/builder-oxidex-sp-1"}))), 1)
-        # Its user is in the snapshot: that VM's record bills it.
-        self.assertEqual(observe_detached_disks(detail, frozenset(), frozenset({"us-south1-b/builder-oxidex-sp-2"})), [])
+        # A present VM may have gained this disk after the earlier instance listing. Its name is not evidence
+        # that its snapshot record includes this disk, so keep storage billing on the disk until handoff.
+        self.assertEqual(len(observe_detached_disks(detail, frozenset(),
+                                                  frozenset({"us-south1-b/builder-oxidex-sp-2"}))), 1)
+        # Suppress only when the very same instance snapshot actually reports this attachment.
+        self.assertEqual(observe_detached_disks(detail, frozenset(detail),
+                                               frozenset({"us-south1-b/builder-oxidex-sp-2"})), [])
         # A same-named VM in another zone is a different VM: the disk is still billed here.
         self.assertEqual(len(observe_detached_disks(detail, frozenset(), frozenset({"us-east1-c/builder-oxidex-sp-2"}))), 1)
         other = {"z/disks/builder-oxidex-x-cache": dict(detail["z/disks/builder-oxidex-sp-cache"], id="102",
                                                         name="builder-oxidex-x-cache",
                                                         users=["projects/p/zones/z/instances/someone-else"])}
         self.assertEqual(observe_detached_disks(other, frozenset(), frozenset()), [])
+
+    def test_disk_attached_between_split_snapshots_keeps_billing_until_handoff(self):
+        from lib.fleet_inventory import observe_detached_disks
+        from lib.dashboard_server import reconcile_instance_records, instance_usage, _single_disk_all_in
+
+        source = "projects/p/zones/us-south1-b/disks/builder-split-cache"
+        created = self.now - 3 * 3600
+        detail = {source: {"id": "split-disk", "name": "builder-split-cache", "type": "pd-ssd",
+            "zone": "zones/us-south1-b", "sizeGb": "100", "users": [],
+            "creationTimestamp": datetime.fromtimestamp(created, timezone.utc).isoformat()}}
+        vm = fleet_observation("split-vm", "builder-split", "us-south1-b", now=self.now,
+                               started_hours_ago=3, vcpu=0, ram_gib=0)
+        vm.update(boot_disk_gb=0, data_disk_gb=0, data_disks={}, disks_detail=[])
+        rows, _ = reconcile_instance_records([], [vm] + observe_detached_disks(detail),
+                                             project="p", now=self.now - 2 * 3600)
+        detail[source]["users"] = ["projects/p/zones/us-south1-b/instances/builder-split"]
+        split = observe_detached_disks(detail, frozenset(), frozenset({"us-south1-b/builder-split"}))
+        rows, _ = reconcile_instance_records(rows, [vm] + split, project="p", now=self.now - 3600)
+        self.assertEqual(next(r for r in rows if r["kind"] == "disk")["status"], "DETACHED")
+        disk = {"id": "split-disk", "source": source, "type": "pd-ssd", "gb": 100,
+                "created_epoch": created, "auto_delete": False}
+        attached = dict(vm, data_disk_type="pd-ssd", data_disk_gb=100, data_disks={"pd-ssd": 100},
+                        disks_detail=[disk])
+        rows, _ = reconcile_instance_records(rows, [attached], project="p", now=self.now)
+        carrier = next(r for r in rows if r["kind"] == "disk")
+        rate = _single_disk_all_in(disk, family=carrier["family"], region=carrier["region"], project="p",
+                                   tax_rate_percent=carrier["pricing"]["tax_rate_percent"])
+        self.assertAlmostEqual(sum(instance_usage(r, self.now)["cost_all_in"] for r in rows), rate * 3,
+                               delta=0.001)
 
     def test_vanished_builder_liability_covers_only_retained_disks(self):
         from lib.dashboard_server import _pricing_rates
