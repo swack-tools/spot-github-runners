@@ -292,8 +292,8 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
         # Users from the later disk listing cannot prove the earlier instance snapshot contained this
         # attachment, even when the user VM was already present. Only attached_sources proves billing ownership.
         users = [str(u).rstrip("/").rsplit("/", 1)[-1] for u in (detail.get("users") or [])]
-        if any(fleet_role(name) is None for name in users):
-            # Current external ownership is outside fleet billing.
+        if users and all(fleet_role(name) is None for name in users):
+            # A disk with only external users is outside fleet billing. Mixed users still include fleet storage.
             continue
         # Keep fleet-used disks here until an instance snapshot actually includes their attachment.
         if str(link) in attached_sources:

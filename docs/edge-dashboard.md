@@ -433,6 +433,12 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   budget) has such a VM,
   scale-up recommendations hold and scale-up plans are refused, because their budget check would pass
   on a cost that's too low.
+- A suspended VM's memory-storage charge isn't priced here. Its unpriced interval remains in
+  `unpriced_history_intervals` after it resumes or is deleted. A first listing that already shows a
+  restart also records unknown earlier compute history. These records keep `lifetime_cost_complete`
+  false. `window_cost_complete` reports whether the selected cost window overlaps missing charges;
+  scale-up budgets hold while applicable missing charges remain in the supported 31-day window.
+  Expiry from that window doesn't make lifetime history complete.
 - A VM in a transitional state, such as `PROVISIONING`, `STAGING`, `STOPPING`, or `REPAIRING`, counts
   at its full rate in burn and budgets. While the role has one, scale-up recommendations hold and
   scale-up plans are refused, because its capacity hasn't settled.

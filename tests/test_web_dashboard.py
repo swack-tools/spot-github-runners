@@ -5968,6 +5968,10 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                                                         name="builder-oxidex-x-cache",
                                                         users=["projects/p/zones/z/instances/someone-else"])}
         self.assertEqual(observe_detached_disks(other, frozenset(), frozenset()), [])
+        mixed = {key: dict(value, users=value["users"] + other[next(iter(other))]["users"])
+                 for key, value in detail.items()}
+        self.assertEqual(len(observe_detached_disks(mixed, frozenset(), frozenset())), 1)
+        self.assertEqual(observe_detached_disks(mixed, frozenset(mixed), frozenset()), [])
 
     def test_disk_attached_between_split_snapshots_keeps_billing_until_handoff(self):
         from lib.fleet_inventory import observe_detached_disks
