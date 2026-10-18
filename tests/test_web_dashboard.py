@@ -7705,6 +7705,24 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
                                              "total_duration_seconds": 120})["build"]
         self.assertEqual(done["requested_at"], "2026-10-18T18:00:00Z")
 
+    def test_reported_request_time_is_never_moved_by_failure_timing(self):
+        with unittest.mock.patch("lib.dashboard_server.time.time", return_value=_iso_to_epoch("2026-10-18T18:00:05Z")):
+            self.store.record_rust_build({"build_id": "rb-req-kept", "status": "RUNNING",
+                                          "requested_at": "2026-10-18T18:00:00Z"})
+        with unittest.mock.patch("lib.dashboard_server.time.time", return_value=_iso_to_epoch("2026-10-18T18:00:10Z")):
+            with self.assertRaisesRegex(ValueError, "Inconsistent failure timing"):
+                self.store.record_rust_build({"build_id": "rb-req-kept", "status": "FAILED",
+                                              "compile_duration_seconds": 30})
+            ok = self.store.record_rust_build({"build_id": "rb-req-kept", "status": "FAILED",
+                                               "compile_duration_seconds": 8})["build"]
+        self.assertEqual((ok["requested_at"], ok["requested_at_inferred"]), ("2026-10-18T18:00:00Z", False))
+
+    def test_float_vcpu_echo_keeps_benchmark(self):
+        self.store.record_rust_build({"build_id": "rb-float", "status": "DELIVERED", "total_duration_seconds": 10.0,
+                                      "instance_benchmark_score": 3000, "vcpu": 16, "cpu_time_seconds": 2.0})
+        echoed = self.store.record_rust_build({"build_id": "rb-float", "vcpu": 16.0})["build"]
+        self.assertEqual((echoed["instance_benchmark_score"], echoed["cpu_points"]), (3000, 6000.0))
+
     def test_unreported_origin_hostname_stays_null(self):
         for ip in ("185.159.157.42", "8.8.8.8"):
             build = self.store.record_rust_build({"build_id": f"rb-host-{ip}", "status": "QUEUED",

@@ -7759,9 +7759,14 @@ class DashboardStore:
                 elif is_unsuccessful and duration is not None:
                     # Only a total includes delivery; a compile time (or request-to-failure span) is the run itself.
                     run_seconds = max(0.0, duration - delivery_sec) if duration_includes_delivery else duration
-                    if req_epoch + run_seconds > now_ts and not payload.get("requested_at"):
-                        # The stored request time (often the first report's arrival) can't be right: the build
-                        # ran for the reported time and ended by now, so it started that long before now.
+                    request_inferred = not payload.get("requested_at") and (
+                        not existing_build.get("requested_at") or existing_build.get("requested_at_inferred") is True)
+                    if req_epoch + run_seconds > now_ts + 1.0:
+                        if not request_inferred:
+                            raise ValueError("Inconsistent failure timing: requested_at plus the reported duration "
+                                             "is after the report")
+                        # An inferred request time (the first report's arrival) can't be right: the build ran for
+                        # the reported time and ended by now, so it started that long before now.
                         req_epoch = float(math.floor(now_ts - run_seconds))
                         req_at = _iso_seconds_ago(0, req_epoch)
                     # Request time plus the exact reported run time, at the precision of the resulting time.
@@ -7870,9 +7875,13 @@ class DashboardStore:
             # report leaves the shape alone, so a changed shape is scored again.
             shape_keys = ("cpu_platform", "vcpu", "machine_type")
             def shape_value(value: Any) -> Any:
-                """A shape value in comparable form: vCPU counts as integers, names stripped."""
+                """A shape value in comparable form: whole numbers (16, "16", 16.0) as integers, names stripped."""
                 text = str(value).strip()
-                return int(text) if text.isdigit() else text
+                try:
+                    number = float(text)
+                except ValueError:
+                    return text
+                return int(number) if math.isfinite(number) and number.is_integer() else text
 
             shape_changed = any(given(k) is not None and (existing_build.get(k) is None
                                                           or shape_value(given(k)) != shape_value(existing_build[k]))
@@ -7889,6 +7898,11 @@ class DashboardStore:
                 "commit_sha": reported("commit_sha"),
                 "status": status_str,
                 "requested_at": req_at,
+                # Whether no report ever gave the request time (it was inferred from a report's arrival).
+                "requested_at_inferred": (False if payload.get("requested_at") else (
+                    existing_build.get("requested_at_inferred") is True
+                    if existing_build.get("requested_at") and str(req_at) == str(existing_build["requested_at"])
+                    else True)),
                 "finished_at": fin_at,
                 "delivered_at": del_at,
                 "total_duration_seconds": raw_duration,

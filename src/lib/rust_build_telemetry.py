@@ -568,6 +568,7 @@ def enrich_rust_build_record(
         "commit_sha": _optional_str(record.get("commit_sha")),
         "status": status_str,
         "requested_at": requested_at,
+        "requested_at_inferred": record.get("requested_at_inferred") is True,
         "finished_at": finished_at,
         "delivered_at": delivered_at,
         "requested_epoch": req_ts,
