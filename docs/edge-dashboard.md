@@ -373,12 +373,16 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   still don't fit is refused, and the inventory reads as stale. Window totals still include it to within an hour, though a search filter
   can't match folded records. A VM that's
   recreated with the same name gets a new record, because the record follows the instance ID.
+  Template creation and deletion plans require `instance_id` when a name matches more than one zonal
+  or historical record. A supplied ID takes priority over the name and never falls back to another VM.
 - Spend covers each VM's attached disks while the VM exists. A fleet-named disk that no VM uses, such
   as a dedicated builder's cache disk (`auto-delete=no`) after its VM is deleted, gets its own
   `DETACHED` record that bills storage until the disk is deleted (shown as present storage). A disk the instance listing still shows
   attached is billed only by its VM's record, and a disk attached to a fleet VM that the instance listing
   doesn't show yet is billed on its own until that VM appears. A disk attached to several fleet VMs is
-  billed once, while every VM keeps the full attachment metadata. VM templates cannot copy shared
+  billed once, while every VM keeps the full attachment metadata. Detached runner data disks named
+  `runner-data` or `runner-data-*` are included too; where fleet users are present, their role identifies
+  which fleet owns the disk. VM templates cannot copy shared
   attachments. Disk users are matched by zone and instance name. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
   is billed by the new record only from the handoff, never again from its creation. Disks are matched
   by their immutable disk ID, so a new disk that reuses a name is billed from its own creation. While
@@ -389,8 +393,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   listing shows whether they still exist; its row shows that storage rate. That storage is repriced like other records. A disk that's
   detached again keeps its earlier standalone interval and restarts billing at the new handoff.
 - Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
-  scale-up plans are refused even when the listing is otherwise current. Grant the permission for
-  scaling to work. For a disk newly attached during this outage, the dashboard defers its cost rather
+  regional scale plans are refused even when the listing is otherwise current. Grant the permission for
+  scaling to work. For a disk newly attached or resized during this outage, the dashboard defers its cost rather
   than assigning a fallback rate. Once disk metadata is available, it fills that disk's history from
   its creation or known handoff time at the verified rate, preserving observed size-change boundaries.
   Deferred intervals follow a disk when its billing owner changes and survive detachment until metadata
@@ -438,15 +442,23 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   restart also records unknown earlier compute history. These records keep `lifetime_cost_complete`
   false. `window_cost_complete` reports whether the selected cost window overlaps missing charges;
   scale-up budgets hold while applicable missing charges remain in the supported 31-day window.
-  Expiry from that window doesn't make lifetime history complete.
+  Expiry from that window doesn't make lifetime history complete. Closing a compute or disk interval
+  at an incomplete fallback price keeps that history marked incomplete even after current rates
+  become trusted. Retained cache-disk prices preserve each disk's pricing-completeness flags.
 - A VM in a transitional state, such as `PROVISIONING`, `STAGING`, `STOPPING`, or `REPAIRING`, counts
-  at its full rate in burn and budgets. While the role has one, scale-up recommendations hold and
-  scale-up plans are refused, because its capacity hasn't settled.
+  at its full rate in burn and budgets. While the role has one, scaling recommendations hold and
+  regional scale plans are refused, including scale-down and no-op plans, because its capacity hasn't settled. For a newly provisioned VM, creation
+  is a provisional boundary until GCE reports its first start. Repricing and state reloads don't turn
+  creation-to-first-start time into a completed compute run; a VM with an earlier proven run retains
+  that history through a restart. Restart staging keeps a completed run's known stop separate from
+  `transitional_since_epoch`, so the stopped gap isn't charged as compute. If a newer stop before the
+  latest start proves an unobserved intervening run whose start can't be recovered, its bounded
+  compute-history uncertainty remains explicit instead of being silently omitted.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error. Until the next
   complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false and
   `fleet_inventory.stale_reason` says why: the rows
-  stay visible, but scaling recommendations hold and scale-up plans are refused. A listing that can't be
+  stay visible, but scaling recommendations hold and all regional scale plans are refused, including scale-down plans. A listing that can't be
   saved, for example on a full disk, also leaves the inventory stale, and so does a refresh that hasn't
   completed for three refresh intervals (6 minutes), for example a hung API connection.
 - Only the active slot reconciles. A store that is frozen, not hydrated, not reconciled with KV, or
@@ -460,6 +472,10 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   capacity stays pending through the OOM lookback, so an OOM reported late can still be answered by it.
   Without a dated readiness transition, only a new identity created after the incident can satisfy it.
   A poll time or missing bootstrap metadata cannot date readiness, so uncertain incidents stay active.
+  GitHub CI entries enter baseline, active-event, and acknowledgement handling only when the shared
+  classifier identifies an OOM on this self-hosted GCP runner fleet. Timeouts, external-runner failures,
+  and non-OOM records keep their original incident history. Actual log evidence and runner identity
+  take priority over stale cached classification flags.
   A later restart of the same identity cannot satisfy a newer incident.
   Hosts first listed together with an OOM that were already running before it count toward its baseline,
   and only ready runner slots count as current runners. Builder OOM events are never handled from the
@@ -471,7 +487,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   nothing, so a quiet fleet doesn't publish a new snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
   empty, the instances tab says that the inventory isn't configured, and scaling recommendations hold
-  and scale-up plans are refused, because the real fleet is unknown. Inventory records loaded from
+  and regional scale plans are refused, because the real fleet is unknown. Inventory records loaded from
   a state file or snapshot are dropped too, since nothing would keep them current, and so is the
   baseline: a later re-enabled inventory starts a new one.
 - On load, from the state file, a KV snapshot, or a handover import, the dashboard drops every instance

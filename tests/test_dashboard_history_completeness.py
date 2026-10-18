@@ -39,7 +39,7 @@ class LifecycleHistoryCompletenessTests(unittest.TestCase):
         self.assertTrue(record["pricing_complete"])  # Current compute/disk rates are known.
         self.assertFalse(record["lifetime_cost_complete"])
         self.assertEqual(record["unpriced_history_intervals"]["suspended_memory"],
-                         [self.now - 3 * 3600, self.now - 3600])
+                         [[self.now - 3 * 3600, self.now - 3600]])
         self.assertTrue(_unpriced_history_in_window(record, self.now - 86400, self.now))
         self.assertFalse(_unpriced_history_in_window(record, self.now - 1800, self.now))
         self.assertFalse(_unpriced_history_in_window(record, self.now - 86400, self.now, include_storage=False))
@@ -67,7 +67,7 @@ class LifecycleHistoryCompletenessTests(unittest.TestCase):
         record = _live_instance_record(resumed, project="p", now=self.now, previous=running)
         self.assertFalse(record["lifetime_cost_complete"])
         self.assertEqual(record["unpriced_history_intervals"]["suspended_memory"],
-                         [self.now - 3 * 3600, self.now - 3600])
+                         [[self.now - 3 * 3600, self.now - 3600]])
 
     def test_legacy_suspended_record_preserves_memory_uncertainty_on_resume(self):
         legacy = _live_instance_record(self.observation(status="SUSPENDED", last_suspended_epoch=self.now - 3 * 3600),
@@ -78,7 +78,7 @@ class LifecycleHistoryCompletenessTests(unittest.TestCase):
                                        now=self.now, previous=legacy)
         self.assertFalse(record["lifetime_cost_complete"])
         self.assertEqual(record["unpriced_history_intervals"]["suspended_memory"],
-                         [self.now - 3 * 3600, self.now - 3600])
+                         [[self.now - 3 * 3600, self.now - 3600]])
 
     def test_recent_deleted_uncertainty_survives_count_compaction(self):
         record = _live_instance_record(self.observation(status="SUSPENDED", last_suspended_epoch=self.now - 3600),
@@ -95,7 +95,7 @@ class LifecycleHistoryCompletenessTests(unittest.TestCase):
         record = _live_instance_record(obs, project="p", now=self.now)
         self.assertFalse(record["lifetime_cost_complete"])
         self.assertEqual(record["unpriced_history_intervals"]["prior_compute"],
-                         [self.now - 10 * 3600, self.now - 2 * 3600])
+                         [[self.now - 10 * 3600, self.now - 2 * 3600]])
         self.assertAlmostEqual(instance_usage(record, self.now)["compute_hours"], 1)
         again = _live_instance_record(obs, project="p", now=self.now,
                                       previous=json.loads(json.dumps(record)))
@@ -108,6 +108,6 @@ class LifecycleHistoryCompletenessTests(unittest.TestCase):
         suspended = _live_instance_record(self.observation(status="SUSPENDED", last_suspended_epoch=self.now - 3600),
                                          project="p", now=self.now)
         deleted = _mark_instance_deleted(suspended, self.now + 3600, project="p")
-        self.assertIsNone(suspended["unpriced_history_intervals"]["suspended_memory"][1])
-        self.assertEqual(deleted["unpriced_history_intervals"]["suspended_memory"][1], self.now + 3600)
+        self.assertIsNone(suspended["unpriced_history_intervals"]["suspended_memory"][0][1])
+        self.assertEqual(deleted["unpriced_history_intervals"]["suspended_memory"][0][1], self.now + 3600)
         self.assertFalse(deleted["lifetime_cost_complete"])
