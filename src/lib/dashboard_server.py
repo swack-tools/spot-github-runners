@@ -1053,7 +1053,7 @@ def _stopped_disk_hourly(pricing: dict[str, Any], *, include_tax: bool = True) -
 def _unpriced_history_in_window(record: dict[str, Any], start: float, end: float,
                                 *, include_storage: bool = True) -> bool:
     """Whether known missing historical charges overlap the selected window."""
-    return any((include_storage or reason != "suspended_memory") and _finite(bounds[0])
+    return any((include_storage or reason not in ("suspended_memory", "fallback_storage")) and _finite(bounds[0])
                and float(bounds[0]) < end and (bounds[1] is None or (_finite(bounds[1]) and float(bounds[1]) > start))
                for reason, bounds in (record.get("unpriced_history_intervals") or {}).items()
                if isinstance(bounds, (list, tuple)) and len(bounds) == 2)
@@ -1063,6 +1063,8 @@ def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previo
                              now: float) -> None:
     """Keep bounded uncertainty per cause; no fabricated price is added for unobserved runs or memory storage."""
     intervals = copy.deepcopy((previous or {}).get("unpriced_history_intervals") or {})
+    for reason, bounds in (record.get("unpriced_history_intervals") or {}).items():
+        intervals[reason] = copy.deepcopy(bounds)
     def add(reason: str, start: float, end: float | None) -> None:
         old = intervals.get(reason)
         intervals[reason] = [min(float(old[0]), start) if old else start,
@@ -1125,7 +1127,7 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
         reasons.append(f"{int(record['local_ssd_gb'])} GiB of Local SSD, which is not priced here")
     record["pricing_complete"] = not reasons
     record["pricing_incomplete_reason"] = "; ".join(reasons)
-    record["lifetime_cost_complete"] = not (record.get("status") == "SUSPENDED"
+    record["lifetime_cost_complete"] = not (record.get("pricing_complete") is False or record.get("status") == "SUSPENDED"
         or record.get("unpriced_lifetime_history") or record.get("deferred_disk_sources")
         or record.get("unpaid_disk_details") or _finite(record.get("disk_history_deferred_at")))
 
@@ -1792,6 +1794,19 @@ def _live_instance_record(
         "utilization_known": False,
     })
     _retain_unpriced_history(record, obs, previous, now)
+    if previous is not None:
+        old_pricing = previous.get("pricing") or {}
+        if old_pricing != record.get("pricing") or previous.get("pricing_complete") is False:
+            old_compute_start = float(previous.get("compute_segment_start") or previous.get("started_epoch") or now)
+            old_run_end = min(now, _current_run_end(previous, now))
+            for stop in (obs.get("last_stop_epoch"), obs.get("last_suspended_epoch")):
+                if _finite(stop) and old_compute_start <= float(stop) <= now and (
+                        record.get("status") in GCE_STOPPED_STATUSES or float(stop) < float(record["started_epoch"])):
+                    old_run_end = min(old_run_end, float(stop))
+            old_disk_end = min(now, float(previous.get("disk_end_epoch") or
+                               (previous.get("deleted_epoch") if not previous.get("disk_liability_pending") else None) or now))
+            _remember_incomplete_pricing(record, previous, old_pricing, old_compute_start, old_run_end,
+                float(previous.get("disk_segment_start") or previous.get("disk_start_epoch") or now), old_disk_end)
     _mark_pricing_completeness(record)
     if role == "cicd_runner":
         count = int(obs.get("runners_count") or 0)
@@ -1825,10 +1840,19 @@ def _retained_pricing(record: dict[str, Any], *, tax_rate_percent: float, projec
         family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type="pd-balanced", boot_disk_gb=0,
         data_disk_type="pd-balanced", data_disk_gb=0, tax_rate_percent=tax_rate_percent, machine_type=None,
         live_pricing=live_pricing, project=project)
-    extra = sum(_single_disk_all_in(d, family=family, region=region, project=project, tax_rate_percent=tax_rate_percent)
-                / (1.0 + tax_rate_percent / 100.0) for d in retained
-                if not _finite(d.get("billing_deferred_since")))
-    return _with_extra_disks(priced, extra)
+    parts = [calculate_spot_pricing(
+        family=family, vcpu=0, ram_gib=0.0, region=region,
+        boot_disk_type=str(d.get("type") or "pd-balanced"), boot_disk_gb=int(d.get("gb") or 0),
+        data_disk_type="pd-balanced", data_disk_gb=0, tax_rate_percent=tax_rate_percent, machine_type=None,
+        live_pricing=live_pricing, project=project) for d in retained
+        if not _finite(d.get("billing_deferred_since"))]
+    out = _with_extra_disks(priced, sum(float(part.get("disk_hourly_usd") or 0.0) for part in parts))
+    unknown = sorted({kind for part in parts for kind in part.get("disk_rate_unknown") or []})
+    if any(part.get("complete") is False for part in parts):
+        out["complete"] = False
+    if unknown:
+        out["disk_rate_unknown"] = unknown
+    return out
 
 
 def _mark_instance_deleted(record: dict[str, Any], now: float, *, disks_pending: bool = False,
@@ -1933,6 +1957,50 @@ def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[floa
             bucket[i] += float(value[i])
 
 
+def _remember_incomplete_pricing(record: dict[str, Any], pricing_record: dict[str, Any],
+                                  old_pricing: dict[str, Any], compute_start: float, compute_end: float,
+                                  disk_start: float, disk_end: float) -> None:
+    """Save trust bounds with closed fallback-priced intervals, independently of the new prospective price."""
+    if old_pricing.get("complete") is not False and pricing_record.get("pricing_complete") is not False:
+        return
+    compute_unknown = bool(old_pricing.get("family_rate_unknown") or
+        (old_pricing.get("complete") is False and not old_pricing.get("disk_rate_unknown")) or
+        pricing_record.get("tax_rate_known") is False)
+    disk_unknown = bool(old_pricing.get("disk_rate_unknown") or pricing_record.get("disk_types_known") is False
+                        or pricing_record.get("unpriced_disk_performance") or pricing_record.get("regional_disks")
+                        or pricing_record.get("local_ssd_gb") or pricing_record.get("tax_rate_known") is False)
+    # Per-disk debt is recoverable and its rates are corrected on recovery; don't turn that debt into a permanent
+    # incomplete-history claim. Other fallback prices have no authoritative historical rate to repair them.
+    debt_sources = set(pricing_record.get("deferred_disk_sources") or [])
+    debt_sources.update(str(d.get("source")) for d in pricing_record.get("unpaid_disk_details") or []
+                        if isinstance(d, dict))
+    if _finite(pricing_record.get("disk_history_deferred_at")):
+        debt_sources.update(pricing_record.get("disk_history_deferred_sources") or
+            [str(d.get("source")) for d in pricing_record.get("disks_detail") or [] if isinstance(d, dict)])
+    if debt_sources:
+        details = [d for d in pricing_record.get("disks_detail") or []
+                   if isinstance(d, dict) and d.get("billing_owner") is not False]
+        paid = [d for d in details if str(d.get("source")) not in debt_sources
+                and not _finite(d.get("billing_deferred_since"))]
+        unknown_types = set(old_pricing.get("disk_rate_unknown") or [])
+        independent_rates = any(str(d.get("type")) in unknown_types for d in paid) or any(
+            kind not in {str(d.get("type")) for d in details} for kind in unknown_types)
+        disk_unknown = bool(independent_rates or pricing_record.get("unpriced_disk_performance")
+                            or pricing_record.get("regional_disks") or pricing_record.get("local_ssd_gb")
+                            or pricing_record.get("tax_rate_known") is False
+                            or (paid and pricing_record.get("disk_types_known") is False))
+    intervals = copy.deepcopy(record.get("unpriced_history_intervals") or {})
+    for reason, start, end, uncertain in (("fallback_compute", compute_start, compute_end, compute_unknown),
+                                         ("fallback_storage", disk_start, disk_end, disk_unknown)):
+        if not uncertain or end <= start:
+            continue
+        old = intervals.get(reason)
+        intervals[reason] = [min(float(old[0]), start) if old else start,
+                             max(float(old[1]), end) if old and old[1] is not None else end]
+        record["unpriced_lifetime_history"] = True
+    record["unpriced_history_intervals"] = intervals
+
+
 def _close_open_segments(record: dict[str, Any], old_pricing: dict[str, Any], now: float) -> None:
     """Close a live record's open compute and disk intervals at ``old_pricing``'s rates up to ``now``."""
     compute_all_in, compute_only, disk_all_in = _pricing_rates(old_pricing)
@@ -1947,6 +2015,7 @@ def _close_open_segments(record: dict[str, Any], old_pricing: dict[str, Any], no
     disks = _disk_segments(record)
     disk_open = max([float(record.get("disk_start_epoch") or started)] + [e for _s, e, _r in disks]
                     + ([float(record["disk_segment_start"])] if _finite(record.get("disk_segment_start")) else []))
+    _remember_incomplete_pricing(record, record, old_pricing, open_start, run_end, disk_open, now)
     if now > disk_open:
         record.setdefault("disk_segments", []).append([disk_open, now, disk_all_in])
     record["disk_segment_start"] = now
@@ -2081,8 +2150,10 @@ def reconcile_instance_records(
     records older than the retention window, and records that did not come from the inventory, are dropped.
     ``observed`` must be the complete listing: a partial one would mark the missing VMs deleted.
     """
+    # Repricing may append to nested run and disk-segment arrays before persistence succeeds. Every working
+    # record must be detached from self.state, including records preserved during denied disk listings.
     existing = [_portable_initial_disk_history(r, now, project) if is_live_instance_record(r) else r
-                for r in existing]
+                for r in copy.deepcopy(existing)]
     # A not-yet-priced disk can change billing owners while disk listing is unavailable. Carry its unpaid
     # interval with the physical attachment rather than losing it when the former owner becomes a non-owner.
     deferred_entries = []
@@ -4759,6 +4830,16 @@ class DashboardStore:
             self.state.pop(DEMO_TELEMETRY_MIGRATION_PENDING_KEY, None)
             self._mark_kv_dirty()
 
+    def _remember_repriced_history(self, inst: dict[str, Any], previous: dict[str, Any]) -> None:
+        now = self._clock()
+        _remember_incomplete_pricing(inst, previous, previous.get("pricing") or {},
+            float(previous.get("compute_segment_start") or previous.get("started_epoch") or now),
+            min(now, _current_run_end(previous, now)),
+            float(previous.get("disk_segment_start") or previous.get("disk_start_epoch") or now),
+            min(now, float(previous.get("disk_end_epoch") or
+                (previous.get("deleted_epoch") if not previous.get("disk_liability_pending") else None) or now)))
+        _mark_pricing_completeness(inst)
+
     def _refresh_instances_pricing(self, records: list[Any] | None = None, *, live: bool = False) -> bool:
         """Recompute active instance pricing using current live/catalog machine rates while preserving historical rates on deleted instances.
 
@@ -4813,6 +4894,7 @@ class DashboardStore:
             )
             old_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else None
             old_completeness = (inst.get("pricing_complete"), inst.get("pricing_incomplete_reason"))
+            old_record = copy.deepcopy(inst) if is_live_instance_record(inst) else None
             if inst.get("retained_only_pricing"):
                 # A deleted builder still billing its cache disk: reprice that disk alone (compute is closed).
                 new_pricing = _retained_pricing(inst, tax_rate_percent=tax_rate_pct, project=self.project,
@@ -4823,6 +4905,9 @@ class DashboardStore:
                 elif old_pricing != new_pricing:
                     repriced = True
                 inst["pricing"] = new_pricing
+                if old_record is not None and old_pricing != new_pricing:
+                    self._remember_repriced_history(inst, old_record)
+                _mark_pricing_completeness(inst)
                 continue
             inst["pricing"] = calculate_spot_pricing(
                 family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
@@ -4847,6 +4932,8 @@ class DashboardStore:
                     family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
                     project=self.project, live_pricing=shared_live_pricing)
                 _mark_pricing_completeness(inst)
+                if old_record is not None and old_pricing != inst["pricing"]:
+                    self._remember_repriced_history(inst, old_record)
                 if old_pricing is not None and _pricing_rates(old_pricing) != _pricing_rates(inst["pricing"]):
                     # New rates apply from now on: time already billed keeps the rates it had.
                     _close_open_segments(inst, old_pricing, self._clock())
