@@ -324,8 +324,8 @@ async def list_regions(api: AsyncGoogleApi, project: str) -> list[dict]:
 
 INSTANCE_LIST_FIELDS = "name,zone,status,machineType,cpuPlatform,lastStartTimestamp,labels,metadata/items"
 # The dashboard's fleet inventory also needs identity, lifetime, Spot, and attached-disk fields.
-FLEET_INSTANCE_LIST_FIELDS = (INSTANCE_LIST_FIELDS + ",id,creationTimestamp,lastStopTimestamp,"
-                              "scheduling(provisioningModel,preemptible),disks(boot,diskSizeGb,source,type)")
+FLEET_INSTANCE_LIST_FIELDS = (INSTANCE_LIST_FIELDS + ",id,creationTimestamp,lastStopTimestamp,lastSuspendedTimestamp,"
+                              "scheduling(provisioningModel,preemptible),disks(boot,diskSizeGb,source,type,autoDelete)")
 
 
 async def list_instances(api: AsyncGoogleApi, project: str, *,
@@ -358,7 +358,9 @@ async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, dict]:
     query = {
         "maxResults": "500",
         "returnPartialSuccess": "true",
-        "fields": "nextPageToken,unreachables,items/*/disks(selfLink,type,provisionedIops,provisionedThroughput)",
+        "fields": ("nextPageToken,unreachables,"
+                   "items/*/disks(id,name,zone,region,sizeGb,users,selfLink,type,provisionedIops,provisionedThroughput,"
+                   "creationTimestamp)"),
     }
     types: dict[str, dict] = {}
     while True:
@@ -373,7 +375,8 @@ async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, dict]:
                         "type": str(disk.get("type", "")).rsplit("/", 1)[-1],
                         # Regional (replicated) disks bill differently from zonal ones of the same type.
                         "regional": "/regions/" in str(disk.get("selfLink", "")) or "/regions/" in str(disk.get("type", "")),
-                        **{k: disk[k] for k in ("provisionedIops", "provisionedThroughput") if k in disk},
+                        **{k: disk[k] for k in ("provisionedIops", "provisionedThroughput", "creationTimestamp",
+                                                "id", "name", "zone", "region", "sizeGb", "users") if k in disk},
                     }
         token = data.get("nextPageToken")
         if not token:

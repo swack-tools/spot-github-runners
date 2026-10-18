@@ -1989,6 +1989,8 @@ def calculate_spot_pricing(
         "total_monthly_usd": _money(total_monthly),
     }
     custom_shape = bool(machine_type) and ("custom" in machine_type or machine_type.endswith("-ext"))
+    # These types bill provisioned throughput or IOPS separately, which this capacity price leaves out.
+    performance_billed = {"hyperdisk-throughput", "pd-extreme"} & {boot_disk_type, data_disk_type if data_disk_gb else ""}
     if on_demand:
         result["provisioning"] = "ondemand"
         result["complete"] = pricing_source == "gcp_billing_catalog" and not custom_shape
@@ -1997,6 +1999,19 @@ def calculate_spot_pricing(
     if custom_shape and pricing_source != "gcp_capacity_history":
         # Custom and extended shapes bill their own SKUs; predefined series rates do not price them.
         result["complete"] = False
+    if performance_billed:
+        result["complete"] = False
+    # A disk type with neither a live rate nor a static one is priced at a generic fallback, which is not a price.
+    unknown_disk = [kind for kind, gb, live in ((boot_disk_type, boot_disk_gb, live_boot_disk),
+                                               (data_disk_type, data_disk_gb, live_data_disk))
+                    if gb and live is None and kind not in DISK_MONTHLY_RATES_USD_PER_GIB]
+    if unknown_disk:
+        result["complete"] = False
+        result["disk_rate_unknown"] = sorted(set(unknown_disk))
+    if pricing_source == "catalog_baseline" and vcpu and family not in SERIES_SPOT_BASE_RATES:
+        # No machine, component, or family rate: the generic per-vCPU/GiB fallback is not a trusted price.
+        result["complete"] = False
+        result["family_rate_unknown"] = True
     return result
 
 

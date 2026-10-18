@@ -95,6 +95,7 @@ from .dashboard_models import (
 )
 from .dashboard_scaling import (
     _assert_finite_json_tree,
+    _is_recent_unhandled_oom,
     classify_github_ci_failure,
     default_scaling_config,
     evaluate_builder_scaling_decision,
@@ -380,13 +381,16 @@ def _build_instance_record(
 INSTANCE_SOURCE_KEY = "inventory_source"
 INSTANCE_SOURCE_GCE = "gce"
 FLEET_INVENTORY_INTERVAL_SECONDS = 120.0
+# The inventory counts as stale when no listing has completed for this many refresh intervals.
+FLEET_INVENTORY_MAX_AGE_INTERVALS = 3
 # When the first successful inventory listing was applied (the baseline later growth is measured against).
 FLEET_BASELINE_STATE_KEY = "fleet_inventory_baseline_at"
 # Deleted VMs stay in the history this long (the longest cost window the dashboard offers is 30 days).
 DELETED_INSTANCE_RETENTION_SECONDS = 31 * 86_400.0
 MAX_WINDOW_HOURS = DELETED_INSTANCE_RETENTION_SECONDS / 3600.0
 # Compute Engine states in which the VM is stopped: compute billing ended at lastStopTimestamp.
-GCE_STOPPED_STATUSES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED"})
+# DETACHED is a fleet disk no VM uses (see fleet_inventory.observe_detached_disks): storage only, like a stopped VM.
+GCE_STOPPED_STATUSES = frozenset({"TERMINATED", "STOPPED", "SUSPENDED", "DETACHED"})
 LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
     "The dashboard does not create, stop, or delete VMs: its instance list mirrors the live Compute Engine "
     "inventory. Run lifecycle changes with the reviewed tools instead (spot_runner_autoscaler.py drains and "
@@ -462,17 +466,107 @@ SEEDED_RUST_BUILD_GAPS = {
     "rb-20261015-004": (145, 14),
     "rb-20261015-005": (190, 14),
 }
-# id -> (run_id, job_id)
-SEEDED_GITHUB_CI_RUNS = {
-    "gh-oom-37192272062": (37192272062, 111407847874),
-    "gh-oom-37192994059": (37192994059, 111409747367),
-    "gh-timeout-38596411473": (38596411473, 115964282184),
-    # The same seeds in older versions, before they were rewritten on load.
-    "gh-oom-38596411473": (38596411473, 115964282184),
-    "gh-oom-38601924810": (38601924810, 116012948102),
+# Match source event content too: reports can replace seeded rows while retaining the same identity.
+# RELATIVE timestamps in the earliest versions are checked against the unchanged build timestamps.
+SEEDED_GITHUB_CI_RUNS = [
+    {
+        "id": "gh-oom-37192272062",
+        "repository": "swack-tools/oxidex",
+        "workflow_name": "CI",
+        "run_id": 37192272062,
+        "job_id": 111407847874,
+        "job_name": "Verify Generated Tables / catalog join",
+        "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-2",
+        "step_number": 8,
+        "line_number": 106,
+        "failed_at": "2026-10-04T09:39:54Z",
+        "error_excerpt": "line 14: 15780 Killed python3 tools/exiftool-tables — ##[error]Process completed with exit code 137.",
+        "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/37192272062/job/111407847874#step:8:106"
+    },
+    {
+        "id": "gh-oom-37192994059",
+        "repository": "swack-tools/oxidex",
+        "workflow_name": "CI",
+        "run_id": 37192994059,
+        "job_id": 111409747367,
+        "job_name": "Verify Generated Tables / tools 5/8",
+        "runner_name": "gha-oxidex-runners-asianortheast2-a-1791098074-5",
+        "step_number": 7,
+        "line_number": 77,
+        "failed_at": "2026-10-04T10:01:39Z",
+        "error_excerpt": "test_committed_rules_and_ledger_equal_fresh_native_generation ... ##[error]Process completed with exit code 137.",
+        "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/37192994059/job/111409747367#step:7:77"
+    },
+    {
+        "id": "gh-timeout-38596411473",
+        "repository": "Appz4Fun/nzbget",
+        "workflow_name": "docs",
+        "run_id": 38596411473,
+        "job_id": 115964282184,
+        "job_name": "deploy (Deploy to GitHub Pages)",
+        "runner_name": "GitHub Actions 1000014245",
+        "step_number": 2,
+        "line_number": 50,
+        "failed_at": "2026-10-14T16:25:26Z",
+        "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
+        "deep_link": "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50"
+    },
+    {
+        "id": "gh-oom-38601924810",
+        "repository": "swack-tools/oxidex",
+        "workflow_name": "Rust 1.99 Qualification Matrix",
+        "run_id": 38601924810,
+        "job_id": 116012948102,
+        "job_name": "cargo-nextest-heavy",
+        "runner_name": "oxidex-za-jnb-01-3",
+        "step_number": 4,
+        "line_number": 118,
+        "failed_at": "RELATIVE",
+        "error_excerpt": "LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)",
+        "deep_link": "https://github.com/swack-tools/oxidex/actions/runs/38601924810/job/116012948102#step:4:118"
+    },
+    {
+        "id": "gh-timeout-38596411473",
+        "repository": "Appz4Fun/nzbget",
+        "workflow_name": "docs",
+        "run_id": 38596411473,
+        "job_id": 115964282184,
+        "job_name": "deploy (Deploy to GitHub Pages)",
+        "runner_name": "GitHub Actions 1000014245",
+        "step_number": 2,
+        "line_number": 50,
+        "failed_at": "RELATIVE",
+        "error_excerpt": "2026-10-14T16:25:26.2656514Z ##[error]Timeout reached, aborting! (Canceling Pages deployment)",
+        "deep_link": "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50"
+    },
+    {
+        "id": "gh-oom-38596411473",
+        "repository": "Appz4Fun/nzbget",
+        "workflow_name": "CI Build & Integration Suite",
+        "run_id": 38596411473,
+        "job_id": 115964282184,
+        "job_name": "linux-x64-release-build",
+        "runner_name": "oxidex-dallas-01-2",
+        "step_number": 2,
+        "line_number": 50,
+        "failed_at": "RELATIVE",
+        "error_excerpt": "error: could not compile `nzbget-core`: process didn't exit successfully (signal: 9, SIGKILL: kill) — container memory.max (16 GiB) exhausted",
+        "deep_link": "https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50"
+    }
+]
+SEEDED_JOURNAL_OOM_EVENT = {
+    "id": "oom-journal-01", "instance_name": "oxidex-runners-dallas-01", "zone": "us-south1-a",
+    "pid": 18492, "process": "rustc", "constraint": "CONSTRAINT_MEMCG",
+    "journal_line": (
+        "kernel: oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),"
+        "cpuset=docker-8f4a21.scope,mems_allowed=0,oom_memcg=/system.slice/docker-8f4a21.scope,"
+        "task_memcg=/system.slice/docker-8f4a21.scope,task=rustc,pid=18492,uid=1001"
+    ),
 }
-# id -> (instance_name, pid)
-SEEDED_JOURNAL_OOM_EVENTS = {"oom-journal-01": ("oxidex-runners-dallas-01", 18492)}
+SEEDED_BUILD_REQUEST_OFFSETS = {
+    "rb-20261015-001": 920, "rb-20261015-002": 2450, "rb-20261015-003": 4800,
+    "rb-20261015-004": 7600, "rb-20261015-005": 11200,
+}
 SEEDED_JOB_COUNTERS = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
 
 
@@ -519,24 +613,46 @@ def _is_seeded_build(record: dict[str, Any]) -> bool:
                                           for k in ("requested_at", "finished_at", "delivered_at"))
     except (KeyError, TypeError, ValueError):
         return False
-    return (round(finished - requested), round(delivered - finished)) == SEEDED_RUST_BUILD_GAPS[build_id]
+    return (finished - requested, delivered - finished) == SEEDED_RUST_BUILD_GAPS[build_id]
 
 
-def _is_seeded_ci_run(record: dict[str, Any]) -> bool:
-    fingerprint = SEEDED_GITHUB_CI_RUNS.get(record.get("id"))
-    return fingerprint is not None and (record.get("run_id"), record.get("job_id")) == fingerprint
+def _seed_fields_match(record: dict[str, Any], fingerprint: dict[str, Any]) -> bool:
+    return all(record.get(k) == v and type(record.get(k)) is type(v) for k, v in fingerprint.items())
 
 
-def _is_seeded_journal_oom(record: dict[str, Any]) -> bool:
-    fingerprint = SEEDED_JOURNAL_OOM_EVENTS.get(record.get("id"))
-    return fingerprint is not None and (record.get("instance_name"), record.get("pid")) == fingerprint
+def _is_seeded_ci_run(record: dict[str, Any], reference: float | None) -> bool:
+    for fingerprint in SEEDED_GITHUB_CI_RUNS:
+        if fingerprint["failed_at"] != "RELATIVE":
+            if _seed_fields_match(record, fingerprint):
+                return True
+        elif reference is not None:
+            expected = dict(fingerprint, failed_at=_iso_epoch(reference - (
+                540 if fingerprint["id"] == "gh-oom-38601924810" else 1380)))
+            if _seed_fields_match(record, expected):
+                return True
+    return False
+
+
+def _is_seeded_journal_oom(record: dict[str, Any], reference: float | None) -> bool:
+    # Its timestamp was generated at startup. Without an unchanged build to recover that startup time,
+    # the record cannot be distinguished from a later report with the same static fields; keep it.
+    if reference is None:
+        return False
+    expected = dict(SEEDED_JOURNAL_OOM_EVENT, observed_at=_iso_epoch(reference - 420))
+    return _seed_fields_match(record, expected)
 
 
 def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
     """Remove seeded demo telemetry from ``state`` in place; returns how many records or counters it dropped."""
     dropped = 0
+    reference = None
     builds = state.get("rust_builds")
     if isinstance(builds, list):
+        for build in builds:
+            if isinstance(build, dict) and _is_seeded_build(build):
+                reference = (_iso_to_epoch(build["requested_at"])
+                             + SEEDED_BUILD_REQUEST_OFFSETS[build["build_id"]])
+                break
         kept = [b for b in builds if not (isinstance(b, dict) and _is_seeded_build(b))]
         dropped += len(builds) - len(kept)
         state["rust_builds"] = kept
@@ -550,7 +666,7 @@ def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
     ):
         records = telem.get(key)
         if isinstance(records, list):
-            kept = [r for r in records if not (isinstance(r, dict) and is_seed(r))]
+            kept = [r for r in records if not (isinstance(r, dict) and is_seed(r, reference))]
             dropped += len(records) - len(kept)
             telem[key] = kept
     if all(telem.get(k) == v and type(telem.get(k)) is int for k, v in SEEDED_JOB_COUNTERS.items()):
@@ -739,7 +855,12 @@ def instance_usage(record: dict[str, Any], now: float, window_start: float | Non
     if run_end > open_start:
         runs.append((open_start, run_end, cur_compute_all_in, cur_compute_only))
     deleted = record.get("deleted_epoch")
-    disk_end = float(deleted) if _finite(deleted) else now
+    if record.get("disk_liability_pending"):
+        disk_end = now  # Its persistent disk may still exist: keep billing until a disk listing resolves it.
+    elif _finite(record.get("disk_end_epoch")):
+        disk_end = float(record["disk_end_epoch"])
+    else:
+        disk_end = float(deleted) if _finite(deleted) else now
     first_start = min([s for s, _e, _a, _c in runs] + [started])
     created = record.get("disk_start_epoch")
     disk_open_start = float(created) if _finite(created) else first_start
@@ -837,14 +958,23 @@ def _with_secondary_disks(
     """``pricing`` (which covers the boot disk and the primary data-disk type) plus every other data-disk type,
     each at its own rate. ``disks`` is an observation or record with ``data_disks`` / ``data_disk_type``."""
     extra = 0.0
+    unknown: set[str] = set()
     for disk_type, disk_gb in _secondary_data_disks(disks):
-        extra += float(calculate_spot_pricing(
+        priced = calculate_spot_pricing(
             family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type=disk_type,
             boot_disk_gb=0, data_disk_type=disk_type, data_disk_gb=disk_gb,
             tax_rate_percent=float(pricing.get("tax_rate_percent", 0.0) or 0.0),
             machine_type=None, live_pricing=live_pricing, project=project,
-        ).get("disk_hourly_usd", 0.0) or 0.0)
-    return _with_extra_disks(pricing, extra)
+        )
+        extra += float(priced.get("disk_hourly_usd", 0.0) or 0.0)
+        if priced.get("complete") is False:
+            unknown.update(priced.get("disk_rate_unknown") or [disk_type])
+    out = _with_extra_disks(pricing, extra)
+    if unknown:
+        # A secondary disk type without a trusted rate leaves the whole price incomplete.
+        out = {**out, "complete": False,
+               "disk_rate_unknown": sorted(set(out.get("disk_rate_unknown") or []) | unknown)}
+    return out
 
 
 def _stopped_disk_hourly(pricing: dict[str, Any], *, include_tax: bool = True) -> float:
@@ -858,14 +988,21 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
     reasons = []
     pricing = record.get("pricing") or {}
     custom = "custom" in str(record.get("machine_type", "")) or str(record.get("machine_type", "")).endswith("-ext")
-    if pricing.get("complete") is False and not custom:
+    if pricing.get("complete") is False and not custom and pricing.get("provisioning") == "ondemand" \
+            and pricing.get("pricing_source") == "spot_baseline_for_on_demand_vm":
         reasons.append("no on-demand rate for this standard (non-Spot) VM")
     if record.get("status") == "SUSPENDED":
         reasons.append("suspended: Compute Engine also bills the preserved memory, which is not priced here")
+    if record.get("tax_rate_known") is False:
+        reasons.append("region outside the dashboard's catalog: no trusted regional compute, disk, or tax rates")
     if record.get("regional_disks"):
         reasons.append("regional (replicated) persistent disk, priced here only at the zonal rate")
     if record.get("disk_types_known") is False:
         reasons.append("disk types unknown (no compute.disks.list), priced at the default type")
+    if pricing.get("disk_rate_unknown"):
+        reasons.append(f"no known rate for disk type(s) {', '.join(pricing['disk_rate_unknown'])}")
+    if pricing.get("family_rate_unknown"):
+        reasons.append(f"no known rate for the {record.get('family') or 'unknown'} machine family")
     if pricing.get("complete") is False and custom:
         reasons.append("custom or extended machine shape, which predefined rates do not price")
     if record.get("unpriced_disk_performance"):
@@ -883,7 +1020,8 @@ def _nonrunning_hourly(inst: dict[str, Any], *, include_disk: bool, include_tax:
     (PROVISIONING, STAGING, STOPPING, REPAIRING, ...) is about to run or still is, so it counts at its full rate.
     """
     pricing = inst.get("pricing") or {}
-    if inst.get("status") in GCE_STOPPED_STATUSES:
+    if inst.get("status") in GCE_STOPPED_STATUSES or inst.get("status") == "DELETED":
+        # A deleted record is counted here only while it still bills an unresolved disk.
         return _stopped_disk_hourly(pricing, include_tax=include_tax) if include_disk else 0.0
     return DashboardStore._instance_hourly_for_budget(pricing, include_disk=include_disk, include_tax=include_tax)
 
@@ -893,17 +1031,71 @@ def _is_transitional(inst: Any) -> bool:
             and inst.get("status") not in ("RUNNING", "DELETED"))
 
 
+def _disk_key(disk: dict[str, Any]) -> str:
+    """A disk's identity across records: its immutable numeric ID (a reused name is a different disk), else its
+    source URL."""
+    disk_id = str(disk.get("id") or "").strip()
+    return f"id:{disk_id}" if disk_id else str(disk.get("source") or "")
+
+
+def _disk_known(disk: dict[str, Any], known: frozenset[str]) -> bool:
+    """True when another record already billed this disk: by immutable ID when the listing gives one (a reused
+    name with a new ID is a new disk), else by source URL."""
+    disk_id = str(disk.get("id") or "").strip()
+    if disk_id:
+        return f"id:{disk_id}" in known
+    return bool(disk.get("source")) and str(disk["source"]) in known
+
+
+def _single_disk_all_in(disk: dict[str, Any], *, family: str, region: str, project: str,
+                        tax_rate_percent: float) -> float:
+    """Hourly USD (with tax) of one persistent disk."""
+    priced = calculate_spot_pricing(
+        family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type=str(disk.get("type") or "pd-balanced"),
+        boot_disk_gb=int(disk.get("gb") or 0), data_disk_type=str(disk.get("type") or "pd-balanced"), data_disk_gb=0,
+        tax_rate_percent=tax_rate_percent, machine_type=None, project=project)
+    return float(priced.get("disk_hourly_usd", 0.0) or 0.0) * (1.0 + tax_rate_percent / 100.0)
+
+
+def _initial_disk_history(
+    obs: dict[str, Any], *, region: str, family: str, project: str, tax_rate_percent: float, now: float,
+) -> tuple[list[tuple[float, float, float]], float | None]:
+    """(closed disk segments, open segment start) for a VM seen for the first time.
+
+    Between successive disk creation times the rate is that of the disks that existed then; the open segment (at
+    the record's full disk rate) starts at the newest disk's creation. Without every creation time, nothing is
+    backfilled: the open segment starts now.
+    """
+    disks = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
+    if not disks:
+        return [], None  # No per-disk evidence (older observations): the VM's creation bounds disk history.
+    if not all(_finite(d.get("created_epoch")) for d in disks):
+        return [], now
+    def disk_all_in(d: dict[str, Any]) -> float:
+        return _single_disk_all_in(d, family=family, region=region, project=project, tax_rate_percent=tax_rate_percent)
+
+    times = sorted({min(float(d["created_epoch"]), now) for d in disks})
+    segments = []
+    for start, end in zip(times, times[1:]):
+        rate = sum(disk_all_in(d) for d in disks if float(d["created_epoch"]) <= start)
+        segments.append((start, end, rate))
+    return segments, times[-1]
+
+
 def _live_instance_record(
     obs: dict[str, Any],
     *,
     project: str,
     now: float,
     previous: dict[str, Any] | None = None,
+    known_disk_sources: frozenset[str] = frozenset(),
+    tax_overrides: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """A dashboard instance record for one Compute Engine observation (see fleet_inventory.observe_fleet_items)."""
+    tax_overrides = tax_overrides or {}
     if obs.get("disk_types_known") is False:
         obs = dict(obs)
-        if previous is not None and previous.get("disk_types_known") is not False:
+        if previous is not None:  # Even if the previous listing was also unverified: keep the last known types.
             # This listing could not read disk types: keep the stored ones where the disks are unchanged in size.
             if int(previous.get("boot_disk_gb") or 0) == int(obs.get("boot_disk_gb") or 0):
                 obs["boot_disk_type"] = previous.get("boot_disk_type") or obs.get("boot_disk_type")
@@ -912,8 +1104,20 @@ def _live_instance_record(
                 obs["data_disks"] = previous.get("data_disks") or obs.get("data_disks")
                 obs["unpriced_disk_performance"] = bool(previous.get("unpriced_disk_performance"))
                 obs["regional_disks"] = bool(previous.get("regional_disks"))
-                if int(previous.get("boot_disk_gb") or 0) == int(obs.get("boot_disk_gb") or 0):
-                    obs["disk_types_known"] = True
+            # Per attachment too: same source and size keeps its stored type, ID, creation, and auto-delete.
+            known = {str(d.get("source")): d for d in previous.get("disks_detail") or []
+                     if isinstance(d, dict) and d.get("source")}
+            merged = []
+            for d in obs.get("disks_detail") or []:
+                if not isinstance(d, dict):
+                    continue
+                old = known.get(str(d.get("source") or ""))
+                if old is not None and int(old.get("gb") or 0) == int(d.get("gb") or 0):
+                    d = {**d, **{k: old.get(k) for k in ("type", "id", "created_epoch", "auto_delete")
+                                 if old.get(k) not in (None, "")}}
+                merged.append(d)
+            obs["disks_detail"] = merged
+            # Still unverified: a same-size disk may have been replaced by another type, so pricing stays incomplete.
     status = str(obs.get("status") or "UNKNOWN").upper()
     started = obs.get("last_start_epoch") or obs.get("created_epoch")
     if not isinstance(started, (int, float)) and previous is not None:
@@ -961,7 +1165,9 @@ def _live_instance_record(
         project=project,
         now_epoch=now,
         # Outside the catalog no regional tax default is known: never borrow another region's.
-        tax_rate_percent=None if region_known else 0.0,
+        # The profile's tax override when set (so first-seen history is not archived at another rate), else the
+        # region's default; outside the catalog no default is known, so never borrow another region's.
+        tax_rate_percent=(tax_overrides[role] if role in tax_overrides else None if region_known else 0.0),
         pricing=copy.deepcopy(reuse_pricing) if reuse_pricing is not None else None,
         provisioning=provisioning,
     )
@@ -970,6 +1176,20 @@ def _live_instance_record(
         record["pricing"] = _with_secondary_disks(record["pricing"], obs, region=region,
                                                   family=record["family"], project=project)
     record["data_disks"] = obs.get("data_disks") or {}
+    record["disks_detail"] = [dict(d) for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
+    # Disk identities: the immutable ID (kept from the previous record when this listing could not read it) and the
+    # source URL as an alias, so a handoff is recognized by either.
+    previous_ids = (previous or {}).get("disk_ids") or {}
+    disk_ids = {}
+    for d in obs.get("disks_detail") or []:
+        if isinstance(d, dict) and d.get("source"):
+            disk_id = str(d.get("id") or previous_ids.get(str(d["source"])) or "")
+            if disk_id:
+                disk_ids[str(d["source"])] = disk_id
+    record["disk_ids"] = disk_ids
+    record["disk_sources"] = sorted({f"id:{i}" for i in disk_ids.values()}
+                                    | {str(d.get("source")) for d in obs.get("disks_detail") or []
+                                       if isinstance(d, dict) and d.get("source")})
     # Capacity this VM adds, not yet counted toward OOM handling: set for a new identity, kept until counted.
     record["capacity_pending"] = bool(previous.get("capacity_pending")) if previous is not None else True
     record["local_ssd_gb"] = int(obs.get("local_ssd_gb") or 0)
@@ -985,8 +1205,11 @@ def _live_instance_record(
     stopped_epoch: float | None = None
     if status == "RUNNING":
         trigger = "Active — RUNNING in the live Compute Engine inventory"
+    elif status == "DETACHED":
+        stopped_epoch = started_epoch  # A disk on its own never runs compute.
+        trigger = "Fleet disk that no VM uses (for example a builder cache disk); it bills storage until deleted"
     elif status in GCE_STOPPED_STATUSES:
-        stop = obs.get("last_stop_epoch")
+        stop = obs.get("last_suspended_epoch") if status == "SUSPENDED" else obs.get("last_stop_epoch")
         if isinstance(stop, (int, float)) and stop >= started_epoch:
             stopped_epoch = float(stop)
         elif previous is not None and isinstance(previous.get("stopped_epoch"), (int, float)):
@@ -1001,14 +1224,67 @@ def _live_instance_record(
     if not _finite(created) and previous is not None:
         created = previous.get("disk_start_epoch")
     disk_start = min(float(created), started_epoch) if _finite(created) else started_epoch
+    if previous is None and known_disk_sources:
+        # A disk that another record already billed (a cache disk moving between a VM and its own DETACHED record)
+        # starts here at the handoff, not again at its creation.
+        handed_off = [dict(d, created_epoch=now) if _disk_known(d, known_disk_sources) else d
+                      for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
+        if handed_off:
+            obs = dict(obs, disks_detail=handed_off)
     prior_runs = _prior_runs(previous)
     disk_segments = _disk_segments(previous)
+    revived_at: float | None = None
+    if previous is not None and previous.get("status") == "DELETED":
+        # Back after it was gone (a cache disk detached again after a VM used it): its earlier standalone interval
+        # stays closed, and billing here restarts now; the time in between was billed by the VM's record.
+        ended = previous.get("deleted_epoch")
+        if _finite(ended) and isinstance(previous.get("pricing"), dict):
+            open_from = max([float(previous.get("disk_start_epoch") or ended)] + [e for _s, e, _r in disk_segments]
+                            + ([float(previous["disk_segment_start"])] if _finite(previous.get("disk_segment_start"))
+                               else []))
+            if ended > open_from:
+                disk_segments.append((open_from, float(ended), _pricing_rates(previous["pricing"])[2]))
+        revived_at = now
+    initial_disk_segment_start: float | None = None
+    deferred_at = (previous or {}).get("disk_history_deferred_at")
+    if previous is not None and _finite(deferred_at):
+        # Disk history was deferred (first seen without disk creation times). Once every attachment has a creation
+        # time, bill the deferred interval per disk from its creation (disks another record billed excepted).
+        disks_now = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
+        if disks_now and all(_finite(d.get("created_epoch")) for d in disks_now):
+            backfill = [dict(d, created_epoch=float(deferred_at)) if _disk_known(d, known_disk_sources) else d
+                        for d in disks_now]
+            segments, open_from = _initial_disk_history(
+                dict(obs, disks_detail=backfill), region=region,
+                family=str(obs.get("machine_type") or "").split("-", 1)[0], project=project,
+                tax_rate_percent=float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0), now=float(deferred_at))
+            if _finite(open_from) and float(deferred_at) > float(open_from):
+                tax_pct = float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0)
+                full = sum(_single_disk_all_in(d, family=record["family"], region=region, project=project,
+                                               tax_rate_percent=tax_pct) for d in backfill)
+                segments = segments + [(float(open_from), float(deferred_at), full)]
+            disk_segments_backfill = segments
+        else:
+            disk_segments_backfill = None
+    else:
+        disk_segments_backfill = None
+    if previous is None:
+        # First sight of this VM: bill earlier disk time per disk from each disk's own creation, never a later-
+        # attached disk back to the VM's creation; with any creation time unknown, start disk history now.
+        disk_segments, initial_disk_segment_start = _initial_disk_history(
+            obs, region=region, family=str(obs.get("machine_type") or "").split("-", 1)[0], project=project,
+            tax_rate_percent=float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0), now=now)
+    if disk_segments_backfill:
+        disk_segments = list(disk_segments_backfill) + disk_segments
+        disk_start = min([disk_start] + [seg[0] for seg in disk_segments_backfill])
     compute_segment_start = started_epoch
     if previous is not None and _finite(previous.get("compute_segment_start")) \
             and float(previous.get("started_epoch") or 0.0) == started_epoch:
         # Same run: keep the boundary of an earlier rate change, or that time would be counted twice.
         compute_segment_start = max(started_epoch, float(previous["compute_segment_start"]))
-    disk_segment_start = previous.get("disk_segment_start") if previous is not None else None
+    disk_segment_start = (revived_at if revived_at is not None
+                          else previous.get("disk_segment_start") if previous is not None
+                          else initial_disk_segment_start)
     if previous is not None and isinstance(previous.get("pricing"), dict):
         prev_compute_all_in, prev_compute_only, prev_disk_all_in = _pricing_rates(previous["pricing"])
         prev_start = float(previous.get("started_epoch") or started_epoch)
@@ -1019,8 +1295,11 @@ def _live_instance_record(
             # start) at the rates that applied to it.
             prev_end = previous.get("stopped_epoch")
             if not _finite(prev_end):
-                stop = obs.get("last_stop_epoch")
-                prev_end = stop if _finite(stop) and prev_start <= stop <= started_epoch else started_epoch
+                # A stop or a suspension (resumed between listings) ended that run: take the latest one that falls
+                # between its start and the new start.
+                ends = [t for t in (obs.get("last_stop_epoch"), obs.get("last_suspended_epoch"))
+                        if _finite(t) and prev_start <= t <= started_epoch]
+                prev_end = max(ends) if ends else started_epoch
             prev_end = min(float(prev_end), started_epoch)
             # Intervals of that run closed after its real stop (for example at a price change while the listing
             # still said RUNNING) end at the stop.
@@ -1046,9 +1325,28 @@ def _live_instance_record(
         if reuse_pricing is None:
             disk_open = max([disk_start] + [e for _s, e, _r in disk_segments]
                             + ([float(disk_segment_start)] if _finite(disk_segment_start) else []))
-            if now > disk_open:
-                disk_segments.append((disk_open, now, prev_disk_all_in))
-            disk_segment_start = now
+            # Where the old disk rate ends: when the only change is added disks whose creation times are known
+            # (and that no other record billed), at the newest one's creation; otherwise at this listing.
+            own_keys = set(previous.get("disk_sources") or [])
+            added = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict)
+                     and not (_disk_key(d) in own_keys or str(d.get("source") or "") in own_keys)]
+            split_at = now
+            if added and all(_finite(d.get("created_epoch")) for d in added) \
+                    and not any(_disk_known(d, known_disk_sources) for d in added):
+                # One step per added disk: between creations the rate is the old disks plus those added so far.
+                tax_pct = float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0)
+                cursor, rate = disk_open, prev_disk_all_in
+                for d in sorted(added, key=lambda item: float(item["created_epoch"])):
+                    at = min(now, max(cursor, float(d["created_epoch"])))
+                    if at > cursor:
+                        disk_segments.append((cursor, at, rate))
+                    cursor = at
+                    rate += _single_disk_all_in(d, family=record["family"], region=region, project=project,
+                                                tax_rate_percent=tax_pct)
+                disk_open, split_at = cursor, cursor
+            if split_at > disk_open:
+                disk_segments.append((disk_open, split_at, prev_disk_all_in))
+            disk_segment_start = split_at
     if stopped_epoch is not None:
         # A stop reported late: intervals of this run closed (for example at a price change) after the real stop
         # end at the stop instead.
@@ -1116,6 +1414,11 @@ def _live_instance_record(
         "pruned_compute_hours": round(pruned_hours, 4),
         "pruned_cost_usd": [round(pruned_all_in, 6), round(pruned_compute, 6)],
         "disk_start_epoch": disk_start,
+        "disk_history_deferred_at": (
+            None if disk_segments_backfill is not None
+            else float(initial_disk_segment_start) if previous is None and initial_disk_segment_start is not None
+            and not all(_finite(d.get("created_epoch")) for d in obs.get("disks_detail") or [] if isinstance(d, dict))
+            else (previous or {}).get("disk_history_deferred_at")),
     })
     usage = instance_usage(record, now)
     runtime_hours = round(usage["compute_hours"], 2)
@@ -1127,6 +1430,7 @@ def _live_instance_record(
         "specs_known": bool(obs.get("specs_known", True)),
         "runner_limits_known": bool(obs.get("runner_limits_known", True)),
         "runners_count_known": bool(obs.get("runners_count_known", True)),
+        "kind": str(obs.get("kind") or "vm"),
         "started_epoch": started_epoch,
         "started_at": _iso_epoch(started_epoch),
         "stopped_epoch": stopped_epoch,
@@ -1150,13 +1454,66 @@ def _live_instance_record(
     return record
 
 
-def _mark_instance_deleted(record: dict[str, Any], now: float) -> dict[str, Any]:
+def _retained_disks(record: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The record's disks that outlive the VM (auto-delete off), or None when the listing gave no auto-delete
+    information (then all disks count, conservatively)."""
+    disks = record.get("disks_detail") or []
+    if not disks or any(not isinstance(d, dict) or d.get("auto_delete") is None for d in disks):
+        return None
+    return [d for d in disks if d.get("auto_delete") is False]
+
+
+def _retained_pricing(record: dict[str, Any], *, tax_rate_percent: float, project: str,
+                      live_pricing: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Pricing of only the disks a deleted VM leaves behind (no compute)."""
+    retained = _retained_disks(record) or []
+    family = str(record.get("family") or "")
+    region = str(record.get("region") or "")
+    priced = calculate_spot_pricing(
+        family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type="pd-balanced", boot_disk_gb=0,
+        data_disk_type="pd-balanced", data_disk_gb=0, tax_rate_percent=tax_rate_percent, machine_type=None,
+        live_pricing=live_pricing, project=project)
+    extra = sum(_single_disk_all_in(d, family=family, region=region, project=project, tax_rate_percent=tax_rate_percent)
+                / (1.0 + tax_rate_percent / 100.0) for d in retained)
+    return _with_extra_disks(priced, extra)
+
+
+def _mark_instance_deleted(record: dict[str, Any], now: float, *, disks_pending: bool = False,
+                           project: str = "homelab-424523") -> dict[str, Any]:
     """The record of a VM that is no longer in the Compute Engine inventory."""
     out = dict(record)
+    if disks_pending:
+        retained = _retained_disks(out)
+        if retained == []:
+            disks_pending = False  # Every disk was auto-deleted with the VM: nothing left to bill.
+        elif retained is not None:
+            # Only the disks that outlive the VM keep billing: close compute and the full disk rate here, and
+            # continue at the rate of the retained disks alone.
+            pricing = out.get("pricing") if isinstance(out.get("pricing"), dict) else {}
+            compute_all_in, compute_only, full_disk = _pricing_rates(pricing)
+            if out.get("status") == "RUNNING" or _instance_end_epoch(out) is None:
+                out["stopped_epoch"] = now
+            started = float(out.get("started_epoch") or now)
+            seg = out.get("compute_segment_start")
+            open_start = max(started, float(seg)) if _finite(seg) else started
+            run_end = min(_current_run_end(out, now), now)
+            if run_end > open_start:
+                out["prior_runs"] = list(out.get("prior_runs") or []) + [[open_start, run_end, compute_all_in,
+                                                                          compute_only]]
+            out["compute_segment_start"] = max(open_start, run_end)
+            disks = _disk_segments(out)
+            disk_open = max([float(out.get("disk_start_epoch") or now)] + [e for _s, e, _r in disks]
+                            + ([float(out["disk_segment_start"])] if _finite(out.get("disk_segment_start")) else []))
+            if now > disk_open:
+                out["disk_segments"] = [list(d) for d in disks] + [[disk_open, now, full_disk]]
+            out["disk_segment_start"] = now
+            out["retained_only_pricing"] = True
+            out["pricing"] = _retained_pricing(
+                out, tax_rate_percent=float(pricing.get("tax_rate_percent", 0.0) or 0.0), project=project)
     if out.get("status") == "RUNNING" or _instance_end_epoch(out) is None:
         # It ran until it disappeared (between two listings; the observation time bounds it).
         out["stopped_epoch"] = now
-    out.update({"status": "DELETED", "deleted_epoch": now})
+    out.update({"status": "DELETED", "deleted_epoch": now, "disk_liability_pending": bool(disks_pending)})
     usage = instance_usage(out, now)
     total_cost, compute_cost = round(usage["cost_all_in"], 2), round(usage["cost_compute"], 2)
     out.update({
@@ -1207,10 +1564,12 @@ def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[floa
                     + ([float(record["disk_segment_start"])] if _finite(record.get("disk_segment_start")) else []))
     for s0, e0, r0 in disks:
         _add_to_buckets(buckets, prefix, s0, e0, r0, 0.0, compute=False)
-    if usage_end > disk_open:
-        _add_to_buckets(buckets, prefix, disk_open, usage_end, cur_disk, 0.0, compute=False)
+    # Disks bill until their own end (a resolved liability can end after the VM was deleted).
+    disk_end = float(record["disk_end_epoch"]) if _finite(record.get("disk_end_epoch")) else usage_end
+    if disk_end > disk_open:
+        _add_to_buckets(buckets, prefix, disk_open, disk_end, cur_disk, 0.0, compute=False)
     own = _rebucket(record.get("folded_cost_buckets") or {}, "", _record_bucket_span(record), _BUCKET_SECONDS,
-                    until=usage_end)
+                    until=max(usage_end, disk_end))
     for key, value in own.items():
         bucket = buckets.setdefault(f"{prefix}{key}", [0.0, 0.0, 0.0])
         for i in range(3):
@@ -1309,6 +1668,8 @@ def reconcile_instance_records(
     project: str,
     now: float,
     compacted: dict[str, list[float]] | None = None,
+    tax_overrides: dict[str, float] | None = None,
+    disks_listed: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Merge a complete Compute Engine fleet listing into the stored instance records.
 
@@ -1323,6 +1684,12 @@ def reconcile_instance_records(
             by_id[str(obs["instance_id"])] = obs
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
+    # Disks the observed VMs have attached (IDs and sources), so a detached record can be retired at the handoff.
+    observed_disk_keys = {key for obs in observed if isinstance(obs, dict) and obs.get("kind") != "disk"
+                          for d in obs.get("disks_detail") or [] if isinstance(d, dict)
+                          for key in (_disk_key(d), str(d.get("source") or "")) if key}
+    # Disks some stored record already bills (or billed): a new record that takes one over starts it at the handoff.
+    known_disks = frozenset(src for r in existing if is_live_instance_record(r) for src in (r.get("disk_sources") or []))
     for record in existing:
         if not is_live_instance_record(record):
             continue
@@ -1332,21 +1699,44 @@ def reconcile_instance_records(
         obs = by_id.get(instance_id)
         if obs is not None:
             seen.add(instance_id)
-            records.append(_live_instance_record(obs, project=project, now=now, previous=record))
+            records.append(_live_instance_record(
+                obs, project=project, now=now, previous=record, tax_overrides=tax_overrides,
+                known_disk_sources=known_disks - frozenset(record.get("disk_sources") or [])))
+        elif not disks_listed and record.get("kind") == "disk" and record.get("status") != "DELETED":
+            if set(record.get("disk_sources") or []) & observed_disk_keys:
+                # Even without the disk listing, a listed VM shows this disk attached: its record takes it over.
+                records.append(_mark_instance_deleted(record, now))
+            else:
+                # The disk listing is unavailable: a detached disk is not seen, not gone. Keep it (still billing).
+                records.append(record)
+        elif record.get("status") == "DELETED" and record.get("disk_liability_pending"):
+            if disks_listed:
+                # The disk listing is back: the cache disk is either listed on its own now (its DETACHED record
+                # takes over from this moment) or gone. Either way this record stops billing it here.
+                records.append(dict(record, disk_liability_pending=False, disk_end_epoch=now))
+            else:
+                records.append(record)
         elif record.get("status") == "DELETED":
             deleted = record.get("deleted_epoch")
             if isinstance(deleted, (int, float)) and now - float(deleted) <= DELETED_INSTANCE_RETENTION_SECONDS:
                 records.append(record)
         else:
-            records.append(_mark_instance_deleted(record, now))
+            # A builder's cache disk outlives its VM (auto-delete=no); while disks cannot be listed nobody can tell
+            # whether it still exists, so its storage keeps billing here until a disk listing resolves it.
+            pending = (not disks_listed and record.get("role") == "rust_builder"
+                       and str(record.get("kind") or "vm") != "disk")
+            records.append(_mark_instance_deleted(record, now, disks_pending=pending, project=project))
     for instance_id, obs in by_id.items():
         if instance_id not in seen:
-            records.append(_live_instance_record(obs, project=project, now=now))
+            records.append(_live_instance_record(obs, project=project, now=now, known_disk_sources=known_disks,
+                                                 tax_overrides=tax_overrides))
     # Live VMs first (newest start first), then deleted history (newest deletion first), bounded in size.
     live = sorted((r for r in records if r.get("status") != "DELETED"),
                   key=lambda r: -float(r.get("started_epoch") or 0.0))
-    gone = sorted((r for r in records if r.get("status") == "DELETED"),
+    gone = sorted((r for r in records if r.get("status") == "DELETED" and not r.get("disk_liability_pending")),
                   key=lambda r: -float(r.get("deleted_epoch") or 0.0))
+    # Records still billing an unresolved disk stay detailed (never compacted) until resolved.
+    live += [r for r in records if r.get("status") == "DELETED" and r.get("disk_liability_pending")]
     # Every record inside the retention period counts in every accepted window (at most MAX_WINDOW_HOURS). Past
     # MAX_DETAILED_INSTANCE_RECORDS the oldest deleted ones are folded into ``compacted`` hour buckets, so the
     # state stays far below the KV value limit while window totals keep their cost.
@@ -1997,7 +2387,9 @@ class DashboardStore:
         if dropped_seeds:
             LOG.warning("Dropped %d seeded demo telemetry record(s) and counter(s) from the dashboard state",
                         dropped_seeds)
-        if loaded.get(DEMO_TEMPLATE_SOURCE_MIGRATION_KEY) != DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION:
+        template_marker = loaded.get(DEMO_TEMPLATE_SOURCE_MIGRATION_KEY)
+        if not (isinstance(template_marker, int) and not isinstance(template_marker, bool)
+                and template_marker >= DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION):
             dropped_sources = drop_seeded_template_sources(base)
             base[DEMO_TEMPLATE_SOURCE_MIGRATION_KEY] = DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION
             if dropped_sources:
@@ -2080,25 +2472,66 @@ class DashboardStore:
             self._stop_event.wait(self.fleet_inventory_interval)
 
     def _consume_ooms_for_fleet_growth(self, previous: list[Any], current: list[dict[str, Any]]) -> None:
-        """Mark OOM events handled once the live fleet actually grew (runner slots, or builder VMs)."""
+        """Mark runner OOM events handled once the live fleet gained ready runner capacity.
 
-        def running(records: list[Any], role: str) -> list[dict[str, Any]]:
-            return [r for r in records if isinstance(r, dict) and r.get("status") == "RUNNING" and r.get("role") == role]
+        Builder OOM events are never handled from the inventory: a dedicated builder runs without a service
+        account, so nothing in its instance record shows that its build container came up. They stay active until
+        an operator acknowledges them.
+        """
 
-        # Only VMs first seen after the baseline add capacity (capacity_pending), and only once they are ready:
-        # RUNNING, and for runner hosts with a bootstrap confirmed in this boot. Each counts once; a restart of
-        # capacity that already existed adds none.
-        def new_running(role: str) -> list[dict[str, Any]]:
-            return [r for r in running(current, role) if r.get("capacity_pending")
-                    and (role != "cicd_runner" or r.get("runners_count_known") is not False)]
+        def ready_slots(records: list[Any]) -> int:
+            return sum(int(r.get("runners_count", 0) or 0) for r in records
+                       if isinstance(r, dict) and r.get("status") == "RUNNING" and r.get("role") == "cicd_runner"
+                       and r.get("runners_count_known") is not False)
 
-        previous_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(previous, "cicd_runner"))
-        added_slots = sum(int(r.get("runners_count", 0) or 0) for r in new_running("cicd_runner"))
-        # Gate on new capacity, but judge the OOM target against the ready capacity actually running now (a host
-        # that stopped in the same listing does not count).
-        current_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(current, "cicd_runner")
-                            if r.get("runners_count_known") is not False)
-        if added_slots > 0:
+        previous_slots = ready_slots(previous)
+        current_slots = ready_slots(current)
+        # Each runner OOM event keeps the ready slots from when the reconcile first saw it, so capacity that only
+        # comes back (a restart, or a replacement in this or a later listing) never reads as growth.
+        def event_epoch(evt: dict[str, Any]) -> float | None:
+            raw = evt.get("failed_at") or evt.get("observed_at") or evt.get("timestamp")
+            try:
+                parsed = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00")) if raw else None
+            except ValueError:
+                return None
+            if parsed is None:
+                return None
+            return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
+
+        previous_ids = {str(r.get("instance_id")) for r in previous if isinstance(r, dict)}
+        pending_ready = [r for r in previous if isinstance(r, dict) and r.get("capacity_pending")
+                         and r.get("status") == "RUNNING" and r.get("role") == "cicd_runner"
+                         and r.get("runners_count_known") is not False]
+        cfg = {**default_scaling_config()["cicd_runner"], **(self.state.get("scaling", {}).get("cicd_runner") or {})}
+        lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60) or 60) * 60.0)
+        now = self._clock()
+        for evt in self._runner_oom_events():
+            # Only events active for scaling (unhandled, inside the lookback) need a capacity baseline.
+            if evt.get("baseline_source") == "inventory" or not _is_recent_unhandled_oom(evt, now, lookback_seconds):
+                continue
+            # The capacity running when the OOM happened: a late report must not count capacity that started after
+            # it (still pending) as part of its baseline. Lowers a baseline the scaling evaluation set from the
+            # already-grown count.
+            when = event_epoch(evt)
+            later = sum(int(r.get("runners_count", 0) or 0) for r in pending_ready
+                        if when is not None and float(r.get("started_epoch") or 0.0) > when)
+            # Hosts first seen in this same listing that were already running before the OOM were part of the
+            # capacity that failed, not an answer to it.
+            earlier_new = sum(int(r.get("runners_count", 0) or 0) for r in current
+                              if isinstance(r, dict) and str(r.get("instance_id")) not in previous_ids
+                              and r.get("status") == "RUNNING" and r.get("role") == "cicd_runner"
+                              and r.get("runners_count_known") is not False
+                              and when is not None and float(r.get("started_epoch") or now) <= when)
+            computed = max(0, previous_slots - later + earlier_new)
+            existing = evt.get("baseline_runners")
+            evt["baseline_runners"] = min(int(existing), computed) if isinstance(existing, int) else computed
+            evt["baseline_source"] = "inventory"
+        # Only VMs first seen after the baseline add capacity (capacity_pending), and only once ready: RUNNING with
+        # a bootstrap confirmed in this boot. A restart of capacity that already existed adds none.
+        new_ready = [r for r in current if isinstance(r, dict) and r.get("capacity_pending")
+                     and r.get("status") == "RUNNING" and r.get("role") == "cicd_runner"
+                     and r.get("runners_count_known") is not False]
+        if new_ready:
             pol = self.state.get("scaling", {}).get("cicd_runner", {})
             prof = self.state.get("profiles", {}).get("cicd_runner", {})
             self._consume_active_oom_events(
@@ -2107,19 +2540,97 @@ class DashboardStore:
                 current_runners=current_slots,
                 step_runners=max(1, int(pol.get("scale_up_step_runners", 2))),
                 max_runners=max(int(prof.get("min_runners", 1)), int(pol.get("max_runners", 24))),
+                recent_within=lookback_seconds,
             )
-        new_builders = new_running("rust_builder")
-        # Builders have one fixed shape: a new one handles builder OOMs only when the running count actually grew
-        # (a replacement for a builder that stopped in the same listing adds nothing).
-        if new_builders and len(running(current, "rust_builder")) > len(running(previous, "rust_builder")):
-            self._consume_active_oom_events(role="rust_builder")
-        for record in new_running("cicd_runner") + new_builders:
-            record["capacity_pending"] = False
+        # New capacity stays pending through the OOM lookback (an OOM reported late can still be answered by it)
+        # and while an OOM it could still satisfy is active; after that it is ordinary capacity.
+        cfg = {**default_scaling_config()["cicd_runner"], **(self.state.get("scaling", {}).get("cicd_runner") or {})}
+        lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60) or 60) * 60.0)
+        now = self._clock()
+        if not self._active_oom_events("cicd_runner"):
+            for record in new_ready:
+                if now - float(record.get("started_epoch") or now) > lookback_seconds:
+                    record["capacity_pending"] = False
+        for record in current:
+            if isinstance(record, dict) and record.get("role") == "rust_builder":
+                record["capacity_pending"] = False
+
+    def _runner_oom_events(self) -> list[dict[str, Any]]:
+        """Unhandled runner OOM events (GitHub OOM runs and journal events on runner hosts)."""
+        telem = self.state.get("scaling_telemetry", {})
+        events = [evt for evt in (telem.get("github_oom_runs") or []) if isinstance(evt, dict)]
+        events += [evt for evt in (telem.get("journal_oom_events") or []) if isinstance(evt, dict)
+                   and str(evt.get("role", "")).strip().lower() != "rust_builder"
+                   and not str(evt.get("instance_name", "")).strip().lower().startswith("builder-")]
+        return [evt for evt in events if not evt.get("handled")]
+
+    def _active_oom_events(self, role: str) -> bool:
+        """True while an OOM event of the role is active for scaling: unhandled and inside the policy's lookback
+        window (the same test the scaling evaluation applies)."""
+        telem = self.state.get("scaling_telemetry", {})
+        cfg = {**default_scaling_config()[role], **(self.state.get("scaling", {}).get(role) or {})}
+        lookback_seconds = max(60.0, float(cfg.get("oom_lookback_minutes", 60) or 60) * 60.0)
+        now = self._clock()
+
+        def builder_event(evt: dict[str, Any]) -> bool:
+            return (str(evt.get("role", "")).strip().lower() == "rust_builder"
+                    or str(evt.get("instance_name", "")).strip().lower().startswith("builder-"))
+
+        events: list[Any] = list(telem.get("journal_oom_events") or [])
+        if role == "cicd_runner":
+            events += list(telem.get("github_oom_runs") or [])
+        else:
+            events += list(telem.get("builder_journal_oom_events") or [])
+        return any(
+            isinstance(evt, dict) and _is_recent_unhandled_oom(evt, now, lookback_seconds)
+            and (builder_event(evt) if role == "rust_builder" else not builder_event(evt))
+            for evt in events
+        )
+
+    def _runner_burn_for_builder_budget(self, cicd_eval: dict[str, Any], cicd_qual: dict[str, Any] | None = None) -> float:
+        """The runner fleet's burn as the builder's shared budget sees it: running runners plus any runner VMs the
+        CI evaluation adds, all priced with the builder budget's disk and tax flags (stopped storage is added
+        separately by _outside_burn)."""
+        running = sum(self._running_role_hourly_rates("cicd_runner", budget_role="rust_builder"))
+        added = max(0, int(cicd_eval.get("desired_instances") or 0) - int(cicd_eval.get("current_instances") or 0))
+        if not added:
+            return round(running, 4)
+        unit = self._resolve_scaling_unit_hourly_usd("cicd_runner", cicd_qual, budget_role="rust_builder")
+        return round(running + added * unit, 4)
+
+    def _builder_evaluation_telemetry(self) -> dict[str, Any]:
+        """Telemetry for the builder evaluation. With a live inventory the running builder count says nothing about
+        working build capacity (builders report no readiness), so the evaluation gets a copy without builder OOM
+        baselines: it can never mark a builder OOM handled from that count, and the events stay active until an
+        operator acknowledges them."""
+        telem = self.state.get("scaling_telemetry", {})
+        if self.fleet_source is None:
+            return telem
+        view = copy.deepcopy(telem)
+        for key in ("journal_oom_events", "builder_journal_oom_events"):
+            for evt in view.get(key) or []:
+                if isinstance(evt, dict):
+                    evt.pop("baseline_instances", None)
+        return view
+
+    def _tax_overrides(self) -> dict[str, float]:
+        """``{role: tax_rate_percent}`` for profiles whose budget overrides the regional tax rate."""
+        out = {}
+        for role, prof in (self.state.get("profiles") or {}).items():
+            budget = prof.get("budget") if isinstance(prof, dict) else None
+            if isinstance(budget, dict) and budget.get("override_regional_tax"):
+                out[role] = float(budget.get("tax_rate_percent", 0.0) or 0.0)
+        return out
 
     def fleet_inventory_status(self) -> dict[str, Any]:
-        """Where the instance list comes from and how fresh it is (in memory; not part of the snapshot)."""
+        """Where the instance list comes from and how fresh it is (in memory; not part of the snapshot). ``fresh``
+        is recomputed (a hung refresh ages out) and ``stale_reason`` says why scaling holds, if it does."""
         with self._lock:
-            return dict(self._fleet_status)
+            status = dict(self._fleet_status)
+            reason = self._inventory_stale_reason()
+        status["fresh"] = not reason
+        status["stale_reason"] = reason
+        return status
 
     def refresh_fleet_inventory(self) -> bool:
         """List the live fleet (read-only) and reconcile the stored instance records with it.
@@ -2144,7 +2655,9 @@ class DashboardStore:
                 self._fleet_status["fresh"] = False
             return False
         try:
-            observed = list(self.fleet_source())
+            listing = self.fleet_source()
+            disks_listed = bool(getattr(listing, "disks_listed", True))
+            observed = list(listing)
         except Exception as exc:  # noqa: BLE001 - keep the last known records; report the failure
             with self._lock:
                 self._fleet_status["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
@@ -2156,23 +2669,34 @@ class DashboardStore:
             compacted = copy.deepcopy(self.state.get(COMPACTED_COSTS_STATE_KEY) or {})
             records, changed = reconcile_instance_records(
                 self.state.get("instances", []), observed, project=self.project, now=self._clock(),
-                compacted=compacted)
+                compacted=compacted, tax_overrides=self._tax_overrides(), disks_listed=disks_listed)
             changed = changed or compacted != (self.state.get(COMPACTED_COSTS_STATE_KEY) or {})
             # Current prices and tax settings, applied here (and so persisted) rather than on reads.
             changed = self._refresh_instances_pricing(records, live=True) or changed
             # The first successful listing (after an upgrade, a migration, or enabling the inventory) is the
             # baseline: the fleet it finds already existed, so it is not growth that handles an OOM event.
             baselined = bool(self.state.get(FLEET_BASELINE_STATE_KEY))
-            if not changed and baselined:
-                return 200, {"changed": False}
             previous_instances = self.state.get("instances", [])
             previous_telemetry = copy.deepcopy(self.state.get("scaling_telemetry", {}))
+            if baselined:
+                # OOM telemetry can arrive while the fleet is quiet: reconcile it on every listing, and save when
+                # it changed something (an event handled, a baseline recorded, a pending marker cleared).
+                try:
+                    self._consume_ooms_for_fleet_growth(previous_instances, records)
+                except Exception:
+                    self.state["scaling_telemetry"] = previous_telemetry
+                    raise
+                changed = (changed or self.state.get("scaling_telemetry") != previous_telemetry
+                           or [_instance_fingerprint(r) for r in previous_instances]
+                           != [_instance_fingerprint(r) for r in records])
+            if not changed and baselined:
+                return 200, {"changed": False}
             previous_compacted = self.state.get(COMPACTED_COSTS_STATE_KEY)
             self.state["instances"] = records
             self.state[COMPACTED_COSTS_STATE_KEY] = compacted
             try:
                 if baselined:
-                    self._consume_ooms_for_fleet_growth(previous_instances, records)
+                    pass  # OOM state was reconciled above.
                 else:
                     self.state[FLEET_BASELINE_STATE_KEY] = _iso_epoch(self._clock())
                     for record in records:
@@ -2201,12 +2725,15 @@ class DashboardStore:
                 self._fleet_status["fresh"] = False
             LOG.warning("Dashboard fleet inventory could not be applied: %s: %s", type(exc).__name__, exc)
             return False
+        done = self._clock()  # Freshness counts from when the listing was applied, not when it started.
         with self._lock:
-            self._fleet_status.update({"last_success_at": _iso_epoch(now), "observed_count": len(observed),
+            self._fleet_status.update({"last_success_at": _iso_epoch(done), "last_success_epoch": done,
+                                       "disks_listed": disks_listed,
+                                       "observed_count": len(observed),
                                        "fresh": True,
                                        "last_error": ""})
             if body.get("changed"):
-                self._fleet_status["last_change_at"] = _iso_epoch(now)
+                self._fleet_status["last_change_at"] = _iso_epoch(done)
         return bool(body.get("changed"))
 
     def close(self, timeout: float = 5.0) -> None:
@@ -3215,10 +3742,11 @@ class DashboardStore:
             return units
         return 1
 
-    def _running_role_hourly_rates(self, role: str) -> list[float]:
-        """Return per-instance hourly USD rates for all currently RUNNING instances of the given role."""
-        prof = self.state.get("profiles", {}).get(role, {})
-        pol = self.state.get("scaling", {}).get(role, {})
+    def _running_role_hourly_rates(self, role: str, *, budget_role: str | None = None) -> list[float]:
+        """Return per-instance hourly USD rates for all currently RUNNING instances of the given role, under the
+        disk and tax flags of ``budget_role``'s budget (default: the role's own)."""
+        prof = self.state.get("profiles", {}).get(budget_role or role, {})
+        pol = self.state.get("scaling", {}).get(budget_role or role, {})
         budget = prof.get("budget", {})
         include_disk = bool(
             pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
@@ -3274,8 +3802,9 @@ class DashboardStore:
                 if _is_transitional(inst) and inst.get("role") == role]
 
     def _held(self, evaluation: dict[str, Any], reason: str, role: str) -> dict[str, Any]:
-        # A held recommendation projects the fleet it keeps, so a shared budget does not reserve a rejected change.
-        projected = round(sum(self._running_role_hourly_rates(role)), 4)
+        # A held recommendation projects the fleet it keeps: its running VMs plus the storage its stopped VMs and
+        # detached disks keep billing. The other role's burn under a shared budget is already taken off the cap.
+        projected = round(sum(self._running_role_hourly_rates(role)) + self._stopped_disk_burn(role), 4)
         return {
             **evaluation,
             "direction": "hold",
@@ -3297,9 +3826,19 @@ class DashboardStore:
                     "fleet and its burn are unknown")
         with self._lock:
             status = dict(self._fleet_status)
-        if status.get("fresh"):
+        last_success = status.get("last_success_epoch")
+        max_age = FLEET_INVENTORY_MAX_AGE_INTERVALS * self.fleet_inventory_interval
+        if status.get("fresh") and status.get("disks_listed") is False:
+            # Without the disk listing, fleet disks that no VM uses (a builder cache disk after its VM is gone)
+            # still bill but cannot be seen.
+            return ("The disk listing is unavailable (compute.disks.list), so disks that outlive their VM cannot "
+                    "be counted")
+        if status.get("fresh") and _finite(last_success) and self._clock() - float(last_success) <= max_age:
             return ""
         detail = status.get("last_error") or "no complete listing yet"
+        if status.get("fresh"):
+            # A refresh that never returns (for example a hung API connection) must not keep old counts trusted.
+            detail = f"no complete listing for more than {int(max_age)} seconds"
         return f"The live inventory is not current ({detail}); fleet counts and burn may be out of date"
 
     def _fail_closed_evaluation(self, evaluation: dict[str, Any], role: str) -> dict[str, Any]:
@@ -3323,11 +3862,12 @@ class DashboardStore:
                                           "priced, so the scale-up budget check cannot be trusted", role)
         return evaluation
 
-    def _stopped_disk_burn(self, role: str) -> float:
+    def _stopped_disk_burn(self, role: str, *, budget_role: str | None = None) -> float:
         """Hourly USD of the role's not-running inventory VMs (disks of stopped ones, full rate of transitional
-        ones), under the role's disk and tax budget flags."""
-        prof = self.state.get("profiles", {}).get(role, {})
-        pol = self.state.get("scaling", {}).get(role, {})
+        ones), under the disk and tax flags of ``budget_role``'s budget (default: the role's own)."""
+        flags_role = budget_role or role
+        prof = self.state.get("profiles", {}).get(flags_role, {})
+        pol = self.state.get("scaling", {}).get(flags_role, {})
         budget = prof.get("budget", {}) if isinstance(prof.get("budget"), dict) else {}
         include_disk = bool(pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True)))
         include_tax = bool(budget.get("include_taxes", False))
@@ -3335,7 +3875,7 @@ class DashboardStore:
             _nonrunning_hourly(inst, include_disk=include_disk, include_tax=include_tax)
             for inst in self.state.get("instances", [])
             if is_live_instance_record(inst) and inst.get("role") == role
-            and inst.get("status") not in ("RUNNING", "DELETED")
+            and (inst.get("status") not in ("RUNNING", "DELETED") or inst.get("disk_liability_pending"))
         ), 4)
 
     def _outside_burn(self, role: str, *, shared: bool, other_running_burn: float) -> float | None:
@@ -3345,7 +3885,8 @@ class DashboardStore:
         own = self._stopped_disk_burn(role)
         if not shared:
             return own if own > 0.0 else None
-        return round(own + other_running_burn + self._stopped_disk_burn(other_role), 4)
+        # Everything charged against this role's shared budget is priced with this budget's disk and tax flags.
+        return round(own + other_running_burn + self._stopped_disk_burn(other_role, budget_role=role), 4)
 
     def _sync_fleet_telemetry(self) -> None:
         """Synchronize scaling telemetry counters, CPU percentages, and active fleet hourly rates with running instances."""
@@ -3360,7 +3901,9 @@ class DashboardStore:
             if inst.get("status") == "RUNNING" and inst.get("role") == "rust_builder"
         ]
         telem = self.state.setdefault("scaling_telemetry", {})
-        telem["current_runners"] = sum(int(inst.get("runners_count", 0)) for inst in running_runners)
+        # Ready runner slots only: a host whose bootstrap is unconfirmed has registered nothing yet.
+        telem["current_runners"] = sum(int(inst.get("runners_count", 0)) for inst in running_runners
+                                       if inst.get("runners_count_known") is not False)
         # Hosts whose runner count is not recorded: slot totals are unknown, so slot-based decisions hold.
         telem["unknown_runner_count_hosts"] = [
             str(inst.get("name")) for inst in running_runners if inst.get("runners_count_known") is False
@@ -3418,13 +3961,17 @@ class DashboardStore:
         self,
         role: str,
         qual: dict[str, Any] | None = None,
+        budget_role: str | None = None,
     ) -> float:
-        """Resolve per-instance hourly USD for scaling evaluation matching active template or density."""
+        """Resolve per-instance hourly USD for scaling evaluation matching active template or density (under the
+        disk and tax flags of ``budget_role``'s budget, default the role's own)."""
         prof = self.state.get("profiles", {}).get(role, {})
         pol = self.state.get("scaling", {}).get(role, {})
-        budget = prof.get("budget", {})
+        flags_prof = self.state.get("profiles", {}).get(budget_role or role, {})
+        flags_pol = self.state.get("scaling", {}).get(budget_role or role, {})
+        budget = flags_prof.get("budget", {})
         include_disk = bool(
-            pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
+            flags_pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
         )
         include_tax = bool(budget.get("include_taxes", False))
         target_units = (
@@ -3614,16 +4161,18 @@ class DashboardStore:
             inst
             for inst in (self.state.get("instances", []) if records is None else records)
             if isinstance(inst, dict)
-            and (is_live_instance_record(inst) and inst.get("status") != "DELETED" if live
+            and (is_live_instance_record(inst)
+                 and (inst.get("status") != "DELETED" or bool(inst.get("disk_liability_pending"))) if live
                  else inst.get("status") == "RUNNING" and not is_live_instance_record(inst))
             and inst.get("region")
-            and inst.get("machine_type")
+            # Disk-only records (DETACHED) have no machine type but still reprice their storage.
+            and (inst.get("machine_type") or (live and inst.get("kind") == "disk"))
         ]
         repriced = False
         if not running_insts:
             return repriced
         active_regions = sorted({str(inst["region"]) for inst in running_insts})
-        active_mtypes = sorted({str(inst["machine_type"]) for inst in running_insts})
+        active_mtypes = sorted({str(inst["machine_type"]) for inst in running_insts if inst.get("machine_type")})
         shared_live_pricing = fetch_live_spot_pricing(
             project=self.project,
             regions=active_regions,
@@ -3653,6 +4202,18 @@ class DashboardStore:
                 )
             )
             old_pricing = inst.get("pricing") if isinstance(inst.get("pricing"), dict) else None
+            old_completeness = (inst.get("pricing_complete"), inst.get("pricing_incomplete_reason"))
+            if inst.get("retained_only_pricing"):
+                # A deleted builder still billing its cache disk: reprice that disk alone (compute is closed).
+                new_pricing = _retained_pricing(inst, tax_rate_percent=tax_rate_pct, project=self.project,
+                                                live_pricing=shared_live_pricing)
+                if old_pricing is not None and _pricing_rates(old_pricing) != _pricing_rates(new_pricing):
+                    _close_open_segments(inst, old_pricing, self._clock())
+                    repriced = True
+                elif old_pricing != new_pricing:
+                    repriced = True
+                inst["pricing"] = new_pricing
+                continue
             inst["pricing"] = calculate_spot_pricing(
                 family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
                 vcpu=int(inst.get("vcpu", 16)),
@@ -3679,6 +4240,10 @@ class DashboardStore:
                 if old_pricing is not None and _pricing_rates(old_pricing) != _pricing_rates(inst["pricing"]):
                     # New rates apply from now on: time already billed keeps the rates it had.
                     _close_open_segments(inst, old_pricing, self._clock())
+                    repriced = True
+                elif old_pricing != inst["pricing"] or old_completeness != (
+                        inst.get("pricing_complete"), inst.get("pricing_incomplete_reason")):
+                    # Same rates, but the price's source or trust changed: save it (budgets rely on completeness).
                     repriced = True
         return repriced
 
@@ -3732,19 +4297,20 @@ class DashboardStore:
                     self.state["profiles"]["cicd_runner"].get("max_instances", 8)
                 ),
                 other_role_hourly_usd=self._outside_burn(
-                    "cicd_runner", shared=ci_shared, other_running_burn=sum(running_builder_rates)),
+                    "cicd_runner", shared=ci_shared,
+                    # The other role's running VMs, priced with this (the evaluated) budget's flags.
+                    other_running_burn=sum(self._running_role_hourly_rates("rust_builder", budget_role="cicd_runner"))),
             ), "cicd_runner")
             builder_scaling_eval = self._fail_closed_evaluation(evaluate_builder_scaling_decision(
                 self.state["scaling"]["rust_builder"],
-                self.state["scaling_telemetry"],
+                self._builder_evaluation_telemetry(),
                 per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd(
                     "rust_builder", builder_qual
                 ),
                 other_role_hourly_usd=self._outside_burn(
                     "rust_builder",
                     shared=builder_shared,
-                    other_running_burn=max(sum(running_runner_rates),
-                                           float(scaling_eval.get("projected_hourly_usd", 0.0))),
+                    other_running_burn=self._runner_burn_for_builder_budget(scaling_eval, cicd_qual),
                 ),
             ), "rust_builder")
             instances_view = self.query_instances(
@@ -3854,7 +4420,7 @@ class DashboardStore:
                     # deleted one stays in the windows that include its deletion (not just its last stop).
                     deleted_epoch = inst.get("deleted_epoch")
                     end_ts = (float(deleted_epoch) if inst["status"] == "DELETED" and isinstance(deleted_epoch, (int, float))
-                              else now_ts)
+                              and not inst.get("disk_liability_pending") else now_ts)
 
                 # Exclude deleted instances whose deletion occurred before the selected window
                 if is_deleted and end_ts < window_start_ts:
@@ -3907,7 +4473,12 @@ class DashboardStore:
                     live_total_cost_compute_only_usd = round(usage["cost_compute"], 2)
                     lifetime_cost = (live_total_cost_usd if include_disk_and_tax
                                      else live_total_cost_compute_only_usd)
-                    if inst["status"] == "DELETED":
+                    if inst["status"] == "DELETED" and inst.get("disk_liability_pending"):
+                        # Gone, but its retained disks may still bill: show that storage rate until resolved.
+                        hourly_rate = round(_stopped_disk_hourly(pricing) if include_disk_and_tax else 0.0, 4)
+                        daily_rate = round(hourly_rate * 24.0, 2)
+                        monthly_rate = round(hourly_rate * 24.0 * 365.0 / 12.0, 2)
+                    elif inst["status"] == "DELETED":
                         # Gone with its disks: no current rate (its history keeps its costs).
                         hourly_rate, daily_rate, monthly_rate = 0.0, 0.0, 0.0
                     elif inst["status"] in GCE_STOPPED_STATUSES:
@@ -3970,7 +4541,10 @@ class DashboardStore:
             deleted_count = sum(1 for r in rows if r["status"] != "RUNNING")
             running_runner_rows = [r for r in running_rows if r.get("role") == "cicd_runner"]
             running_builder_rows = [r for r in running_rows if r.get("role") == "rust_builder"]
-            running_runner_slots = sum(int(r.get("runners_count", 0)) for r in running_runner_rows)
+            # Confirmed (ready) runner slots only; hosts whose bootstrap is unconfirmed are counted separately.
+            running_runner_slots = sum(int(r.get("runners_count", 0)) for r in running_runner_rows
+                                       if r.get("runners_count_known") is not False)
+            unconfirmed_runner_hosts = sum(1 for r in running_runner_rows if r.get("runners_count_known") is False)
             if include_deleted and not q:
                 # Deleted VMs compacted into hour buckets (see MAX_DETAILED_INSTANCE_RECORDS) still count.
                 compacted_prefixes = ([f"{r_filter}|"] if r_filter and r_filter != "all"
@@ -3985,7 +4559,8 @@ class DashboardStore:
             stopped_disk_burn = sum(
                 _nonrunning_hourly(r, include_disk=include_disk_and_tax, include_tax=include_disk_and_tax)
                 for r in rows
-                if is_live_instance_record(r) and r["status"] not in ("RUNNING", "DELETED")
+                if is_live_instance_record(r)
+                and (r["status"] not in ("RUNNING", "DELETED") or r.get("disk_liability_pending"))
             )
             active_hourly_burn = round(
                 sum(r["active_hourly_usd"] for r in running_rows) + stopped_disk_burn, 4
@@ -4001,6 +4576,7 @@ class DashboardStore:
                 "deleted_count": deleted_count,
                 "running_runner_vms": len(running_runner_rows),
                 "running_runner_slots": running_runner_slots,
+                "unconfirmed_runner_hosts": unconfirmed_runner_hosts,
                 "running_builder_vms": len(running_builder_rows),
                 "total_window_spend_usd": total_window_spend,
                 "active_hourly_burn_usd": active_hourly_burn,
@@ -4260,8 +4836,13 @@ class DashboardStore:
         current_runners: int | None = None,
         step_runners: int | None = None,
         max_runners: int | None = None,
+        recent_within: float | None = None,
     ) -> None:
-        """Mark active/unhandled OOM events as handled/acknowledged so a single OOM does not repeatedly trigger scale-ups."""
+        """Mark active/unhandled OOM events as handled/acknowledged so a single OOM does not repeatedly trigger scale-ups.
+
+        With ``recent_within`` (seconds), only events still active (unhandled, inside that lookback) are touched, so
+        expired incidents are never rewritten as handled."""
+        lookback_now = self._clock()
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         telem = self.state.setdefault("scaling_telemetry", {})
 
@@ -4285,6 +4866,8 @@ class DashboardStore:
                     continue
                 if event_id and str(run.get("id", "")) != event_id and str(run.get("run_id", "")) != event_id:
                     continue
+                if recent_within is not None and not _is_recent_unhandled_oom(run, lookback_now, recent_within):
+                    continue
                 if not _runner_oom_satisfied(run):
                     continue
                 run["handled"] = True
@@ -4302,6 +4885,8 @@ class DashboardStore:
             if role == "cicd_runner" and is_builder:
                 continue
             if role == "rust_builder" and not is_builder:
+                continue
+            if recent_within is not None and not _is_recent_unhandled_oom(evt, lookback_now, recent_within):
                 continue
             if not is_builder and not _runner_oom_satisfied(evt):
                 continue
@@ -4524,6 +5109,12 @@ class DashboardStore:
                     ),
                     4,
                 )
+                if self.fleet_source is not None:
+                    # With a live inventory, each role's shared cap prices the other role's VMs with its own flags.
+                    runner_burn_for_builder = round(
+                        sum(self._running_role_hourly_rates("cicd_runner", budget_role="rust_builder")), 4)
+                    builder_burn_for_runner = round(
+                        sum(self._running_role_hourly_rates("rust_builder", budget_role="cicd_runner")), 4)
                 cicd_eval = self._fail_closed_evaluation(evaluate_scaling_decision(
                     self.state["scaling"]["cicd_runner"],
                     self.state["scaling_telemetry"],
@@ -4540,14 +5131,15 @@ class DashboardStore:
                 ), "cicd_runner")
                 builder_eval = self._fail_closed_evaluation(evaluate_builder_scaling_decision(
                     self.state["scaling"]["rust_builder"],
-                    self.state["scaling_telemetry"],
+                    self._builder_evaluation_telemetry(),
                     per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
                     other_role_hourly_usd=self._outside_burn(
                         "rust_builder",
                         shared=bool(global_budget_shared
                                     or self.state["scaling"]["rust_builder"].get("shared_global_budget")),
-                        other_running_burn=max(runner_burn_for_builder,
-                                               float(cicd_eval.get("projected_hourly_usd", 0.0))),
+                        other_running_burn=(
+                            self._runner_burn_for_builder_budget(cicd_eval) if self.fleet_source is not None
+                            else max(runner_burn_for_builder, float(cicd_eval.get("projected_hourly_usd", 0.0)))),
                     ) or 0.0,
                 ), "rust_builder")
                 self._persist()
@@ -4944,14 +5536,21 @@ class DashboardStore:
                 (
                     i
                     for i in self.state["instances"]
-                    if (instance_id and i["instance_id"] == instance_id)
-                    or (instance_name and i["name"] == instance_name)
+                    # An instance ID is exact; names can repeat across zones and over time.
+                    if (i["instance_id"] == instance_id if instance_id else (instance_name and i["name"] == instance_name))
                 ),
                 None,
             )
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
+            if inst.get("kind") == "disk":
+                raise ValueError(f"{inst['name']} is a disk, not a VM; a VM template needs a VM as its source")
+            if inst.get("disk_types_known") is False:
+                raise ValueError(
+                    f"The disk types of {inst['name']} are not verified (no compute.disks.list), so a VM template "
+                    "cannot describe them; create the template from the profile instead"
+                )
             if inst.get("regional_disks") or inst.get("unpriced_disk_performance"):
                 raise ValueError(
                     f"{inst['name']} has regional disks or provisioned Hyperdisk performance, which a VM template "
@@ -5059,8 +5658,9 @@ class DashboardStore:
                 (
                     i
                     for i in self.state["instances"]
-                    if (instance_id and i.get("instance_id") == instance_id)
-                    or (instance_name and i.get("name") == instance_name)
+                    # An instance ID is exact; names can repeat across zones and over time.
+                    if (i.get("instance_id") == instance_id if instance_id
+                        else (instance_name and i.get("name") == instance_name))
                 ),
                 None,
             )
@@ -5185,7 +5785,8 @@ class DashboardStore:
                         # A host with several data-disk types cannot be described by one type and size.
                         (i for i in running_in_region
                          if len(i.get("data_disks") or {}) <= 1 and not int(i.get("local_ssd_gb") or 0)
-                         and not i.get("regional_disks") and not i.get("unpriced_disk_performance")), None)
+                         and not i.get("regional_disks") and not i.get("unpriced_disk_performance")
+                         and i.get("disk_types_known") is not False), None)
                     if existing_cand is not None:
                         try:
                             self._validate_vm_template_compatibility(existing_cand, prof, role)
@@ -5387,15 +5988,15 @@ class DashboardStore:
                 if unpriced:
                     raise ValueError(
                         f"The planned {unpriced[0].get('machine_type')} VMs cannot be fully priced (custom or extended "
-                        "shape, or a standard VM without an on-demand rate); the scale-up cannot be checked against "
-                        "the budget"
+                        "shape, a standard VM without an on-demand rate, or a disk type that bills provisioned "
+                        "performance); the scale-up cannot be checked against the budget"
                     )
                 # Stopped inventory VMs bill no compute but keep billing their disks; transitional ones count fully.
                 stopped_disk_hourly = sum(
                     _nonrunning_hourly(i, include_disk=include_disk, include_tax=include_tax)
                     for i in instances
                     if is_live_instance_record(i)
-                    and i["status"] not in ("RUNNING", "DELETED")
+                    and (i["status"] not in ("RUNNING", "DELETED") or i.get("disk_liability_pending"))
                     and (i["role"] == role or (shared_global and i["role"] == other_role))
                 )
                 projected_fleet_hourly = round(
@@ -5841,14 +6442,28 @@ class DashboardStore:
                 raise
             builder_eval = self._fail_closed_evaluation(evaluate_builder_scaling_decision(
                 self.state["scaling"]["rust_builder"],
-                self.state["scaling_telemetry"],
+                self._builder_evaluation_telemetry(),
                 per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("rust_builder"),
                 now_epoch=now_ts,
                 other_role_hourly_usd=self._outside_burn(
                     "rust_builder",
                     shared=bool(self.state["scaling"]["rust_builder"].get("shared_global_budget")
                                 or self.state.get("global_budget_enforced")),
-                    other_running_burn=sum(self._running_role_hourly_rates("cicd_runner")),
+                    other_running_burn=self._runner_burn_for_builder_budget(self._fail_closed_evaluation(
+                        # The CI evaluation (on a copy, so this read changes no OOM state): runner VMs it would add
+                        # count against the shared budget too, as on the overview.
+                        evaluate_scaling_decision(
+                            self.state["scaling"]["cicd_runner"],
+                            copy.deepcopy(self.state["scaling_telemetry"]),
+                            per_instance_hourly_usd=self._resolve_scaling_unit_hourly_usd("cicd_runner"),
+                            max_instances=int(self.state["profiles"]["cicd_runner"].get("max_instances", 8)),
+                            other_role_hourly_usd=self._outside_burn(
+                                "cicd_runner",
+                                shared=self._role_shares_budget("cicd_runner"),
+                                other_running_burn=sum(self._running_role_hourly_rates(
+                                    "rust_builder", budget_role="cicd_runner")),
+                            ),
+                        ), "cicd_runner")),
                 ),
             ), "rust_builder")
             return {
