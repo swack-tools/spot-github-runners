@@ -485,7 +485,9 @@ GitHub CI failure runs, journal OOM events, or job counters.
     `builder-oxidex-eu-01`. `POST /api/rust-builds` merges a partial update into an existing build, so
     these match only when every field the seed set is unchanged, including the seeded gaps between the
     requested, finished, and delivered times and their original whole-second UTC format. Fractional timing
-    corrections stay even when all three times shift together.
+    corrections stay even when all three times shift together. At least two distinct build IDs must agree
+    on their startup time; a build with shifted timestamps stays, and ambiguous ties or isolated remnants
+    stay untouched.
   - The GitHub CI runs `gh-oom-37192272062`, `gh-oom-37192994059`, and `gh-timeout-38596411473`, and
     the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`, matched with their
     complete seeded report content, including logs, links, and failure times.

@@ -6710,7 +6710,7 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
           'runner_name': 'oxidex-za-jnb-01-3',
           'step_number': 4,
           'line_number': 118,
-          'failed_at': '2027-01-15T07:51:00Z',
+          'failed_at': '2027-01-15T07:37:00Z',
           'error_excerpt': 'LLVM ERROR: out of memory / Allocation failed during LTO link pass (exit code 137)',
           'failure_classification': 'OOM',
           'is_oom': True,
@@ -6726,7 +6726,7 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
           'runner_name': 'oxidex-dallas-01-2',
           'step_number': 2,
           'line_number': 50,
-          'failed_at': '2027-01-15T07:37:00Z',
+          'failed_at': '2027-01-15T07:51:00Z',
           'error_excerpt': "error: could not compile `nzbget-core`: process didn't exit successfully (signal: 9, "
                            'SIGKILL: kill) — container memory.max (16 GiB) exhausted',
           'deep_link': 'https://github.com/Appz4Fun/nzbget/actions/runs/38596411473/job/115964282184#step:2:50'}]
@@ -6780,6 +6780,20 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         self.assertEqual(drop_seeded_demo_telemetry(state), 0)
         self.assertEqual(state["rust_builds"], [build])
 
+    def test_uniform_whole_second_build_shift_keeps_the_corrected_record(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        for shift in (-60, 60):
+            with self.subTest(shift=shift):
+                state = seeded_demo_telemetry(ref_now=1800000000)
+                build = state["rust_builds"][0]
+                for key in ("requested_at", "finished_at", "delivered_at"):
+                    stamp = datetime.fromisoformat(build[key].replace("Z", "+00:00")).timestamp()
+                    build[key] = datetime.fromtimestamp(stamp + shift, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                self.assertEqual(drop_seeded_demo_telemetry(state), 11)
+                self.assertEqual(state["rust_builds"], [build])
+                self.assertEqual(state["scaling_telemetry"]["journal_oom_events"], [])
+
     def test_extra_event_evidence_survives_legacy_cleanup(self):
         from lib.dashboard_server import drop_seeded_demo_telemetry
 
@@ -6806,8 +6820,9 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
                 state = {"rust_builds": [dict(seed, **update)]}
                 self.assertEqual(drop_seeded_demo_telemetry(state), 0)
                 self.assertEqual(len(state["rust_builds"]), 1)
+        # One isolated row has no independent startup-time evidence; keep ambiguous history.
         state = {"rust_builds": [dict(seed)]}
-        self.assertEqual(drop_seeded_demo_telemetry(state), 1)
+        self.assertEqual(drop_seeded_demo_telemetry(state), 0)
 
     def test_newer_migration_marker_is_kept_and_not_rerun(self):
         from lib.dashboard_server import DashboardStore

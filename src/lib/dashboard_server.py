@@ -578,23 +578,25 @@ def demo_telemetry_migrated(state: dict[str, Any]) -> bool:
             and marker >= DEMO_TELEMETRY_MIGRATION_VERSION)
 
 
-def _is_seeded_build(record: dict[str, Any]) -> bool:
+def _seeded_build_reference(record: dict[str, Any]) -> float | None:
     build_id = record.get("build_id")
     fingerprint = SEEDED_RUST_BUILDS.get(build_id)
     if fingerprint is None or any(record.get(k) != v or type(record.get(k)) is not type(v)
                                   for k, v in fingerprint.items()):
-        return False
+        return None
     # The original seeds always used whole-second UTC strings. A report may shift all three timestamps
     # equally (keeping their gaps), so fractional or reformatted timestamps still establish a correction.
     timestamps = [record.get(k) for k in ("requested_at", "finished_at", "delivered_at")]
     if any(not isinstance(stamp, str) or not re.fullmatch(
             r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp) for stamp in timestamps):
-        return False
+        return None
     try:
         requested, finished, delivered = (_iso_to_epoch(stamp) for stamp in timestamps)
     except (KeyError, TypeError, ValueError):
-        return False
-    return (finished - requested, delivered - finished) == SEEDED_RUST_BUILD_GAPS[build_id]
+        return None
+    if (finished - requested, delivered - finished) != SEEDED_RUST_BUILD_GAPS[build_id]:
+        return None
+    return requested + SEEDED_BUILD_REQUEST_OFFSETS[build_id]
 
 
 # Normalization and OOM handling may add these fields to an unchanged seed. Any other extra field is
@@ -617,7 +619,7 @@ def _is_seeded_ci_run(record: dict[str, Any], reference: float | None) -> bool:
                 return True
         elif reference is not None:
             expected = dict(fingerprint, failed_at=_iso_epoch(reference - (
-                540 if fingerprint["id"] == "gh-oom-38601924810" else 1380)))
+                1380 if fingerprint["id"] == "gh-oom-38601924810" else 540)))
             if _seed_fields_match(record, expected):
                 return True
     return False
@@ -638,12 +640,21 @@ def drop_seeded_demo_telemetry(state: dict[str, Any]) -> int:
     reference = None
     builds = state.get("rust_builds")
     if isinstance(builds, list):
+        # All five build seeds were generated against one startup time. A single corrected row can preserve
+        # its internal gaps while moving every timestamp, so require independent build IDs to corroborate the
+        # startup time and keep any row that disagrees. Ambiguous ties and isolated remnants stay untouched.
+        candidates: dict[float, set[str]] = {}
         for build in builds:
-            if isinstance(build, dict) and _is_seeded_build(build):
-                reference = (_iso_to_epoch(build["requested_at"])
-                             + SEEDED_BUILD_REQUEST_OFFSETS[build["build_id"]])
-                break
-        kept = [b for b in builds if not (isinstance(b, dict) and _is_seeded_build(b))]
+            if isinstance(build, dict):
+                epoch = _seeded_build_reference(build)
+                if epoch is not None:
+                    candidates.setdefault(epoch, set()).add(build["build_id"])
+        ranked = sorted(candidates, key=lambda epoch: len(candidates[epoch]), reverse=True)
+        if (ranked and len(candidates[ranked[0]]) >= 2
+                and (len(ranked) == 1 or len(candidates[ranked[0]]) > len(candidates[ranked[1]]))):
+            reference = ranked[0]
+        kept = [b for b in builds if not (
+            reference is not None and isinstance(b, dict) and _seeded_build_reference(b) == reference)]
         dropped += len(builds) - len(kept)
         state["rust_builds"] = kept
     telem = state.get("scaling_telemetry")
