@@ -3629,9 +3629,9 @@ class DashboardStore:
                 and template_marker >= DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION):
             dropped_sources = drop_seeded_template_sources(base)
             base[DEMO_TEMPLATE_SOURCE_MIGRATION_KEY] = DEMO_TEMPLATE_SOURCE_MIGRATION_VERSION
+            # The one-time marker must also reach KV when no source pairs needed removal.
+            base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
             if dropped_sources:
-                # Template-only cleanup must also replace equal-version KV snapshots via the active writer.
-                base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
                 LOG.warning("Removed the nonexistent source instance from %d preset VM template(s)", dropped_sources)
         previous = getattr(self, "state", None)
         self.state = base
