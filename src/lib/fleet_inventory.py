@@ -285,14 +285,13 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
         role = fleet_role(name) or (tracked_roles or {}).get("id:" + str(detail.get("id", "")))
         if role is None or not detail.get("id"):
             continue
-        # Instance names are zonal: compare "<zone>/<name>" keys (from the users' self-links).
-        users = ["/".join(str(u).rstrip("/").split("/")[-3::2]) for u in (detail.get("users") or [])]
-        if users and (snapshot_names is None or any(u in snapshot_names or fleet_role(u.rsplit("/", 1)[-1]) is None
-                                                    for u in users)):
-            # Used by a VM in this instance snapshot (its record bills it), or by a VM outside the fleet.
+        # Users from the later disk listing cannot prove the earlier instance snapshot contained this
+        # attachment, even when the user VM was already present. Only attached_sources proves billing ownership.
+        users = [str(u).rstrip("/").rsplit("/", 1)[-1] for u in (detail.get("users") or [])]
+        if any(fleet_role(name) is None for name in users):
+            # Current external ownership is outside fleet billing.
             continue
-        # Otherwise any user is a fleet VM the instance listing (taken just before) has not shown yet: bill the disk
-        # here for now, so no time is lost; that VM's record takes it over at the handoff.
+        # Keep fleet-used disks here until an instance snapshot actually includes their attachment.
         if str(link) in attached_sources:
             # The instance listing (taken just before) still shows it attached: its VM's record bills it.
             continue
