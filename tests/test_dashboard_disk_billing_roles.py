@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from lib import compute_api
-from lib.fleet_inventory import gce_fleet_source, observe_fleet_items
+from lib.fleet_inventory import gce_fleet_source, observe_detached_disks, observe_fleet_items
 
 
 class SharedDiskBillingRoleTests(unittest.TestCase):
@@ -110,6 +110,59 @@ class SharedDiskBillingRoleTests(unittest.TestCase):
         self.assertTrue(all(o["specs_known"] for o in obs))
         for o in obs:
             self.assertEqual(o["disks_detail"][0]["source"], items[0]["disks"][0]["source"])
+
+
+class SplitSnapshotDiskBillingRoleTests(unittest.TestCase):
+    def catalog(self, name, users, *, include_name=True):
+        source = "projects/p/zones/us-south1-a/disks/" + name
+        detail = {"id": "501", "type": "pd-ssd", "sizeGb": "100", "zone": "zones/us-south1-a",
+                  "users": ["projects/p/zones/us-south1-a/instances/" + user for user in users]}
+        if include_name:
+            detail["name"] = name
+        return {source: detail}
+
+    def assert_one_disk_charge(self, observations):
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["instance_id"], "disk-501")
+        self.assertEqual(observations[0]["kind"], "disk")
+        self.assertEqual(sum(sum(o["data_disks"].values()) for o in observations), 100)
+        self.assertEqual(sum(d["gb"] for o in observations for d in o["disks_detail"]), 100)
+
+    def test_unnamed_mixed_users_flag_ambiguity_independent_of_order(self):
+        users = ("builder-a", "oxidex-runners-a", "builder-b")
+        for ordered, include_name in itertools.product(itertools.permutations(users), (True, False)):
+            with self.subTest(users=ordered, include_name=include_name):
+                catalog = self.catalog("custom-cache", ordered, include_name=include_name)
+                obs = observe_detached_disks(catalog)
+                self.assert_one_disk_charge(obs)
+                self.assertTrue(obs[0].get("storage_billing_ambiguous"))
+                self.assertEqual(obs[0]["role"], "cicd_runner")  # Stable numerical carrier, not role evidence.
+
+    def test_explicit_name_or_source_role_wins_for_mixed_users(self):
+        cases = (("runner-data", "cicd_runner"), ("runner-data-cache", "cicd_runner"),
+                 ("oxidex-runners-cache", "cicd_runner"), ("builder-cache", "rust_builder"))
+        for (name, role), ordered, include_name in itertools.product(
+                cases, itertools.permutations(("builder-a", "oxidex-runners-a")), (True, False)):
+            with self.subTest(name=name, users=ordered, include_name=include_name):
+                obs = observe_detached_disks(self.catalog(name, ordered, include_name=include_name))
+                self.assert_one_disk_charge(obs)
+                self.assertEqual(obs[0]["role"], role)
+                self.assertIs(obs[0].get("storage_billing_ambiguous"), False)
+
+    def test_single_role_users_remain_unambiguous(self):
+        for users, role in ((("builder-a", "builder-b"), "rust_builder"),
+                            (("oxidex-runners-a", "spot-runners-b"), "cicd_runner")):
+            for ordered in itertools.permutations(users):
+                with self.subTest(users=ordered):
+                    obs = observe_detached_disks(self.catalog("custom-cache", ordered))
+                    self.assert_one_disk_charge(obs)
+                    self.assertEqual(obs[0]["role"], role)
+                    self.assertIs(obs[0].get("storage_billing_ambiguous"), False)
+
+    def test_attached_source_suppresses_split_snapshot_charge(self):
+        catalog = self.catalog("custom-cache", ("builder-a", "oxidex-runners-a"))
+        self.assert_one_disk_charge(observe_detached_disks(catalog))
+        self.assertEqual(observe_detached_disks(catalog, attached_sources=frozenset(catalog)), [])
 
 
 if __name__ == "__main__":

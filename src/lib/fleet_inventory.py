@@ -321,7 +321,12 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
         name = str(detail.get("name", "") or "")
         users = [str(u).rstrip("/").rsplit("/", 1)[-1] for u in (detail.get("users") or [])]
         user_roles = sorted({fleet_role(user) for user in users if fleet_role(user) is not None})
-        named_role = ("cicd_runner" if name == "runner-data" or name.startswith("runner-data-") else fleet_role(name))
+        disk_name = name or str(link).rstrip("/").rsplit("/", 1)[-1]
+        named_role = ("cicd_runner" if disk_name == "runner-data" or disk_name.startswith("runner-data-")
+                      else fleet_role(disk_name))
+        # A later disk listing can show users in both roles before either attachment reaches the VM snapshot.
+        # Keep one numerical carrier, but flag both role budgets via this disk record when attribution is unknown.
+        storage_billing_ambiguous = len(user_roles) > 1 and named_role not in user_roles
         role = (named_role if named_role in user_roles else user_roles[0]) if user_roles else (
             named_role or (tracked_roles or {}).get("id:" + str(detail.get("id", ""))))
         if role is None or not detail.get("id"):
@@ -365,6 +370,7 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
             "data_disk_type": kind,
             "data_disk_gb": size,
             "data_disks": {kind: size},
+            "storage_billing_ambiguous": storage_billing_ambiguous,
             "local_ssd_gb": 0,
             "unpriced_disk_performance": _unpriced_performance(detail),
             "regional_disks": bool(detail.get("regional")),
