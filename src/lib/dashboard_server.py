@@ -584,16 +584,30 @@ def _is_seeded_build(record: dict[str, Any]) -> bool:
     if fingerprint is None or any(record.get(k) != v or type(record.get(k)) is not type(v)
                                   for k, v in fingerprint.items()):
         return False
+    # The original seeds always used whole-second UTC strings. A report may shift all three timestamps
+    # equally (keeping their gaps), so fractional or reformatted timestamps still establish a correction.
+    timestamps = [record.get(k) for k in ("requested_at", "finished_at", "delivered_at")]
+    if any(not isinstance(stamp, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp) for stamp in timestamps):
+        return False
     try:
-        requested, finished, delivered = (_iso_to_epoch(str(record[k]))
-                                          for k in ("requested_at", "finished_at", "delivered_at"))
+        requested, finished, delivered = (_iso_to_epoch(stamp) for stamp in timestamps)
     except (KeyError, TypeError, ValueError):
         return False
     return (finished - requested, delivered - finished) == SEEDED_RUST_BUILD_GAPS[build_id]
 
 
+# Normalization and OOM handling may add these fields to an unchanged seed. Any other extra field is
+# source evidence that the seed never supplied and must be preserved.
+SEED_EVENT_DERIVED_FIELDS = frozenset({
+    "failure_classification", "is_oom", "is_self_hosted_runner", "badge_text",
+    "handled", "acknowledged", "handled_at", "baseline_runners", "baseline_source",
+})
+
+
 def _seed_fields_match(record: dict[str, Any], fingerprint: dict[str, Any]) -> bool:
-    return all(record.get(k) == v and type(record.get(k)) is type(v) for k, v in fingerprint.items())
+    return (not (record.keys() - fingerprint.keys() - SEED_EVENT_DERIVED_FIELDS)
+            and all(record.get(k) == v and type(record.get(k)) is type(v) for k, v in fingerprint.items()))
 
 
 def _is_seeded_ci_run(record: dict[str, Any], reference: float | None) -> bool:

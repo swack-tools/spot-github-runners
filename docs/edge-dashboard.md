@@ -484,14 +484,16 @@ GitHub CI failure runs, journal OOM events, or job counters.
   - The Rust builds `rb-20261015-001` through `rb-20261015-005`, on `builder-oxidex-turin-01` and
     `builder-oxidex-eu-01`. `POST /api/rust-builds` merges a partial update into an existing build, so
     these match only when every field the seed set is unchanged, including the seeded gaps between the
-    requested, finished, and delivered times.
+    requested, finished, and delivered times and their original whole-second UTC format. Fractional timing
+    corrections stay even when all three times shift together.
   - The GitHub CI runs `gh-oom-37192272062`, `gh-oom-37192994059`, and `gh-timeout-38596411473`, and
     the older IDs of the same seeds, `gh-oom-38596411473` and `gh-oom-38601924810`, matched with their
     complete seeded report content, including logs, links, and failure times.
   - The journal OOM event `oom-journal-01`, matched with its complete seeded report content. Its generated
     observation time and older CI failure times are checked against the startup time recovered from an
     unchanged seeded build. If that time cannot be recovered, these events stay rather than risking a
-    reported correction.
+    reported correction. Additional source evidence, such as a log hash or cgroup path, also keeps the
+    event; only known classification and handling fields may be added to an unchanged seed.
 - The migration also resets the job counters to 0 when all three still hold the seeded values, 14 jobs in
   the past hour, 7 provisioned, and 3 queued. Any other combination stays as reported.
 - The drop keeps the loaded `state_version` and sets `demo_telemetry_migration_pending` in the saved

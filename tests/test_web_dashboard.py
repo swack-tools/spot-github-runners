@@ -6750,6 +6750,27 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
                     self.assertEqual(drop_seeded_demo_telemetry(state), 5)
                     self.assertEqual(state["scaling_telemetry"][key], [record])
 
+    def test_uniform_fractional_build_shift_is_a_reported_correction(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        build = seeded_demo_telemetry()["rust_builds"][0]
+        for key in ("requested_at", "finished_at", "delivered_at"):
+            stamp = datetime.fromisoformat(build[key].replace("Z", "+00:00")).timestamp()
+            build[key] = datetime.fromtimestamp(stamp + 0.25, timezone.utc).isoformat()
+        state = {"rust_builds": [build]}
+        self.assertEqual(drop_seeded_demo_telemetry(state), 0)
+        self.assertEqual(state["rust_builds"], [build])
+
+    def test_extra_event_evidence_survives_legacy_cleanup(self):
+        from lib.dashboard_server import drop_seeded_demo_telemetry
+
+        state = seeded_demo_telemetry()
+        state["scaling_telemetry"]["github_oom_runs"][0]["log_sha256"] = "evidence-sha256"
+        state["scaling_telemetry"]["journal_oom_events"][0]["cgroup_path"] = "/jobs/actual-job"
+        self.assertEqual(drop_seeded_demo_telemetry(state), 10)  # 5 builds, 2 CI runs, 3 counters
+        self.assertEqual(len(state["scaling_telemetry"]["github_oom_runs"]), 1)
+        self.assertEqual(len(state["scaling_telemetry"]["journal_oom_events"]), 1)
+
     def test_partial_real_updates_to_a_seeded_build_are_kept(self):
         from lib.dashboard_server import drop_seeded_demo_telemetry
 
