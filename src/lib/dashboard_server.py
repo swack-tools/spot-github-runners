@@ -6804,7 +6804,9 @@ class DashboardStore:
                             else now_ts
                         )
                     )
-                    duration = max(0.0, round(fin_epoch_target - req_epoch_existing, 2))
+                    # Keep full precision until inferred timestamps are formed. Rounding elapsed time here can
+                    # carry a status-only completion into the next second and hide it from immediate telemetry.
+                    duration = max(0.0, fin_epoch_target - req_epoch_existing)
                 else:
                     duration = 0.0
                 delivery_sec = explicit_delivery if explicit_delivery is not None else 0.0
