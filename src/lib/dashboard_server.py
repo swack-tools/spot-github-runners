@@ -712,6 +712,16 @@ def _has_unresolved_storage(record: dict[str, Any]) -> bool:
     return bool(record.get("disk_liability_pending") or record.get("unpaid_disk_details"))
 
 
+def _select_instance_record(instances: list[Any], instance_id: str, instance_name: str) -> dict[str, Any] | None:
+    """IDs are exact; names alone must identify one current or retained historical record."""
+    matches = [i for i in instances if isinstance(i, dict)
+               and (str(i.get("instance_id")) == instance_id if instance_id
+                    else bool(instance_name) and i.get("name") == instance_name)]
+    if not instance_id and len(matches) > 1:
+        raise ValueError(f"Instance name '{instance_name}' is ambiguous; supply instance_id")
+    return matches[0] if matches else None
+
+
 def _instance_end_epoch(record: dict[str, Any]) -> float | None:
     """When compute billing for a record ended: its stop time, else its deletion time (None while running)."""
     for key in ("stopped_epoch", "deleted_epoch"):
@@ -1314,6 +1324,11 @@ def _live_instance_record(
             if old is not None and not _same_disk(old, disk):
                 old = None
             deferred = (old or {}).get("billing_deferred_since", disk.get("billing_deferred_since"))
+            if (not _finite(deferred) and old is not None and obs.get("disk_types_known") is False
+                    and int(old.get("gb") or 0) != int(disk.get("gb") or 0)):
+                # A resized attachment is newly unpriced capacity even though its source already existed. Keep
+                # each observed size boundary until authoritative disk metadata can repair this interval.
+                deferred = now
             if (not _finite(deferred) and old is None and not _finite(disk.get("created_epoch"))
                     and obs.get("disk_types_known") is False
                     and (previous is not None or not _disk_known(disk, known_disk_sources))
@@ -1964,10 +1979,16 @@ def _remember_incomplete_pricing(record: dict[str, Any], pricing_record: dict[st
         unknown_types = set(old_pricing.get("disk_rate_unknown") or [])
         independent_rates = any(str(d.get("type")) in unknown_types for d in paid) or any(
             kind not in {str(d.get("type")) for d in details} for kind in unknown_types)
+        current_details = [d for d in record.get("disks_detail") or [] if isinstance(d, dict)]
+        # A project-wide denied-listing flag does not invalidate an unchanged, previously identified disk merely
+        # because another attachment has recoverable debt. On recovery, changed identities/types remain unknown.
+        unverified_paid = any(not d.get("id") or (record.get("disk_types_known") is True and not any(
+            str(current.get("id")) == str(d["id"]) and current.get("type") == d.get("type")
+            and int(current.get("gb") or 0) == int(d.get("gb") or 0) for current in current_details)) for d in paid)
         disk_unknown = bool(independent_rates or pricing_record.get("unpriced_disk_performance")
                             or pricing_record.get("regional_disks") or pricing_record.get("local_ssd_gb")
                             or pricing_record.get("tax_rate_known") is False
-                            or (paid and pricing_record.get("disk_types_known") is False))
+                            or (unverified_paid and pricing_record.get("disk_types_known") is False))
     intervals = copy.deepcopy(record.get("unpriced_history_intervals") or {})
     for reason, start, end, uncertain in (("fallback_compute", compute_start, compute_end, compute_unknown),
                                          ("fallback_storage", disk_start, disk_end, disk_unknown)):
@@ -6248,15 +6269,7 @@ class DashboardStore:
         with self._lock:
             instance_id = str(payload.get("instance_id", "")).strip()
             instance_name = str(payload.get("instance_name", "")).strip()
-            inst = next(
-                (
-                    i
-                    for i in self.state["instances"]
-                    # An instance ID is exact; names can repeat across zones and over time.
-                    if (i["instance_id"] == instance_id if instance_id else (instance_name and i["name"] == instance_name))
-                ),
-                None,
-            )
+            inst = _select_instance_record(self.state["instances"], instance_id, instance_name)
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
@@ -6372,16 +6385,7 @@ class DashboardStore:
         with self._lock:
             instance_id = str(payload.get("instance_id", "")).strip()
             instance_name = str(payload.get("instance_name", "")).strip()
-            inst = next(
-                (
-                    i
-                    for i in self.state["instances"]
-                    # An instance ID is exact; names can repeat across zones and over time.
-                    if (i.get("instance_id") == instance_id if instance_id
-                        else (instance_name and i.get("name") == instance_name))
-                ),
-                None,
-            )
+            inst = _select_instance_record(self.state["instances"], instance_id, instance_name)
             if inst is None:
                 raise ValueError("Instance not found")
             if inst.get("status") == "DELETED":
@@ -6443,6 +6447,9 @@ class DashboardStore:
                     f"target_instances ({target_count}) in {region} (total fleet: {projected_total}) "
                     f"exceeds maximum allowed instances ({max_allowed}) for role '{role}'"
                 )
+            stale_reason = self._inventory_stale_reason()
+            if stale_reason:
+                raise ValueError(f"{stale_reason}; plan the scale change after the next complete listing")
             now_ts = time.time()
             would_retire: list[dict[str, Any]] = []
             new_records: list[dict[str, Any]] = []
@@ -6652,9 +6659,6 @@ class DashboardStore:
                         f"Runner count is not recorded on running host(s) {', '.join(unknown_counts[:5])}; "
                         "the runner total is unknown, so a scale-up cannot be checked against max_runners"
                     )
-                stale_reason = self._inventory_stale_reason()
-                if stale_reason:
-                    raise ValueError(f"{stale_reason}; plan the scale-up after the next complete listing")
                 pending_hosts = self._transitional_hosts(role)
                 if pending_hosts:
                     raise ValueError(
