@@ -6984,10 +6984,11 @@ class DashboardStore:
             cache_hits, cache_misses, total_crates, reported_crates = _merged_crate_counts(payload, existing_build)
 
             if is_non_delivered:
+                # Without a reported request time, a build that reports elapsed time started that long ago.
                 req_at = (
                     payload.get("requested_at")
                     or existing_build.get("requested_at")
-                    or _iso_seconds_ago(duration if is_unsuccessful and duration is not None else 0, now_ts)
+                    or _iso_seconds_ago(duration if duration is not None else 0, now_ts)
                 )
                 req_epoch = _iso_to_epoch(str(req_at))
                 if "finished_at" in payload:
@@ -6995,7 +6996,15 @@ class DashboardStore:
                 elif existing_build.get("finished_at"):
                     fin_at = existing_build.get("finished_at")
                 elif is_unsuccessful and duration is not None:
-                    fin_at = _iso_seconds_ago(0, max(now_ts, req_epoch + max(0.0, duration - delivery_sec)))
+                    run_seconds = max(0.0, duration - delivery_sec)
+                    fin_epoch = req_epoch + run_seconds
+                    if fin_epoch > now_ts and not payload.get("requested_at"):
+                        # The stored request time (often the first report's arrival) can't be right: the build
+                        # ran for the reported time and ended by now, so it started that long before now.
+                        req_epoch = now_ts - run_seconds
+                        req_at = _iso_seconds_ago(0, req_epoch)
+                        fin_epoch = now_ts
+                    fin_at = _iso_seconds_ago(0, fin_epoch)
                 else:
                     fin_at = None
                 del_at = (
@@ -7085,18 +7094,22 @@ class DashboardStore:
                 else:
                     raise ValueError(UNKNOWN_BUILD_TIMING_MESSAGE)
 
+            def given(key: str) -> Any:
+                """This report's value, treating a blank string as not reported."""
+                value = payload.get(key)
+                return None if isinstance(value, str) and not value.strip() else value
+
             def reported(key: str) -> Any:
                 """This report's value, else the stored build's; None when neither reported it."""
-                value = payload.get(key)
+                value = given(key)
                 return value if value is not None else existing_build.get(key)
 
             # An explicit benchmark score stands in for the host shape. A stored score is kept only while the
             # report leaves the shape alone, so a changed shape is scored again.
             shape_keys = ("cpu_platform", "vcpu", "machine_type")
-            shape_changed = any(payload.get(k) is not None and payload.get(k) != existing_build.get(k)
-                                for k in shape_keys)
-            benchmark_score = (payload.get("instance_benchmark_score")
-                               if payload.get("instance_benchmark_score") is not None
+            shape_changed = any(given(k) is not None and given(k) != existing_build.get(k) for k in shape_keys)
+            benchmark_score = (given("instance_benchmark_score")
+                               if given("instance_benchmark_score") is not None
                                else (None if shape_changed else existing_build.get("instance_benchmark_score")))
 
             raw = {

@@ -7623,6 +7623,28 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         self.assertIsNone(later["finished_at"])
         self.assertEqual((later["compile_duration_seconds"], later["total_duration_seconds"]), (None, None))
 
+    def test_active_build_is_backdated_by_reported_elapsed_time(self):
+        build = self.store.record_rust_build({"build_id": "rb-elapsed", "status": "RUNNING",
+                                              "compile_duration_seconds": 30.0})["build"]
+        self.assertAlmostEqual(time.time() - _iso_to_epoch(build["requested_at"]), 30.0, delta=2.0)
+        delivered = self.store.record_rust_build({"build_id": "rb-elapsed", "status": "DELIVERED"})["build"]
+        self.assertGreaterEqual(delivered["total_duration_seconds"], 29.0)
+
+    def test_blank_text_in_an_update_keeps_stored_values(self):
+        self.store.record_rust_build({"build_id": "rb-blank", "status": "DELIVERED", "total_duration_seconds": 5.0,
+                                      "project_name": "oxidex", "instance_name": "builder-oxidex-1",
+                                      "origin_ip": "8.8.8.8", "instance_benchmark_score": 2000, "vcpu": 16})
+        kept = self.store.record_rust_build({"build_id": "rb-blank", "project_name": "", "instance_name": "  ",
+                                             "origin_ip": "", "vcpu": "", "instance_benchmark_score": ""})["build"]
+        self.assertEqual((kept["project_name"], kept["instance_name"], kept["origin_ip"], kept["vcpu"],
+                          kept["instance_benchmark_score"]), ("oxidex", "builder-oxidex-1", "8.8.8.8", 16, 2000))
+
+    def test_late_failure_timing_never_finishes_in_the_future(self):
+        self.store.record_rust_build({"build_id": "rb-late", "status": "FAILED"})
+        build = self.store.record_rust_build({"build_id": "rb-late", "compile_duration_seconds": 30.0})["build"]
+        self.assertLessEqual(_iso_to_epoch(build["finished_at"]), time.time() + 1.0)
+        self.assertEqual(build["compile_duration_seconds"], 30.0)
+
     def test_explicit_benchmark_survives_an_echoed_shape(self):
         self.store.record_rust_build({"build_id": "rb-echo", "status": "DELIVERED", "total_duration_seconds": 10.0,
                                       "instance_benchmark_score": 2000, "vcpu": 16, "cpu_time_seconds": 10.0})

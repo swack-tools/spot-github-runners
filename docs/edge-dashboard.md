@@ -553,6 +553,7 @@ build carries stays `null`, and the page shows it as not reported. It never fill
 machine type, commit, origin IP, crate count, memory peak, CPU time, or duration.
 
 - A new build needs a `status`. An update without one keeps the stored status.
+- A blank text value counts as not reported, so it doesn't replace a stored value.
 - A completed build, such as `DELIVERED`, needs enough timing to place it. `delivered_at` defaults to
   when the report arrives. The request time comes from `requested_at`, from `total_duration_seconds`, or
   from both `compile_duration_seconds` and `delivery_duration_seconds`. Without one of these the request
@@ -561,7 +562,8 @@ machine type, commit, origin IP, crate count, memory peak, CPU time, or duration
   from `requested_at` plus `compile_duration_seconds`. Without any of these, `finished_at` and the compile
   and delivery durations stay `null`. The dashboard doesn't split the total between compiling and delivery.
 - An active build, such as `RUNNING`, keeps a reported `compile_duration_seconds` across partial updates,
-  until its final timing replaces it. A build that hasn't been delivered has no delivery time, and a
+  until its final timing replaces it. Without `requested_at`, its request time is that many seconds before
+  the report. A build that hasn't been delivered has no delivery time, and a
   failed build reported without timing has no durations.
 - `cache_hits`, `cache_misses`, and `total_crates` are stored as reported. A missing count is derived only
   when the other two are present. An update keeps the stored counts it omits, unless one contradicts the
