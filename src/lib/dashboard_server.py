@@ -887,6 +887,12 @@ def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previo
         record["suspension_resume_boundary"] = list(resume_boundary)
     else:
         resume_boundary = None
+    terminal_boundary = (previous or {}).get("suspension_terminal_boundary")
+    if (isinstance(terminal_boundary, (list, tuple)) and len(terminal_boundary) == 2
+            and all(_finite(value) for value in terminal_boundary) and terminal_boundary[1] >= terminal_boundary[0]):
+        record["suspension_terminal_boundary"] = list(terminal_boundary)
+    else:
+        terminal_boundary = None
     status = record.get("status")
     started = float(record["started_epoch"])
     if (previous or {}).get("status") == "SUSPENDED" and "suspended_memory" not in intervals:
@@ -907,11 +913,32 @@ def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previo
             prior_memory = normalize_unpriced_intervals(previous.get("unpriced_history_intervals"))
             open_starts = [start for start, end in prior_memory.get("suspended_memory", []) if end is None]
             suspended = max(open_starts) if open_starts else None
-    if status == "SUSPENDED":
+    terminal_end = None
+    if _finite(suspended) and status in ("TERMINATED", "STOPPED") and float(suspended) >= started:
+        stopped = obs.get("last_stop_epoch")
+        if _finite(stopped) and float(suspended) <= float(stopped) <= now:
+            terminal_end = float(stopped)
+        elif terminal_boundary is not None and terminal_boundary[0] == float(suspended):
+            terminal_end = float(terminal_boundary[1])
+        else:
+            terminal_end = now  # The first terminal observation bounds saved-memory billing.
+        terminal_boundary = [float(suspended), terminal_end]
+        record["suspension_terminal_boundary"] = terminal_boundary
+    elif (status != "SUSPENDED" and _finite(suspended) and terminal_boundary is not None
+            and terminal_boundary[0] == float(suspended)):
+        terminal_end = float(terminal_boundary[1])
+    if terminal_end is not None:
+        # A saved terminal boundary also survives a later staging/start and interval retention.
+        intervals["suspended_memory"] = [[begin, min(end if end is not None else terminal_end, terminal_end)]
+            for begin, end in intervals.get("suspended_memory", []) if begin <= terminal_end]
+        add("suspended_memory", float(suspended), terminal_end)
+        record.pop("pending_suspension_epoch", None)
+    elif status == "SUSPENDED":
         at = float(suspended) if _finite(suspended) else float(record.get("stopped_epoch") or now)
         add("suspended_memory", min(at, now), None)
         record["pending_suspension_epoch"] = min(at, now)
-    elif _finite(suspended) and float(suspended) >= started:
+    elif (_finite(suspended) and float(suspended) >= started
+            and status not in ("TERMINATED", "STOPPED", "DELETED", "DETACHED")):
         # The actual resume start has not arrived, including transitional snapshots.
         record["pending_suspension_epoch"] = float(suspended)
         add("suspended_memory", float(suspended), None)
@@ -938,13 +965,15 @@ def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previo
         add("prior_compute", float(created) if _finite(created) and float(created) < ended else 0.0, ended)
     previous_stop = (previous or {}).get("stopped_epoch")
     if _finite(previous_stop):
-        # A newer end before the current latest start proves an intervening run after the observed stop. Its
-        # start is no longer in GCE's latest-start field, so preserve bounded uncertainty instead of billing the
-        # whole known stopped gap or silently dropping that run.
+        # A terminal timestamp after suspension ended saved memory, not a second compute run.
+        # Only a still later end can prove unseen compute after that known storage-only interval.
+        inference_start = float(previous_stop)
+        if terminal_boundary is not None and terminal_boundary[0] == inference_start:
+            inference_start = max(inference_start, float(terminal_boundary[1]))
         unseen_ends = [float(t) for t in (obs.get("last_stop_epoch"), obs.get("last_suspended_epoch"))
-                       if _finite(t) and float(previous_stop) < float(t) < started]
+                       if _finite(t) and inference_start < float(t) < started]
         if unseen_ends:
-            add("prior_compute", float(previous_stop), max(unseen_ends))
+            add("prior_compute", inference_start, max(unseen_ends))
     _save_unpriced_intervals(record, intervals, now)
 
 
@@ -1548,10 +1577,18 @@ def _live_instance_record(
         stopped_epoch = started_epoch  # A disk on its own never runs compute.
         trigger = "Fleet disk that no VM uses (for example a builder cache disk); it bills storage until deleted"
     elif status in GCE_STOPPED_STATUSES:
-        stop = obs.get("last_suspended_epoch") if status == "SUSPENDED" else obs.get("last_stop_epoch")
-        if isinstance(stop, (int, float)) and stop >= started_epoch:
-            stopped_epoch = float(stop)
-        elif previous is not None and isinstance(previous.get("stopped_epoch"), (int, float)):
+        stops = (obs.get("last_suspended_epoch"),) if status == "SUSPENDED" else (
+            obs.get("last_stop_epoch"), obs.get("last_suspended_epoch"))
+        ends = [float(stop) for stop in stops if _finite(stop) and started_epoch <= float(stop) <= now]
+        previous_stop = (previous or {}).get("stopped_epoch")
+        if (_finite(previous_stop) and (previous or {}).get("started_epoch") == started_epoch
+                and started_epoch <= float(previous_stop) <= now):
+            ends.append(float(previous_stop))  # A later terminal timestamp cannot reopen known stopped compute.
+        if ends:
+            # Saved memory can outlive compute: termination must not bill the suspended gap as a run.
+            stopped_epoch = min(ends)
+        elif previous is not None and _finite(previous.get("stopped_epoch")) \
+                and started_epoch <= float(previous["stopped_epoch"]) <= now:
             stopped_epoch = float(previous["stopped_epoch"])
         else:
             stopped_epoch = now

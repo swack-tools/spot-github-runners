@@ -4711,9 +4711,14 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                                                       started_hours_ago=1.0, now=self.now), project="p", now=self.now)
         rec["prior_runs"] = [[self.now - (100 - i) * 3600.0, self.now - (100 - i) * 3600.0 + 1800.0] for i in range(60)]
         before = instance_usage(rec, self.now, self.now - 744 * 3600.0)
-        with unittest.mock.patch.object(dashboard_server, "MAX_INSTANCE_STATE_BYTES", 3_000):
+        # Leave bounded serialization headroom: wall-clock fractional digits must not decide whether
+        # the fully compacted fixture fits. The original detail must still exceed this exact budget.
+        compact = dashboard_server._coarsen_record_buckets(dashboard_server._fold_record_detail(rec, 0))
+        budget = dashboard_server._serialized_size([[compact], [], {}]) + 128
+        self.assertGreater(dashboard_server._serialized_size([[rec], [], {}]), budget)
+        with unittest.mock.patch.object(dashboard_server, "MAX_INSTANCE_STATE_BYTES", budget):
             live, _gone = dashboard_server._fit_size_budget([rec], [], {}, self.now)
-            self.assertLessEqual(dashboard_server._serialized_size([live, [], {}]), 3_000)
+            self.assertLessEqual(dashboard_server._serialized_size([live, [], {}]), budget)
         self.assertLessEqual(len(live[0]["prior_runs"]), dashboard_server.MIN_DETAILED_SEGMENTS)
         after = instance_usage(live[0], self.now, self.now - 744 * 3600.0)
         self.assertAlmostEqual(after["compute_hours"], before["compute_hours"], delta=0.01)
