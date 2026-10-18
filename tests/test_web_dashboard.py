@@ -31,8 +31,6 @@ from lib.dashboard_scaling import (
     parse_github_oom_deep_link,
 )
 from lib.dashboard_server import (
-    INSTANCE_SOURCE_GCE,
-    INSTANCE_SOURCE_KEY,
     _build_instance_record,
     create_dashboard_server,
     main as dashboard_main,
