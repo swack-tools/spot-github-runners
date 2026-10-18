@@ -536,8 +536,9 @@ GitHub CI failure runs, journal OOM events, or job counters.
   hour, 7 provisioned, and 3 queued. Earlier versions stored no provenance for counters: a fresh partial
   report could produce that tuple while leaving old demo events untouched. There is no way to prove the
   saved counters are still demo data. New states start at 0; later reports replace the saved counters.
-- The drop keeps the loaded `state_version` and sets `demo_telemetry_migration_pending` in the saved
-  state, so a restart doesn't lose it. The active slot then commits the migrated state as the next
+- The migration keeps the loaded `state_version` and sets `demo_telemetry_migration_pending` in the saved
+  state, so a restart doesn't lose it. It does this even when no seeded record matched, because adding the
+  marker alone changes the state. The active slot then commits the migrated state as the next
   `state_version` through the same checks as any change, and publishes it to KV. Any new version clears
   the flag. A standby slot waits, so its copy never shadows the active slot's next change. A rollback then
   sees the migrated version as newer than the old slot's copy and carries it back.
@@ -1158,6 +1159,9 @@ again. Every deploy removes the grants the floor no longer needs, and skips thos
   removes the runtime account's `roles/secretmanager.secretAccessor` binding, and the label, from every
   labeled secret that the service no longer references. That covers every former floor token secret,
   including one that only left a target's `secret=`.
+- After it updates the service, it removes every secret volume that no container mounts. `--set-secrets`
+  drops the mount of a former floor token but keeps its volume, which still names the secret. The removal
+  creates one more revision, and only when such a volume exists.
 
 Removing the floor never deletes a secret or a VM. Floor hosts that exist keep running until the autoscaler or
 an operator retires them.

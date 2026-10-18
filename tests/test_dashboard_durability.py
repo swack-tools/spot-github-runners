@@ -66,12 +66,19 @@ def no_live_pricing(test: unittest.TestCase) -> None:
     test.addCleanup(patcher.stop)
 
 
+# States written by a version that already ran the one-time demo telemetry migration: a markerless state is legacy
+# and gets one version of its own on the active slot (DemoTelemetryMigrationCommitTests covers that).
+MIGRATED = {"demo_telemetry_migration": 1}
+
+
 def write_state(path: Path, version: int, targets: list[str]) -> None:
-    path.write_text(json.dumps({"state_version": version, "controlled_targets": targets}), encoding="utf-8")
+    path.write_text(json.dumps({"state_version": version, "controlled_targets": targets, **MIGRATED}),
+                    encoding="utf-8")
 
 
 def kv_snapshot(version: int, targets: list[str], slot: str = "a") -> str:
-    return json.dumps(build_snapshot({"controlled_targets": targets, "project": "elsewhere"}, version, slot, now=1))
+    return json.dumps(build_snapshot({"controlled_targets": targets, "project": "elsewhere", **MIGRATED}, version,
+                                     slot, now=1))
 
 
 class HydrationTests(unittest.TestCase):
@@ -1101,6 +1108,24 @@ class DemoTelemetryMigrationCommitTests(unittest.TestCase):
         store.kv_tick()
         self.clock.now += 3600
         store.kv_tick()
+
+    def test_marker_only_migration_is_committed_as_a_new_version(self):
+        # A legacy state with no seed rows left (for example cleared by an operator) still gains the one-time
+        # marker. That is a content change, so the active slot publishes it as a new version; otherwise a markerless
+        # copy at the same version would look current to KV and to a rollback.
+        legacy = {"state_version": 5, "controlled_targets": ["o/kept"]}
+        (Path(self.tmp.name) / "a.json").write_text(json.dumps(legacy), encoding="utf-8")
+        self.fake.values[KV_STATE_KEY] = json.dumps(build_snapshot(dict(legacy), 5, "a", now=1))
+        store = self.store("a.json")
+        self.assertEqual(store.state_version(), 5)
+        self.assertIs(store.state["demo_telemetry_migration_pending"], True)
+        store.hydrate()
+        self.tick_until_published(store)
+        published = parse_snapshot(self.fake.values[KV_STATE_KEY])
+        self.assertEqual(published["state_version"], 6)
+        self.assertEqual(published["state"]["demo_telemetry_migration"], 1)
+        self.assertNotIn("demo_telemetry_migration_pending", published["state"])
+        self.assertEqual(published["state"]["controlled_targets"], ["o/kept"])
 
     def test_without_kv_the_start_commits_a_new_version(self):
         path = Path(self.tmp.name) / "local.json"
