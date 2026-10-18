@@ -380,7 +380,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `DETACHED` record that bills storage until the disk is deleted (shown as present storage). A disk the instance listing still shows
   attached is billed only by its VM's record, and a disk attached to a fleet VM that the instance listing
   doesn't show yet is billed on its own until that VM appears. A disk attached to several fleet VMs is
-  billed once, while every VM keeps the full attachment metadata. VM templates cannot copy shared
+  billed once, while every VM keeps the full attachment metadata. Detached runner data disks named
+  `runner-data` or `runner-data-*` are included too; where fleet users are present, their role identifies
+  which fleet owns the disk. VM templates cannot copy shared
   attachments. Disk users are matched by zone and instance name. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
   is billed by the new record only from the handoff, never again from its creation. Disks are matched
   by their immutable disk ID, so a new disk that reuses a name is billed from its own creation. While
@@ -445,7 +447,10 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   become trusted. Retained cache-disk prices preserve each disk's pricing-completeness flags.
 - A VM in a transitional state, such as `PROVISIONING`, `STAGING`, `STOPPING`, or `REPAIRING`, counts
   at its full rate in burn and budgets. While the role has one, scale-up recommendations hold and
-  scale-up plans are refused, because its capacity hasn't settled.
+  scale-up plans are refused, because its capacity hasn't settled. For a newly provisioned VM, creation
+  is a provisional boundary until GCE reports its first start. Repricing and state reloads don't turn
+  creation-to-first-start time into a completed compute run; a VM with an earlier proven run retains
+  that history through a restart.
 - A listing with an unreachable zone, or one that fails, changes nothing. The instance view's
   `fleet_inventory` field reports the last successful listing and the last error. Until the next
   complete listing, and after a restart until the first one, `fleet_inventory.fresh` is false and
@@ -464,6 +469,10 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   capacity stays pending through the OOM lookback, so an OOM reported late can still be answered by it.
   Without a dated readiness transition, only a new identity created after the incident can satisfy it.
   A poll time or missing bootstrap metadata cannot date readiness, so uncertain incidents stay active.
+  GitHub CI entries enter baseline, active-event, and acknowledgement handling only when the shared
+  classifier identifies an OOM on this self-hosted GCP runner fleet. Timeouts, external-runner failures,
+  and non-OOM records keep their original incident history. Actual log evidence and runner identity
+  take priority over stale cached classification flags.
   A later restart of the same identity cannot satisfy a newer incident.
   Hosts first listed together with an OOM that were already running before it count toward its baseline,
   and only ready runner slots count as current runners. Builder OOM events are never handled from the
