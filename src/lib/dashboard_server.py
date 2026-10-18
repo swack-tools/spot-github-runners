@@ -874,7 +874,8 @@ def _live_instance_record(
                 old = known.get(str(d.get("source") or ""))
                 if old is not None and int(old.get("gb") or 0) == int(d.get("gb") or 0):
                     d = {**d, **{k: old.get(k) for k in ("type", "id", "created_epoch", "auto_delete")
-                                 if old.get(k) not in (None, "")}}
+                                 if old.get(k) not in (None, "")
+                                 and (k != "auto_delete" or not isinstance(d.get(k), bool))}}
                 merged.append(d)
             obs["disks_detail"] = merged
             if merged and all("boot" in d for d in merged):
