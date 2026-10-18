@@ -3126,8 +3126,10 @@ class DashboardStore:
             # A state written before the migration: drop its seeds once (a newer marker is kept as it is).
             dropped_seeds = drop_seeded_demo_telemetry(base, source_state=loaded)
             base[DEMO_TELEMETRY_MIGRATION_KEY] = DEMO_TELEMETRY_MIGRATION_VERSION
-            if dropped_seeds:
-                base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
+            # Adding the marker changes content even when nothing matched (an operator may have cleared the seeds):
+            # a copy without it at the same version would look current to KV and to a rollback, and losing the
+            # one-time marker would let a later upgrade rerun the cleanup. Commit it as a new version either way.
+            base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
         if base.get(DEMO_TELEMETRY_MIGRATION_PENDING_KEY) is not True:
             base.pop(DEMO_TELEMETRY_MIGRATION_PENDING_KEY, None)
         previous = getattr(self, "state", None)
