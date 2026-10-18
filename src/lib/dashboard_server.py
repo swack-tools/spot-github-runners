@@ -989,9 +989,18 @@ def _live_instance_record(
         if reuse_pricing is None:
             disk_open = max([disk_start] + [e for _s, e, _r in disk_segments]
                             + ([float(disk_segment_start)] if _finite(disk_segment_start) else []))
-            if now > disk_open:
-                disk_segments.append((disk_open, now, prev_disk_all_in))
-            disk_segment_start = now
+            # Where the old disk rate ends: when the only change is added disks whose creation times are known
+            # (and that no other record billed), at the newest one's creation; otherwise at this listing.
+            own_keys = set(previous.get("disk_sources") or [])
+            added = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict)
+                     and not (_disk_key(d) in own_keys or str(d.get("source") or "") in own_keys)]
+            split_at = now
+            if added and all(_finite(d.get("created_epoch")) for d in added) \
+                    and not any(_disk_known(d, known_disk_sources) for d in added):
+                split_at = min(now, max(disk_open, max(float(d["created_epoch"]) for d in added)))
+            if split_at > disk_open:
+                disk_segments.append((disk_open, split_at, prev_disk_all_in))
+            disk_segment_start = split_at
     if stopped_epoch is not None:
         # A stop reported late: intervals of this run closed (for example at a price change) after the real stop
         # end at the stop instead.
@@ -1280,8 +1289,9 @@ def reconcile_instance_records(
         obs = by_id.get(instance_id)
         if obs is not None:
             seen.add(instance_id)
-            records.append(_live_instance_record(obs, project=project, now=now, previous=record,
-                                                 tax_overrides=tax_overrides))
+            records.append(_live_instance_record(
+                obs, project=project, now=now, previous=record, tax_overrides=tax_overrides,
+                known_disk_sources=known_disks - frozenset(record.get("disk_sources") or [])))
         elif not disks_listed and record.get("kind") == "disk" and record.get("status") != "DELETED":
             # The disk listing is unavailable: a detached disk is not seen, not gone. Keep it (still billing).
             records.append(record)
@@ -2422,14 +2432,15 @@ class DashboardStore:
                 self._fleet_status["fresh"] = False
             LOG.warning("Dashboard fleet inventory could not be applied: %s: %s", type(exc).__name__, exc)
             return False
+        done = self._clock()  # Freshness counts from when the listing was applied, not when it started.
         with self._lock:
-            self._fleet_status.update({"last_success_at": _iso_epoch(now), "last_success_epoch": now,
+            self._fleet_status.update({"last_success_at": _iso_epoch(done), "last_success_epoch": done,
                                        "disks_listed": disks_listed,
                                        "observed_count": len(observed),
                                        "fresh": True,
                                        "last_error": ""})
             if body.get("changed"):
-                self._fleet_status["last_change_at"] = _iso_epoch(now)
+                self._fleet_status["last_change_at"] = _iso_epoch(done)
         return bool(body.get("changed"))
 
     def close(self, timeout: float = 5.0) -> None:

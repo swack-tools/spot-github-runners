@@ -5598,6 +5598,44 @@ class FleetInventoryReconcileTests(unittest.TestCase):
             self.store.create_vm_template_from_instance({"instance_name": "builder-oxidex-t-cache",
                                                          "assign_to_profile": False})
 
+    def test_freshness_counts_from_completion(self):
+        self.fleet = [fleet_observation("9800", "oxidex-runners-slow-1", "us-south1-a", now=self.now)]
+        clock = [time.time()]
+
+        def slow_source():
+            clock[0] += 5 * self.store.fleet_inventory_interval  # The listing takes a long time.
+            return list(self.fleet)
+
+        self.store.fleet_source = slow_source
+        with unittest.mock.patch.object(self.store, "_clock", side_effect=lambda: clock[0]):
+            self.store.refresh_fleet_inventory()
+            self.assertEqual(self.store._inventory_stale_reason(), "")
+
+    def test_added_disk_billed_from_its_creation(self):
+        from lib.dashboard_server import instance_usage
+
+        created = self.now - 10 * 86400.0
+        boot = {"type": "pd-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-ad", "id": "1"}
+        vm = fleet_observation("9900", "builder-oxidex-add-1", "us-south1-b", started_hours_ago=240.0, now=self.now)
+        vm.update(created_epoch=created, data_disk_gb=0, data_disks={}, disks_detail=[boot])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        added_at = self.now - 2 * 86400.0
+        grown = dict(vm, data_disk_gb=500, data_disks={"pd-balanced": 500}, data_disk_type="pd-balanced",
+                     disks_detail=[boot, {"type": "pd-balanced", "gb": 500, "created_epoch": added_at,
+                                          "source": "z/data-ad", "id": "2"}])
+        self.fleet = [grown]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-add-1")
+        self.assertAlmostEqual(rec["disk_segment_start"], added_at, delta=1.0)
+        self.assertAlmostEqual(rec["disk_segments"][-1][1], added_at, delta=1.0)
+
+    def test_detached_rows_render_as_present_storage(self):
+        from lib.dashboard_ui_assets import DASHBOARD_HTML
+
+        self.assertIn('inst.status === "DETACHED" ? \'<span style="color:#fcd34d;">Present (storage still billed)',
+                      DASHBOARD_HTML)
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

@@ -351,7 +351,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
   that disk-only rate, and a deleted VM's row shows no current rate. When a VM starts again, its earlier running intervals stay in its runtime and
   window spend. When its machine type or disks change, or its prices change, the time before the change
-  keeps the earlier rates. A stop that's reported late ends the run at the reported stop time. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
+  keeps the earlier rates; a disk added to a listed VM starts billing at its own creation time. A stop that's reported late ends the run at the reported stop time. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
   toward the runner and builder telemetry, but the disks of stopped VMs count against the scaling
   budgets. Hiding deleted instances doesn't hide stopped VMs, because they still exist. The listing
   carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.
@@ -367,7 +367,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   recreated with the same name gets a new record, because the record follows the instance ID.
 - Spend covers each VM's attached disks while the VM exists. A fleet-named disk that no VM uses, such
   as a dedicated builder's cache disk (`auto-delete=no`) after its VM is deleted, gets its own
-  `DETACHED` record that bills storage until the disk is deleted. A disk the instance listing still shows
+  `DETACHED` record that bills storage until the disk is deleted (shown as present storage). A disk the instance listing still shows
   attached is billed only by its VM's record. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
   is billed by the new record only from the handoff, never again from its creation. Disks are matched
   by their immutable disk ID, so a new disk that reuses a name is billed from its own creation. While
