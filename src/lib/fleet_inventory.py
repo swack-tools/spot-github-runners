@@ -112,7 +112,15 @@ def observe_fleet_items(
     # A persistent disk attached to several fleet VMs (read-only or multi-writer) is one disk: bill it once, on the
     # first VM in the listing that has it.
     billed_disks: set[str] = set()
-    for item in items:
+    fleet_items = [vm for vm in items if isinstance(vm, dict) and isinstance(vm.get("name"), str)
+                   and fleet_role(vm["name"]) is not None and vm.get("id")]
+    attachment_counts: dict[str, int] = {}
+    for vm in fleet_items:
+        for disk in vm.get("disks") or []:
+            if isinstance(disk, dict) and disk.get("source") and disk.get("type") != "SCRATCH":
+                identity = str(_disk_detail(disk_types, str(disk["source"])).get("id") or disk["source"])
+                attachment_counts[identity] = attachment_counts.get(identity, 0) + 1
+    for item in sorted(fleet_items, key=lambda vm: (str(vm.get("id") or ""), str(vm.get("name") or ""))):
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             continue
         name = item["name"]
@@ -131,6 +139,7 @@ def observe_fleet_items(
         if not specs_known:
             vcpu, ram_gib = _vcpu_from_machine_type(machine_type), 0.0
         boot_disk_type, boot_disk_gb = DEFAULT_DISK_TYPE, 0
+        boot_disk_billed_gb = 0
         data_disk_type, data_disk_gb = DEFAULT_DISK_TYPE, 0
         data_disks: dict[str, int] = {}
         local_ssd_gb = 0
@@ -140,6 +149,7 @@ def observe_fleet_items(
         # Each persistent disk with its own creation time, so history before a later-attached disk is not billed
         # at its rate.
         disks_detail: list[dict[str, Any]] = []
+        shared_attachments: list[dict[str, Any]] = []
         for disk in item.get("disks", []) if isinstance(item.get("disks"), list) else []:
             if not isinstance(disk, dict):
                 continue
@@ -151,8 +161,7 @@ def observe_fleet_items(
                 continue
             detail = _disk_detail(disk_types, str(disk.get("source", "")))
             identity = str(detail.get("id") or "") or str(disk.get("source", "") or "")
-            if identity and identity in billed_disks:
-                continue
+            shared_elsewhere = bool(identity) and identity in billed_disks
             if identity:
                 billed_disks.add(identity)
             if disk_types_known and not detail.get("type"):
@@ -165,17 +174,23 @@ def observe_fleet_items(
             disks_detail.append({"type": dtype, "gb": size, "created_epoch": gce_epoch(detail.get("creationTimestamp")),
                                  "source": str(disk.get("source", "") or ""), "id": str(detail.get("id", "") or ""),
                                  # None when the listing did not say (older observations).
+                                 "boot": bool(disk.get("boot")),
+                                 "billing_owner": not shared_elsewhere,
                                  "auto_delete": disk.get("autoDelete") if isinstance(disk.get("autoDelete"), bool)
                                  else None})
+            if attachment_counts.get(identity, 0) > 1:
+                shared_attachments.append(dict(disks_detail[-1]))
             if disk.get("boot"):
                 boot_disk_type, boot_disk_gb = dtype, size
+                boot_disk_billed_gb = 0 if shared_elsewhere else size
             else:
                 # Several data disks: report the first one's type and the total size; data_disks keeps the size of
                 # each type so each is priced at its own rate.
                 if data_disk_gb == 0:
                     data_disk_type = dtype
                 data_disk_gb += size
-                data_disks[dtype] = data_disks.get(dtype, 0) + size
+                if not shared_elsewhere:
+                    data_disks[dtype] = data_disks.get(dtype, 0) + size
         scheduling = item.get("scheduling") if isinstance(item.get("scheduling"), dict) else {}
         spot = (str(scheduling.get("provisioningModel", "")).upper() == "SPOT"
                 or bool(scheduling.get("preemptible", False)))
@@ -212,9 +227,13 @@ def observe_fleet_items(
             "spot": spot,
             "boot_disk_type": boot_disk_type,
             "boot_disk_gb": boot_disk_gb,
+            "boot_disk_billed_gb": boot_disk_billed_gb,
             "data_disk_type": data_disk_type,
             "data_disk_gb": data_disk_gb,
+            # data_disks is the billed breakdown; data_disk_gb is everything attached (the VM's shape).
             "data_disks": data_disks,
+            "data_disks_attached_gb": data_disk_gb,
+            "shared_attachments": shared_attachments,
             "local_ssd_gb": local_ssd_gb,
             "unpriced_disk_performance": unpriced_performance,
             "regional_disks": regional_disks,
@@ -264,8 +283,10 @@ def observe_detached_disks(disk_details: Mapping[str, Any],
         role = fleet_role(name)
         if role is None or not detail.get("id"):
             continue
-        users = [str(u).rsplit("/", 1)[-1] for u in (detail.get("users") or [])]
-        if users and (snapshot_names is None or any(u in snapshot_names or fleet_role(u) is None for u in users)):
+        # Instance names are zonal: compare "<zone>/<name>" keys (from the users' self-links).
+        users = ["/".join(str(u).rstrip("/").split("/")[-3::2]) for u in (detail.get("users") or [])]
+        if users and (snapshot_names is None or any(u in snapshot_names or fleet_role(u.rsplit("/", 1)[-1]) is None
+                                                    for u in users)):
             # Used by a VM in this instance snapshot (its record bills it), or by a VM outside the fleet.
             continue
         # Otherwise any user is a fleet VM the instance listing (taken just before) has not shown yet: bill the disk
@@ -379,7 +400,8 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                                       + (observe_detached_disks(disk_types, frozenset(
                                           str(d.get("source", "")) for i in fleet_items
                                           for d in (i.get("disks") or []) if isinstance(d, dict)),
-                                          frozenset(str(i.get("name", "")) for i in items if isinstance(i, dict)))
+                                          frozenset(f"{str(i.get('zone', '')).rsplit('/', 1)[-1]}/{i.get('name', '')}"
+                                                    for i in items if isinstance(i, dict)))
                                          if types_known else []))
                 result.disks_listed = types_known
                 return result

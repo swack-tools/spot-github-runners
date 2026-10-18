@@ -608,16 +608,30 @@ def _is_seeded_build(record: dict[str, Any]) -> bool:
     if fingerprint is None or any(record.get(k) != v or type(record.get(k)) is not type(v)
                                   for k, v in fingerprint.items()):
         return False
+    # The original seeds always used whole-second UTC strings. A report may shift all three timestamps
+    # equally (keeping their gaps), so fractional or reformatted timestamps still establish a correction.
+    timestamps = [record.get(k) for k in ("requested_at", "finished_at", "delivered_at")]
+    if any(not isinstance(stamp, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp) for stamp in timestamps):
+        return False
     try:
-        requested, finished, delivered = (_iso_to_epoch(str(record[k]))
-                                          for k in ("requested_at", "finished_at", "delivered_at"))
+        requested, finished, delivered = (_iso_to_epoch(stamp) for stamp in timestamps)
     except (KeyError, TypeError, ValueError):
         return False
     return (finished - requested, delivered - finished) == SEEDED_RUST_BUILD_GAPS[build_id]
 
 
+# Normalization and OOM handling may add these fields to an unchanged seed. Any other extra field is
+# source evidence that the seed never supplied and must be preserved.
+SEED_EVENT_DERIVED_FIELDS = frozenset({
+    "failure_classification", "is_oom", "is_self_hosted_runner", "badge_text",
+    "handled", "acknowledged", "handled_at", "baseline_runners", "baseline_source",
+})
+
+
 def _seed_fields_match(record: dict[str, Any], fingerprint: dict[str, Any]) -> bool:
-    return all(record.get(k) == v and type(record.get(k)) is type(v) for k, v in fingerprint.items())
+    return (not (record.keys() - fingerprint.keys() - SEED_EVENT_DERIVED_FIELDS)
+            and all(record.get(k) == v and type(record.get(k)) is type(v) for k, v in fingerprint.items()))
 
 
 def _is_seeded_ci_run(record: dict[str, Any], reference: float | None) -> bool:
@@ -933,7 +947,8 @@ def _with_extra_disks(pricing: dict[str, Any], extra_disk_hourly: float) -> dict
 def _primary_data_disk_gb(obs: dict[str, Any]) -> int:
     """GiB of the observation's data disks of its primary data-disk type (other types are priced separately)."""
     by_type = obs.get("data_disks")
-    if isinstance(by_type, dict) and by_type:
+    if isinstance(by_type, dict) and (by_type or "data_disks_attached_gb" in obs):
+        # The billed breakdown (a disk shared with another fleet VM is billed there, not here).
         return int(by_type.get(str(obs.get("data_disk_type") or ""), 0) or 0)
     return int(obs.get("data_disk_gb") or 0)
 
@@ -1042,9 +1057,20 @@ def _disk_known(disk: dict[str, Any], known: frozenset[str]) -> bool:
     """True when another record already billed this disk: by immutable ID when the listing gives one (a reused
     name with a new ID is a new disk), else by source URL."""
     disk_id = str(disk.get("id") or "").strip()
+    source = str(disk.get("source") or "")
     if disk_id:
-        return f"id:{disk_id}" in known
-    return bool(disk.get("source")) and str(disk["source"]) in known
+        # By ID; or by source when the stored record only ever knew this disk by its source (its ID was never
+        # read, for example during a disk-listing outage). A source stored with a different ID is a reused name.
+        if f"id:{disk_id}" in known:
+            return True
+        if not source or f"srconly:{source}" not in known:
+            return False
+        # A disk created after the old VM vanished cannot be its retained attachment.
+        prefix = f"srcbound:{source}|"
+        bounds = [float(k[len(prefix):]) for k in known if k.startswith(prefix)]
+        created = disk.get("created_epoch")
+        return not _finite(created) or not bounds or float(created) <= min(bounds)
+    return bool(source) and source in known
 
 
 def _single_disk_all_in(disk: dict[str, Any], *, family: str, region: str, project: str,
@@ -1057,6 +1083,29 @@ def _single_disk_all_in(disk: dict[str, Any], *, family: str, region: str, proje
     return float(priced.get("disk_hourly_usd", 0.0) or 0.0) * (1.0 + tax_rate_percent / 100.0)
 
 
+def _record_disk_keys(record: dict[str, Any]) -> frozenset[str]:
+    """A record's disk identities: ``id:<id>`` keys, source aliases, and ``srconly:<source>`` for disks it knows
+    only by source (no ID was ever read)."""
+    sources = [k for k in (record.get("disk_sources") or []) if not str(k).startswith("id:")]
+    with_ids = set((record.get("disk_ids") or {}).keys())
+    # Source-only matching is restricted to an unresolved liability. An ordinary VM attachment, even on a
+    # live VM, cannot prove a later same-named disk with a newly learned ID is the same physical disk.
+    unresolved = bool(record.get("disk_liability_pending"))
+    aliases = [s for s in sources if unresolved and s not in with_ids]
+    bounds = ([f"srcbound:{s}|{float(record['deleted_epoch'])}" for s in aliases]
+              if _finite(record.get("deleted_epoch")) else [])
+    return frozenset(list(record.get("disk_sources") or []) + [f"srconly:{s}" for s in aliases] + bounds)
+
+
+
+def _billed_record_disk_keys(record: dict[str, Any]) -> frozenset[str]:
+    """Attachment metadata alone is not evidence that a record billed a shared disk."""
+    unowned = {key for d in record.get("disks_detail") or []
+               if isinstance(d, dict) and d.get("billing_owner") is False
+               for key in (_disk_key(d), str(d.get("source") or ""), f"srconly:{d.get('source', '')}")}
+    return _record_disk_keys(record) - unowned
+
+
 def _initial_disk_history(
     obs: dict[str, Any], *, region: str, family: str, project: str, tax_rate_percent: float, now: float,
 ) -> tuple[list[tuple[float, float, float]], float | None]:
@@ -1066,7 +1115,8 @@ def _initial_disk_history(
     the record's full disk rate) starts at the newest disk's creation. Without every creation time, nothing is
     backfilled: the open segment starts now.
     """
-    disks = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
+    disks = [d for d in obs.get("disks_detail") or []
+             if isinstance(d, dict) and d.get("billing_owner") is not False]
     if not disks:
         return [], None  # No per-disk evidence (older observations): the VM's creation bounds disk history.
     if not all(_finite(d.get("created_epoch")) for d in disks):
@@ -1103,7 +1153,7 @@ def _live_instance_record(
                 obs["data_disk_type"] = previous.get("data_disk_type") or obs.get("data_disk_type")
                 obs["data_disks"] = previous.get("data_disks") or obs.get("data_disks")
                 obs["unpriced_disk_performance"] = bool(previous.get("unpriced_disk_performance"))
-                obs["regional_disks"] = bool(previous.get("regional_disks"))
+                obs["regional_disks"] = bool(obs.get("regional_disks") or previous.get("regional_disks"))
             # Per attachment too: same source and size keeps its stored type, ID, creation, and auto-delete.
             known = {str(d.get("source")): d for d in previous.get("disks_detail") or []
                      if isinstance(d, dict) and d.get("source")}
@@ -1114,9 +1164,24 @@ def _live_instance_record(
                 old = known.get(str(d.get("source") or ""))
                 if old is not None and int(old.get("gb") or 0) == int(d.get("gb") or 0):
                     d = {**d, **{k: old.get(k) for k in ("type", "id", "created_epoch", "auto_delete")
-                                 if old.get(k) not in (None, "")}}
+                                 if old.get(k) not in (None, "")
+                                 and (k != "auto_delete" or not isinstance(d.get(k), bool))}}
                 merged.append(d)
             obs["disks_detail"] = merged
+            if merged and all("boot" in d for d in merged):
+                # Restore type evidence without restoring the former billing owner: ownership comes from this
+                # complete instance snapshot, even during a disk-listing outage.
+                billed_data: dict[str, int] = {}
+                obs["boot_disk_billed_gb"] = 0
+                for d in merged:
+                    if d.get("billing_owner") is False:
+                        continue
+                    if d["boot"]:
+                        obs["boot_disk_billed_gb"] += int(d.get("gb") or 0)
+                    else:
+                        kind = str(d.get("type") or "pd-balanced")
+                        billed_data[kind] = billed_data.get(kind, 0) + int(d.get("gb") or 0)
+                obs["data_disks"] = billed_data
             # Still unverified: a same-size disk may have been replaced by another type, so pricing stays incomplete.
     status = str(obs.get("status") or "UNKNOWN").upper()
     started = obs.get("last_start_epoch") or obs.get("created_epoch")
@@ -1130,7 +1195,7 @@ def _live_instance_record(
     provisioning = "spot" if obs.get("spot", True) else "ondemand"
     shape_keys = ("spot", "region", "machine_type", "vcpu", "ram_gib", "boot_disk_type", "boot_disk_gb",
                   "data_disk_type", "data_disk_gb", "data_disks", "local_ssd_gb", "unpriced_disk_performance",
-                  "regional_disks")
+                  "regional_disks", "boot_disk_billed_gb", "data_disks_attached_gb")
     reuse_pricing = (
         previous.get("pricing")
         if previous is not None and isinstance(previous.get("pricing"), dict)
@@ -1149,7 +1214,7 @@ def _live_instance_record(
         ram_gib=float(obs.get("ram_gib") or 0.0),
         cpu_platform=str(obs.get("cpu_platform") or ""),
         boot_disk_type=str(obs.get("boot_disk_type") or "pd-balanced"),
-        boot_disk_gb=int(obs.get("boot_disk_gb") or 0),
+        boot_disk_gb=int(obs.get("boot_disk_billed_gb", obs.get("boot_disk_gb")) or 0),
         data_disk_type=str(obs.get("data_disk_type") or "pd-balanced"),
         data_disk_gb=_primary_data_disk_gb(obs),
         runners_count=int(obs.get("runners_count") or 0),
@@ -1175,7 +1240,13 @@ def _live_instance_record(
         # Data disks of other types than the first are priced at their own rates.
         record["pricing"] = _with_secondary_disks(record["pricing"], obs, region=region,
                                                   family=record["family"], project=project)
+    record["boot_disk_gb"] = int(obs.get("boot_disk_gb") or 0)
+    if "boot_disk_billed_gb" in obs:
+        record["boot_disk_billed_gb"] = obs["boot_disk_billed_gb"]
     record["data_disks"] = obs.get("data_disks") or {}
+    if "data_disks_attached_gb" in obs:
+        record["data_disks_attached_gb"] = obs["data_disks_attached_gb"]
+    record["shared_attachments"] = obs.get("shared_attachments") or []
     record["disks_detail"] = [dict(d) for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
     # Disk identities: the immutable ID (kept from the previous record when this listing could not read it) and the
     # source URL as an alias, so a handoff is recognized by either.
@@ -1250,7 +1321,8 @@ def _live_instance_record(
     if previous is not None and _finite(deferred_at):
         # Disk history was deferred (first seen without disk creation times). Once every attachment has a creation
         # time, bill the deferred interval per disk from its creation (disks another record billed excepted).
-        disks_now = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict)]
+        disks_now = [d for d in obs.get("disks_detail") or []
+                     if isinstance(d, dict) and d.get("billing_owner") is not False]
         if disks_now and all(_finite(d.get("created_epoch")) for d in disks_now):
             backfill = [dict(d, created_epoch=float(deferred_at)) if _disk_known(d, known_disk_sources) else d
                         for d in disks_now]
@@ -1328,7 +1400,7 @@ def _live_instance_record(
             # Where the old disk rate ends: when the only change is added disks whose creation times are known
             # (and that no other record billed), at the newest one's creation; otherwise at this listing.
             own_keys = set(previous.get("disk_sources") or [])
-            added = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict)
+            added = [d for d in obs.get("disks_detail") or [] if isinstance(d, dict) and d.get("billing_owner") is not False
                      and not (_disk_key(d) in own_keys or str(d.get("source") or "") in own_keys)]
             split_at = now
             if added and all(_finite(d.get("created_epoch")) for d in added) \
@@ -1417,7 +1489,8 @@ def _live_instance_record(
         "disk_history_deferred_at": (
             None if disk_segments_backfill is not None
             else float(initial_disk_segment_start) if previous is None and initial_disk_segment_start is not None
-            and not all(_finite(d.get("created_epoch")) for d in obs.get("disks_detail") or [] if isinstance(d, dict))
+            and not all(_finite(d.get("created_epoch")) for d in obs.get("disks_detail") or []
+                        if isinstance(d, dict) and d.get("billing_owner") is not False)
             else (previous or {}).get("disk_history_deferred_at")),
     })
     usage = instance_usage(record, now)
@@ -1460,7 +1533,7 @@ def _retained_disks(record: dict[str, Any]) -> list[dict[str, Any]] | None:
     disks = record.get("disks_detail") or []
     if not disks or any(not isinstance(d, dict) or d.get("auto_delete") is None for d in disks):
         return None
-    return [d for d in disks if d.get("auto_delete") is False]
+    return [d for d in disks if d.get("auto_delete") is False and d.get("billing_owner") is not False]
 
 
 def _retained_pricing(record: dict[str, Any], *, tax_rate_percent: float, project: str,
@@ -1689,7 +1762,7 @@ def reconcile_instance_records(
                           for d in obs.get("disks_detail") or [] if isinstance(d, dict)
                           for key in (_disk_key(d), str(d.get("source") or "")) if key}
     # Disks some stored record already bills (or billed): a new record that takes one over starts it at the handoff.
-    known_disks = frozenset(src for r in existing if is_live_instance_record(r) for src in (r.get("disk_sources") or []))
+    known_disks = frozenset(key for r in existing if is_live_instance_record(r) for key in _billed_record_disk_keys(r))
     for record in existing:
         if not is_live_instance_record(record):
             continue
@@ -1701,7 +1774,10 @@ def reconcile_instance_records(
             seen.add(instance_id)
             records.append(_live_instance_record(
                 obs, project=project, now=now, previous=record, tax_overrides=tax_overrides,
-                known_disk_sources=known_disks - frozenset(record.get("disk_sources") or [])))
+                known_disk_sources=frozenset(
+                    key for other in existing if is_live_instance_record(other)
+                    and str(other.get("instance_id", "")) != instance_id
+                    for key in _billed_record_disk_keys(other))))
         elif not disks_listed and record.get("kind") == "disk" and record.get("status") != "DELETED":
             if set(record.get("disk_sources") or []) & observed_disk_keys:
                 # Even without the disk listing, a listed VM shows this disk attached: its record takes it over.
@@ -1710,7 +1786,26 @@ def reconcile_instance_records(
                 # The disk listing is unavailable: a detached disk is not seen, not gone. Keep it (still billing).
                 records.append(record)
         elif record.get("status") == "DELETED" and record.get("disk_liability_pending"):
-            if disks_listed:
+            attached = [d for observed_vm in observed if isinstance(observed_vm, dict)
+                        and observed_vm.get("kind") != "disk"
+                        for d in observed_vm.get("disks_detail") or [] if isinstance(d, dict)]
+            retained = _retained_disks(record)
+            moved = [d for d in retained or [] if any(
+                _disk_known(current_disk, _record_disk_keys(dict(record, disks_detail=[d],
+                    disk_sources=[_disk_key(d), str(d.get("source") or "")],
+                    disk_ids={str(d.get("source")): d["id"]} if d.get("id") else {})))
+                for current_disk in attached)]
+            transferred = bool(retained) and len(moved) == len(retained)
+            if not disks_listed and moved and not transferred:
+                out = copy.deepcopy(record)
+                pricing = out.get("pricing") or {}
+                _close_open_segments(out, pricing, now)
+                out["disks_detail"] = [dict(d, billing_owner=False) if d in moved else d
+                                       for d in out.get("disks_detail") or []]
+                out["pricing"] = _retained_pricing(out, project=project,
+                    tax_rate_percent=float(pricing.get("tax_rate_percent") or 0.0))
+                records.append(out)
+            elif disks_listed or transferred:
                 # The disk listing is back: the cache disk is either listed on its own now (its DETACHED record
                 # takes over from this moment) or gone. Either way this record stops billing it here.
                 records.append(dict(record, disk_liability_pending=False, disk_end_epoch=now))
@@ -1718,6 +1813,8 @@ def reconcile_instance_records(
                 records.append(record)
         elif record.get("status") == "DELETED":
             deleted = record.get("deleted_epoch")
+            if _finite(record.get("disk_end_epoch")):
+                deleted = max(float(deleted or 0), float(record["disk_end_epoch"]))
             if isinstance(deleted, (int, float)) and now - float(deleted) <= DELETED_INSTANCE_RETENTION_SECONDS:
                 records.append(record)
         else:
@@ -2522,7 +2619,14 @@ class DashboardStore:
                               and r.get("status") == "RUNNING" and r.get("role") == "cicd_runner"
                               and r.get("runners_count_known") is not False
                               and when is not None and float(r.get("started_epoch") or now) <= when)
-            computed = max(0, previous_slots - later + earlier_new)
+            # A replaced/stopped host can still have been part of the fleet when a late OOM occurred.
+            # Include that historical capacity instead of treating its replacement as net growth.
+            ended_after_event = sum(int(r.get("runners_count", 0) or 0) for r in previous
+                                    if isinstance(r, dict) and r.get("role") == "cicd_runner"
+                                    and r.get("status") != "RUNNING" and r.get("runners_count_known") is not False
+                                    and when is not None and float(r.get("started_epoch") or now) <= when
+                                    and (_instance_end_epoch(r) is None or _instance_end_epoch(r) >= when))
+            computed = max(0, previous_slots - later + earlier_new + ended_after_event)
             existing = evt.get("baseline_runners")
             evt["baseline_runners"] = min(int(existing), computed) if isinstance(existing, int) else computed
             evt["baseline_source"] = "inventory"
@@ -4220,7 +4324,7 @@ class DashboardStore:
                 ram_gib=float(inst.get("ram_gib", 64)),
                 region=str(inst["region"]),
                 boot_disk_type=str(inst.get("boot_disk_type", "hyperdisk-balanced")),
-                boot_disk_gb=int(inst.get("boot_disk_gb", 40)),
+                boot_disk_gb=int(inst.get("boot_disk_billed_gb", inst.get("boot_disk_gb", 40))),
                 data_disk_type=str(inst.get("data_disk_type", "hyperdisk-balanced")),
                 data_disk_gb=_primary_data_disk_gb(inst) if is_live_instance_record(inst)
                 else int(inst.get("data_disk_gb", 100)),
@@ -4421,6 +4525,8 @@ class DashboardStore:
                     deleted_epoch = inst.get("deleted_epoch")
                     end_ts = (float(deleted_epoch) if inst["status"] == "DELETED" and isinstance(deleted_epoch, (int, float))
                               and not inst.get("disk_liability_pending") else now_ts)
+                    if _finite(inst.get("disk_end_epoch")):
+                        end_ts = max(end_ts, float(inst["disk_end_epoch"]))
 
                 # Exclude deleted instances whose deletion occurred before the selected window
                 if is_deleted and end_ts < window_start_ts:
@@ -5544,6 +5650,8 @@ class DashboardStore:
             if inst is None:
                 raise ValueError("Source instance not found for VM template creation")
 
+            if inst.get("shared_attachments"):
+                raise ValueError("VMs with shared disk attachments cannot be copied to single-VM templates")
             if inst.get("kind") == "disk":
                 raise ValueError(f"{inst['name']} is a disk, not a VM; a VM template needs a VM as its source")
             if inst.get("disk_types_known") is False:
@@ -5785,6 +5893,7 @@ class DashboardStore:
                         # A host with several data-disk types cannot be described by one type and size.
                         (i for i in running_in_region
                          if len(i.get("data_disks") or {}) <= 1 and not int(i.get("local_ssd_gb") or 0)
+                         and not i.get("shared_attachments")
                          and not i.get("regional_disks") and not i.get("unpriced_disk_performance")
                          and i.get("disk_types_known") is not False), None)
                     if existing_cand is not None:
