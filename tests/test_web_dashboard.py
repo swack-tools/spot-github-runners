@@ -6088,6 +6088,25 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertEqual(instance_usage(retired, self.now)["cost_all_in"],
                          instance_usage(retired, self.now + 3600)["cost_all_in"])
 
+    def test_denied_disk_listing_preserves_current_attachment_auto_delete(self):
+        from lib.dashboard_server import _live_instance_record, _mark_instance_deleted
+
+        obs = fleet_observation("auto-delete-change", "builder-auto-delete-change", "us-south1-b", now=self.now)
+        obs["disks_detail"] = [{"source": "z/cache-auto-delete", "id": "91", "type": "pd-balanced", "gb": 100,
+                                "created_epoch": self.now - 7200, "auto_delete": True}]
+        previous = _live_instance_record(obs, project="p", now=self.now - 3600)
+        current = dict(obs, disk_types_known=False,
+                       disks_detail=[dict(obs["disks_detail"][0], id="", auto_delete=False)])
+        record = _live_instance_record(current, project="p", now=self.now, previous=previous)
+        self.assertFalse(record["disks_detail"][0]["auto_delete"])
+        deleted = _mark_instance_deleted(record, self.now, disks_pending=True, project="p")
+        self.assertTrue(deleted["disk_liability_pending"])
+        # The reverse change is authoritative too: newly auto-deleting storage leaves no liability.
+        changed_back = dict(current, disks_detail=[dict(current["disks_detail"][0], auto_delete=True)])
+        record = _live_instance_record(changed_back, project="p", now=self.now, previous=record)
+        self.assertTrue(record["disks_detail"][0]["auto_delete"])
+        self.assertFalse(_mark_instance_deleted(record, self.now, disks_pending=True, project="p")["disk_liability_pending"])
+
     def test_partial_disk_transfer_keeps_unmatched_liability_billing(self):
         from lib.dashboard_server import reconcile_instance_records, instance_usage
 
