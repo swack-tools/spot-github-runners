@@ -579,6 +579,10 @@ def enrich_rust_build_record(
         "cache_hits": hits,
         "cache_misses": misses,
         "total_crates": total_crates,
+        # Which counts were reported rather than derived (record_rust_build's merge prefers reported ones).
+        "reported_crate_counts": [k for k in ("cache_hits", "cache_misses", "total_crates")
+                                  if k in (record.get("reported_crate_counts") or [])
+                                  or (record.get("reported_crate_counts") is None and record.get(k) is not None)],
         "cache_hit_rate_percent": cache_hit_rate,
         "instance_name": instance_name,
         "zone": zone,

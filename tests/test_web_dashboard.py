@@ -2557,7 +2557,7 @@ class DashboardServerIntegrationTests(unittest.TestCase):
             },
         )["build"]
         self.assertEqual(failed_resp["status"], "FAILED")
-        self.assertEqual(failed_resp["compile_duration_seconds"], 0.0)
+        self.assertIsNone(failed_resp["compile_duration_seconds"])  # no timing reported
         self.assertIsNone(failed_resp["delivery_duration_seconds"])  # never delivered
         self.assertIsNone(failed_resp["cache_hits"])
         self.assertIsNone(failed_resp["peak_ram_gib"])
@@ -7465,6 +7465,9 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
             self.assertEqual(state["scaling_telemetry"], counters)
 
 
+from lib.rust_build_telemetry import _iso_to_epoch  # noqa: E402
+
+
 class RustBuildReportedFieldsTests(unittest.TestCase):
     """A recorded Rust build holds only what was reported; nothing stands in for a missing figure."""
 
@@ -7586,6 +7589,47 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         from lib.dashboard_ui_assets import DASHBOARD_HTML
 
         self.assertIn("A delivered build needs its compile and delivery seconds", DASHBOARD_HTML)
+
+    def test_active_compile_time_survives_partial_updates(self):
+        self.store.record_rust_build({"build_id": "rb-run", "status": "RUNNING", "compile_duration_seconds": 30.0})
+        kept = self.store.record_rust_build({"build_id": "rb-run", "cache_hits": 4})["build"]
+        self.assertEqual((kept["compile_duration_seconds"], kept["total_duration_seconds"]), (30.0, 30.0))
+        newer = self.store.record_rust_build({"build_id": "rb-run", "compile_duration_seconds": 45.0})["build"]
+        self.assertEqual((newer["compile_duration_seconds"], newer["total_duration_seconds"]), (45.0, 45.0))
+        # Finishing replaces the in-progress figure with the final timing instead of contradicting it.
+        requested = newer["requested_at"]
+        failed = self.store.record_rust_build({
+            "build_id": "rb-run", "status": "FAILED",
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_iso_to_epoch(requested) + 100))})["build"]
+        self.assertEqual(failed["compile_duration_seconds"], 100.0)
+
+    def test_failed_build_without_timing_stays_unknown(self):
+        build = self.store.record_rust_build({"build_id": "rb-fail", "status": "OOM_KILLED"})["build"]
+        self.assertIsNone(build["finished_at"])
+        self.assertEqual((build["compile_duration_seconds"], build["delivery_duration_seconds"],
+                          build["total_duration_seconds"]), (None, None, None))
+
+    def test_explicit_benchmark_survives_an_echoed_shape(self):
+        self.store.record_rust_build({"build_id": "rb-echo", "status": "DELIVERED", "total_duration_seconds": 10.0,
+                                      "instance_benchmark_score": 2000, "vcpu": 16, "cpu_time_seconds": 10.0})
+        echoed = self.store.record_rust_build({"build_id": "rb-echo", "vcpu": 16})["build"]
+        self.assertEqual((echoed["instance_benchmark_score"], echoed["cpu_points"]), (2000, 20000.0))
+        changed = self.store.record_rust_build({"build_id": "rb-echo", "vcpu": 8})["build"]
+        self.assertIsNone(changed["instance_benchmark_score"])
+
+    def test_reported_crate_count_wins_over_a_derived_one(self):
+        base = {"build_id": "rb-derive", "status": "DELIVERED", "total_duration_seconds": 30.0}
+        first = self.store.record_rust_build({**base, "cache_hits": 8, "cache_misses": 2})["build"]
+        self.assertEqual(first["reported_crate_counts"], ["cache_hits", "cache_misses"])
+        updated = self.store.record_rust_build({"build_id": "rb-derive", "cache_misses": 3})["build"]
+        self.assertEqual((updated["cache_hits"], updated["cache_misses"], updated["total_crates"]), (8, 3, 11))
+        self.assertEqual(updated["reported_crate_counts"], ["cache_hits", "cache_misses"])
+
+    def test_summary_counts_reported_zero_crate_builds(self):
+        self.store.record_rust_build({"build_id": "rb-zero", "status": "DELIVERED", "total_duration_seconds": 5.0,
+                                      "cache_hits": 0, "total_crates": 0})
+        summary = self.store.get_rust_builds_summary()
+        self.assertEqual((summary["total_cache_hits"], summary["overall_cache_hit_rate_percent"]), (0, 0.0))
 
     def test_summary_counts_hits_without_crate_totals(self):
         self.store.record_rust_build({"build_id": "rb-h", "status": "DELIVERED", "total_duration_seconds": 60.0,

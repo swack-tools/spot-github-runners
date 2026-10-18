@@ -6796,10 +6796,12 @@ class DashboardStore:
             hits = reported_values("cache_hits")
             total_hits = sum(hits) if hits else None
             with_crates = [b for b in completed_builds
-                           if b.get("cache_hits") is not None and b.get("total_crates")]
+                           if b.get("cache_hits") is not None and b.get("total_crates") is not None]
             total_crates = sum(b["total_crates"] for b in with_crates)
-            overall_hit_rate = (round(sum(b["cache_hits"] for b in with_crates) / total_crates * 100.0, 1)
-                                if total_crates else None)
+            if total_crates:
+                overall_hit_rate = round(sum(b["cache_hits"] for b in with_crates) / total_crates * 100.0, 1)
+            else:
+                overall_hit_rate = 0.0 if with_crates else None  # reported zero-crate builds count as 0%
             peaks = reported_values("peak_ram_gib")
             max_peak_ram = max(peaks) if peaks else None
             cpu_times = reported_values("cpu_time_seconds")
@@ -6866,15 +6868,19 @@ class DashboardStore:
                 if "total_duration_seconds" in payload
                 else (existing_build.get("total_duration_seconds") if not was_non_delivered else None)
             )
+            # A build still in progress keeps its reported stage durations across partial updates; once it
+            # finishes, its final timing replaces them. (An active build's total is its compile time, re-derived.)
+            keep_stage_durations = not was_non_delivered or (
+                is_unfinished and prev_status_norm in UNFINISHED_BUILD_STATUSES)
             raw_delivery = (
                 payload.get("delivery_duration_seconds")
                 if "delivery_duration_seconds" in payload
-                else (existing_build.get("delivery_duration_seconds") if not was_non_delivered else None)
+                else (existing_build.get("delivery_duration_seconds") if keep_stage_durations else None)
             )
             raw_compile = (
                 payload.get("compile_duration_seconds")
                 if "compile_duration_seconds" in payload
-                else (existing_build.get("compile_duration_seconds") if not was_non_delivered else None)
+                else (existing_build.get("compile_duration_seconds") if keep_stage_durations else None)
             )
             explicit_total = (
                 _finite_float(raw_duration, "total_duration_seconds", min_val=0.0)
@@ -6925,7 +6931,7 @@ class DashboardStore:
                     )
                     duration = max(0.0, round(fin_epoch_target - req_epoch_existing, 2))
                 else:
-                    duration = 0.0
+                    duration = None  # no timing reported: it stays unknown
                 delivery_sec = explicit_delivery if explicit_delivery is not None else 0.0
             else:
                 if explicit_total is not None:
@@ -6970,20 +6976,20 @@ class DashboardStore:
                 else (duration - delivery_sec if duration is not None and delivery_sec is not None else None)
             )
 
-            cache_hits, cache_misses, total_crates = _merged_crate_counts(payload, existing_build)
+            cache_hits, cache_misses, total_crates, reported_crates = _merged_crate_counts(payload, existing_build)
 
             if is_non_delivered:
                 req_at = (
                     payload.get("requested_at")
                     or existing_build.get("requested_at")
-                    or _iso_seconds_ago(duration if is_unsuccessful else 0, now_ts)
+                    or _iso_seconds_ago(duration if is_unsuccessful and duration is not None else 0, now_ts)
                 )
                 req_epoch = _iso_to_epoch(str(req_at))
                 if "finished_at" in payload:
                     fin_at = payload.get("finished_at")
                 elif existing_build.get("finished_at"):
                     fin_at = existing_build.get("finished_at")
-                elif is_unsuccessful:
+                elif is_unsuccessful and duration is not None:
                     fin_at = _iso_seconds_ago(0, max(now_ts, req_epoch + max(0.0, duration - delivery_sec)))
                 else:
                     fin_at = None
@@ -7082,10 +7088,11 @@ class DashboardStore:
             # An explicit benchmark score stands in for the host shape. A stored score is kept only while the
             # report leaves the shape alone, so a changed shape is scored again.
             shape_keys = ("cpu_platform", "vcpu", "machine_type")
+            shape_changed = any(payload.get(k) is not None and payload.get(k) != existing_build.get(k)
+                                for k in shape_keys)
             benchmark_score = (payload.get("instance_benchmark_score")
                                if payload.get("instance_benchmark_score") is not None
-                               else (None if any(payload.get(k) is not None for k in shape_keys)
-                                     else existing_build.get("instance_benchmark_score")))
+                               else (None if shape_changed else existing_build.get("instance_benchmark_score")))
 
             raw = {
                 "build_id": incoming_build_id or f"rb-{uuid.uuid4().hex[:8]}",
@@ -7113,6 +7120,7 @@ class DashboardStore:
                 "cache_hits": cache_hits,
                 "cache_misses": cache_misses,
                 "total_crates": total_crates,
+                REPORTED_CRATE_COUNTS_KEY: reported_crates,
                 "instance_name": reported("instance_name"),
                 "zone": reported("zone"),
                 "machine_type": reported("machine_type"),
@@ -7185,27 +7193,36 @@ class DashboardStore:
 
 
 CRATE_COUNT_KEYS = ("cache_hits", "cache_misses", "total_crates")
+REPORTED_CRATE_COUNTS_KEY = "reported_crate_counts"
 
 
-def _merged_crate_counts(payload: dict[str, Any], stored: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
-    """Crate counts of a build update: this report's counts over the stored ones, field by field.
+def _merged_crate_counts(
+    payload: dict[str, Any], stored: dict[str, Any],
+) -> tuple[int | None, int | None, int | None, list[str]]:
+    """Crate counts of a build update, plus which of them were reported rather than derived.
 
-    A stored count that contradicts the new report (for example, misses that no longer fit the new hits and the
-    stored total) is dropped and re-derived from the others; reported counts always win. A count nobody
-    reported stays None.
+    This report's counts win over the stored ones, field by field. A stored count that contradicts the new report
+    is dropped and derived again from the others, a previously derived count before a reported one (a build stored
+    before reported counts were tracked treats every stored count as reported). A count nobody reported stays None.
     """
     reported = {k: payload[k] for k in CRATE_COUNT_KEYS if payload.get(k) is not None}
     kept = {k: stored[k] for k in CRATE_COUNT_KEYS if k not in reported and stored.get(k) is not None}
+    stored_reported = stored.get(REPORTED_CRATE_COUNTS_KEY)
+    if not isinstance(stored_reported, list):
+        stored_reported = list(kept)
 
-    def counts(values: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
-        return _crate_counts(*(values.get(k) for k in CRATE_COUNT_KEYS))
+    def counts(values: dict[str, Any]) -> tuple[int | None, int | None, int | None, list[str]]:
+        hits, misses, total = _crate_counts(*(values.get(k) for k in CRATE_COUNT_KEYS))
+        sources = [k for k in CRATE_COUNT_KEYS if k in reported or (k in values and k in stored_reported)]
+        return hits, misses, total, sources
 
     try:
         return counts({**kept, **reported})
     except ValueError:
         if not kept:
             raise
-    for dropped in ("cache_misses", "cache_hits", "total_crates"):
+    order = sorted(("cache_misses", "cache_hits", "total_crates"), key=lambda k: k in stored_reported)
+    for dropped in order:
         if dropped in kept:
             try:
                 return counts({**{k: v for k, v in kept.items() if k != dropped}, **reported})
