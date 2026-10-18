@@ -87,7 +87,7 @@ class PhysicalDiskRoleTests(unittest.TestCase):
         disk=next(r for r in rows if r['instance_id']=='disk-shared')
         self.assertTrue(disk['storage_billing_ambiguous'])
         self.assertEqual(disk['storage_billing_ambiguous_roles'],['cicd_runner','rust_builder'])
-        rows=self.reload(rows,2)
+        self.reload(rows,2)
         self.store.state['scaling']['rust_builder']['include_disk_in_scale_budget']=True
         with patch('lib.dashboard_server.time.time',return_value=self.now+7200):
             self.assertIn('custom-cache',self.store._incomplete_cost_hosts('rust_builder'))

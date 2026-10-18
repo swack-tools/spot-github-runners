@@ -59,7 +59,8 @@ from .dashboard_auth import (
 )
 from .dashboard_deferred_history import append_deferred_context, deferred_segments
 from .dashboard_history import (normalize_unpriced_intervals, add_unpriced_interval, history_components,
-                                history_in_window, compact_unpriced_intervals)
+                                history_in_window, compact_unpriced_intervals, tax_history_components,
+                                split_legacy_tax_intervals)
 from .fleet_inventory import fleet_source_from_env, gce_epoch, observe_detached_disks, builder_shape_compatible
 from .patch_console import PatchConsole, PatchConsoleError, config_repo_token, executor_from_env, host_source_from_env
 from .edge_state import (
@@ -739,32 +740,108 @@ def _stopped_disk_hourly(pricing: dict[str, Any], *, include_tax: bool = True) -
     return disk * (1.0 + float(pricing.get("tax_rate_percent", 0.0) or 0.0) / 100.0) if include_tax else disk
 
 
+def _taxable_history_ranges(record: dict[str, Any], now: float) -> tuple[list[list[float]] | None, list[list[float]]]:
+    """Actual charged intervals used to decode the old component-agnostic tax reason."""
+    pricing = record.get("pricing") or {}
+    compute: list[list[float]] | None = []
+    if record.get("kind") != "disk":
+        for start, end, all_in, principal in _prior_runs(record):
+            if principal is None or principal > 0 or (all_in is not None and all_in > 0):
+                compute.append([start, end])
+        if float(pricing.get("compute_hourly_usd") or 0) > 0:
+            started = record.get("started_epoch")
+            if _finite(started):
+                start = max(float(started), float(record["compute_segment_start"])
+                            if _finite(record.get("compute_segment_start")) else float(started))
+                end = min(now, _current_run_end(record, now))
+                if end > start:
+                    compute.append([start, end])
+            else:
+                compute = None  # Missing timestamps cannot prove there was no taxable compute.
+    storage = [[start, end] for start, end, rate in _disk_segments(record) if rate > 0]
+    for key, value in (record.get("folded_cost_buckets") or {}).items():
+        if not isinstance(value, (list, tuple)) or len(value) != 3 or not all(_finite(v) for v in value):
+            continue
+        try:
+            start = float(key)
+        except (TypeError, ValueError):
+            continue
+        end = min(now, start + _record_bucket_span(record))
+        if not _finite(start) or end <= start:
+            continue
+        if record.get("kind") != "disk" and float(value[2]) > 0 and compute is not None:
+            compute.append([start, end])
+        if float(value[1]) > float(value[2]):
+            storage.append([start, end])
+    disk_end = record.get("disk_end_epoch")
+    if not _finite(disk_end):
+        disk_end = record.get("deleted_epoch") if record.get("status") == "DELETED"             and not record.get("disk_liability_pending") else now
+    end = min(now, float(disk_end)) if _finite(disk_end) else now
+    if float(pricing.get("disk_hourly_usd") or 0) > 0:
+        start = next((float(record[key]) for key in ("disk_segment_start", "disk_start_epoch", "started_epoch")
+                      if _finite(record.get(key))), None)
+        if start is not None and end > start:
+            storage.append([start, end])
+    for disk in list(record.get("disks_detail") or []) + list(record.get("unpaid_disk_details") or []):
+        if not isinstance(disk, dict) or disk.get("billing_owner") is False or int(disk.get("gb") or 0) <= 0:
+            continue
+        if _finite(disk.get("billing_deferred_since")) or _finite(record.get("disk_history_deferred_at")):
+            start = next((float(value) for value in (disk.get("created_epoch"), disk.get("billing_deferred_since"),
+                record.get("disk_history_deferred_at"), record.get("disk_start_epoch"), record.get("started_epoch"))
+                if _finite(value)), None)
+            stop = min(end, float(disk["billing_missing_since"])) if _finite(disk.get("billing_missing_since")) else end
+            if start is not None and stop > start:
+                storage.append([start, stop])
+    return compute, storage
+
+
+def _component_tax_history(record: dict[str, Any], raw: Any = None, *, now: float | None = None) -> Any:
+    raw = record.get("unpriced_history_intervals") if raw is None else raw
+    if not isinstance(raw, dict) or "fallback_tax" not in raw:
+        return raw
+    compute, storage = _taxable_history_ranges(record, time.time() if now is None else now)
+    return split_legacy_tax_intervals(raw, compute_intervals=compute, storage_intervals=storage)
+
+
 def _unpriced_history_in_window(record: dict[str, Any], start: float, end: float,
                                 *, include_storage: bool = True, include_tax: bool | None = None) -> bool:
     """Whether known missing historical charges overlap the selected cost components."""
-    return history_in_window(record.get("unpriced_history_intervals"), start, end, include_storage,
+    return history_in_window(_component_tax_history(record, now=end), start, end, include_storage,
                              include_tax=include_tax)
 
 
 def _save_unpriced_intervals(record: dict[str, Any], intervals: dict[str, Any], now: float) -> None:
+    intervals = _component_tax_history(record, intervals, now=now)
+    compute_tax, storage_tax = tax_history_components(intervals)
     recent, compute, storage = compact_unpriced_intervals(intervals, now, DELETED_INSTANCE_RETENTION_SECONDS)
     record["unpriced_history_intervals"] = recent
+    if compute_tax:
+        record["unpriced_compute_tax_lifetime_history"] = True
+    if storage_tax:
+        record["unpriced_storage_tax_lifetime_history"] = True
     if compute:
         record["unpriced_compute_lifetime_history"] = True
     if storage:
         record["unpriced_storage_lifetime_history"] = True
-    if compute or storage:
+    if compute or storage or compute_tax or storage_tax:
         record["unpriced_lifetime_history"] = True
 
 
-def _lifetime_history_components(record: dict[str, Any]) -> tuple[bool, bool]:
+def _lifetime_tax_components(record: dict[str, Any]) -> tuple[bool, bool]:
+    compute, storage = tax_history_components(_component_tax_history(record))
+    return (compute or bool(record.get("unpriced_compute_tax_lifetime_history")),
+            storage or bool(record.get("unpriced_storage_tax_lifetime_history")))
+
+
+def _lifetime_history_components(record: dict[str, Any], *, include_tax: bool = False) -> tuple[bool, bool]:
     compute, storage = history_components(record.get("unpriced_history_intervals"))
     compute = compute or bool(record.get("unpriced_compute_lifetime_history"))
     storage = storage or bool(record.get("unpriced_storage_lifetime_history"))
-    # Old states also used the generic flag for expired unpaid disk debt without interval bounds.
-    if record.get("unpriced_lifetime_history") and not (compute or storage):
+    compute_tax, storage_tax = _lifetime_tax_components(record)
+    # Old states also used this generic flag for expired unpaid disk debt without interval bounds.
+    if record.get("unpriced_lifetime_history") and not (compute or storage or compute_tax or storage_tax):
         storage = True
-    return compute, storage
+    return (compute or (include_tax and compute_tax), storage or (include_tax and storage_tax))
 
 
 def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previous: dict[str, Any] | None,
@@ -880,15 +957,29 @@ def _tax_unknown(record: dict[str, Any]) -> bool:
     return record.get("tax_rate_known") is False and not record.get("tax_rate_overridden")
 
 
+def _selected_tax_unknown(record: dict[str, Any], *, include_storage: bool) -> bool:
+    if not _tax_unknown(record):
+        return False
+    pricing = record.get("pricing") or {}
+    live_compute = (record.get("kind") != "disk" and not record.get("retained_only_pricing")
+                    and record.get("status") not in GCE_STOPPED_STATUSES | {"DELETED"}
+                    and float(pricing.get("compute_hourly_usd") or 0) > 0)
+    live_storage = (include_storage and (record.get("status") != "DELETED" or record.get("disk_liability_pending"))
+                    and (float(pricing.get("disk_hourly_usd") or 0) > 0
+                         or (record.get("status") == "SUSPENDED" and float(record.get("ram_gib") or 0) > 0)))
+    return bool(live_compute or live_storage)
+
+
 def _selected_pricing_complete(record: dict[str, Any], *, include_storage: bool, include_tax: bool = False) -> bool:
     compute, storage = _pricing_component_reasons(record)
-    return not compute and not (include_storage and storage) and not (include_tax and _tax_unknown(record))
+    return not compute and not (include_storage and storage) and not (
+        include_tax and _selected_tax_unknown(record, include_storage=include_storage))
 
 
 def _mark_pricing_completeness(record: dict[str, Any]) -> None:
     """Keep the all-in summary while component-specific consumers select their own costs."""
     compute, storage = _pricing_component_reasons(record)
-    tax = ["regional tax rate is unknown"] if _tax_unknown(record) else []
+    tax = ["regional tax rate is unknown"] if _selected_tax_unknown(record, include_storage=True) else []
     record["pricing_complete"] = not (compute or storage or tax)
     record["pricing_incomplete_reason"] = "; ".join(compute + storage + tax)
     record["lifetime_cost_complete"] = not (compute or storage or tax or record.get("unpriced_lifetime_history"))
@@ -1111,7 +1202,7 @@ def _remember_deferred_trust(record: dict[str, Any], disk: dict[str, Any], start
         if str(disk.get("type")) not in context.get("known_disk_types", []):
             add_unpriced_interval(intervals, "fallback_storage", begin, finish)
         if context.get("tax_rate_known") is False:
-            add_unpriced_interval(intervals, "fallback_tax", begin, finish)
+            add_unpriced_interval(intervals, "fallback_storage_tax", begin, finish)
     _save_unpriced_intervals(record, intervals, now)
 
 
@@ -1357,6 +1448,9 @@ def _live_instance_record(
             bounds.setdefault(str(disk["source"]), now)
     record["unpriced_lifetime_history"] = bool((previous or {}).get("unpriced_lifetime_history"))
     for component, unknown in zip(("compute", "storage"), _lifetime_history_components(previous or {})):
+        if unknown:
+            record[f"unpriced_{component}_lifetime_history"] = True
+    for component, unknown in zip(("compute_tax", "storage_tax"), _lifetime_tax_components(previous or {})):
         if unknown:
             record[f"unpriced_{component}_lifetime_history"] = True
     record["billed_disk_source_bounds"] = bounds
@@ -1738,6 +1832,11 @@ def _live_instance_record(
                                (previous.get("deleted_epoch") if not previous.get("disk_liability_pending") else None) or now))
             _remember_incomplete_pricing(record, previous, old_pricing, old_compute_start, old_run_end,
                 float(previous.get("disk_segment_start") or previous.get("disk_start_epoch") or now), old_disk_end)
+    if previous is None and _tax_unknown(record):
+        start = float(record.get("compute_segment_start") or record.get("started_epoch") or now)
+        _remember_incomplete_pricing(record, record, record.get("pricing") or {},
+            start, min(now, _current_run_end(record, now)),
+            float(record.get("disk_segment_start") or record.get("disk_start_epoch") or now), now)
     _snapshot_deferred_pricing(record, now, project)
     _mark_pricing_completeness(record)
     if role == "cicd_runner":
@@ -1905,7 +2004,7 @@ def _remember_incomplete_pricing(record: dict[str, Any], pricing_record: dict[st
                                   old_pricing: dict[str, Any], compute_start: float, compute_end: float,
                                   disk_start: float, disk_end: float) -> None:
     """Save trust bounds with closed fallback-priced intervals, independently of the new prospective price."""
-    if old_pricing.get("complete") is not False and pricing_record.get("pricing_complete") is not False:
+    if old_pricing.get("complete") is not False and pricing_record.get("pricing_complete") is not False             and not _tax_unknown(pricing_record):
         return
     compute_reasons, storage_reasons = _pricing_component_reasons(dict(pricing_record, pricing=old_pricing))
     compute_unknown = bool(compute_reasons)
@@ -1945,13 +2044,16 @@ def _remember_incomplete_pricing(record: dict[str, Any], pricing_record: dict[st
             continue
         add_unpriced_interval(intervals, reason, start, end)
     if _tax_unknown(pricing_record):
-        start, end = min(compute_start, disk_start), max(compute_end, disk_end)
-        if end > start:
-            add_unpriced_interval(intervals, "fallback_tax", start, end)
+        if (pricing_record.get("kind") != "disk" and float(old_pricing.get("compute_hourly_usd") or 0) > 0
+                and compute_end > compute_start):
+            add_unpriced_interval(intervals, "fallback_compute_tax", compute_start, compute_end)
+        if float(old_pricing.get("disk_hourly_usd") or 0) > 0 and disk_end > disk_start:
+            add_unpriced_interval(intervals, "fallback_storage_tax", disk_start, disk_end)
     _save_unpriced_intervals(record, intervals, max(compute_end, disk_end))
 
 
-def _close_open_segments(record: dict[str, Any], old_pricing: dict[str, Any], now: float) -> None:
+def _close_open_segments(record: dict[str, Any], old_pricing: dict[str, Any], now: float,
+                           *, pricing_record: dict[str, Any] | None = None) -> None:
     """Close a live record's open compute and disk intervals at ``old_pricing``'s rates up to ``now``."""
     compute_all_in, compute_only, disk_all_in = _pricing_rates(old_pricing)
     started = float(record.get("started_epoch") or now)
@@ -1965,7 +2067,8 @@ def _close_open_segments(record: dict[str, Any], old_pricing: dict[str, Any], no
     disks = _disk_segments(record)
     disk_open = max([float(record.get("disk_start_epoch") or started)] + [e for _s, e, _r in disks]
                     + ([float(record["disk_segment_start"])] if _finite(record.get("disk_segment_start")) else []))
-    _remember_incomplete_pricing(record, record, old_pricing, open_start, run_end, disk_open, now)
+    _remember_incomplete_pricing(record, pricing_record if pricing_record is not None else record,
+                                  old_pricing, open_start, run_end, disk_open, now)
     if now > disk_open:
         record.setdefault("disk_segments", []).append([disk_open, now, disk_all_in])
     record["disk_segment_start"] = now
@@ -4622,7 +4725,7 @@ class DashboardStore:
             # be trusted, and the owning profile can supply an explicit tax rate.
             own = budget_of(inst.get("role"))
             includes = bool(evaluated.get("include_taxes", False))
-            return _tax_unknown(inst) and includes and not own.get("override_regional_tax")
+            return _selected_tax_unknown(inst, include_storage=includes_storage) and includes and not own.get("override_regional_tax")
 
         return [
             str(inst.get("name")) for inst in self.state.get("instances", [])
@@ -5102,19 +5205,20 @@ class DashboardStore:
                 context_record = dict(inst, pricing=dict(cur_pricing, tax_rate_percent=tax_rate_pct))
                 repriced = _snapshot_deferred_pricing(context_record, self._clock(), self.project,
                                                       shared_live_pricing) or repriced
+            tax_trust_changed = old_record is not None and _tax_unknown(old_record) != _tax_unknown(inst)
             if id(inst) in debt_only_ids:
                 continue  # Closed VM rates remain historical; only its unresolved disk context advances.
             if inst.get("retained_only_pricing"):
                 # A deleted builder still billing its cache disk: reprice that disk alone (compute is closed).
                 new_pricing = _retained_pricing(inst, tax_rate_percent=tax_rate_pct, project=self.project,
                                                 live_pricing=shared_live_pricing)
-                if old_pricing is not None and _pricing_rates(old_pricing) != _pricing_rates(new_pricing):
-                    _close_open_segments(inst, old_pricing, self._clock())
+                if old_pricing is not None and (_pricing_rates(old_pricing) != _pricing_rates(new_pricing) or tax_trust_changed):
+                    _close_open_segments(inst, old_pricing, self._clock(), pricing_record=old_record)
                     repriced = True
                 elif old_pricing != new_pricing:
                     repriced = True
                 inst["pricing"] = new_pricing
-                if old_record is not None and old_pricing != new_pricing:
+                if old_record is not None and (old_pricing != new_pricing or tax_trust_changed):
                     self._remember_repriced_history(inst, old_record)
                 _mark_pricing_completeness(inst)
                 continue
@@ -5141,11 +5245,11 @@ class DashboardStore:
                     family=str(inst.get("family") or str(inst["machine_type"]).split("-", 1)[0]),
                     project=self.project, live_pricing=shared_live_pricing)
                 _mark_pricing_completeness(inst)
-                if old_record is not None and old_pricing != inst["pricing"]:
+                if old_record is not None and (old_pricing != inst["pricing"] or tax_trust_changed):
                     self._remember_repriced_history(inst, old_record)
-                if old_pricing is not None and _pricing_rates(old_pricing) != _pricing_rates(inst["pricing"]):
+                if old_pricing is not None and (_pricing_rates(old_pricing) != _pricing_rates(inst["pricing"]) or tax_trust_changed):
                     # New rates apply from now on: time already billed keeps the rates it had.
-                    _close_open_segments(inst, old_pricing, self._clock())
+                    _close_open_segments(inst, old_pricing, self._clock(), pricing_record=old_record)
                     repriced = True
                 elif old_pricing != inst["pricing"] or old_completeness != (
                         inst.get("pricing_complete"), inst.get("pricing_incomplete_reason")):
@@ -5413,8 +5517,8 @@ class DashboardStore:
                     "total_cost_in_window_usd": total_cost_in_window,
                     "lifetime_cost_selected_mode_usd": lifetime_cost,
                     "lifetime_selected_cost_complete": bool(_selected_pricing_complete(inst, include_storage=include_disk_and_tax, include_tax=include_disk_and_tax)
-                        and not _lifetime_history_components(inst)[0]
-                        and not (include_disk_and_tax and _lifetime_history_components(inst)[1])),
+                        and not _lifetime_history_components(inst, include_tax=include_disk_and_tax)[0]
+                        and not (include_disk_and_tax and _lifetime_history_components(inst, include_tax=True)[1])),
                 }
 
                 if q:

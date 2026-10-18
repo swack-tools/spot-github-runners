@@ -435,7 +435,6 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
     It raises when any zone is unreachable: a partial listing must never make a VM look deleted.
     """
     shape_cache: dict[tuple[str, str], dict[str, Any]] = {}
-    disk_listing = {"ok_before": False}
 
     def source() -> list[dict[str, Any]]:
         import asyncio
@@ -457,14 +456,12 @@ def gce_fleet_source(project: str) -> Callable[[], list[dict[str, Any]]]:
                 try:
                     # Always: a fleet disk can outlive the last fleet VM (a builder cache disk) and still bill.
                     disk_types = await compute_api.list_disk_types(api, auth.project)
-                    disk_listing["ok_before"] = True
                 except Exception as exc:
-                    if disk_listing["ok_before"] or not _permission_denied(exc):
-                        # Transient (or after a restart, when this process has not listed disks yet but stored
-                        # records may hold real types): fail the whole listing so known types are not replaced.
+                    if not _permission_denied(exc):
+                        # Transient failures still reject the whole refresh rather than publishing a partial view.
                         raise RuntimeError(f"disk listing failed: {type(exc).__name__}: {exc}") from exc
-                    # No compute.disks.list (HTTP 403): disk types fall back to the default, flagged as unknown so
-                    # stored types are kept and new records are not priced as complete.
+                    # Permission can be revoked after a successful listing. Keep the current VM snapshot;
+                    # unknown disk types and the absent catalog let reconciliation preserve earlier evidence.
                     types_known = False
                 wanted = {(str(i.get("zone", "")).rsplit("/", 1)[-1], str(i.get("machineType", "")).rsplit("/", 1)[-1])
                           for i in fleet_items}

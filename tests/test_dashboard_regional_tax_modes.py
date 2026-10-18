@@ -75,7 +75,8 @@ class RegionalTaxModes(unittest.TestCase):
         with patch('lib.dashboard_server.fetch_live_spot_pricing',return_value=self.live):
             self.store._refresh_instances_pricing(live=True)
         record=self.store.state['instances'][0]
-        self.assertIn('fallback_tax',record['unpriced_history_intervals'])
+        self.assertIn('fallback_compute_tax',record['unpriced_history_intervals'])
+        self.assertIn('fallback_storage_tax',record['unpriced_history_intervals'])
         self.assertNotIn('fallback_compute',record['unpriced_history_intervals'])
         self.assertNotIn('fallback_storage',record['unpriced_history_intervals'])
         self.assertEqual(self.mode(disks=True,taxes=False),[])
