@@ -109,18 +109,46 @@ def observe_fleet_items(
     disk_types = disk_types or {}
     shapes = shapes or {}
     observed: list[dict[str, Any]] = []
-    # A persistent disk attached to several fleet VMs (read-only or multi-writer) is one disk: bill it once, on the
-    # first VM in the listing that has it.
+    # A shared disk bills once. Select its role before choosing a stable owner within that role, so arbitrary
+    # instance IDs cannot move explicitly attributed storage between the runner and builder budgets.
     billed_disks: set[str] = set()
-    fleet_items = [vm for vm in items if isinstance(vm, dict) and isinstance(vm.get("name"), str)
-                   and fleet_role(vm["name"]) is not None and vm.get("id")]
+    fleet_items = sorted(
+        [vm for vm in items if isinstance(vm, dict) and isinstance(vm.get("name"), str)
+         and fleet_role(vm["name"]) is not None and str(vm.get("id") or "").strip()],
+        key=lambda vm: (str(vm["id"]), vm["name"]))
     attachment_counts: dict[str, int] = {}
+    disk_participants: dict[str, list[tuple[tuple[str, str], str]]] = {}
+    disk_roles: dict[str, set[str]] = {}
     for vm in fleet_items:
         for disk in vm.get("disks") or []:
-            if isinstance(disk, dict) and disk.get("source") and disk.get("type") != "SCRATCH":
-                identity = str(_disk_detail(disk_types, str(disk["source"])).get("id") or disk["source"])
+            if (isinstance(disk, dict) and disk.get("source")
+                    and str(disk.get("type", "")).upper() != "SCRATCH"):
+                source = str(disk["source"])
+                detail = _disk_detail(disk_types, source)
+                identity = str(detail.get("id") or source)
                 attachment_counts[identity] = attachment_counts.get(identity, 0) + 1
-    for item in sorted(fleet_items, key=lambda vm: (str(vm.get("id") or ""), str(vm.get("name") or ""))):
+                disk_participants.setdefault(identity, []).append(((str(vm["id"]), vm["name"]),
+                                                                    fleet_role(vm["name"])))
+                # Catalog name and source identify the actual disk. deviceName is only an attachment alias;
+                # disk labels are not in the API projection and cannot establish ownership here.
+                disk_name = str(detail.get("name") or source.rstrip("/").rsplit("/", 1)[-1])
+                named_role = ("cicd_runner" if disk_name == "runner-data" or disk_name.startswith("runner-data-")
+                              else fleet_role(disk_name))
+                if named_role:
+                    disk_roles.setdefault(identity, set()).add(named_role)
+    billing_owners: dict[str, tuple[str, str]] = {}
+    ambiguous_disks: set[str] = set()
+    for identity, participants in disk_participants.items():
+        candidates = participants
+        if len({role for _, role in participants}) > 1:
+            named_roles = disk_roles.get(identity, set())
+            candidates = [p for p in participants if p[1] in named_roles] if len(named_roles) == 1 else []
+            if not candidates:
+                # Keep fleet burn deduplicated, but every participant must fail closed for role storage budgets.
+                ambiguous_disks.add(identity)
+                candidates = participants
+        billing_owners[identity] = candidates[0][0]
+    for item in fleet_items:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             continue
         name = item["name"]
@@ -146,6 +174,7 @@ def observe_fleet_items(
         unpriced_performance = False
         regional_disks = False
         unresolved_disks = False
+        storage_billing_ambiguous = False
         # Each persistent disk with its own creation time, so history before a later-attached disk is not billed
         # at its rate.
         disks_detail: list[dict[str, Any]] = []
@@ -161,9 +190,12 @@ def observe_fleet_items(
                 continue
             detail = _disk_detail(disk_types, str(disk.get("source", "")))
             identity = str(detail.get("id") or "") or str(disk.get("source", "") or "")
-            shared_elsewhere = bool(identity) and identity in billed_disks
-            if identity:
+            shared_elsewhere = bool(identity) and (
+                identity in billed_disks
+                or billing_owners.get(identity, (str(item["id"]), name)) != (str(item["id"]), name))
+            if identity and not shared_elsewhere:
                 billed_disks.add(identity)
+            storage_billing_ambiguous = storage_billing_ambiguous or identity in ambiguous_disks
             if disk_types_known and not detail.get("type"):
                 # The disk listing did not cover this attachment (for example a disk created between the two
                 # listings): its type is unknown, not the default.
@@ -238,6 +270,7 @@ def observe_fleet_items(
             "data_disks": data_disks,
             "data_disks_attached_gb": data_disk_gb,
             "shared_attachments": shared_attachments,
+            "storage_billing_ambiguous": storage_billing_ambiguous,
             "local_ssd_gb": local_ssd_gb,
             "unpriced_disk_performance": unpriced_performance,
             "regional_disks": regional_disks,

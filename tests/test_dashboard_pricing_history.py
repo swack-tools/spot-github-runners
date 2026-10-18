@@ -126,7 +126,7 @@ class PricingHistoryTests(unittest.TestCase):
         record = {}
         _remember_incomplete_pricing(record, previous,
             {"complete": False, "disk_rate_unknown": ["unsupported-cache"]}, 0, 0, 0, 3600)
-        self.assertEqual(record["unpriced_history_intervals"]["fallback_storage"], [0, 3600])
+        self.assertEqual(record["unpriced_history_intervals"]["fallback_storage"], [[0, 3600]])
         self.assertTrue(record["unpriced_lifetime_history"])
         # Debt for the only unknown disk remains recoverable, without manufacturing a permanent history hold.
         previous["disks_detail"] = [dict(pending, type="unsupported-cache")]
@@ -150,7 +150,7 @@ class PricingHistoryTests(unittest.TestCase):
                 else:
                     previous[flag] = 1
                 _remember_incomplete_pricing(current, previous, {}, 0, 0, 0, 3600)
-                self.assertEqual(current["unpriced_history_intervals"]["fallback_storage"], [0, 3600])
+                self.assertEqual(current["unpriced_history_intervals"]["fallback_storage"], [[0, 3600]])
 
     def test_retirement_keeps_unsupported_boot_history_when_cache_rate_is_complete(self):
         obs = self.observation(boot_disk_type="unsupported-boot", boot_disk_gb=40)
@@ -163,7 +163,7 @@ class PricingHistoryTests(unittest.TestCase):
         self.assertTrue(retired["pricing_complete"])
         self.assertFalse(retired["lifetime_cost_complete"])
         self.assertEqual(retired["unpriced_history_intervals"]["fallback_storage"],
-                         [self.now - 7200, self.now + 3600])
+                         [[self.now - 7200, self.now + 3600]])
         self.assertNotIn("fallback_compute", retired["unpriced_history_intervals"])
 
     def test_all_auto_deleted_disks_keep_recent_unknown_history_in_budget_holds(self):
@@ -175,7 +175,7 @@ class PricingHistoryTests(unittest.TestCase):
         retired = _mark_instance_deleted(record, self.now + 3600, disks_pending=True, project="p")
         self.assertFalse(retired["disk_liability_pending"])
         self.assertFalse(retired["lifetime_cost_complete"])
-        self.assertEqual(retired["unpriced_history_intervals"]["fallback_storage"][1], self.now + 3600)
+        self.assertEqual(retired["unpriced_history_intervals"]["fallback_storage"][0][1], self.now + 3600)
         store = self.store()
         store.state["instances"] = [retired]
         with patch("lib.dashboard_server.time.time", return_value=self.now + 7200):
@@ -193,7 +193,7 @@ class PricingHistoryTests(unittest.TestCase):
         record = _live_instance_record(obs, project="p", now=self.now)
         retired = _mark_instance_deleted(record, self.now + 3600, disks_pending=False, project="p")
         self.assertEqual(retired["unpriced_history_intervals"]["fallback_compute"],
-                         [self.now - 7200, self.now - 3600])
+                         [[self.now - 7200, self.now - 3600]])
 
     def test_resolved_liability_keeps_uncertain_history_through_its_storage_end(self):
         from lib.dashboard_server import reconcile_instance_records, instance_usage
@@ -209,7 +209,7 @@ class PricingHistoryTests(unittest.TestCase):
         resolved = rows[0]
         self.assertFalse(resolved["disk_liability_pending"])
         self.assertEqual(resolved["disk_end_epoch"], end)
-        self.assertEqual(resolved["unpriced_history_intervals"]["fallback_storage"][1], end)
+        self.assertEqual(resolved["unpriced_history_intervals"]["fallback_storage"][0][1], end)
         self.assertAlmostEqual(instance_usage(resolved, end)["cost_all_in"], expected_cost, places=6)
         self.assertFalse(resolved["lifetime_cost_complete"])
 
