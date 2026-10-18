@@ -404,8 +404,8 @@ LIFECYCLE_ACTIONS_DISABLED_MESSAGE = (
 #
 # Earlier versions seeded demo Rust builds, GitHub CI failure runs, a journal OOM event, and job counters into the
 # default state, which then persisted to the state file and the Cloudflare KV snapshot and showed as real. Loading
-# a state without the migration marker (one written by such a version) drops these exact records and resets the
-# counters when they still hold the seeded values. A record matches only when its id and the stable fields every
+# a state without the migration marker (one written by such a version) drops these exact records. Legacy job
+# counters have no source provenance and remain as reported. A record matches only when its id and the fields every
 # seeded version gave it all match, so a real report merged into a seeded row survives. The default state carries
 # the marker, so later loads never touch telemetry reported after the migration. The active slot then commits the
 # migrated state as a new state_version (DashboardStore.commit_demo_telemetry_migration).
@@ -568,7 +568,6 @@ SEEDED_BUILD_REQUEST_OFFSETS = {
     "rb-20261015-001": 920, "rb-20261015-002": 2450, "rb-20261015-003": 4800,
     "rb-20261015-004": 7600, "rb-20261015-005": 11200,
 }
-SEEDED_JOB_COUNTERS = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
 
 
 def demo_telemetry_migrated(state: dict[str, Any]) -> bool:
@@ -672,7 +671,7 @@ def _original_seed_reference(state: dict[str, Any]) -> float | None:
 
 
 def drop_seeded_demo_telemetry(state: dict[str, Any], *, source_state: dict[str, Any] | None = None) -> int:
-    """Remove seeded demo telemetry from ``state`` in place; returns how many records or counters it dropped."""
+    """Remove seeded demo telemetry from ``state`` in place; returns how many records it dropped."""
     dropped = 0
     reference = _original_seed_reference(state if source_state is None else source_state)
     builds = state.get("rust_builds")
@@ -694,11 +693,8 @@ def drop_seeded_demo_telemetry(state: dict[str, Any], *, source_state: dict[str,
             kept = [r for r in records if not (isinstance(r, dict) and is_seed(r, reference))]
             dropped += len(records) - len(kept)
             telem[key] = kept
-    # Values alone cannot establish provenance: real reported counters can equal the demo tuple.
-    if dropped and all(telem.get(k) == v and type(telem.get(k)) is int for k, v in SEEDED_JOB_COUNTERS.items()):
-        for key in SEEDED_JOB_COUNTERS:
-            telem[key] = 0
-        dropped += len(SEEDED_JOB_COUNTERS)
+    # Old partial reports could update counters while leaving all seeded event lists untouched. Neither the
+    # numeric tuple nor the presence of old seeds proves the counters are demo data; preserve every saved value.
     return dropped
 
 
@@ -2795,7 +2791,7 @@ class DashboardStore:
                 self.state = previous
             raise ValueError(f"invalid dashboard state: {type(exc).__name__}: {exc}") from exc
         if dropped_seeds:
-            LOG.warning("Dropped %d seeded demo telemetry record(s) and counter(s) from the dashboard state",
+            LOG.warning("Dropped %d seeded demo telemetry record(s) from the dashboard state",
                         dropped_seeds)
 
     def commit_demo_telemetry_migration(self) -> bool:

@@ -507,9 +507,10 @@ GitHub CI failure runs, journal OOM events, or job counters.
     by the unchanged saved presets. If that time cannot be recovered, these events stay rather than risking a
     reported correction. Additional source evidence, such as a log hash or cgroup path, also keeps the
     event; only known classification and handling fields may be added to an unchanged seed.
-- The migration resets the job counters to 0 only when it also removes a confirmed seeded record and all
-  three counters still hold the seeded values, 14 jobs in the past hour, 7 provisioned, and 3 queued. Counter
-  values alone don't prove demo provenance, so the tuple stays as reported when no seed record is removed.
+- The migration preserves all saved job counters, including the old demo tuple of 14 jobs in the past
+  hour, 7 provisioned, and 3 queued. Earlier versions stored no provenance for counters: a fresh partial
+  report could produce that tuple while leaving old demo events untouched. There is no way to prove the
+  saved counters are still demo data. New states start at 0; later reports replace the saved counters.
 - The drop keeps the loaded `state_version` and sets `demo_telemetry_migration_pending` in the saved
   state, so a restart doesn't lose it. The active slot then commits the migrated state as the next
   `state_version` through the same checks as any change, and publishes it to KV. Any new version clears

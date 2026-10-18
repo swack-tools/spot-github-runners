@@ -7080,7 +7080,7 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in telem["github_oom_runs"]], ["gh-ci-real0001"])
         self.assertEqual([(e["id"], e["instance_name"]) for e in telem["journal_oom_events"]],
                          [("oom-journal-01", "oxidex-runners-real-1")])
-        self.assertEqual((telem["jobs_ran_past_hour"], telem["provisioned_jobs"], telem["queued_jobs"]), (0, 0, 0))
+        self.assertEqual((telem["jobs_ran_past_hour"], telem["provisioned_jobs"], telem["queued_jobs"]), (14, 7, 3))
 
     def test_default_state_seeds_no_telemetry(self):
         from lib.dashboard_server import default_dashboard_state
@@ -7210,7 +7210,7 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
                 for key in ("requested_at", "finished_at", "delivered_at"):
                     stamp = datetime.fromisoformat(build[key].replace("Z", "+00:00")).timestamp()
                     build[key] = datetime.fromtimestamp(stamp + shift, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                self.assertEqual(drop_seeded_demo_telemetry(state), 11)
+                self.assertEqual(drop_seeded_demo_telemetry(state), 8)
                 self.assertEqual(state["rust_builds"], [build])
                 self.assertEqual(state["scaling_telemetry"]["journal_oom_events"], [])
 
@@ -7245,13 +7245,29 @@ class SeededTelemetryMigrationTests(unittest.TestCase):
         self.assertEqual(len(self.store.state["rust_builds"]), 5)
         self.assertEqual(self.store.state["scaling_telemetry"]["queued_jobs"], 3)
 
+    def test_fresh_partial_counter_report_survives_even_with_old_seed_events(self):
+        from lib.dashboard_server import DashboardStore
+
+        # Simulate the old deployment: its report path wrote no migration marker and left omitted event lists.
+        self.store.state = self._seeded_raw_state()
+        counters = {"jobs_ran_past_hour": 14, "provisioned_jobs": 7, "queued_jobs": 3}
+        self.store.update_scaling({"telemetry": counters})
+        before = json.loads(self.state_file.read_text(encoding="utf-8"))
+        self.assertNotIn("demo_telemetry_migration", before)
+        self.assertEqual(len(before["scaling_telemetry"]["github_oom_runs"]), 4)
+        with self.assertLogs("spot_dashboard", "WARNING"):
+            reloaded = DashboardStore(state_path=self.state_file)
+        self.addCleanup(reloaded.close)
+        self.assertEqual(len(reloaded.state["scaling_telemetry"]["github_oom_runs"]), 1)
+        self.assertEqual({key: reloaded.state["scaling_telemetry"][key] for key in counters}, counters)
+
     def test_extra_event_evidence_survives_legacy_cleanup(self):
         from lib.dashboard_server import drop_seeded_demo_telemetry
 
         state = seeded_demo_telemetry()
         state["scaling_telemetry"]["github_oom_runs"][0]["log_sha256"] = "evidence-sha256"
         state["scaling_telemetry"]["journal_oom_events"][0]["cgroup_path"] = "/jobs/actual-job"
-        self.assertEqual(drop_seeded_demo_telemetry(state), 10)  # 5 builds, 2 CI runs, 3 counters
+        self.assertEqual(drop_seeded_demo_telemetry(state), 7)  # 5 builds, 2 CI runs
         self.assertEqual(len(state["scaling_telemetry"]["github_oom_runs"]), 1)
         self.assertEqual(len(state["scaling_telemetry"]["journal_oom_events"]), 1)
 
