@@ -341,8 +341,10 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   be read also fails the refresh, so no VM is priced without its memory.
 - A listed VM shows its Compute Engine status: `RUNNING`, or `TERMINATED`, `STOPPED`, or `SUSPENDED`
   after a Spot preemption or a manual stop. A stopped VM stops adding compute cost at its
-  `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted. When a VM starts
-  again, its earlier running intervals stay in its runtime and window spend. Only `RUNNING` VMs count
+  `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
+  that disk-only rate. When a VM starts again, its earlier running intervals stay in its runtime and
+  window spend. When its machine type or disks change, the time before the change keeps the earlier
+  rates. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
   toward the runner and builder telemetry, but the disks of stopped VMs count against the scaling
   budgets. Hiding deleted instances doesn't hide stopped VMs, because they still exist. The listing
   carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.

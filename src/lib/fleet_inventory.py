@@ -98,6 +98,7 @@ def observe_fleet_items(
             vcpu, ram_gib = _vcpu_from_machine_type(machine_type), 0.0
         boot_disk_type, boot_disk_gb = DEFAULT_DISK_TYPE, 0
         data_disk_type, data_disk_gb = DEFAULT_DISK_TYPE, 0
+        data_disks: dict[str, int] = {}
         for disk in item.get("disks", []) if isinstance(item.get("disks"), list) else []:
             if not isinstance(disk, dict):
                 continue
@@ -107,10 +108,12 @@ def observe_fleet_items(
             if disk.get("boot"):
                 boot_disk_type, boot_disk_gb = dtype, size
             else:
-                # Several data disks: report the type of the first and their total size.
+                # Several data disks: report the first one's type and the total size; data_disks keeps the size of
+                # each type so each is priced at its own rate.
                 if data_disk_gb == 0:
                     data_disk_type = dtype
                 data_disk_gb += size
+                data_disks[dtype] = data_disks.get(dtype, 0) + size
         scheduling = item.get("scheduling") if isinstance(item.get("scheduling"), dict) else {}
         spot = (str(scheduling.get("provisioningModel", "")).upper() == "SPOT"
                 or bool(scheduling.get("preemptible", False)))
@@ -142,6 +145,7 @@ def observe_fleet_items(
             "boot_disk_gb": boot_disk_gb,
             "data_disk_type": data_disk_type,
             "data_disk_gb": data_disk_gb,
+            "data_disks": data_disks,
             "runners_count": runners_count,
             "runner_vcpu": runner_vcpu,
             "runner_ram_gib": runner_ram_gib,

@@ -4436,6 +4436,96 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         records, _changed = reconcile_instance_records(deleted, [], project="p", now=self.now)
         self.assertEqual(len(records), 450)
 
+    def test_many_restarts_inside_window_all_count(self):
+        for i in range(60):
+            start_ago = 700.0 - 10.0 * i
+            self.fleet = [fleet_observation("3000", "oxidex-runners-flap-1", "us-south1-a",
+                                            started_hours_ago=start_ago, now=self.now)]
+            self.store.refresh_fleet_inventory()
+            self.fleet = [fleet_observation("3000", "oxidex-runners-flap-1", "us-south1-a", status="TERMINATED",
+                                            started_hours_ago=start_ago, stopped_hours_ago=start_ago - 5.0,
+                                            now=self.now)]
+            self.store.refresh_fleet_inventory()
+        rec = self._record("oxidex-runners-flap-1")
+        self.assertEqual(len(rec["prior_runs"]), 59)  # The 60th run is the current (stopped) one.
+        row = next(r for r in self.store.query_instances(window_hours=744)["instances"]
+                   if r["name"] == "oxidex-runners-flap-1")
+        self.assertAlmostEqual(row["hours_in_window"], 300.0, delta=0.1)
+
+    def test_stopped_row_shows_disk_only_active_rate(self):
+        self.fleet = [fleet_observation("3100", "builder-oxidex-rate-1", "us-south1-b", status="TERMINATED",
+                                        started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)]
+        self.store.refresh_fleet_inventory()
+        row = self.store.query_instances()["instances"][0]
+        pricing = row["pricing"]
+        disk_all_in = pricing["disk_hourly_usd"] * (1 + pricing["tax_rate_percent"] / 100.0)
+        self.assertAlmostEqual(row["active_hourly_usd"], disk_all_in, delta=0.0001)
+        self.assertLess(row["active_hourly_usd"], pricing["total_hourly_usd"])
+        compute_only = self.store.query_instances(include_disk_and_tax=False)["instances"][0]
+        self.assertEqual(compute_only["active_hourly_usd"], 0.0)
+
+    def test_each_data_disk_type_is_priced_at_its_rate(self):
+        from lib.fleet_inventory import observe_fleet_items
+
+        items = [{"id": "3200", "name": "builder-oxidex-disks-1", "zone": "zones/us-south1-b", "status": "RUNNING",
+                  "machineType": "machineTypes/n4-highcpu-16",
+                  "disks": [{"boot": True, "diskSizeGb": "40", "source": "d/boot"},
+                            {"boot": False, "diskSizeGb": "100", "source": "d/ssd"},
+                            {"boot": False, "diskSizeGb": "500", "source": "d/std"}]}]
+        obs = observe_fleet_items(items, disk_types={"d/boot": "pd-balanced", "d/ssd": "pd-ssd", "d/std": "pd-standard"},
+                                  shapes={("us-south1-b", "n4-highcpu-16"): {"vcpu": 16, "ram_gib": 32.0}})
+        self.assertEqual(obs[0]["data_disks"], {"pd-ssd": 100, "pd-standard": 500})
+        self.assertEqual((obs[0]["data_disk_type"], obs[0]["data_disk_gb"]), ("pd-ssd", 600))
+        self.fleet = obs
+        with unittest.mock.patch("lib.dashboard_models.fetch_live_spot_pricing", return_value={}):
+            self.store.refresh_fleet_inventory()
+            rec = self._record("builder-oxidex-disks-1")
+            tax = rec["pricing"]["tax_rate_percent"]
+            common = dict(family="n4", vcpu=16, ram_gib=32.0, region="us-south1", boot_disk_type="pd-balanced",
+                          boot_disk_gb=40, tax_rate_percent=tax, machine_type="n4-highcpu-16")
+            primary = calculate_spot_pricing(**common, data_disk_type="pd-ssd", data_disk_gb=100)
+            standard = calculate_spot_pricing(family="n4", vcpu=0, ram_gib=0.0, region="us-south1",
+                                              boot_disk_type="pd-standard", boot_disk_gb=0,
+                                              data_disk_type="pd-standard", data_disk_gb=500, tax_rate_percent=tax)
+            all_ssd = calculate_spot_pricing(**common, data_disk_type="pd-ssd", data_disk_gb=600)
+        self.assertEqual(rec["data_disk_gb"], 600)
+        self.assertAlmostEqual(rec["pricing"]["disk_hourly_usd"],
+                               primary["disk_hourly_usd"] + standard["disk_hourly_usd"], delta=0.0002)
+        self.assertNotAlmostEqual(rec["pricing"]["disk_hourly_usd"], all_ssd["disk_hourly_usd"], places=3)
+
+    def test_disk_resize_keeps_earlier_rate_for_history(self):
+        from lib.dashboard_server import _pricing_rates, instance_usage
+
+        small = fleet_observation("3300", "builder-oxidex-grow-1", "us-south1-b", started_hours_ago=10.0, now=self.now)
+        self.fleet = [small]
+        self.store.refresh_fleet_inventory()
+        old_rates = _pricing_rates(self._record("builder-oxidex-grow-1")["pricing"])
+        big = dict(small, data_disk_gb=2000)
+        self.fleet = [big]
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        rec = self._record("builder-oxidex-grow-1")
+        new_rates = _pricing_rates(rec["pricing"])
+        self.assertGreater(new_rates[2], old_rates[2])
+        self.assertEqual(len(rec["disk_segments"]), 1)
+        self.assertEqual(len(rec["prior_runs"]), 1)
+        frozen_at = rec["disk_segment_start"]
+        later = frozen_at + 5 * 3600.0
+        usage = instance_usage(rec, later)
+        created = rec["disk_start_epoch"]
+        expected = ((frozen_at - created) / 3600.0 * old_rates[2] + 5.0 * new_rates[2]
+                    + (frozen_at - rec["started_epoch"]) / 3600.0 * old_rates[0] + 5.0 * new_rates[0])
+        self.assertAlmostEqual(usage["cost_all_in"], expected, delta=0.001)
+        # A repeat listing of the new shape does not freeze again.
+        self.assertFalse(self.store.refresh_fleet_inventory())
+
+    def test_fleet_total_keeps_sub_cent_costs(self):
+        self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
+                                        started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]
+        self.store.refresh_fleet_inventory()
+        view = self.store.query_instances(window_hours=1)
+        self.assertTrue(all(r["total_cost_in_window_usd"] <= 0.01 for r in view["instances"]))
+        self.assertGreater(view["total_window_spend_usd"], sum(r["total_cost_in_window_usd"] for r in view["instances"]))
+
     def test_inventory_status_reports_source(self):
         from lib.dashboard_server import DashboardStore
 
