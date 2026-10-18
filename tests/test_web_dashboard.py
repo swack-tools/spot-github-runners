@@ -7664,6 +7664,18 @@ class RustBuildReportedFieldsTests(unittest.TestCase):
         self.assertEqual(build["finished_at"], "2026-10-18T18:00:12.250000Z")
         self.assertEqual(build["compile_duration_seconds"], 12.0)
 
+    def test_delivered_finish_keeps_request_precision(self):
+        for index, payload in enumerate((
+                {"compile_duration_seconds": 12, "delivered_at": "2026-10-18T18:00:20.250Z"},
+                {"compile_duration_seconds": 12, "delivery_duration_seconds": 3},
+                {"total_duration_seconds": 15, "delivery_duration_seconds": 3})):
+            with self.subTest(payload=payload):
+                build = self.store.record_rust_build({"build_id": f"rb-dprec-{index}",
+                                                      "status": "DELIVERED",
+                                                      "requested_at": "2026-10-18T18:00:00.250Z", **payload})["build"]
+                self.assertEqual(build["finished_at"], "2026-10-18T18:00:12.250000Z")
+                self.assertEqual(build["compile_duration_seconds"], 12.0)
+
     def test_failure_with_delivery_field_keeps_compile_time(self):
         build = self.store.record_rust_build({"build_id": "rb-del", "status": "OOM_KILLED",
                                               "compile_duration_seconds": 30, "delivery_duration_seconds": 5})["build"]

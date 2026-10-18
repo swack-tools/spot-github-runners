@@ -7784,12 +7784,12 @@ class DashboardStore:
                     del_at = str(payload["delivered_at"])
                     del_epoch = _iso_to_epoch(del_at)
                 else:
-                    del_epoch = max(now_ts, req_epoch + duration)
-                    del_at = _iso_seconds_ago(0, del_epoch)
+                    del_at = _iso_seconds_ago(0, max(now_ts, req_epoch + duration))
+                    del_epoch = _iso_to_epoch(del_at)
                 if payload.get("finished_at"):
                     fin_at = str(payload["finished_at"])
                 elif delivery_sec is not None:
-                    fin_at = _iso_seconds_ago(0, max(req_epoch, del_epoch - delivery_sec))
+                    fin_at = _iso_at_epoch(max(req_epoch, del_epoch - delivery_sec))
                 else:
                     fin_at = None  # not reported: the compile/delivery split stays unknown
             elif (payload.get("requested_at") or existing_build.get("requested_at")) and not payload.get("delivered_at"):
@@ -7806,12 +7806,12 @@ class DashboardStore:
                     fin_at = str(existing_build["finished_at"])
                     fin_epoch = _iso_to_epoch(fin_at)
                 elif known_compile is not None:
-                    fin_epoch = req_epoch + max(0.0, known_compile)
-                    fin_at = _iso_seconds_ago(0, fin_epoch)
+                    fin_at = _iso_at_epoch(req_epoch + max(0.0, known_compile))
+                    fin_epoch = _iso_to_epoch(fin_at)
                 elif delivery_sec is not None:
                     # Delivered when reported, so it finished the reported delivery time before that.
-                    fin_epoch = now_ts - delivery_sec
-                    fin_at = _iso_seconds_ago(0, fin_epoch)
+                    fin_at = _iso_at_epoch(_iso_to_epoch(_iso_seconds_ago(0, now_ts)) - delivery_sec)
+                    fin_epoch = _iso_to_epoch(fin_at)
                 else:
                     fin_epoch = None
                     fin_at = None  # not reported: the compile/delivery split stays unknown
@@ -7824,31 +7824,29 @@ class DashboardStore:
                     del_at = str(existing_build["delivered_at"])
                 else:
                     if explicit_total is not None:
-                        del_epoch = req_epoch + duration
+                        del_at = _iso_at_epoch(req_epoch + duration)
                     elif delivery_sec is not None and fin_epoch is not None:
-                        del_epoch = fin_epoch + delivery_sec
+                        del_at = _iso_at_epoch(fin_epoch + delivery_sec)
                     else:
-                        del_epoch = now_ts  # delivered when reported
-                    del_at = _iso_seconds_ago(0, del_epoch)
+                        del_at = _iso_seconds_ago(0, now_ts)  # delivered when reported
             else:
                 del_at = payload.get("delivered_at") or _iso_seconds_ago(0, now_ts)
                 del_epoch = _iso_to_epoch(str(del_at))
                 if payload.get("finished_at"):
                     fin_at = payload["finished_at"]
                 elif delivery_sec is not None:
-                    fin_at = _iso_seconds_ago(delivery_sec, del_epoch)
+                    fin_at = _iso_at_epoch(del_epoch - delivery_sec)
                 elif known_compile is not None and payload.get("requested_at"):
-                    fin_at = _iso_seconds_ago(
-                        0, _iso_to_epoch(str(payload["requested_at"])) + max(0.0, known_compile))
+                    fin_at = _iso_at_epoch(_iso_to_epoch(str(payload["requested_at"])) + max(0.0, known_compile))
                 else:
                     fin_at = None  # not reported: the compile/delivery split stays unknown
                 fin_epoch = _iso_to_epoch(str(fin_at)) if fin_at else None
                 if payload.get("requested_at"):
                     req_at = payload["requested_at"]
                 elif known_compile is not None and fin_epoch is not None:
-                    req_at = _iso_seconds_ago(max(0.0, known_compile), fin_epoch)
+                    req_at = _iso_at_epoch(fin_epoch - max(0.0, known_compile))
                 elif duration is not None:
-                    req_at = _iso_seconds_ago(max(0.0, duration), del_epoch)
+                    req_at = _iso_at_epoch(del_epoch - max(0.0, duration))
                 elif existing_build.get("requested_at"):
                     req_at = existing_build["requested_at"]
                 else:
