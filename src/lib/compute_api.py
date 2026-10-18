@@ -325,7 +325,7 @@ async def list_regions(api: AsyncGoogleApi, project: str) -> list[dict]:
 INSTANCE_LIST_FIELDS = "name,zone,status,machineType,cpuPlatform,lastStartTimestamp,labels,metadata/items"
 # The dashboard's fleet inventory also needs identity, lifetime, Spot, and attached-disk fields.
 FLEET_INSTANCE_LIST_FIELDS = (INSTANCE_LIST_FIELDS + ",id,creationTimestamp,lastStopTimestamp,"
-                              "scheduling(provisioningModel,preemptible),disks(boot,diskSizeGb,source)")
+                              "scheduling(provisioningModel,preemptible),disks(boot,diskSizeGb,source,type)")
 
 
 async def list_instances(api: AsyncGoogleApi, project: str, *,
@@ -351,21 +351,28 @@ async def list_instances(api: AsyncGoogleApi, project: str, *,
         query["pageToken"] = token
 
 
-async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, str]:
-    """``{disk selfLink: disk type name}`` for every persistent disk, from one aggregated listing."""
+async def list_disk_types(api: AsyncGoogleApi, project: str) -> dict[str, dict]:
+    """``{disk selfLink: {"type", "provisionedIops", "provisionedThroughput"}}`` for every persistent disk, from one
+    aggregated listing (the performance keys only where Compute Engine reports them)."""
     path = f"{API_ROOT}/projects/{quote(project, safe='')}/aggregated/disks"
     query = {
         "maxResults": "500",
         "returnPartialSuccess": "true",
-        "fields": "nextPageToken,items/*/disks(selfLink,type)",
+        "fields": "nextPageToken,unreachables,items/*/disks(selfLink,type,provisionedIops,provisionedThroughput)",
     }
-    types: dict[str, str] = {}
+    types: dict[str, dict] = {}
     while True:
         data = await api.get_json(path, query)
+        if data.get("unreachables"):
+            # A partial listing would silently drop those zones' disks (and their known types).
+            raise RuntimeError(f"disk listing zones unreachable: {', '.join(data['unreachables'][:5])}")
         for scoped in data.get("items", {}).values():
             for disk in scoped.get("disks", []):
                 if isinstance(disk, dict) and disk.get("selfLink"):
-                    types[str(disk["selfLink"])] = str(disk.get("type", "")).rsplit("/", 1)[-1]
+                    types[str(disk["selfLink"])] = {
+                        "type": str(disk.get("type", "")).rsplit("/", 1)[-1],
+                        **{k: disk[k] for k in ("provisionedIops", "provisionedThroughput") if k in disk},
+                    }
         token = data.get("nextPageToken")
         if not token:
             return types
