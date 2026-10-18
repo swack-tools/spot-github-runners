@@ -588,7 +588,9 @@ uses it. A template created from a listed instance with
   dashboard loads a state without the `builder_preset_migration` marker, it replaces an unedited copy of
   that preset with `tpl-builder-n4-16`, keeps its creation time, and points any profile that used it at
   the new preset. A copy that someone edited is their template, so it stays, and so do the profiles that
-  use it. This runs once and commits through the same pending path.
+  use it. The old preset also stays when a profile that uses it would reject the new one, for example
+  with a benchmark minimum higher than the new preset's score, and the dashboard logs why. This runs once and
+  commits through the same pending path.
 
 ## State durability
 

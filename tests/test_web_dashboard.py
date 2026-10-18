@@ -7679,6 +7679,20 @@ class BuilderPresetMigrationTests(unittest.TestCase):
         self.assertEqual(reloaded.state["profiles"]["rust_builder"]["vm_template_id"], "tpl-builder-c4d-16")
         self.assertEqual(reloaded.state["builder_preset_migration"], 1)
 
+    def test_legacy_preset_stays_when_a_profile_would_reject_the_new_one(self):
+        raw = self._legacy_raw()
+        raw["profiles"]["rust_builder"]["min_benchmark_score"] = 2400  # the c4d preset scores 2610, n4 2261
+        with self.assertLogs("spot_dashboard", "WARNING") as logs:
+            reloaded = self._reload(raw)
+        self.assertIn("would not accept tpl-builder-n4-16", "\n".join(logs.output))
+        ids = [t["id"] for t in reloaded.state["vm_templates"]]
+        self.assertIn("tpl-builder-c4d-16", ids)
+        self.assertNotIn("tpl-builder-n4-16", ids)
+        self.assertEqual(reloaded.state["profiles"]["rust_builder"]["vm_template_id"], "tpl-builder-c4d-16")
+        self.assertNotIn("demo_telemetry_migration_pending", reloaded.state)
+        # The profile still accepts unrelated edits.
+        reloaded.update_profile("rust_builder", {"max_instances": 3})
+
     def test_migrated_state_keeps_a_legacy_preset(self):
         raw = self._legacy_raw()
         raw["builder_preset_migration"] = 1

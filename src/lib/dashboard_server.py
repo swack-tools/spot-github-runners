@@ -23,7 +23,7 @@ import stat
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 import uuid
 
@@ -620,24 +620,41 @@ LEGACY_BUILDER_PRESET: dict[str, Any] = {
 }
 
 
-def migrate_builder_preset(state: dict[str, Any]) -> bool:
-    """Replace an unedited legacy c4d builder preset with the n4 preset in place; True when it changed ``state``."""
+def migrate_builder_preset(
+    state: dict[str, Any],
+    validate: Callable[[dict[str, Any], dict[str, Any], str], Any] | None = None,
+) -> bool:
+    """Replace an unedited legacy c4d builder preset with the n4 preset in place; True when it changed ``state``.
+
+    ``validate(template, profile, role)`` raises ValueError when a profile can't use a template. When any profile
+    that uses the old preset would reject the new one (a raised benchmark minimum, for example), nothing changes:
+    the owner's working configuration stays as it is.
+    """
     templates = state.get("vm_templates")
     if not isinstance(templates, list) or any(
             isinstance(t, dict) and t.get("id") == BUILDER_PRESET_ID for t in templates):
         return False
-    preset = next(t for t in default_dashboard_state()["vm_templates"] if t["id"] == BUILDER_PRESET_ID)
-    for index, tpl in enumerate(templates):
-        if (isinstance(tpl, dict) and tpl.get("id") == LEGACY_BUILDER_PRESET_ID
-                and {k: v for k, v in tpl.items() if k != "created_at"} == LEGACY_BUILDER_PRESET):
-            templates[index] = dict(preset, created_at=tpl.get("created_at", preset["created_at"]))
-            break
-    else:
+    index = next((i for i, tpl in enumerate(templates)
+                  if isinstance(tpl, dict) and tpl.get("id") == LEGACY_BUILDER_PRESET_ID
+                  and {k: v for k, v in tpl.items() if k != "created_at"} == LEGACY_BUILDER_PRESET), None)
+    if index is None:
         return False
+    default_preset = next(t for t in default_dashboard_state()["vm_templates"] if t["id"] == BUILDER_PRESET_ID)
+    preset = dict(default_preset, created_at=templates[index].get("created_at", default_preset["created_at"]))
     profiles = state.get("profiles")
-    for profile in profiles.values() if isinstance(profiles, dict) else []:
-        if isinstance(profile, dict) and profile.get("vm_template_id") == LEGACY_BUILDER_PRESET_ID:
-            profile["vm_template_id"] = BUILDER_PRESET_ID
+    users = [(role, profile) for role, profile in (profiles.items() if isinstance(profiles, dict) else [])
+             if isinstance(profile, dict) and profile.get("vm_template_id") == LEGACY_BUILDER_PRESET_ID]
+    if validate is not None:
+        for role, profile in users:
+            try:
+                validate(preset, profile, str(profile.get("role", role)))
+            except ValueError as exc:
+                LOG.warning("Kept builder preset %s: profile %s would not accept %s (%s)",
+                            LEGACY_BUILDER_PRESET_ID, role, BUILDER_PRESET_ID, exc)
+                return False
+    templates[index] = preset
+    for _role, profile in users:
+        profile["vm_template_id"] = BUILDER_PRESET_ID
     return True
 
 
@@ -2994,7 +3011,7 @@ class DashboardStore:
         if not (isinstance(preset_marker, int) and not isinstance(preset_marker, bool)
                 and preset_marker >= BUILDER_PRESET_MIGRATION_VERSION):
             base[BUILDER_PRESET_MIGRATION_KEY] = BUILDER_PRESET_MIGRATION_VERSION
-            if migrate_builder_preset(base):
+            if migrate_builder_preset(base, self._validate_vm_template_compatibility):
                 # Content changed without a version: the active writer commits it as the next version.
                 base[DEMO_TELEMETRY_MIGRATION_PENDING_KEY] = True
                 LOG.warning("Replaced the c4d-highcpu-16 builder preset %s with %s (n4-highcpu-16)",
