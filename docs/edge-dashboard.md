@@ -438,7 +438,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   restart also records unknown earlier compute history. These records keep `lifetime_cost_complete`
   false. `window_cost_complete` reports whether the selected cost window overlaps missing charges;
   scale-up budgets hold while applicable missing charges remain in the supported 31-day window.
-  Expiry from that window doesn't make lifetime history complete.
+  Expiry from that window doesn't make lifetime history complete. Closing a compute or disk interval
+  at an incomplete fallback price keeps that history marked incomplete even after current rates
+  become trusted. Retained cache-disk prices preserve each disk's pricing-completeness flags.
 - A VM in a transitional state, such as `PROVISIONING`, `STAGING`, `STOPPING`, or `REPAIRING`, counts
   at its full rate in burn and budgets. While the role has one, scale-up recommendations hold and
   scale-up plans are refused, because its capacity hasn't settled.
