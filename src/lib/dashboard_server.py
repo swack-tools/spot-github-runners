@@ -579,7 +579,12 @@ def instance_usage(record: dict[str, Any], now: float, window_start: float | Non
     if run_end > open_start:
         runs.append((open_start, run_end, cur_compute_all_in, cur_compute_only))
     deleted = record.get("deleted_epoch")
-    disk_end = float(deleted) if _finite(deleted) else now
+    if record.get("disk_liability_pending"):
+        disk_end = now  # Its persistent disk may still exist: keep billing until a disk listing resolves it.
+    elif _finite(record.get("disk_end_epoch")):
+        disk_end = float(record["disk_end_epoch"])
+    else:
+        disk_end = float(deleted) if _finite(deleted) else now
     first_start = min([s for s, _e, _a, _c in runs] + [started])
     created = record.get("disk_start_epoch")
     disk_open_start = float(created) if _finite(created) else first_start
@@ -728,7 +733,8 @@ def _nonrunning_hourly(inst: dict[str, Any], *, include_disk: bool, include_tax:
     (PROVISIONING, STAGING, STOPPING, REPAIRING, ...) is about to run or still is, so it counts at its full rate.
     """
     pricing = inst.get("pricing") or {}
-    if inst.get("status") in GCE_STOPPED_STATUSES:
+    if inst.get("status") in GCE_STOPPED_STATUSES or inst.get("status") == "DELETED":
+        # A deleted record is counted here only while it still bills an unresolved disk.
         return _stopped_disk_hourly(pricing, include_tax=include_tax) if include_disk else 0.0
     return DashboardStore._instance_hourly_for_budget(pricing, include_disk=include_disk, include_tax=include_tax)
 
@@ -754,6 +760,16 @@ def _disk_known(disk: dict[str, Any], known: frozenset[str]) -> bool:
     return bool(disk.get("source")) and str(disk["source"]) in known
 
 
+def _single_disk_all_in(disk: dict[str, Any], *, family: str, region: str, project: str,
+                        tax_rate_percent: float) -> float:
+    """Hourly USD (with tax) of one persistent disk."""
+    priced = calculate_spot_pricing(
+        family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type=str(disk.get("type") or "pd-balanced"),
+        boot_disk_gb=int(disk.get("gb") or 0), data_disk_type=str(disk.get("type") or "pd-balanced"), data_disk_gb=0,
+        tax_rate_percent=tax_rate_percent, machine_type=None, project=project)
+    return float(priced.get("disk_hourly_usd", 0.0) or 0.0) * (1.0 + tax_rate_percent / 100.0)
+
+
 def _initial_disk_history(
     obs: dict[str, Any], *, region: str, family: str, project: str, tax_rate_percent: float, now: float,
 ) -> tuple[list[tuple[float, float, float]], float | None]:
@@ -768,14 +784,8 @@ def _initial_disk_history(
         return [], None  # No per-disk evidence (older observations): the VM's creation bounds disk history.
     if not all(_finite(d.get("created_epoch")) for d in disks):
         return [], now
-    tax = 1.0 + tax_rate_percent / 100.0
-
     def disk_all_in(d: dict[str, Any]) -> float:
-        priced = calculate_spot_pricing(
-            family=family, vcpu=0, ram_gib=0.0, region=region, boot_disk_type=str(d.get("type") or "pd-balanced"),
-            boot_disk_gb=int(d.get("gb") or 0), data_disk_type=str(d.get("type") or "pd-balanced"), data_disk_gb=0,
-            tax_rate_percent=tax_rate_percent, machine_type=None, project=project)
-        return float(priced.get("disk_hourly_usd", 0.0) or 0.0) * tax
+        return _single_disk_all_in(d, family=family, region=region, project=project, tax_rate_percent=tax_rate_percent)
 
     times = sorted({min(float(d["created_epoch"]), now) for d in disks})
     segments = []
@@ -997,7 +1007,17 @@ def _live_instance_record(
             split_at = now
             if added and all(_finite(d.get("created_epoch")) for d in added) \
                     and not any(_disk_known(d, known_disk_sources) for d in added):
-                split_at = min(now, max(disk_open, max(float(d["created_epoch"]) for d in added)))
+                # One step per added disk: between creations the rate is the old disks plus those added so far.
+                tax_pct = float(record["pricing"].get("tax_rate_percent", 0.0) or 0.0)
+                cursor, rate = disk_open, prev_disk_all_in
+                for d in sorted(added, key=lambda item: float(item["created_epoch"])):
+                    at = min(now, max(cursor, float(d["created_epoch"])))
+                    if at > cursor:
+                        disk_segments.append((cursor, at, rate))
+                    cursor = at
+                    rate += _single_disk_all_in(d, family=record["family"], region=region, project=project,
+                                                tax_rate_percent=tax_pct)
+                disk_open, split_at = cursor, cursor
             if split_at > disk_open:
                 disk_segments.append((disk_open, split_at, prev_disk_all_in))
             disk_segment_start = split_at
@@ -1103,13 +1123,13 @@ def _live_instance_record(
     return record
 
 
-def _mark_instance_deleted(record: dict[str, Any], now: float) -> dict[str, Any]:
+def _mark_instance_deleted(record: dict[str, Any], now: float, *, disks_pending: bool = False) -> dict[str, Any]:
     """The record of a VM that is no longer in the Compute Engine inventory."""
     out = dict(record)
     if out.get("status") == "RUNNING" or _instance_end_epoch(out) is None:
         # It ran until it disappeared (between two listings; the observation time bounds it).
         out["stopped_epoch"] = now
-    out.update({"status": "DELETED", "deleted_epoch": now})
+    out.update({"status": "DELETED", "deleted_epoch": now, "disk_liability_pending": bool(disks_pending)})
     usage = instance_usage(out, now)
     total_cost, compute_cost = round(usage["cost_all_in"], 2), round(usage["cost_compute"], 2)
     out.update({
@@ -1295,12 +1315,23 @@ def reconcile_instance_records(
         elif not disks_listed and record.get("kind") == "disk" and record.get("status") != "DELETED":
             # The disk listing is unavailable: a detached disk is not seen, not gone. Keep it (still billing).
             records.append(record)
+        elif record.get("status") == "DELETED" and record.get("disk_liability_pending"):
+            if disks_listed:
+                # The disk listing is back: the cache disk is either listed on its own now (its DETACHED record
+                # takes over from this moment) or gone. Either way this record stops billing it here.
+                records.append(dict(record, disk_liability_pending=False, disk_end_epoch=now))
+            else:
+                records.append(record)
         elif record.get("status") == "DELETED":
             deleted = record.get("deleted_epoch")
             if isinstance(deleted, (int, float)) and now - float(deleted) <= DELETED_INSTANCE_RETENTION_SECONDS:
                 records.append(record)
         else:
-            records.append(_mark_instance_deleted(record, now))
+            # A builder's cache disk outlives its VM (auto-delete=no); while disks cannot be listed nobody can tell
+            # whether it still exists, so its storage keeps billing here until a disk listing resolves it.
+            pending = (not disks_listed and record.get("role") == "rust_builder"
+                       and str(record.get("kind") or "vm") != "disk")
+            records.append(_mark_instance_deleted(record, now, disks_pending=pending))
     for instance_id, obs in by_id.items():
         if instance_id not in seen:
             records.append(_live_instance_record(obs, project=project, now=now, known_disk_sources=known_disks,
@@ -1308,8 +1339,10 @@ def reconcile_instance_records(
     # Live VMs first (newest start first), then deleted history (newest deletion first), bounded in size.
     live = sorted((r for r in records if r.get("status") != "DELETED"),
                   key=lambda r: -float(r.get("started_epoch") or 0.0))
-    gone = sorted((r for r in records if r.get("status") == "DELETED"),
+    gone = sorted((r for r in records if r.get("status") == "DELETED" and not r.get("disk_liability_pending")),
                   key=lambda r: -float(r.get("deleted_epoch") or 0.0))
+    # Records still billing an unresolved disk stay detailed (never compacted) until resolved.
+    live += [r for r in records if r.get("status") == "DELETED" and r.get("disk_liability_pending")]
     # Every record inside the retention period counts in every accepted window (at most MAX_WINDOW_HOURS). Past
     # MAX_DETAILED_INSTANCE_RECORDS the oldest deleted ones are folded into ``compacted`` hour buckets, so the
     # state stays far below the KV value limit while window totals keep their cost.
@@ -2304,6 +2337,17 @@ class DashboardStore:
             and (builder_event(evt) if role == "rust_builder" else not builder_event(evt))
             for evt in events
         )
+
+    def _runner_burn_for_builder_budget(self, cicd_eval: dict[str, Any], cicd_qual: dict[str, Any] | None = None) -> float:
+        """The runner fleet's burn as the builder's shared budget sees it: running runners plus any runner VMs the
+        CI evaluation adds, all priced with the builder budget's disk and tax flags (stopped storage is added
+        separately by _outside_burn)."""
+        running = sum(self._running_role_hourly_rates("cicd_runner", budget_role="rust_builder"))
+        added = max(0, int(cicd_eval.get("desired_instances") or 0) - int(cicd_eval.get("current_instances") or 0))
+        if not added:
+            return round(running, 4)
+        unit = self._resolve_scaling_unit_hourly_usd("cicd_runner", cicd_qual, budget_role="rust_builder")
+        return round(running + added * unit, 4)
 
     def _builder_evaluation_telemetry(self) -> dict[str, Any]:
         """Telemetry for the builder evaluation. With a live inventory the running builder count says nothing about
@@ -3580,7 +3624,7 @@ class DashboardStore:
             _nonrunning_hourly(inst, include_disk=include_disk, include_tax=include_tax)
             for inst in self.state.get("instances", [])
             if is_live_instance_record(inst) and inst.get("role") == role
-            and inst.get("status") not in ("RUNNING", "DELETED")
+            and (inst.get("status") not in ("RUNNING", "DELETED") or inst.get("disk_liability_pending"))
         ), 4)
 
     def _outside_burn(self, role: str, *, shared: bool, other_running_burn: float) -> float | None:
@@ -3666,13 +3710,17 @@ class DashboardStore:
         self,
         role: str,
         qual: dict[str, Any] | None = None,
+        budget_role: str | None = None,
     ) -> float:
-        """Resolve per-instance hourly USD for scaling evaluation matching active template or density."""
+        """Resolve per-instance hourly USD for scaling evaluation matching active template or density (under the
+        disk and tax flags of ``budget_role``'s budget, default the role's own)."""
         prof = self.state.get("profiles", {}).get(role, {})
         pol = self.state.get("scaling", {}).get(role, {})
-        budget = prof.get("budget", {})
+        flags_prof = self.state.get("profiles", {}).get(budget_role or role, {})
+        flags_pol = self.state.get("scaling", {}).get(budget_role or role, {})
+        budget = flags_prof.get("budget", {})
         include_disk = bool(
-            pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
+            flags_pol.get("include_disk_in_scale_budget", budget.get("include_disk_costs", True))
         )
         include_tax = bool(budget.get("include_taxes", False))
         target_units = (
@@ -4023,9 +4071,7 @@ class DashboardStore:
                 other_role_hourly_usd=self._outside_burn(
                     "rust_builder",
                     shared=builder_shared,
-                    other_running_burn=max(
-                        sum(self._running_role_hourly_rates("cicd_runner", budget_role="rust_builder")),
-                        float(scaling_eval.get("projected_hourly_usd", 0.0))),
+                    other_running_burn=self._runner_burn_for_builder_budget(scaling_eval, cicd_qual),
                 ),
             ), "rust_builder")
             instances_view = self.query_instances(
@@ -4135,7 +4181,7 @@ class DashboardStore:
                     # deleted one stays in the windows that include its deletion (not just its last stop).
                     deleted_epoch = inst.get("deleted_epoch")
                     end_ts = (float(deleted_epoch) if inst["status"] == "DELETED" and isinstance(deleted_epoch, (int, float))
-                              else now_ts)
+                              and not inst.get("disk_liability_pending") else now_ts)
 
                 # Exclude deleted instances whose deletion occurred before the selected window
                 if is_deleted and end_ts < window_start_ts:
@@ -4269,7 +4315,8 @@ class DashboardStore:
             stopped_disk_burn = sum(
                 _nonrunning_hourly(r, include_disk=include_disk_and_tax, include_tax=include_disk_and_tax)
                 for r in rows
-                if is_live_instance_record(r) and r["status"] not in ("RUNNING", "DELETED")
+                if is_live_instance_record(r)
+                and (r["status"] not in ("RUNNING", "DELETED") or r.get("disk_liability_pending"))
             )
             active_hourly_burn = round(
                 sum(r["active_hourly_usd"] for r in running_rows) + stopped_disk_burn, 4
@@ -4868,8 +4915,9 @@ class DashboardStore:
                         "rust_builder",
                         shared=bool(global_budget_shared
                                     or self.state["scaling"]["rust_builder"].get("shared_global_budget")),
-                        other_running_burn=max(runner_burn_for_builder,
-                                               float(cicd_eval.get("projected_hourly_usd", 0.0))),
+                        other_running_burn=(
+                            self._runner_burn_for_builder_budget(cicd_eval) if self.fleet_source is not None
+                            else max(runner_burn_for_builder, float(cicd_eval.get("projected_hourly_usd", 0.0)))),
                     ) or 0.0,
                 ), "rust_builder")
                 self._persist()
@@ -5726,7 +5774,7 @@ class DashboardStore:
                     _nonrunning_hourly(i, include_disk=include_disk, include_tax=include_tax)
                     for i in instances
                     if is_live_instance_record(i)
-                    and i["status"] not in ("RUNNING", "DELETED")
+                    and (i["status"] not in ("RUNNING", "DELETED") or i.get("disk_liability_pending"))
                     and (i["role"] == role or (shared_global and i["role"] == other_role))
                 )
                 projected_fleet_hourly = round(

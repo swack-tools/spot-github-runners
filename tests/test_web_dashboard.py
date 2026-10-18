@@ -5636,6 +5636,73 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.assertIn('inst.status === "DETACHED" ? \'<span style="color:#fcd34d;">Present (storage still billed)',
                       DASHBOARD_HTML)
 
+    def test_two_added_disks_split_at_each_creation(self):
+        created = self.now - 10 * 86400.0
+        boot = {"type": "pd-balanced", "gb": 40, "created_epoch": created, "source": "z/boot-2a", "id": "11"}
+        vm = fleet_observation("9910", "builder-oxidex-add-2", "us-south1-b", started_hours_ago=240.0, now=self.now)
+        vm.update(created_epoch=created, data_disk_gb=0, data_disks={}, disks_detail=[boot])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        first, second = self.now - 3 * 86400.0, self.now - 86400.0
+        grown = dict(vm, data_disk_gb=300, data_disks={"pd-balanced": 300}, data_disk_type="pd-balanced",
+                     disks_detail=[boot,
+                                   {"type": "pd-balanced", "gb": 100, "created_epoch": first, "source": "z/d1", "id": "12"},
+                                   {"type": "pd-balanced", "gb": 200, "created_epoch": second, "source": "z/d2", "id": "13"}])
+        self.fleet = [grown]
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-add-2")
+        ends = [round(seg[1]) for seg in rec["disk_segments"]]
+        self.assertIn(round(first), ends)
+        self.assertIn(round(second), ends)
+        rates = [seg[2] for seg in rec["disk_segments"]]
+        self.assertLess(rates[-2], rates[-1])  # The step after the first added disk bills more.
+        self.assertAlmostEqual(rec["disk_segment_start"], second, delta=1.0)
+
+    def test_runner_burn_for_builder_budget_prices_added_runners(self):
+        self.fleet = [self._runner("9920", "oxidex-runners-bb-1")]
+        self.store.refresh_fleet_inventory()
+        running = sum(self.store._running_role_hourly_rates("cicd_runner", budget_role="rust_builder"))
+        unit = self.store._resolve_scaling_unit_hourly_usd("cicd_runner", None, budget_role="rust_builder")
+        burn = self.store._runner_burn_for_builder_budget({"desired_instances": 3, "current_instances": 1})
+        self.assertAlmostEqual(burn, running + 2 * unit, delta=0.0002)
+        held = self.store._runner_burn_for_builder_budget({"desired_instances": 1, "current_instances": 1,
+                                                           "projected_hourly_usd": 99.0})
+        self.assertAlmostEqual(held, running, delta=0.0002)  # Never the held projection with storage in it.
+
+    def test_vanished_builder_keeps_disk_liability_while_disks_unlisted(self):
+        from lib.dashboard_server import instance_usage
+        from lib.fleet_inventory import FleetListing, observe_detached_disks
+
+        created = self.now - 5 * 86400.0
+        cache = "projects/p/zones/us-south1-b/disks/builder-oxidex-lia-cache"
+        vm = fleet_observation("9930", "builder-oxidex-lia", "us-south1-b", started_hours_ago=120.0, now=self.now)
+        vm.update(created_epoch=created, disks_detail=[
+            {"type": "pd-balanced", "gb": 100, "created_epoch": created, "source": cache, "id": "55"}])
+        self.fleet = [vm]
+        self.store.refresh_fleet_inventory()
+        listing = FleetListing([])
+        listing.disks_listed = False
+        self.store.fleet_source = lambda: listing
+        self.store.refresh_fleet_inventory()  # The builder is gone while disks cannot be listed.
+        rec = self._record("builder-oxidex-lia")
+        self.assertEqual(rec["status"], "DELETED")
+        self.assertTrue(rec["disk_liability_pending"])
+        later = time.time() + 7200.0
+        self.assertGreater(instance_usage(rec, later)["disk_hours"], instance_usage(rec, time.time())["disk_hours"])
+        self.assertGreater(self.store._stopped_disk_burn("rust_builder"), 0.0)
+        stamp = datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.fleet = observe_detached_disks({cache: {"id": "55", "name": "builder-oxidex-lia-cache",
+                                                     "zone": "z/us-south1-b", "sizeGb": "100", "type": "pd-balanced",
+                                                     "creationTimestamp": stamp}})
+        self.store.fleet_source = lambda: list(self.fleet)
+        resumed = time.time()
+        self.store.refresh_fleet_inventory()
+        rec = self._record("builder-oxidex-lia")
+        self.assertFalse(rec["disk_liability_pending"])
+        self.assertGreaterEqual(rec["disk_end_epoch"], resumed - 1.0)
+        detached = self._record("builder-oxidex-lia-cache")
+        self.assertGreaterEqual(detached["disk_segment_start"], resumed - 1.0)  # Takes over at the same moment.
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

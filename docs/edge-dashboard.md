@@ -351,7 +351,7 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   `lastStopTimestamp`, but its attached disks keep adding cost until the VM is deleted, and its row shows
   that disk-only rate, and a deleted VM's row shows no current rate. When a VM starts again, its earlier running intervals stay in its runtime and
   window spend. When its machine type or disks change, or its prices change, the time before the change
-  keeps the earlier rates; a disk added to a listed VM starts billing at its own creation time. A stop that's reported late ends the run at the reported stop time. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
+  keeps the earlier rates; each disk added to a listed VM starts billing at its own creation time. A stop that's reported late ends the run at the reported stop time. Each data-disk type is priced at its own rate, and fleet totals add unrounded costs. Only `RUNNING` VMs count
   toward the runner and builder telemetry, but the disks of stopped VMs count against the scaling
   budgets. Hiding deleted instances doesn't hide stopped VMs, because they still exist. The listing
   carries no CPU utilization, so inventory VMs never trigger a CPU-based scale-down recommendation.
@@ -371,7 +371,9 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   attached is billed only by its VM's record. Disks are listed even when no fleet VM is left, and a disk that moves between records (a VM and its `DETACHED` record, or a replacement VM)
   is billed by the new record only from the handoff, never again from its creation. Disks are matched
   by their immutable disk ID, so a new disk that reuses a name is billed from its own creation. While
-  disks can't be listed, existing `DETACHED` records are kept, not marked deleted. A disk that's
+  disks can't be listed, existing `DETACHED` records are kept, not marked deleted, and a builder that
+  disappears keeps billing its disk storage (`disk_liability_pending`) until a disk listing shows
+  whether its cache disk still exists. A disk that's
   detached again keeps its earlier standalone interval and restarts billing at the new handoff.
 - Without `compute.disks.list`, detached disks can't be seen, so scaling recommendations hold and
   scale-up plans are refused even when the listing is otherwise current. Grant the permission for
@@ -402,8 +404,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   without a known rate (when no live price was found), and for a VM whose
   Hyperdisk bills provisioned IOPS or throughput (Hyperdisk Throughput, or Hyperdisk Balanced provisioned past 3,000 IOPS or 140 MiBps, or with
   no reported performance), the record is marked
-  `pricing_complete: false`. Under a shared budget, the other role's VMs and disks are priced with the
-  disk and tax settings of the budget being checked. While the role's fleet (both roles under a shared
+  `pricing_complete: false`. Under a shared budget, the other role's VMs and disks, including runner VMs the CI evaluation would add,
+  are priced with the disk and tax settings of the budget being checked. While the role's fleet (both roles under a shared
   budget) has such a VM,
   scale-up recommendations hold and scale-up plans are refused, because their budget check would pass
   on a cost that's too low.
