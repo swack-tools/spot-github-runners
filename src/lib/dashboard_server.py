@@ -1050,6 +1050,51 @@ def _stopped_disk_hourly(pricing: dict[str, Any], *, include_tax: bool = True) -
     return disk * (1.0 + float(pricing.get("tax_rate_percent", 0.0) or 0.0) / 100.0) if include_tax else disk
 
 
+def _unpriced_history_in_window(record: dict[str, Any], start: float, end: float,
+                                *, include_storage: bool = True) -> bool:
+    """Whether known missing historical charges overlap the selected window."""
+    return any((include_storage or reason != "suspended_memory") and _finite(bounds[0])
+               and float(bounds[0]) < end and (bounds[1] is None or (_finite(bounds[1]) and float(bounds[1]) > start))
+               for reason, bounds in (record.get("unpriced_history_intervals") or {}).items()
+               if isinstance(bounds, (list, tuple)) and len(bounds) == 2)
+
+
+def _retain_unpriced_history(record: dict[str, Any], obs: dict[str, Any], previous: dict[str, Any] | None,
+                             now: float) -> None:
+    """Keep bounded uncertainty per cause; no fabricated price is added for unobserved runs or memory storage."""
+    intervals = copy.deepcopy((previous or {}).get("unpriced_history_intervals") or {})
+    def add(reason: str, start: float, end: float | None) -> None:
+        old = intervals.get(reason)
+        intervals[reason] = [min(float(old[0]), start) if old else start,
+                            None if end is None or (old and old[1] is None) else
+                            max(float(old[1]), end) if old else end]
+
+    status = record.get("status")
+    started = float(record["started_epoch"])
+    if (previous or {}).get("status") == "SUSPENDED" and "suspended_memory" not in intervals:
+        previous_stop = previous.get("stopped_epoch")
+        add("suspended_memory", float(previous_stop) if _finite(previous_stop)
+            else float(previous.get("started_epoch") or now), None)
+    if status != "SUSPENDED":
+        for bounds in intervals.values():
+            if bounds[1] is None:
+                bounds[1] = max(float(bounds[0]), min(now, started if started >= float(bounds[0]) else now))
+    suspended = obs.get("last_suspended_epoch")
+    if status == "SUSPENDED":
+        at = float(suspended) if _finite(suspended) else float(record.get("stopped_epoch") or now)
+        add("suspended_memory", min(at, now), None)
+    elif _finite(suspended) and float(suspended) < started:
+        add("suspended_memory", float(suspended), started)
+    stopped = obs.get("last_stop_epoch")
+    if previous is None and obs.get("kind") != "disk" and _finite(stopped) and float(stopped) < started:
+        created = obs.get("created_epoch")
+        add("prior_compute", float(created) if _finite(created) and float(created) < float(stopped) else 0.0,
+            float(stopped))
+    record["unpriced_history_intervals"] = intervals
+    if intervals:
+        record["unpriced_lifetime_history"] = True
+
+
 def _mark_pricing_completeness(record: dict[str, Any]) -> None:
     """Flag inventory records whose recorded cost is known to be too low (budgets fail closed on them)."""
     reasons = []
@@ -1080,7 +1125,8 @@ def _mark_pricing_completeness(record: dict[str, Any]) -> None:
         reasons.append(f"{int(record['local_ssd_gb'])} GiB of Local SSD, which is not priced here")
     record["pricing_complete"] = not reasons
     record["pricing_incomplete_reason"] = "; ".join(reasons)
-    record["lifetime_cost_complete"] = not (record.get("unpriced_lifetime_history") or record.get("deferred_disk_sources")
+    record["lifetime_cost_complete"] = not (record.get("status") == "SUSPENDED"
+        or record.get("unpriced_lifetime_history") or record.get("deferred_disk_sources")
         or record.get("unpaid_disk_details") or _finite(record.get("disk_history_deferred_at")))
 
 
@@ -1745,6 +1791,7 @@ def _live_instance_record(
         # Utilization is not part of the inventory listing.
         "utilization_known": False,
     })
+    _retain_unpriced_history(record, obs, previous, now)
     _mark_pricing_completeness(record)
     if role == "cicd_runner":
         count = int(obs.get("runners_count") or 0)
@@ -1787,7 +1834,7 @@ def _retained_pricing(record: dict[str, Any], *, tax_rate_percent: float, projec
 def _mark_instance_deleted(record: dict[str, Any], now: float, *, disks_pending: bool = False,
                            project: str = "homelab-424523") -> dict[str, Any]:
     """The record of a VM that is no longer in the Compute Engine inventory."""
-    out = dict(record)
+    out = copy.deepcopy(record)
     if disks_pending:
         retained = _retained_disks(out)
         if retained == []:
@@ -1834,6 +1881,10 @@ def _mark_instance_deleted(record: dict[str, Any], now: float, *, disks_pending:
         "cpu_utilization_percent": 0.0,
         "ram_utilization_percent": 0.0,
     })
+    for bounds in (out.get("unpriced_history_intervals") or {}).values():
+        if bounds[1] is None:
+            bounds[1] = max(float(bounds[0]), now)
+    _mark_pricing_completeness(out)
     return out
 
 
@@ -2262,11 +2313,13 @@ def reconcile_instance_records(
     # Live VMs first (newest start first), then deleted history (newest deletion first), bounded in size.
     live = sorted((r for r in records if r.get("status") != "DELETED"),
                   key=lambda r: -float(r.get("started_epoch") or 0.0))
-    gone = sorted((r for r in records if r.get("status") == "DELETED" and not r.get("disk_liability_pending") and not r.get("unpaid_disk_details")),
+    gone = sorted((r for r in records if r.get("status") == "DELETED" and not r.get("disk_liability_pending") and not r.get("unpaid_disk_details")
+                   and not _unpriced_history_in_window(r, now - DELETED_INSTANCE_RETENTION_SECONDS, now)),
                   key=lambda r: -float(r.get("deleted_epoch") or 0.0))
     # Records still billing an unresolved disk stay detailed (never compacted) until resolved.
     live += [r for r in records if r.get("status") == "DELETED"
-             and (r.get("disk_liability_pending") or r.get("unpaid_disk_details"))]
+             and (r.get("disk_liability_pending") or r.get("unpaid_disk_details")
+                  or _unpriced_history_in_window(r, now - DELETED_INSTANCE_RETENTION_SECONDS, now))]
     # Every record inside the retention period counts in every accepted window (at most MAX_WINDOW_HOURS). Past
     # MAX_DETAILED_INSTANCE_RECORDS the oldest deleted ones are folded into ``compacted`` hour buckets, so the
     # state stays far below the KV value limit while window totals keep their cost.
@@ -4331,6 +4384,9 @@ class DashboardStore:
             return budget if isinstance(budget, dict) else {}
 
         evaluated = budget_of(role)
+        now = time.time()
+        includes_storage = bool(self.state.get("scaling", {}).get(role, {}).get("include_disk_in_scale_budget",
+                                                                            evaluated.get("include_disk_costs", True)))
 
         def tax_unknown(inst: dict[str, Any]) -> bool:
             # A region outside the catalog has no tax rate: unknown, not free, when either the evaluated budget or
@@ -4342,8 +4398,11 @@ class DashboardStore:
 
         return [
             str(inst.get("name")) for inst in self.state.get("instances", [])
-            if is_live_instance_record(inst) and inst.get("role") in roles and (inst.get("status") != "DELETED" or _has_unresolved_storage(inst))
-            and (inst.get("pricing_complete") is False or tax_unknown(inst))
+            if is_live_instance_record(inst) and inst.get("role") in roles and (inst.get("status") != "DELETED" or _has_unresolved_storage(inst)
+                 or _unpriced_history_in_window(inst, now - DELETED_INSTANCE_RETENTION_SECONDS, now))
+            and (inst.get("pricing_complete") is False or tax_unknown(inst)
+                 or _unpriced_history_in_window(inst, now - DELETED_INSTANCE_RETENTION_SECONDS, now,
+                     include_storage=includes_storage))
         ]
 
     def _transitional_hosts(self, role: str) -> list[str]:
@@ -5049,6 +5108,11 @@ class DashboardStore:
                     "active_hourly_usd": hourly_rate,
                     "active_daily_usd": daily_rate,
                     "active_monthly_usd": monthly_rate,
+                    "window_cost_complete": bool(inst.get("pricing_complete", True) and (inst.get("lifetime_cost_complete", True) or
+                        (not inst.get("deferred_disk_sources") and not inst.get("unpaid_disk_details")
+                         and not _finite(inst.get("disk_history_deferred_at"))
+                         and not _unpriced_history_in_window(inst, window_start_ts, now_ts,
+                                                             include_storage=include_disk_and_tax)))),
                     "hours_in_window": hours_in_window,
                     "total_cost_in_window_usd": total_cost_in_window,
                     "lifetime_cost_selected_mode_usd": lifetime_cost,
@@ -5132,6 +5196,7 @@ class DashboardStore:
                 "running_runner_slots": running_runner_slots,
                 "unconfirmed_runner_hosts": unconfirmed_runner_hosts,
                 "running_builder_vms": len(running_builder_rows),
+                "window_cost_complete": all(r.get("window_cost_complete", True) for r in rows),
                 "total_window_spend_usd": total_window_spend,
                 "active_hourly_burn_usd": active_hourly_burn,
                 "active_daily_burn_usd": round(active_hourly_burn * 24.0, 2),
