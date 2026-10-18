@@ -4819,6 +4819,46 @@ class FleetInventoryReconcileTests(unittest.TestCase):
         self.store.refresh_fleet_inventory()
         self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
 
+    def test_bootstrap_confirmation_alone_updates_record(self):
+        provisioning = fleet_observation("5200", "oxidex-runners-boot-2", "us-south1-a", now=self.now)
+        provisioning["runners_count_known"] = False
+        self.fleet = [provisioning]
+        self.store.refresh_fleet_inventory()
+        self.assertEqual(self.store.state["scaling_telemetry"]["unknown_runner_count_hosts"], ["oxidex-runners-boot-2"])
+        self.fleet = [dict(provisioning, runners_count_known=True)]  # Bootstrap confirmed; nothing else changed.
+        self.assertTrue(self.store.refresh_fleet_inventory())
+        self.assertTrue(self._record("oxidex-runners-boot-2")["runners_count_known"])
+        self.assertEqual(self.store.state["scaling_telemetry"]["unknown_runner_count_hosts"], [])
+
+    def test_new_vm_beside_stopped_capacity_handles_oom(self):
+        running = fleet_observation("5300", "builder-oxidex-cap-1", "us-south1-b", now=self.now)
+        stopped = fleet_observation("5301", "builder-oxidex-cap-2", "us-south1-b", status="TERMINATED",
+                                    started_hours_ago=5.0, stopped_hours_ago=1.0, now=self.now)
+        self.fleet = [running, stopped]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            self.store.state["scaling_telemetry"]["journal_oom_events"] = [
+                {"id": "oom-b3", "instance_name": "builder-oxidex-cap-1", "role": "rust_builder"}]
+        self.fleet = [running, stopped, fleet_observation("5302", "builder-oxidex-cap-3", "us-south1-b", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        self.assertTrue(self.store.state["scaling_telemetry"]["journal_oom_events"][0].get("handled"))
+
+    def test_unknown_region_tax_holds_tax_inclusive_scale_ups(self):
+        self.fleet = [fleet_observation("5400", "builder-oxidex-far-1", "mars-central1-a", now=self.now)]
+        self.store.refresh_fleet_inventory()
+        with self.store._lock:
+            budget = self.store.state["profiles"]["rust_builder"]["budget"]
+            budget["include_taxes"] = True
+            budget["override_regional_tax"] = False
+        self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), ["builder-oxidex-far-1"])
+        with self.store._lock:
+            budget["include_taxes"] = False
+        self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), [])
+        with self.store._lock:
+            budget["include_taxes"] = True
+            budget["override_regional_tax"] = True
+        self.assertEqual(self.store._incomplete_cost_hosts("rust_builder"), [])
+
     def test_fleet_total_keeps_sub_cent_costs(self):
         self.fleet = [fleet_observation(f"34{i:03d}", f"oxidex-runners-short-{i}", "us-south1-a",
                                         started_hours_ago=1.0 / 60.0, now=self.now) for i in range(300)]

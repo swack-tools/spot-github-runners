@@ -971,16 +971,17 @@ def _mark_instance_deleted(record: dict[str, Any], now: float) -> dict[str, Any]
     return out
 
 
-def _instance_fingerprint(record: Any) -> tuple[Any, ...]:
-    """The fields whose change is a real fleet change (worth a new state version and a KV publish)."""
+# Record fields recomputed from the clock on every listing; any other stored field changing is a real change.
+_VOLATILE_RECORD_FIELDS = frozenset({"runtime_hours", "total_cost_usd", "total_cost_compute_only_usd"})
+
+
+def _instance_fingerprint(record: Any) -> str:
+    """Every stored field except the clock-derived ones, so any change that affects telemetry, pricing completeness,
+    or history (worth a new state version and a KV publish) is detected."""
     if not isinstance(record, dict):
-        return (repr(record),)
-    return tuple(record.get(key) for key in (
-        "instance_id", "name", "status", "zone", "machine_type", "vcpu", "ram_gib", "cpu_platform",
-        "boot_disk_type", "boot_disk_gb", "data_disk_type", "data_disk_gb", "runners_count",
-        "started_epoch", "stopped_epoch", "deleted_epoch", "spot", INSTANCE_SOURCE_KEY,
-    )) + (json.dumps([record.get("prior_runs") or [], record.get("disk_segments") or [],
-                      record.get("data_disks") or {}, record.get("folded_cost_buckets") or {}], sort_keys=True),)
+        return repr(record)
+    return json.dumps({k: v for k, v in record.items() if k not in _VOLATILE_RECORD_FIELDS},
+                      sort_keys=True, default=repr)
 
 
 def _compact_deleted_record(record: dict[str, Any], buckets: dict[str, list[float]], now: float) -> None:
@@ -2028,13 +2029,18 @@ class DashboardStore:
         def running(records: list[Any], role: str) -> list[dict[str, Any]]:
             return [r for r in records if isinstance(r, dict) and r.get("status") == "RUNNING" and r.get("role") == role]
 
-        def existing(records: list[Any], role: str) -> list[dict[str, Any]]:
-            # Capacity that already existed, running or stopped: a restart brings it back, it adds none.
-            return [r for r in records if isinstance(r, dict) and r.get("status") != "DELETED" and r.get("role") == role]
+        # Capacity that already existed (running or stopped) adds none when it starts again; only running VMs whose
+        # identity is new add capacity.
+        existed = {str(r.get("instance_id")) for r in previous
+                   if isinstance(r, dict) and r.get("status") != "DELETED"}
 
-        previous_slots = sum(int(r.get("runners_count", 0) or 0) for r in existing(previous, "cicd_runner"))
-        current_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(current, "cicd_runner"))
-        if current_slots > previous_slots:
+        def new_running(role: str) -> list[dict[str, Any]]:
+            return [r for r in running(current, role) if str(r.get("instance_id")) not in existed]
+
+        previous_slots = sum(int(r.get("runners_count", 0) or 0) for r in running(previous, "cicd_runner"))
+        added_slots = sum(int(r.get("runners_count", 0) or 0) for r in new_running("cicd_runner"))
+        current_slots = previous_slots + added_slots
+        if added_slots > 0:
             pol = self.state.get("scaling", {}).get("cicd_runner", {})
             prof = self.state.get("profiles", {}).get("cicd_runner", {})
             self._consume_active_oom_events(
@@ -2044,7 +2050,7 @@ class DashboardStore:
                 step_runners=max(1, int(pol.get("scale_up_step_runners", 2))),
                 max_runners=max(int(prof.get("min_runners", 1)), int(pol.get("max_runners", 24))),
             )
-        if len(running(current, "rust_builder")) > len(existing(previous, "rust_builder")):
+        if new_running("rust_builder"):
             self._consume_active_oom_events(role="rust_builder")
 
     def fleet_inventory_status(self) -> dict[str, Any]:
@@ -3175,10 +3181,18 @@ class DashboardStore:
         """Inventory VMs (of the role, and of the other role under a shared budget) whose cost is understated."""
         roles = {role, "rust_builder" if role == "cicd_runner" else "cicd_runner"} if self._role_shares_budget(role) \
             else {role}
+        def tax_unknown(inst: dict[str, Any]) -> bool:
+            # A region outside the catalog has no tax rate: unknown, not free, when the budget includes taxes
+            # (unless the profile overrides the regional rate).
+            budget = self.state.get("profiles", {}).get(inst.get("role"), {}).get("budget", {})
+            budget = budget if isinstance(budget, dict) else {}
+            return (inst.get("tax_rate_known") is False and bool(budget.get("include_taxes", False))
+                    and not budget.get("override_regional_tax"))
+
         return [
             str(inst.get("name")) for inst in self.state.get("instances", [])
-            if is_live_instance_record(inst) and inst.get("role") in roles
-            and inst.get("status") != "DELETED" and inst.get("pricing_complete") is False
+            if is_live_instance_record(inst) and inst.get("role") in roles and inst.get("status") != "DELETED"
+            and (inst.get("pricing_complete") is False or tax_unknown(inst))
         ]
 
     def _transitional_hosts(self, role: str) -> list[str]:

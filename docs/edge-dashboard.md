@@ -369,7 +369,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   nothing pending), the runner total is unknown: the runner scaling recommendation holds and names the host, and scale-up
   plans are refused.
 - A VM in a region outside the dashboard's region catalog is priced with no tax, marked
-  `tax_rate_known: false`, rather than with another region's default tax. Each inventory refresh,
+  `tax_rate_known: false`, rather than with another region's default tax. When its role's budget
+  includes taxes without a tax override, that unknown tax holds scale-ups like other unpriced costs. Each inventory refresh,
   not a page read, reprices the listed VMs, stopped ones included, so a tax override also applies to
   their disks, and the rate change is saved with the state.
 - A standard (non-Spot) VM is priced from the Billing Catalog's on-demand rates. Without them, for a
@@ -392,7 +393,8 @@ inventory lists. The dashboard doesn't ship demo or seed instances.
   inactive makes no Compute Engine calls and keeps the records the active slot last published.
 - The first successful listing is a baseline, recorded as `fleet_inventory_baseline_at`. The VMs it finds
   already existed, so they don't mark OOM events handled. Only later growth beyond the capacity that
-  already existed, running or stopped, does: a stopped VM that starts again adds none. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
+  already existed does: only running VMs with a new instance ID add capacity, so a stopped VM that
+  starts again adds none. A listing that changes nothing writes nothing, so a quiet fleet doesn't publish a new
   snapshot.
 - Without `DASHBOARD_FLEET_INVENTORY=gce`, for example on a local dashboard, the instance list stays
   empty and the instances tab says that the inventory isn't configured. Inventory records loaded from
