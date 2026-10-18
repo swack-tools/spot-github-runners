@@ -1158,8 +1158,11 @@ class DemoTelemetryMigrationCommitTests(unittest.TestCase):
         snapshot = build_snapshot(self.seeded(5), 5, "a", now=1)
         self.fake.values[KV_STATE_KEY] = json.dumps(snapshot)
         new = self.store("b.json", slot="b")
-        self.assertTrue(new.import_snapshot(snapshot)["imported"])
-        self.assertEqual(new.state_version(), 5)
+        # The import reports the snapshot's own version: the control plane records it as the replacement's
+        # floor and must be able to re-import the same snapshot (from KV or the frozen old slot) to reach it.
+        self.assertEqual(new.import_snapshot(snapshot), {"state_version": 5, "imported": True})
+        self.assertEqual(new.import_snapshot(snapshot), {"state_version": 5, "imported": True})
+        self.assert_migrated(new.state)
         self.fake.values[KV_ORIGIN_KEY] = OriginRecord.for_slot("b", now=5).to_json()
         self.tick_until_published(new)
         published = parse_snapshot(self.fake.values[KV_STATE_KEY])

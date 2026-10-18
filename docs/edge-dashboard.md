@@ -440,6 +440,10 @@ GitHub CI failure runs, journal OOM events, or job counters.
   `state_version` through the same checks as any change, and publishes it to KV. Any new version clears
   the flag. A standby slot waits, so its copy never shadows the active slot's next change. A rollback then
   sees the migrated version as newer than the old slot's copy and carries it back.
+- A handover import keeps the snapshot's `state_version`, because the control plane records the version
+  that an import reports as the floor for any later re-import. The replacement commits the migration once
+  it confirms that it's the active slot, within one writer check (30 seconds) of cutover. A rollback inside
+  that window leaves the old slot's demo telemetry in place until the next rotation migrates it again.
 
 ## State durability
 
