@@ -392,6 +392,34 @@ GitHub CI failure runs, journal OOM events, or job counters.
   past hour, 7 provisioned, and 3 queued. Any other combination stays as reported.
 - A reported record that only shares a run ID with a seed stays as reported.
 
+### Reporting a GitHub CI failure run
+
+`POST /api/scaling` with an `add_github_oom_run` object records one failed GitHub Actions job. The
+dashboard stores only what the caller sends and rejects an incomplete run with HTTP 400, leaving the
+state unchanged.
+
+- Identify the failing step with `deep_link`, an Actions job URL that ends in `#step:<step>:<line>`, or
+  with all of `repository`, `run_id`, `job_id`, `step_number`, and `line_number`. When you send both,
+  the fields must match the link.
+- Send `error_excerpt`, the failing log line. The dashboard classifies the run as an OOM, a timeout, or
+  another failure from this line.
+- Send `runner_name` when the job log shows it. Without it the run counts as an external runner's, so
+  it's shown but never triggers a fleet scale-up.
+- The dashboard's own form sends only what you enter in it.
+
+## Machine shape templates
+
+The VM templates `tpl-runner-n4-std16`, `tpl-runner-za-n2-16`, and `tpl-builder-c4d-16` are preset
+machine shapes, so they don't name a source VM. A template created from a listed instance with
+`POST /api/vm-templates/from-instance` records that VM as its `source_instance`.
+
+- Earlier versions gave the presets the source VMs `oxidex-runners-dallas-01`,
+  `oxidex-runners-za-jnb-01`, and `builder-oxidex-turin-01`, which never existed. When the dashboard
+  loads a state that such a version wrote, from the state file, a KV snapshot, or a handover import, it
+  removes exactly these preset and source pairs and logs how many it removed.
+- It then marks the state with `demo_template_source_migration`, so this runs once. Later loads keep
+  every template's source as stored.
+
 ## State durability
 
 - The dashboard writes state atomically to `/var/lib/spot-dashboard/state.json` on the boot disk.
