@@ -2283,9 +2283,12 @@ def reconcile_instance_records(
         known_ids = {str(obs.get("instance_id")) for obs in observed if isinstance(obs, dict)}
         observed = list(observed) + [obs for obs in recovered if obs["instance_id"] not in known_ids
                                    and "id:" + obs["instance_id"].removeprefix("disk-") in tracked_roles]
+    # Active disk-only owners and unresolved retained liabilities carry the same physical metadata as a VM.
+    # Final deleted records cannot prove a later same-named disk's identity or rate.
     trusted_disks = [d for r in existing if is_live_instance_record(r)
-                     and r.get("status") != "DELETED" and r.get("kind") != "disk"
+                     and (r.get("status") != "DELETED" or r.get("disk_liability_pending"))
                      for d in r.get("disks_detail") or [] if isinstance(d, dict)
+                     and (r.get("status") != "DELETED" or d.get("auto_delete") is not True)
                      and not _finite(d.get("billing_deferred_since"))
                      and (r.get("disk_types_known") is not False or d.get("id"))]
     normalized = []
@@ -2299,7 +2302,9 @@ def reconcile_instance_records(
                 continue
             if obs.get("disk_types_known") is False:
                 trusted = next((d for d in trusted_disks if _same_disk(disk, d)
-                                and int(d.get("gb") or 0) == int(disk.get("gb") or 0)), None)
+                                and int(d.get("gb") or 0) == int(disk.get("gb") or 0)
+                                and (not _finite(disk.get("created_epoch")) or not _finite(d.get("created_epoch"))
+                                     or float(disk["created_epoch"]) == float(d["created_epoch"]))), None)
                 if trusted is not None:
                     disk = {**disk, **{k: trusted[k] for k in ("type", "id", "created_epoch")
                                       if trusted.get(k) not in (None, "")}}
@@ -4546,7 +4551,9 @@ class DashboardStore:
 
         return [
             str(inst.get("name")) for inst in self.state.get("instances", [])
-            if is_live_instance_record(inst) and inst.get("role") in roles and (inst.get("status") != "DELETED" or _has_unresolved_storage(inst)
+            if is_live_instance_record(inst) and (inst.get("role") in roles or
+                 (includes_storage and inst.get("kind") == "disk" and inst.get("storage_billing_ambiguous")))
+            and (inst.get("status") != "DELETED" or _has_unresolved_storage(inst)
                  or _unpriced_history_in_window(inst, now - DELETED_INSTANCE_RETENTION_SECONDS, now))
             and (not _selected_pricing_complete(inst, include_storage=includes_storage) or tax_unknown(inst)
                  or _unpriced_history_in_window(inst, now - DELETED_INSTANCE_RETENTION_SECONDS, now,

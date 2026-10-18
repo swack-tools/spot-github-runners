@@ -6355,7 +6355,18 @@ class FleetInventoryReconcileTests(unittest.TestCase):
                     rows, _ = reconcile_instance_records(rows, observations, project="p", now=self.now - hours * 3600,
                                                          disks_listed=verified)
                     if hours == 2:
-                        self.assertTrue(any(r.get("unpaid_disk_details") for r in rows))
+                        if carrier_deleted:
+                            # The detached owner now supplies its real type/ID at the denied handoff. A missing
+                            # VM carries a priced retained liability instead of inventing new unpriced debt.
+                            carrier = next(r for r in rows if r["instance_id"] == "a")
+                            self.assertTrue(carrier["disk_liability_pending"])
+                            self.assertEqual(carrier["disks_detail"][0]["type"], real["type"])
+                            self.assertEqual(carrier["disks_detail"][0]["id"], real["id"])
+                            expected_rate = _single_disk_all_in(real, family=carrier["family"], region=carrier["region"],
+                                project="p", tax_rate_percent=0)
+                            self.assertAlmostEqual(carrier["pricing"]["disk_hourly_usd"], expected_rate, delta=0.0001)
+                        else:
+                            self.assertTrue(any(r.get("unpaid_disk_details") for r in rows))
                 rate = _single_disk_all_in(real, family="n4", region="us-south1", project="p",
                                            tax_rate_percent=rows[0]["pricing"]["tax_rate_percent"])
                 self.assertAlmostEqual(sum(instance_usage(r, self.now)["cost_all_in"] for r in rows), 10 * rate, delta=0.001)
