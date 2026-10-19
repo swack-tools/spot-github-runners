@@ -17,3 +17,22 @@ def tier_poll_delay(state, interval, started_at, finished_at):
     # at least interval apart. Sleeping after health/price work otherwise makes
     # six five-minute observations age out of the unchanged 30-minute history.
     return max(0, interval - (finished_at - observed_at))
+
+
+# A one-shot check (the Cloud Run job) waits at most this long for the tier sampling boundary.
+ONCE_SAMPLE_MAX_WAIT_SECONDS = 120
+
+
+def once_sample_wait(state, interval, now):
+    """Seconds a ``--once`` tier check waits so its sample lands at least ``interval`` after the last accepted one.
+
+    The tier policy ignores a sample taken less than 300 s after its last one and restarts its streak after 450 s.
+    A scheduler that starts a check every 5 minutes doesn't keep samples 300 s apart, because the work before the
+    sample varies; waiting for the boundary keeps every interval between 300 s and the longest pre-sample work.
+    """
+    policy = state.get('tier_policy')
+    previous = policy.get('timestamp') if isinstance(policy, dict) else None
+    if isinstance(previous, bool) or not isinstance(previous, (int, float)) or not math.isfinite(previous):
+        return 0
+    wait = previous + interval - now
+    return wait if 0 < wait <= ONCE_SAMPLE_MAX_WAIT_SECONDS else 0
