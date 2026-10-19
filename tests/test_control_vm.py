@@ -3298,14 +3298,14 @@ class StartupScriptImageWatcherTests(unittest.TestCase):
         self.watch = re.search(r"<<'WATCH'\n(.*?)^WATCH$", self.text, re.S | re.M).group(1)
 
     def test_each_run_reports_its_progress(self):
-        done = 'report_run "done ${UPDATE_ID:--} $DASHBOARD_IMAGE_REF"'
+        done = 'report_run_end "done ${UPDATE_ID:--} $DASHBOARD_IMAGE_REF"'
         self.assertLess(self.main.index("wait_for_metadata"), self.main.index("report_run_start\n  read_update_id"))
         self.assertLess(self.main.index("report_run_start"), self.main.index("run_containers"))
         self.assertLess(self.main.index("remove_old_images"), self.main.index(done))
         self.assertLess(self.main.index(done), self.main.index("report_health"))
         cleanup = re.search(r"^cleanup\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
         self.assertTrue(cleanup.startswith('cleanup() {\n  local status=$?\n'))
-        self.assertIn('report_run "failed ${UPDATE_ID:--} $(date +%s)"', cleanup)
+        self.assertIn('report_run_end "failed ${UPDATE_ID:--} $(date +%s)"', cleanup)
         follow = re.search(r"^follow_image_changes\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
         self.assertIn('DASHBOARD_IMAGE="$latest"\n    read_update_id', follow)  # the id of the image it applies
         self.assertIn('"$METADATA/instance/guest-attributes/spot-dashboard/run"', self.text)
@@ -3362,8 +3362,9 @@ class StartupScriptImageWatcherTests(unittest.TestCase):
             (stub / "env").write_text("A=2\n", encoding="utf-8")  # a changed setting or secret replaces it
             self.assertEqual(run(), ["inspect", "stop", "rm", "run"])
 
-    def run_watcher(self, value, running):
+    def run_watcher(self, value, running, swaps=False):
         # curl call 1 answers with the value and an ETag; call 2 fails, so the watcher sleeps, which ends the run.
+        # swaps: a rerun replaces the container, so docker then reports the requested image.
         stubs = {
             "curl": r'''#!/usr/bin/env bash
 if [[ " $* " == *" PUT "* ]]; then
@@ -3383,7 +3384,8 @@ done
 printf '{}'
 ''',
             "sleep": "#!/usr/bin/env bash\nkill -TERM $PPID\n",
-            "docker": "#!/usr/bin/env bash\nprintf '%s\\n' \"$RUNNING\"\n",
+            "docker": ("#!/usr/bin/env bash\nif [[ -n $SWAPS && -e $STUB/reruns ]]; then printf '%s\\n' \"$VALUE\"; "
+                       "else printf '%s\\n' \"$RUNNING\"; fi\n"),
             "google_metadata_script_runner": '#!/usr/bin/env bash\necho "$*" >> "$STUB/reruns"\n',
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -3392,7 +3394,8 @@ printf '{}'
             for name, body in stubs.items():
                 (stub / name).write_text(body, encoding="utf-8")
                 (stub / name).chmod(0o755)
-            env = {"PATH": f"{stub}:/usr/bin:/bin", "STUB": str(stub), "VALUE": value, "RUNNING": running}
+            env = {"PATH": f"{stub}:/usr/bin:/bin", "STUB": str(stub), "VALUE": value, "RUNNING": running,
+                   "SWAPS": "1" if swaps else ""}
             subprocess.run(["bash", str(stub / "watch.sh")], env=env, capture_output=True, text=True, timeout=30)
             reruns = (stub / "reruns").read_text() if (stub / "reruns").exists() else ""
             self.puts = (stub / "puts").read_text().splitlines() if (stub / "puts").exists() else []
@@ -3435,6 +3438,33 @@ printf '{}'
         # Nothing to swap: it confirms the request, so the controller knows no run is pending for it.
         self.assertEqual(self.puts, [f"done upd-1 {new} -> http://metadata.google.internal/computeMetadata/v1/instance/"
                                      "guest-attributes/spot-dashboard/run"])
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_watcher_confirms_its_rerun_without_waiting_for_another_change(self):
+        new = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "b" * 64
+        old = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "a" * 64
+        # The rerun swapped the container (its own end report may have been lost): confirmed before the next wait.
+        reruns, urls = self.run_watcher(new, old, swaps=True)
+        self.assertEqual(reruns, "startup\n")
+        self.assertEqual(len([u for u in urls if "wait_for_change" in u]), 2)
+        self.assertEqual(self.puts, [f"done upd-1 {new} -> http://metadata.google.internal/computeMetadata/v1/instance/"
+                                     "guest-attributes/spot-dashboard/run"])
+        # A failed rerun (still the old image) is not retried in a loop: it waits for the next change.
+        reruns, _ = self.run_watcher(new, old)
+        self.assertEqual(reruns, "startup\n")
+        self.assertEqual(self.puts, [])
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_the_end_report_is_retried(self):
+        functions = "".join(re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", self.text, re.S | re.M).group(0)
+                            for name in ("report_run", "report_run_end"))
+        script = ('exec 3>&1\nMETADATA=http://x\nlog() { :; }\nsleep() { :; }\n'
+                  'curl() { n=$((n + 1)); echo "try $n" >&3; ((n >= 3)); }\n' + functions
+                  + 'report_run_end "done x y" && echo reported\n')
+        result = subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
+                                timeout=30)
+        self.assertEqual(result.stdout.split("\n")[-2:], ["reported", ""])
+        self.assertIn("try 3", result.stdout)
 
     @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
     def test_a_run_that_cannot_report_its_start_stops_once_reporting_is_enabled(self):

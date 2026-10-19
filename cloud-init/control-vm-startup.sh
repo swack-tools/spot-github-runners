@@ -359,6 +359,18 @@ report_run() {
     "$METADATA/instance/guest-attributes/spot-dashboard/run" >/dev/null 2>&1
 }
 
+# The end report ("done" or "failed"), retried: a lost one leaves "running", and the controller then waits for the
+# watcher's own confirmation (it reconciles right after the run it started) instead of releasing the container.
+report_run_end() {
+  local attempt
+  for attempt in 1 2 3 4 5 6; do
+    report_run "$1" && return 0
+    ((attempt == 6)) || sleep 5
+  done
+  log "could not report the end of this run (guest attribute spot-dashboard/run)"
+  return 1
+}
+
 # The "running" report is required once guest attributes are enabled: a run that can't announce itself stops
 # before it touches a container, so the controller never mistakes it for no run at all.
 report_run_start() {
@@ -378,7 +390,7 @@ read_update_id() {
 cleanup() {
   local status=$?
   if ((status != 0)); then
-    report_run "failed ${UPDATE_ID:--} $(date +%s)" || true
+    report_run_end "failed ${UPDATE_ID:--} $(date +%s)" || true
   fi
   if [[ -n "$BUILD_DIR" ]]; then
     rm -rf "$BUILD_DIR"
@@ -546,18 +558,24 @@ readonly CONTAINER=spot-dashboard
 log() { printf 'spot-dashboard-image-watch: %s\n' "$*" >&2; }
 attr() { curl -fsS --max-time 10 -H 'Metadata-Flavor: Google' "$ATTRS/$1" 2>/dev/null || true; }
 etag=NONE
+# After a rerun, check once without waiting, so a run whose own end report was lost is still confirmed promptly.
+recheck=0
 while true; do
-  # Wakes on any metadata change: a request can change only dashboard-update-id (a restore of the running image).
-  headers="$(mktemp)"
-  if ! curl -fsS --max-time 3700 -D "$headers" -H 'Metadata-Flavor: Google' \
-      "$ATTRS/?recursive=true&wait_for_change=true&timeout_sec=3600&last_etag=$etag" >/dev/null; then
+  if ((recheck == 0)); then
+    # Wakes on any metadata change: a request can change only dashboard-update-id (a restore of the running image).
+    headers="$(mktemp)"
+    if ! curl -fsS --max-time 3700 -D "$headers" -H 'Metadata-Flavor: Google' \
+        "$ATTRS/?recursive=true&wait_for_change=true&timeout_sec=3600&last_etag=$etag" >/dev/null; then
+      rm -f "$headers"
+      sleep 15
+      continue
+    fi
+    etag="$(tr -d '\r' <"$headers" | sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//p' | tail -n 1)"
     rm -f "$headers"
-    sleep 15
-    continue
+    [[ "$etag" =~ ^[A-Za-z0-9]+$ ]] || etag=NONE
   fi
-  etag="$(tr -d '\r' <"$headers" | sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//p' | tail -n 1)"
-  rm -f "$headers"
-  [[ "$etag" =~ ^[A-Za-z0-9]+$ ]] || etag=NONE
+  rechecking=$recheck
+  recheck=0
   value="$(attr dashboard-image)"
   [[ -n "$value" ]] || continue
   running="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
@@ -569,8 +587,11 @@ while true; do
       >/dev/null 2>&1 || true
     continue
   fi
+  # Right after a rerun, a mismatch means it failed: wait for the next change (or the hourly timeout) to retry.
+  ((rechecking == 0)) || continue
   log "dashboard-image is $value but $CONTAINER runs ${running:-nothing}; rerunning the startup script"
   google_metadata_script_runner startup || log "the startup script failed; retrying at the next change or in an hour"
+  recheck=1
 done
 WATCH
   write_root_file "/etc/systemd/system/$WATCH_UNIT" 0644 <<UNIT
@@ -682,7 +703,7 @@ main() {
   run_containers
   unset GITHUB_TOKEN
   remove_old_images
-  report_run "done ${UPDATE_ID:--} $DASHBOARD_IMAGE_REF" || true
+  report_run_end "done ${UPDATE_ID:--} $DASHBOARD_IMAGE_REF" || true
   report_health
 }
 

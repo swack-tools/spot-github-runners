@@ -1282,6 +1282,46 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(h.saves, 0)
 
 
+class MisroutedSlotTests(unittest.TestCase):
+    """A tunnel that reaches the other slot's VM never counts as this slot's health."""
+
+    def test_health_for_slot_rejects_an_answer_from_the_other_slot(self):
+        h = tcv.Harness()
+        h.http.healthy("a", version=4, image=IMG_B)
+        h.http.health["a"][1]["slot"] = "b"
+        result = cv.health_for_slot(cv.probe_health(h.http, h.config, "a"), "a")
+        self.assertEqual((result.ok, result.hydrated, result.frozen, result.image), (False, False, False, None))
+        self.assertIn("answered as slot 'b'", result.detail)
+        h.http.healthy("a", version=4, image=IMG_B)
+        self.assertTrue(cv.health_for_slot(cv.probe_health(h.http, h.config, "a"), "a").ok)
+        unreachable = cv.HealthResult.unknown("unreachable")
+        self.assertIs(cv.health_for_slot(unreachable, "a"), unreachable)
+
+    def test_a_rollout_never_starts_through_a_misrouted_tunnel(self):
+        h = TrackingHarness()
+        h.active()
+        h.http.health["a"][1]["slot"] = "b"
+        self.assertNotEqual(h.tick().action, "update_image")
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations(), [])
+
+    def test_a_misrouted_answer_never_releases_or_resets(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        self.assertEqual(h.transition["step"], "wait_image")
+        h.swapped()
+        h.http.health["a"][1]["slot"] = "b"  # the new image's health, but from slot b's VM
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS + 60
+        h.tick()
+        self.assertIsNotNone(h.transition)
+        self.assertIn("answered as slot 'b'", h.transition["error"])
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B)])
+        h.finish()  # routed correctly again: the release goes ahead
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+
+
 class ImageHealthTests(unittest.TestCase):
     def test_probe_reads_the_reported_image(self):
         h = tcv.Harness()

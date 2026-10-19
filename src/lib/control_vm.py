@@ -1191,6 +1191,15 @@ def probe_health(requester: edge_state.Requester, config: ControlConfig, slot: s
                         slot=reported_slot, image=image)
 
 
+def health_for_slot(result: HealthResult, slot: str) -> HealthResult:
+    """The probe result only when the dashboard answered as ``slot``: a misrouted tunnel that reaches the other
+    slot's VM must never count as this slot ready, frozen, hydrated, or serving an image."""
+    if result.slot == slot or (result.status_code is None and not result.hydrated):
+        return result
+    return HealthResult(False, status_code=result.status_code,
+                        detail=f"the slot {slot} hostname answered as slot {result.slot!r}")
+
+
 def _access_headers(config: ControlConfig) -> dict[str, str]:
     return {"CF-Access-Client-Id": config.access_client_id,
             "CF-Access-Client-Secret": config.access_client_secret,
@@ -1513,7 +1522,7 @@ class ControlVmManager:
             return Plan(plan.action, f"{plan.reason}; {reason}", slot=plan.slot, target_slot=plan.target_slot,
                         offer=plan.offer)
         ready = (active is not None and active.running and other is None
-                 and (obs.health.get(obs.origin.slot) or HealthResult.unknown()).ok)
+                 and health_for_slot(obs.health.get(obs.origin.slot) or HealthResult.unknown(), obs.origin.slot).ok)
         now = self.clock()
         last_abort = self.cstate.get("last_abort_at") or 0
         retry = (self.cstate.get("image") or {}).get("retry")
@@ -2198,7 +2207,7 @@ class ControlVmManager:
             # started writable (an image whose freeze handling regressed) and may have accepted changes: freeze it
             # and take its current state rather than importing the older snapshot over it. (Without a kept
             # snapshot no container was replaced, and the idempotent unfreeze below just runs again.)
-            health = probe_health(self.requester, self.config, slot)
+            health = health_for_slot(probe_health(self.requester, self.config, slot), slot)
             if not health.hydrated:
                 return False, f"slot {slot} is not reachable to release it: {health.detail}"
             if not health.frozen or t.get("capture_pending"):
@@ -2207,15 +2216,17 @@ class ControlVmManager:
                 t["capture_pending"] = True
                 self.save()
                 status, body = self._control(slot, "freeze", "POST")
+                if status != 200:
+                    return False, f"freeze before releasing slot {slot} returned {status}"
                 version = body.get("state_version") if isinstance(body, dict) else None
                 floor = t.get("frozen_version") or 0
-                if status == 200 and isinstance(version, int) and not isinstance(version, bool) and version < floor \
+                if isinstance(version, int) and not isinstance(version, bool) and version < floor \
                         and not t.get("release_attempted"):
                     # Writable from the start and behind the frozen state: its changes and the frozen ones diverged.
                     return False, (f"operator action needed: slot {slot} started writable at state_version {version}, "
                                    f"below the frozen {floor}")
-                if not (status == 200 and self._record_freeze(t, body)):
-                    return False, f"freeze before releasing slot {slot} returned {status}"
+                if not self._record_freeze(t, body):
+                    return False, f"freeze before releasing slot {slot} returned an unusable snapshot"
         t["release_attempted"] = True  # before the call: a lost response may still have released it
         self.save()
         snapshot = t.get("frozen_snapshot")
@@ -2286,7 +2297,7 @@ class ControlVmManager:
             # holding them for the whole update timeout. The rollback pins the previous image again.
             return self._abort(t, f"{control_vm_name(slot)} is {vm.status if vm else 'missing'} during the image "
                                   f"update")
-        result = obs.health.get(slot) or HealthResult.unknown()
+        result = health_for_slot(obs.health.get(slot) or HealthResult.unknown(), slot)
         floor = t.get("frozen_version") or 0
         release_error = None
         if vm.running and result.image == image and result.hydrated and not t.get("released"):
@@ -2295,7 +2306,7 @@ class ControlVmManager:
             ok, detail = self._release(t, slot) if settled else (False, detail)
             self._note(detail, level=logging.INFO if ok else logging.WARNING)
             if ok:
-                result = probe_health(self.requester, self.config, slot)
+                result = health_for_slot(probe_health(self.requester, self.config, slot), slot)
             else:
                 release_error = detail
         if release_error:
@@ -2382,7 +2393,7 @@ class ControlVmManager:
         waited = self.clock() - t["step_started_at"]
         if (vm is not None and vm.running and t.get("release_attempted") and not t.get("refrozen")
                 and t.get("image_written") and not t.get("restored") and not t.get("capture_pending")
-                and (obs.health.get(slot) or HealthResult.unknown()).frozen):
+                and health_for_slot(obs.health.get(slot) or HealthResult.unknown(), slot).frozen):
             # Still frozen: no release landed, so it is drained and its (possibly stale) state must not replace the
             # kept snapshot.
             t["refrozen"] = True
@@ -2412,7 +2423,7 @@ class ControlVmManager:
                 t["refrozen"] = True
                 self._note("froze slot %s again at state_version %s before the rollback", slot, t["frozen_version"])
             else:
-                health = obs.health.get(slot) or HealthResult.unknown()
+                health = health_for_slot(obs.health.get(slot) or HealthResult.unknown(), slot)
                 if waited >= IMAGE_UPDATE_TIMEOUT_SECONDS and not health.hydrated:
                     # Unreachable for the whole timeout: HTTP can't drain it, and it takes no changes through the edge
                     # either. Fence it by stop (as a recovery fences an old VM); the rollback then ends through the
@@ -2452,7 +2463,7 @@ class ControlVmManager:
                        level=logging.WARNING)
         if t.get("freeze_requested") and not t.get("released") and vm is not None:
             # The freeze marker survives container swaps and reboots, so the restored container starts frozen.
-            health = obs.health.get(slot) or HealthResult.unknown()
+            health = health_for_slot(obs.health.get(slot) or HealthResult.unknown(), slot)
             if vm.running and health.hydrated:
                 if t.get("image_written") and health.image == t["dashboard_image"]:
                     detail = f"{vm.name} still runs {t['dashboard_image']}"  # the watcher has not swapped back yet
@@ -2464,7 +2475,7 @@ class ControlVmManager:
                                        else (True, ""))
                     ok = False
                     if settled:
-                        fresh = probe_health(self.requester, self.config, slot)
+                        fresh = health_for_slot(probe_health(self.requester, self.config, slot), slot)
                         if not fresh.hydrated or (t.get("image_written") and fresh.image == t["dashboard_image"]):
                             detail = f"{vm.name} reports image {fresh.image or 'unknown'}: {fresh.detail}"
                         else:

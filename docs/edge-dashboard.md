@@ -1379,9 +1379,13 @@ free-tier e2-micro. The VM keeps its slot, boot disk, state file, and `origin:ac
 Each metadata write carries an update ID in `dashboard-update-id`. Each startup script run reports its progress in
 the guest attribute `spot-dashboard/run`, which the `enable-guest-attributes=TRUE` metadata allows: `running`, then
 `done` or `failed` with the update ID it applied. Once reporting is on, a run that can't report its start stops
-before it touches a container. When the container already runs the pinned image, the watcher reports `done` for
-that ID itself. A run in progress may still replace the container, so the manager releases a container, in a
-rollout or a rollback, only after the run for its own update ID ends.
+before it touches a container, and a run retries its end report. When the container already runs the pinned image,
+the watcher reports `done` for that ID itself, and it checks once right after each run it starts, so a lost end
+report doesn't stall the rollout. A run in progress may still replace the container, so the manager releases a
+container, in a rollout or a rollback, only after the run for its own update ID ends.
+
+The manager trusts a health answer only when it comes from the slot it asked about. When a slot's tunnel reaches
+the other slot's VM, the rollout doesn't start, and an update in progress neither releases nor resets the VM.
 
 A container that starts writable, for example an image whose freeze handling regressed, may have accepted
 changes. The manager freezes it and imports its current state instead of the older frozen snapshot. When that state
