@@ -1027,3 +1027,14 @@ class AutoDeployWorkflowTests(unittest.TestCase):
         push = text[text.index("- name: Push"):text.index("- name: Log out")]
         self.assertLess(push.index('docker manifest inspect "${IMAGE}:${GITHUB_SHA}"'),
                         push.index('docker push "${IMAGE}:${GITHUB_SHA}"'))
+        branch = "\n".join(line[10:] for line in push[push.index("          if lookup="):push.index("          digest=")]
+                            .splitlines())
+        for lookup, pushed, code in (("", False, 0), ("no such manifest: x", True, 0), ("HTTP 503", False, 1)):
+            script = ("set -euo pipefail\nIMAGE=r/control-watchdog\nGITHUB_SHA=1\n"
+                      "docker() { if [[ \"$1\" == manifest ]]; then [[ -z \"$LOOKUP\" ]] || { echo \"$LOOKUP\" >&2; "
+                      "return 1; }; return 0; fi; echo \"CALLED $1\"; }\n" + branch)
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env={"LOOKUP": lookup,
+                                                                                                 "PATH": "/usr/bin:/bin"})
+            with self.subTest(lookup=lookup):
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual("CALLED push" in result.stdout, pushed)

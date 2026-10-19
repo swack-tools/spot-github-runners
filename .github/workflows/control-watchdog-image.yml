@@ -124,11 +124,15 @@ jobs:
         run: |
           # A commit tag never moves: a re-run of a commit that was already pushed reuses its image, so the deployed
           # digest keeps the commit tag the deploy job reads to prove the next commit is newer.
-          if docker manifest inspect "${IMAGE}:${GITHUB_SHA}" >/dev/null 2>&1; then
+          # Push only when the registry says the tag is absent; any other lookup failure stops the job.
+          if lookup="$(docker manifest inspect "${IMAGE}:${GITHUB_SHA}" 2>&1 >/dev/null)"; then
             echo "::notice::${IMAGE}:${GITHUB_SHA} already exists; reusing it instead of moving the tag"
             docker pull --quiet "${IMAGE}:${GITHUB_SHA}" >/dev/null
-          else
+          elif grep -qiE 'no such manifest|manifest unknown' <<<"${lookup}"; then
             docker push "${IMAGE}:${GITHUB_SHA}"
+          else
+            echo "::error::could not tell whether ${IMAGE}:${GITHUB_SHA} exists: ${lookup}"
+            exit 1
           fi
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${GITHUB_SHA}")"
           [[ "$digest" == "${IMAGE}@sha256:"* && "$digest" =~ @sha256:[0-9a-f]{64}$ ]] \
