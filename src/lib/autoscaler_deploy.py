@@ -262,7 +262,7 @@ def role_file(config: AutoscalerDeployConfig) -> str:
 
 def read_role_permissions(config: AutoscalerDeployConfig, runner: wd.Runner) -> tuple[str, ...]:
     """Read the base role and the project's custom-role support levels; raises DeployError on failure."""
-    return wd.read_role_permissions(config.project, runner)
+    return wd.read_role_permissions(config.project, runner, APIS)
 
 
 def hosts_condition() -> dict[str, str]:

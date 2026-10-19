@@ -1075,10 +1075,12 @@ predefined role each time it runs, as the autoscaler deploy does for `spotRunner
 none of the dropped permissions: it never runs `gcloud compute ssh`, and it writes only instance metadata on the
 VMs that the conditions name.
 
-Deploys before the custom role bound the predefined role with the same conditions. Every deploy removes those
-bindings after it adds the custom role bindings, so the watchdog keeps its compute access throughout. It removes
-the binding under each condition and the unconditional one that `--no-compute-condition` made, and skips any that
-is absent.
+Deploys before the custom role bound the predefined role with the same conditions. IAM changes take several
+minutes to propagate, so the deploy doesn't revoke the predefined role in the run that first grants the custom
+role: it prints that the custom role is newly bound. Run the deploy again 10 minutes or more later. A deploy that
+finds the custom role binding already in the project policy when it starts removes the predefined role under each
+condition, the unconditional predefined binding that `--no-compute-condition` made, and an unconditional custom
+role binding from such a deploy. It skips any binding that is absent.
 
 The service references these secrets:
 

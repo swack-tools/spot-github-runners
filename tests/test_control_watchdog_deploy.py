@@ -586,10 +586,9 @@ class FloorRemovalTests(unittest.TestCase):
         code, err = self.deploy(run, ENV)
         self.assertEqual(code, 0, err)
         compute = [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]]
-        floor = [c for c in compute if flag(c, "role") == CUSTOM_ROLE]
-        self.assertEqual(len(floor), 1)
-        self.assertEqual(flag(floor[0], "condition-from-file").rsplit("/", 1)[1], "floor-condition.json")
-        self.assertEqual(len([c for c in compute if flag(c, "role") == PREDEFINED_ROLE]), 3)
+        self.assertEqual(len(compute), 1)
+        self.assertEqual(flag(compute[0], "role"), CUSTOM_ROLE)
+        self.assertEqual(flag(compute[0], "condition-from-file").rsplit("/", 1)[1], "floor-condition.json")
         removed = sorted(c[3] for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"])
         self.assertEqual(removed, ["spot-floor-github-old", "spot-floor-github-swackhamer"])
         self.assertTrue(all(flag(c, "role") == "roles/secretmanager.secretAccessor"
@@ -601,9 +600,7 @@ class FloorRemovalTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         removed = [c[3] for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"]]
         self.assertEqual(removed, ["spot-floor-github-old"])  # swackhamer's secret is still configured
-        # Only the predefined role's old bindings go; the floor keeps its custom role binding.
-        self.assertEqual({flag(c, "role") for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]},
-                         {PREDEFINED_ROLE})
+        self.assertFalse([c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]])
         labels = sorted(c[3] for c in calls if any(a.startswith("--update-labels=spot-runner-floor") for a in c))
         self.assertEqual(labels, ["spot-floor-github-swackhamer", "spot-floor-github-xbmc4lyfe"])
 
@@ -632,6 +629,7 @@ class FloorRemovalTests(unittest.TestCase):
                 self.assertIn('"$name"', script)
                 self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
                 floor_removal = [c for c in commands(script) if c[1:3] == ["projects", "remove-iam-policy-binding"]
+                                 and flag(c, "condition-from-file") == "@FILE:floor-condition.json"
                                  and flag(c, "role") == CUSTOM_ROLE]
                 self.assertEqual(bool(floor_removal), env is ENV)
 
@@ -746,7 +744,8 @@ class OrphanedVolumeTests(unittest.TestCase):
 class CustomComputeRoleTests(unittest.TestCase):
     """Both compute bindings use a custom role without project metadata, OS Login, or IAM policy writes."""
 
-    def runner(self, role_ok=True):
+    def runner(self, role_ok=True, bound=False):
+        """``bound``: the custom role binding was already in the project policy when the deploy started."""
         calls, seen = [], {}
 
         def run(argv):
@@ -754,6 +753,8 @@ class CustomComputeRoleTests(unittest.TestCase):
             calls.append(argv)
             if argv[:4] in (["gcloud", "iam", "roles", "create"], ["gcloud", "iam", "roles", "update"]):
                 seen["role"] = json.loads(Path(flag(argv, "file")).read_text())
+            if argv[:3] == ["gcloud", "projects", "get-iam-policy"]:
+                return SimpleNamespace(returncode=0, stdout=f"{CUSTOM_ROLE}\n" if bound else "", stderr="")
             if "remove-iam-policy-binding" in argv and argv[1] == "projects":
                 for arg in argv:
                     if arg.startswith("--condition-from-file="):
@@ -775,7 +776,13 @@ class CustomComputeRoleTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}", *extra], runner=run, env=env)
+        self.out = out.getvalue()
         return code, err.getvalue()
+
+    @staticmethod
+    def removals(calls, role=None):
+        return [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]
+                and (role is None or flag(c, "role") == role)]
 
     def test_the_role_is_the_base_role_without_project_metadata_os_login_or_iam_policy_writes(self):
         run, calls, seen = self.runner()
@@ -794,46 +801,66 @@ class CustomComputeRoleTests(unittest.TestCase):
         self.assertIs(autoscaler_deploy.role_permissions, deploy.role_permissions)
         self.assertEqual(autoscaler_deploy.EXCLUDED_PERMISSIONS, deploy.EXCLUDED_PERMISSIONS)
 
-    def test_the_role_exists_before_its_bindings_and_the_old_bindings_go_after_them(self):
+    def test_the_apis_are_enabled_before_the_base_role_is_read(self):
         run, calls, _ = self.runner()
         code, err = self.deploy(run)
         self.assertEqual(code, 0, err)
-        role = next(i for i, c in enumerate(calls) if c[1:4] == ["iam", "roles", "create"])
-        adds = [i for i, c in enumerate(calls) if c[1:3] == ["projects", "add-iam-policy-binding"]]
-        removes = [i for i, c in enumerate(calls) if c[1:3] == ["projects", "remove-iam-policy-binding"]
-                   and flag(c, "role") == PREDEFINED_ROLE]
-        self.assertEqual(len(adds), 2)
-        self.assertLess(role, min(adds))
-        self.assertLess(max(adds), min(removes))
+        enable = next(i for i, c in enumerate(calls) if c[1:3] == ["services", "enable"])
+        read = next(i for i, c in enumerate(calls) if c[1:4] == ["iam", "roles", "describe"])
+        self.assertLess(enable, read)
+        self.assertIn("iam.googleapis.com", calls[enable])
+        self.assertIn("cloudbilling.googleapis.com", calls[enable])  # the floor's APIs too
 
-    def test_every_binding_an_earlier_deploy_made_is_removed_and_absence_is_fine(self):
+    def test_a_new_custom_binding_keeps_the_predefined_role_until_a_later_deploy(self):
+        # IAM propagates in minutes: revoking the old grant in the run that adds the new one could leave a gap.
+        run, calls, _ = self.runner(bound=False)
+        code, err = self.deploy(run)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.removals(calls, PREDEFINED_ROLE))
+        self.assertIn("is newly bound: run this deploy again", self.out)
+        gate = next(i for i, c in enumerate(calls) if c[1:3] == ["projects", "get-iam-policy"])
+        adds = [i for i, c in enumerate(calls) if c[1:3] == ["projects", "add-iam-policy-binding"]]
+        self.assertEqual(len(adds), 2)
+        self.assertLess(gate, min(adds))  # the policy is read before this deploy adds anything
+        gate_filter = flag(calls[gate], "filter")
+        self.assertIn(f'bindings.role="{CUSTOM_ROLE}"', gate_filter)
+        self.assertIn('bindings.condition.title="spot-control-vms-only"', gate_filter)
+
+    def test_every_binding_an_earlier_deploy_made_is_removed_once_the_custom_role_is_bound(self):
         for env, extra in ((ENV, ()), (FLOOR_ENV, ()), (ENV, ("--no-compute-condition",))):
             with self.subTest(floor=env is FLOOR_ENV, extra=extra):
-                run, calls, seen = self.runner()
+                run, calls, seen = self.runner(bound=True)
                 code, err = self.deploy(run, env, *extra)
                 self.assertEqual(code, 0, err)
-                legacy = [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]
-                          and flag(c, "role") == PREDEFINED_ROLE]
+                legacy = self.removals(calls, PREDEFINED_ROLE)
                 self.assertEqual([flag(c, "member") for c in legacy],
                                  [f"serviceAccount:spot-control-watchdog@{PROJECT}.iam.gserviceaccount.com"] * 3)
                 self.assertEqual(sum(flag(c, "condition") == "None" for c in legacy), 1)
                 # The removal files carry the exact conditions the predefined role was granted with.
                 self.assertIn(deploy.control_condition(), seen["removed"])
                 self.assertIn(deploy.floor_condition(), seen["removed"])
+                # An unconditional custom role binding from a --no-compute-condition deploy goes too, unless this
+                # deploy is itself unconditional.
+                unconditional = [c for c in self.removals(calls, CUSTOM_ROLE) if flag(c, "condition") == "None"]
+                self.assertEqual(len(unconditional), 0 if extra else 1)
 
     def test_an_unreadable_base_role_stops_before_anything_changes(self):
         run, calls, _ = self.runner(role_ok=False)
         code, err = self.deploy(run)
         self.assertEqual(code, 1)
         self.assertIn("could not read roles/compute.instanceAdmin.v1", err)
-        self.assertFalse([c for c in calls if not ("describe" in c or "list-testable-permissions" in c)])
+        self.assertFalse([c for c in calls if not ("describe" in c or "list-testable-permissions" in c
+                                                   or c[1:3] == ["services", "enable"])])
 
-    def test_the_dry_run_shows_the_role_and_the_removals(self):
+    def test_the_dry_run_shows_the_role_and_the_gated_removals(self):
         code, script, err = dry_run(f"--image={IMAGE}", env=FLOOR_ENV)
         self.assertEqual(code, 0, err)
+        self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
         self.assertIn("<computed at deploy time: roles/compute.instanceAdmin.v1 minus", script)
-        removals = [c for c in commands(script) if c[1:3] == ["projects", "remove-iam-policy-binding"]]
-        self.assertEqual([flag(c, "role") for c in removals], [PREDEFINED_ROLE] * 3)
+        self.assertIn('if [ -n "$(gcloud projects get-iam-policy', script)
+        self.assertEqual([flag(c, "role") for c in self.removals(commands(script))
+                          if flag(c, "role") == PREDEFINED_ROLE or flag(c, "condition") == "None"],
+                         [PREDEFINED_ROLE] * 3 + [CUSTOM_ROLE])
 
     def test_the_watchdog_code_never_uses_ssh_or_project_metadata(self):
         # The custom role drops what these would need; control VMs and floor hosts get instance metadata only.

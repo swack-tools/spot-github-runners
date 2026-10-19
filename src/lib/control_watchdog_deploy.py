@@ -13,8 +13,9 @@ minimum per execution, which at this cadence leaves the free tier. This module c
 4. The Artifact Registry Docker repository for the watchdog image.
 5. A check that every Secret Manager secret the service references has an enabled version (it never writes one).
 6. The custom compute role (``roles/compute.instanceAdmin.v1`` without project metadata, OS Login, or IAM policy
-   writes), then IAM, each binding on the narrowest resource that works (see :func:`iam_bindings`), then the removal
-   of the predefined compute role bindings that earlier deploys made.
+   writes); the removal of the predefined compute role bindings that earlier deploys made, once the custom role's
+   binding predates this deploy; then IAM, each binding on the narrowest resource that works (see
+   :func:`iam_bindings`).
 7. The Workload Identity pool and GitHub OIDC provider, limited to the image workflow on ``main``.
 8. With ``--image``: the Cloud Run service (no unauthenticated access, concurrency 1, at most one instance, secrets
    as Secret Manager references only), its invoker binding, and the Cloud Scheduler job with an OIDC target.
@@ -359,6 +360,9 @@ class Step:
     # (command printing the Cloud Run service as JSON, update command): after the run commands, the update runs with
     # --remove-volume=<names> when the service has secret volumes that no container mounts.
     volume_prune: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+    # (read command, message): the remove commands run only when the read prints something; otherwise the deploy
+    # prints the message and removes nothing.
+    remove_when: tuple[tuple[str, ...], str] | None = None
 
 
 def _c(*argv: str) -> tuple[str, ...]:
@@ -419,8 +423,15 @@ def custom_role_file(title: str, permissions: Sequence[str]) -> str:
                        "stage": "GA", "includedPermissions": included}, indent=2)
 
 
-def read_role_permissions(project: str, runner: Runner) -> tuple[str, ...]:
-    """Read the base role and the project's custom-role support levels; raises DeployError on failure."""
+def read_role_permissions(project: str, runner: Runner, apis: Sequence[str] = ()) -> tuple[str, ...]:
+    """Read the base role and the project's custom-role support levels; raises DeployError on failure.
+
+    ``apis`` are enabled first: on a fresh project the IAM API is off, and a permission whose service API is off may
+    be missing from the testable permissions."""
+    if apis:
+        enabled = runner(["gcloud", "services", "enable", *apis, f"--project={project}"])
+        if enabled.returncode != 0:
+            raise DeployError(f"could not enable the APIs: {(enabled.stderr or '').strip()[:300]}")
     described = runner(["gcloud", "iam", "roles", "describe", BASE_COMPUTE_ROLE, "--format=json"])
     testable = runner(["gcloud", "iam", "list-testable-permissions",
                        f"//cloudresourcemanager.googleapis.com/projects/{project}",
@@ -441,6 +452,11 @@ def read_role_permissions(project: str, runner: Runner) -> tuple[str, ...]:
 def control_condition() -> dict[str, str]:
     return {"expression": COMPUTE_CONDITION_EXPRESSION, "title": "spot-control-vms-only",
             "description": "Instances and disks named spot-control-*; other resource types unrestricted"}
+
+
+def apis(config: DeployConfig) -> tuple[str, ...]:
+    # The runner floor prices offers from the Cloud Billing Catalog API, which needs the API in this project.
+    return (*APIS, "cloudbilling.googleapis.com") if config.floor_enabled else APIS
 
 
 def floor_condition() -> dict[str, str]:
@@ -496,9 +512,7 @@ def build_steps(config: DeployConfig) -> list[Step]:
     location = f"--location={config.region}"
     bucket = f"gs://{config.state_bucket}"
     runtime = f"serviceAccount:{config.runtime_email}"
-    # The runner floor prices offers from the Cloud Billing Catalog API, which needs the API in this project.
-    apis = (*APIS, "cloudbilling.googleapis.com") if config.floor_enabled else APIS
-    steps = [Step("Enable the APIs", run=(_c("gcloud", "services", "enable", *apis, p),))]
+    steps = [Step("Enable the APIs", run=(_c("gcloud", "services", "enable", *apis(config), p),))]
     steps.append(Step(
         f"State bucket {bucket}: regional, uniform bucket-level access, public access prevention",
         check=_c("gcloud", "storage", "buckets", "describe", bucket, p, "--format=value(name)"),
@@ -544,6 +558,31 @@ def build_steps(config: DeployConfig) -> list[Step]:
                    "--format=none"),),
         update=(_c("gcloud", "iam", "roles", "update", ROLE_ID, p, "--file=@FILE:watchdog-compute-role.json",
                    "--format=none", "--quiet"),)))
+    # Earlier deploys bound the predefined role with the same conditions (or none, with --no-compute-condition). IAM
+    # changes take minutes to propagate, so the deploy removes those bindings only once the custom role binding
+    # existed before it started: a fresh grant and a revocation in one run could leave the watchdog without access
+    # in between. The same goes for an unconditional custom role binding that a --no-compute-condition deploy made,
+    # which would otherwise keep granting the role on every VM.
+    gate = (f'bindings.role="{config.compute_role}" AND bindings.members="{runtime}" AND '
+            + ('bindings.condition.title="spot-control-vms-only"' if config.compute_condition
+               else "NOT bindings.condition:*"))
+    legacy = [_c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
+                 f"--role={BASE_COMPUTE_ROLE}", condition, "--format=none")
+              for condition in ("--condition-from-file=@FILE:compute-condition.json",
+                                "--condition-from-file=@FILE:floor-condition.json", "--condition=None")]
+    if config.compute_condition:
+        legacy.append(_c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
+                         f"--role={config.compute_role}", "--condition=None", "--format=none"))
+    steps.append(Step(
+        f"Remove the {BASE_COMPUTE_ROLE} bindings earlier deploys made, once the custom role is bound (absent ones "
+        "are skipped)",
+        files={"compute-condition.json": json.dumps(control_condition(), indent=2),
+               "floor-condition.json": json.dumps(floor_condition(), indent=2)},
+        remove=tuple(legacy),
+        remove_when=(_c("gcloud", "projects", "get-iam-policy", config.project, "--flatten=bindings[].members",
+                        f"--filter={gate}", "--format=value(bindings.role)"),
+                     f"{config.compute_role} is newly bound: run this deploy again once IAM has propagated it "
+                     f"(10 minutes or more) to remove the {BASE_COMPUTE_ROLE} bindings")))
     compute_args = (["--condition-from-file=@FILE:compute-condition.json"] if config.compute_condition
                     else ["--condition=None"])
     iam_runs = [
@@ -567,17 +606,6 @@ def build_steps(config: DeployConfig) -> list[Step]:
                     "--format=none") for secret in sorted(set(mounts.values()))]
     steps.append(Step("Runtime service account IAM (narrowest resource for each role)", run=tuple(iam_runs),
                       files=files))
-    # Earlier deploys bound the predefined role with the same conditions (or none, with --no-compute-condition).
-    # The custom role bindings above are in place first, so the watchdog keeps its access throughout.
-    legacy_files = {"compute-condition.json": json.dumps(control_condition(), indent=2),
-                    "floor-condition.json": json.dumps(floor_condition(), indent=2)}
-    steps.append(Step(
-        f"Remove the {BASE_COMPUTE_ROLE} bindings earlier deploys made (absent ones are skipped)",
-        files=legacy_files, remove=tuple(
-            _c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
-               f"--role={BASE_COMPUTE_ROLE}", condition, "--format=none")
-            for condition in ("--condition-from-file=@FILE:compute-condition.json",
-                              "--condition-from-file=@FILE:floor-condition.json", "--condition=None"))))
     # Grants the runner floor no longer needs: the floor compute binding once no floor target is configured, and
     # the accessor on every labeled floor token secret that the service no longer references.
     removals: list[tuple[str, ...]] = []
@@ -710,7 +738,13 @@ def render(config: DeployConfig, steps: Sequence[Step], *, title: str = "Control
             describe, update = step.volume_prune
             lines.append(f"volumes=\"$({_shell(describe)} | python3 -c {shlex.quote(ORPHANED_VOLUMES_PY)})\"")
             lines.append(f"if [ -n \"$volumes\" ]; then {_shell(update)} \"--remove-volume=$volumes\"; fi")
-        lines += [f"{_shell(c)} 2>/dev/null || echo 'already absent'" for c in step.remove]
+        if step.remove_when:
+            gate, skipped = step.remove_when
+            lines.append(f"if [ -n \"$({_shell(gate)})\" ]; then")
+            lines += [f"  {_shell(c)} 2>/dev/null || echo 'already absent'" for c in step.remove]
+            lines += ["else", f"  echo {shlex.quote(skipped)}", "fi"]
+        else:
+            lines += [f"{_shell(c)} 2>/dev/null || echo 'already absent'" for c in step.remove]
         for listing, keep, commands in step.prune:
             lines.append(f"for name in $({_shell(listing)}); do")
             lines.append(f"  case ' {' '.join(keep)} ' in *\" $name \"*) continue ;; esac")
@@ -808,7 +842,16 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
                     raise DeployError(f"{step.title} failed: unexpected volume name(s) {', '.join(map(repr, bad))}")
                 if orphans:
                     run((*update, "--remove-volume=" + ",".join(orphans)), step.files, step.title)
-            for command in step.remove:
+            removals = step.remove
+            if step.remove_when:
+                gate, skipped = step.remove_when
+                result = runner(materialize(gate, step.files))
+                if result.returncode != 0:
+                    raise DeployError(f"{step.title} failed: {(result.stderr or '').strip()[:500]}")
+                if not (result.stdout or "").strip():
+                    out(f"  {skipped}")
+                    removals = ()
+            for command in removals:
                 remove(command, step.files, step.title)
             for listing, keep, commands in step.prune:
                 result = runner(materialize(listing, step.files))
@@ -883,7 +926,7 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner = default_runner,
         if problems:
             raise DeployError("refusing to deploy:\n  - " + "\n  - ".join(problems))
         if not args.dry_run:
-            config = replace(config, role_permissions=read_role_permissions(config.project, runner))
+            config = replace(config, role_permissions=read_role_permissions(config.project, runner, apis(config)))
         steps = build_steps(config)
         if args.dry_run:
             sys.stdout.write(render(config, steps))
