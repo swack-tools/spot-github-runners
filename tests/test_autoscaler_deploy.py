@@ -97,7 +97,14 @@ class ConfigTests(unittest.TestCase):
 
     def test_job_args_add_the_dedicated_host_account_and_nothing_per_execution(self):
         args = config().job_args()
-        self.assertEqual(args[args.index("--host-service-account") + 1], HOST_SA)
+        self.assertEqual(args[-1], f"--host-service-account={HOST_SA}")
+        # Each flag with a value is one item: gcloud's --args refuses a list holding one item twice.
+        self.assertIn("--job-repository=swack-tools/oxidex", args)
+        self.assertIn("--remote-builder", args)
+        self.assertEqual(len(args), len(set(args)))
+        from lib.spot_runner_autoscaler import args_parser
+        self.assertEqual(vars(args_parser().parse_args(args)),
+                         vars(args_parser().parse_args(list(ARGS) + ["--host-service-account", HOST_SA])))
         for refused in ("--once", "--dry-run", "--state-file", "--log-file", "--github-user"):
             self.assertNotIn(refused, args)
 
@@ -130,6 +137,7 @@ class ValidateTests(unittest.TestCase):
             "two different secrets": config(ssh_secret=deploy.DEFAULT_GITHUB_SECRET),
             "--memory": config(memory="lots"),
             "--task-timeout": config(task_timeout=60),
+            "appear twice": config(autoscaler_args=ARGS + ("--remote-builder",)),
             "schedule must be": config(schedule="*/10 * * * *"),
         }
         for needle, c in cases.items():

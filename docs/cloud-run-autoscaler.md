@@ -234,8 +234,8 @@ lease doesn't protect the cutover.
 
    The check starts from an empty state, because the state object doesn't exist yet. It proves the image, the
    GitHub token, and the read access of the IAM bindings. Read its log in Cloud Logging. Its `gcloud` calls use a
-   token with only the `cloud-platform.read-only` scope, so its `gcloud compute ssh` can't add the job's key to a
-   host: hosts show missing SSH evidence until the first live check connects.
+   token with only the `compute.readonly` and `cloud-platform.read-only` scopes, so its `gcloud compute ssh`
+   can't add the job's key to a host: hosts show missing SSH evidence until the first live check connects.
 
 1. Stop the LaunchAgent. `launchctl` sends `SIGTERM`, and the controller saves its state before each provider
    change, so a stop in the middle of a check is safe:

@@ -16,7 +16,7 @@ execution runs exactly one ``spot_runner_autoscaler.py --once`` check with the c
   ``oxidex-runners-*`` only) and never again, instead of a new key on every execution.
 * ``SPOT_AUTOSCALER_DRY_RUN=1`` (``gcloud run jobs execute ... --update-env-vars``) runs the read-only
   ``--dry-run`` check instead: no lease, no state write, no provider change. Its ``gcloud`` calls use an access
-  token with only the ``cloud-platform.read-only`` scope (``CLOUDSDK_AUTH_ACCESS_TOKEN_FILE``), so not even
+  token with only the ``compute.readonly`` and ``cloud-platform.read-only`` scopes (``CLOUDSDK_AUTH_ACCESS_TOKEN_FILE``), so not even
   ``gcloud compute ssh`` can add the key to a host's metadata; a host that doesn't have the key yet shows up as
   missing SSH evidence until a live check has connected once.
 
@@ -44,6 +44,9 @@ ENV_SSH_KEY_FILE = "SPOT_AUTOSCALER_SSH_KEY_FILE"
 ENV_FLOOR_STATE_URI = "SPOT_RUNNER_FLOOR_STATE_URI"
 STATE_DIR = Path("/tmp/spot-runner-autoscaler")
 READ_ONLY_SCOPE = "https://www.googleapis.com/auth/cloud-platform.read-only"
+# Compute Engine refuses cloud-platform.read-only ("insufficient authentication scopes"); it takes compute.readonly.
+# The dry run's gcloud calls are Compute Engine and Resource Manager reads, and these two scopes cover both.
+READ_ONLY_SCOPES = ("https://www.googleapis.com/auth/compute.readonly", READ_ONLY_SCOPE)
 TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 GITHUB_SECRET_ROOT = "/secrets/autoscaler-github"
 SSH_SECRET_ROOT = "/secrets/autoscaler-ssh"
@@ -175,14 +178,14 @@ def install_read_only_gcloud_token(directory: Path, fetch: Callable[[str], str] 
     """Write a read-only-scoped access token of the job's account for gcloud (``CLOUDSDK_AUTH_ACCESS_TOKEN_FILE``).
 
     The metadata server narrows a token only when ``scopes`` comes with ``enforce_scopes=true``; without it the
-    token keeps the account's full scope. Tokeninfo then proves the token holds the read-only scope and no other,
+    token keeps the account's full scope. Tokeninfo then proves the token holds read-only scopes and no other,
     or the dry run doesn't start."""
     import json
     import urllib.parse
 
     from . import compute_api
 
-    url = (f"{compute_api.METADATA_TOKEN_URL}?scopes={urllib.parse.quote(READ_ONLY_SCOPE, safe='')}"
+    url = (f"{compute_api.METADATA_TOKEN_URL}?scopes={urllib.parse.quote(','.join(READ_ONLY_SCOPES), safe='')}"
            "&enforce_scopes=true")
     try:
         raw = (fetch or compute_api._metadata_get)(url)
@@ -192,9 +195,9 @@ def install_read_only_gcloud_token(directory: Path, fetch: Callable[[str], str] 
     if not isinstance(token, str) or not token.strip() or any(c.isspace() for c in token.strip()):
         raise JobConfigError("the metadata server returned no read-only access token for the dry run")
     granted = (scopes or token_scopes)(token.strip())
-    if granted != {READ_ONLY_SCOPE}:
-        raise JobConfigError(f"the dry run token has scopes {sorted(granted)}, not only {READ_ONLY_SCOPE}; the dry "
-                             "run does not start")
+    if not granted or not granted <= set(READ_ONLY_SCOPES):
+        raise JobConfigError(f"the dry run token has scopes {sorted(granted)}, not only read-only ones "
+                             f"({', '.join(READ_ONLY_SCOPES)}); the dry run does not start")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "gcloud-read-only-token"
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)

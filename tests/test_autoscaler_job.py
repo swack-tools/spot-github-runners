@@ -153,14 +153,15 @@ class MainTests(unittest.TestCase):
         self.addCleanup(lambda: os.environ.pop("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", None) if saved is None
                         else os.environ.__setitem__("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", saved))
         with self.keygen(), patch("lib.compute_api._metadata_get", side_effect=metadata), \
-                patch.object(job, "token_scopes", return_value={job.READ_ONLY_SCOPE}), \
+                patch.object(job, "token_scopes", return_value=set(job.READ_ONLY_SCOPES)), \
                 patch.object(controller, "main", side_effect=autoscaler):
             self.assertEqual(job.main(BASE, env={**self.env, job.ENV_DRY_RUN: "1"}), 0)
         self.assertIn("--dry-run", seen["argv"])
         self.assertEqual(Path(seen["file"]).read_text(), "ya29.read-only")
         self.assertEqual(stat.S_IMODE(Path(seen["file"]).stat().st_mode), 0o600)
         self.assertEqual(len(urls), 1)
-        self.assertTrue(urls[0].endswith("?scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform.read-only"
+        self.assertTrue(urls[0].endswith("?scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcompute.readonly%2C"
+                                         "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform.read-only"
                                          "&enforce_scopes=true"))
 
     def test_a_token_that_kept_wider_scopes_stops_the_dry_run(self):
