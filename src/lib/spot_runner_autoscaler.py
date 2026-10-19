@@ -432,9 +432,31 @@ def terminate_spot_vm(vm: GceVm, project: str, org: str, runners: list[GitHubRun
 
 
 def read_scale_state(path: Path) -> dict:
-    """Read loop counters that must survive LaunchAgent restarts."""
+    """Read loop counters that must survive LaunchAgent restarts (or, with SPOT_AUTOSCALER_STATE_URI, executions)."""
+    from . import autoscaler_state_store
+
+    store = autoscaler_state_store.active()
+    if store is not None:
+        # Cloud Storage state: a missing or unreadable object is never replaced by an empty state on a live check.
+        data = store.load()
+        if data is None:
+            if not store.read_only:
+                raise autoscaler_state_store.AutoscalerStateError(
+                    f"autoscaler state {store.uri} does not exist; seed it from the workstation's state file "
+                    "(gcloud storage cp <state.json> <uri> --if-generation-match=0) before the first live check")
+            LOG.warning("Autoscaler state %s does not exist yet; this dry run starts from an empty state", store.uri)
+            return {"idle_loops": 0, "scale_up_active": False}
+        try:
+            state = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise autoscaler_state_store.AutoscalerStateError(
+                f"autoscaler state {store.uri} is not JSON; repair it by hand") from exc
+        if not isinstance(state, dict):
+            raise autoscaler_state_store.AutoscalerStateError(f"autoscaler state {store.uri} is not a JSON object")
+        path = None
     try:
-        state = json.loads(path.read_text())
+        if path is not None:
+            state = json.loads(path.read_text())
     except FileNotFoundError:
         return {"idle_loops": 0, "scale_up_active": False}
     except (json.JSONDecodeError, OSError) as exc:
@@ -450,7 +472,9 @@ def read_scale_state(path: Path) -> dict:
 
 
 def write_scale_state(path: Path, state: dict) -> None:
-    """Write autoscaler loop counters atomically."""
+    """Write autoscaler loop counters atomically; with SPOT_AUTOSCALER_STATE_URI also durably to Cloud Storage."""
+    from . import autoscaler_state_store
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile("w", dir=path.parent, delete=False) as temp:
         json.dump(state, temp)
@@ -458,6 +482,10 @@ def write_scale_state(path: Path, state: dict) -> None:
         os.fsync(temp.fileno())
         temporary_path = Path(temp.name)
     temporary_path.replace(path)
+    store = autoscaler_state_store.active()
+    if store is not None:
+        # Raises (and fences every later provider change) unless the object now holds exactly this state.
+        store.save(json.dumps(state).encode("utf-8"))
 
 
 def begin_host_operation(kind, vm, runners, vms, state, state_path, **metadata):
@@ -490,6 +518,13 @@ def import_deployment_receipt(state, state_path,current=None):
     """Recover the provider identity even when a launch vanishes before inventory."""
     operation = state.get("host_operation", {})
     receipt = operation.get("deployment_receipt")
+    if operation.get("kind") == "launch" and not operation.get("receipt_imported") and receipt \
+            and not Path(receipt).exists():
+        # A Cloud Run execution that died mid-launch left the receipt only in its Cloud Storage mirror.
+        from . import autoscaler_state_store
+        store = autoscaler_state_store.active()
+        if store is not None:
+            store.restore_receipt(Path(receipt))
     if (operation.get("kind") != "launch" or operation.get("receipt_imported")
             or not receipt or not Path(receipt).exists()):
         return False
@@ -2756,6 +2791,8 @@ def launch_offer(offer, args: argparse.Namespace, state=None, state_path=None) -
             command.append('--resource-monitoring')
         if getattr(args, 'billing_export_table', None):
             command.extend(['--billing-export-table', args.billing_export_table])
+        if getattr(args, 'host_service_account', None):
+            command.extend(['--host-service-account', args.host_service_account])
         profile = machine_profile(offer.machine_type)
         if profile is None:
             raise RuntimeError(f'Unsupported runner machine type: {offer.machine_type}')
@@ -3005,6 +3042,8 @@ def install_launch_agent(args: argparse.Namespace) -> Path:
         plist['ProgramArguments'].extend(['--config-repo', args.config_repo])
     if getattr(args, 'make_before_break', False):
         plist['ProgramArguments'].append('--make-before-break')
+    if getattr(args, 'host_service_account', None):
+        plist['ProgramArguments'].extend(['--host-service-account', args.host_service_account])
     plist_path.write_bytes(plistlib.dumps(plist))
     subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], check=False, timeout=60)
     return plist_path
@@ -3043,6 +3082,9 @@ def args_parser() -> argparse.ArgumentParser:
                         help='Install dedicated remote Rust builders on new nodes (default enabled)')
     parser.add_argument("--disk-size-gb", type=int, default=100)
     parser.add_argument('--billing-export-table', help='Billing export project.dataset.table for launch cost logs (or GCP_BILLING_EXPORT_TABLE)')
+    parser.add_argument('--host-service-account', default=None,
+                        help='Service account e-mail new runner hosts run as (default: the project default Compute '
+                             'Engine account); the Cloud Run job sets a dedicated metrics-and-logs-only account')
     parser.add_argument("--log-file", type=Path, default=Path.home() / "spot-ghrunner.log")
     parser.add_argument("--state-file", type=Path,
                         default=Path.home() / "Library" / "Application Support"
@@ -3069,7 +3111,14 @@ def main(argv: list[str] | None = None) -> int:
     if (args.maximum_hosts < 1 or (args.scaling_mode in ('resource','tiered') and args.interval_seconds != 300)
             or (args.scaling_mode=='tiered' and args.maximum_hosts>5)):
         raise ValueError('Resource mode requires 300-second checks and a positive maximum host count')
+    if args.host_service_account is not None and not re.fullmatch(
+            r'[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9.:-]+\.iam\.gserviceaccount\.com', args.host_service_account):
+        raise ValueError('--host-service-account must be a user-managed service account e-mail')
     load_env(ROOT / ".env")
+    from . import autoscaler_state_store
+    if not args.install_launch_agent:
+        # SPOT_AUTOSCALER_STATE_URI: the controller state lives in Cloud Storage; a dry run only reads it.
+        autoscaler_state_store.configure(read_only=args.dry_run)
     if args.github_user:
         secret=subprocess.check_output(["gh","auth","token","--user",args.github_user],text=True,timeout=30).strip()
         if not secret:raise RuntimeError("Missing requested GitHub account credential")
@@ -3135,14 +3184,27 @@ def run_controller(args: argparse.Namespace) -> int:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError(f"Another controller owns state {state_path}") from exc
-        holder = None if getattr(args, 'dry_run', False) else acquire_floor_lease(args)
+        from . import autoscaler_state_store
+        from .runner_floor import ENV_STATE_URI
+        store = autoscaler_state_store.active()
+        live = not getattr(args, 'dry_run', False)
+        if store is not None and live and not str(os.environ.get(ENV_STATE_URI, '') or '').strip():
+            # The floor lease is what serializes controllers of the target, and its guard fences provider changes
+            # behind the state's durability; Cloud Storage state without it is refused.
+            raise RuntimeError(f'{autoscaler_state_store.ENV_STATE_URI} needs {ENV_STATE_URI} (the runner floor '
+                               'lease) for a live check')
+        holder = acquire_floor_lease(args) if live else None
         if holder is False:
             return 0
         try:
-            return _run_controller(args)
+            code = _run_controller(args)
         finally:
             if holder:
                 release_floor_lease(holder)
+        if store is not None and store.failure:
+            LOG.error('Autoscaler state %s is not durable: %s', store.uri, store.failure)
+            return code or 1
+        return code
 
 
 def acquire_floor_lease(args: argparse.Namespace):
@@ -3181,11 +3243,18 @@ def acquire_floor_lease(args: argparse.Namespace):
         time.sleep(args.interval_seconds)
     try:
         holder.start()
-        _FLOOR_LEASE_GUARD = holder.guard
+        guard = holder.guard
+        from . import autoscaler_state_store
+        if autoscaler_state_store.active() is not None:
+            def guard():
+                # A Cloud Storage state write that failed or conflicted holds every later provider change too.
+                autoscaler_state_store.check()
+                holder.guard()
+        _FLOOR_LEASE_GUARD = guard
         _FLOOR_LEASE_HOLDER = holder
         # Every mutating child process (gcloud, gh, ssh, the deployment manager), whichever module starts it, proves
         # the lease immediately before it starts: cleanups that check only inventory freshness are covered too.
-        install_mutation_fence(holder.guard)
+        install_mutation_fence(guard)
         LOG.info('Holding the runner floor lease of %s; the floor keeper skips this target while this controller '
                  'runs', target)
         if holder.orphaned:
@@ -3311,7 +3380,16 @@ def _run_controller(args: argparse.Namespace) -> int:
                  current, busy, len(fleet_vms))
         if args.scaling_mode=='tiered':
             from .tier_controller import check_tiers
-            from .poll_cadence import tier_poll_delay
+            from .poll_cadence import once_sample_wait, tier_poll_delay
+            if args.once:
+                wait = once_sample_wait(state, args.interval_seconds, time.time())
+                if wait:
+                    # One check per scheduled execution: keep tier samples at least one interval apart, then take
+                    # a fresh runner inventory, because a fleet change needs one under 120 s old.
+                    LOG.info('Waiting %.0f seconds for the tier sampling boundary', wait)
+                    time.sleep(wait)
+                    runners = list_github_runners(_active_target(args))
+                    state['runner_inventory_observed_at'] = time.time()
             check_started_at = time.time()
             check_tiers(vms,runners,args,state,state_path)
             if args.once:return 0

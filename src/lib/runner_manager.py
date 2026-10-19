@@ -142,6 +142,9 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runner-group-id", type=int, default=10)
     parser.add_argument("--runner-prefix", default="oxidex-asia")
     parser.add_argument("--existing-instance", action="store_true", help="Attach/bootstrap an existing Spot VM")
+    parser.add_argument("--host-service-account", default=None,
+                        help="Service account e-mail the new VM runs as, with only the logging-write and "
+                             "monitoring-write scopes (default: the project default Compute Engine account)")
     parser.add_argument("--deployment-receipt", type=Path,
                         help="Persist the created VM identity before waiting for runner registration")
     parser.add_argument("--registration-timeout-seconds", type=int, default=1200,
@@ -457,6 +460,10 @@ def write_deployment_receipt(args: argparse.Namespace, vm: GceVm) -> None:
         os.fsync(temp.fileno())
         temporary = Path(temp.name)
     temporary.replace(path)
+    # The autoscaler's Cloud Run job keeps its state in Cloud Storage: the receipt must be there too before the
+    # launch goes on, or an execution that dies during the bootstrap wait would take the only copy with it.
+    from .autoscaler_state_store import save_receipt_from_env
+    save_receipt_from_env(path)
 
 
 def launch_target_label(args: argparse.Namespace) -> str:
@@ -825,7 +832,10 @@ def apply_startup(args: argparse.Namespace, zone: str, script: str) -> None:
                         network, f"--metadata-from-file={metadata_files}", _plain_metadata_flag(patch_plain),
                         # A runner floor host runs with no service account: CI jobs can reach the metadata server.
                         *(["--no-service-account", "--no-scopes"] if getattr(args, "no_service_account", False)
-                          else []),
+                          # A dedicated host account: the Ops Agent writes metrics and logs, and nothing else.
+                          else [f"--service-account={args.host_service_account}",
+                                "--scopes=logging-write,monitoring-write"]
+                          if getattr(args, "host_service_account", None) else []),
                         f"--labels={TARGET_LABEL_KEY}={launch_target_label(args)}",
                         "--format=json(id,name,zone,status,disks,cpuPlatform,minCpuPlatform)",
                         "--quiet"], quiet=True)

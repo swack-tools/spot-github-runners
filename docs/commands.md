@@ -20,6 +20,7 @@ The last column names the exact flag or action that makes it change something.
 | [`src/runner_fleet.py`](#runner-fleet) | Reads runners and VMs | Nothing |
 | [`src/spot_runner_manager.py`](#spot-runner-manager) | Prints a plan after read-only checks | `--apply`, which also deletes old unattached manager-labeled disks in the zone, or `--patch-live` (which needs no `--apply`) |
 | [`src/spot_runner_autoscaler.py`](#spot-runner-autoscaler) | Manages the fleet | `--dry-run` leaves VMs, disks, registrations, and controller state unchanged, but its `gcloud compute ssh` can add your SSH key; `--install-launch-agent` installs the macOS agent |
+| [`src/spot_runner_autoscaler_deploy.py`](#spot-runner-autoscaler-deploy) | Prints the deploy commands | `--apply` creates or updates the autoscaler's serverless job, scheduler, service accounts, custom role, and IAM bindings |
 | [`src/control_vm.py`](#control-vm) | `status` and `plan` read only | `ensure --apply`, `rotate --apply`; `render-startup` always writes its `--output` file |
 | [`src/runner_floor.py`](#runner-floor) | `status` and `tick` read only | `tick --apply` and `replace-unmanaged --apply` create, start, and delete runner hosts and runner registrations |
 | [`src/web_dashboard.py`](#web-dashboard) | Serves HTTP | `--state-file` persists state, including with `--dump-overview`; served POST routes can change state. With `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` set, `POST /api/patches/save` opens a pull request on the config repository, and with `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts |
@@ -212,6 +213,7 @@ Spot price, compatible storage, and quota before it changes anything. It loads
 | `--runner-prefix` | String | `oxidex-asia` | Runner name prefix. |
 | `--existing-instance` | Flag | Off | Adopt and bootstrap an existing Spot VM instead of creating one. With `--apply`, it labels the VM, attaches the data disk or turns on its auto-delete, writes startup metadata, and resets a running VM or starts a stopped one. |
 | `--deployment-receipt` | Path | None | Save the created VM identity before waiting for runner registration. |
+| `--host-service-account` | Service account email | None | Create the VM as this account with only the `logging-write` and `monitoring-write` scopes, instead of the default Compute Engine account. |
 | `--registration-timeout-seconds` | Integer | `1200` | Fail when bootstrap has not finished this long after deployment starts. |
 | `--apply` | Flag | Off | Run provisioning and startup-script deployment. |
 | `--remote-builder` | Flag | Off | Install the legacy shared-host Rust builder on a tier host. See the note after this table. |
@@ -306,6 +308,7 @@ operation. See [Fleet and autoscaler](fleet-and-autoscaler.md) for the policies.
 | `--remote-builder`, `--no-remote-builder` | Flag pair | Enabled | Install the legacy shared-host Rust builder on new tiered hosts. |
 | `--disk-size-gb` | Integer | `100` | Data disk size for new hosts. |
 | `--billing-export-table` | `project.dataset.table` | `GCP_BILLING_EXPORT_TABLE` | Billing export table for launch cost logs. |
+| `--host-service-account` | Service account email | None | Account that new runner hosts run as, with only the `logging-write` and `monitoring-write` scopes. Without it, hosts run as the project's default Compute Engine account. The serverless autoscaler job sets the dedicated `spot-runner-host` account. |
 | `--log-file` | Path | `~/spot-ghrunner.log` | Append-only controller log. |
 | `--state-file` | Path | `~/Library/Application Support/Spot Runner Autoscaler/state.json` | Controller state file. |
 | `--install-launch-agent` | Flag | Off | Install the macOS LaunchAgent and exit. |
@@ -323,6 +326,40 @@ python3 src/spot_runner_autoscaler.py \
   --scaling-mode tiered --tier-job-memory-gib 32 \
   --no-remote-builder --dry-run --once
 ```
+
+## `src/spot_runner_autoscaler_deploy.py` {#spot-runner-autoscaler-deploy}
+
+<!-- Cloud Run and Cloud Scheduler are product names, not the old "Cloud" shorthand for GCP. -->
+<!-- vale Google.WordList = NO -->
+
+Creates or updates the autoscaler's Cloud Run job, its Cloud Scheduler trigger, its service accounts, the
+`spotRunnerHostAdmin` custom role, and the IAM bindings. Without `--apply` it prints every command as a shell
+script and runs nothing. See [Serverless autoscaler](cloud-run-autoscaler.md).
+
+| Flag | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `--project` | String | Owner's project | GCP project. |
+| `--region` | String | `us-central1` | Region of the job, the scheduler, and the image repository. |
+| `--bucket` | String | `<project>-spot-control-state` | State bucket that the watchdog deploy created. |
+| `--image` | Image digest | None | `<region>-docker.pkg.dev/<project>/spot-control/spot-runner-autoscaler@sha256:<digest>`. Without it, only the infrastructure is deployed. |
+| `--autoscaler-args-file` | Path | None | Autoscaler flags for the job: shell words on each line, `#` comments. Needed with `--image`. |
+| `--github-secret` | String | `spot-floor-github-swack-tools` | Secret Manager secret with the GitHub token. |
+| `--ssh-secret` | String | `spot-runner-autoscaler-ssh-key` | Secret Manager secret with the autoscaler's SSH private key. |
+| `--cpu` | Integer | `1` | vCPUs for each execution. |
+| `--memory` | Quantity | `2Gi` | Memory for each execution. |
+| `--task-timeout` | Integer | `3600` | Seconds before Cloud Run stops an execution. |
+| `--github-repo` | `owner/repo` | `swack-tools/spot-github-runners` | Repository of the image workflow. |
+| `--project-number` | Integer | Looked up | Skip the project number lookup. |
+| `--no-compute-condition` | Flag | Off | Grant the custom role without the `oxidex-runners-*` IAM condition. |
+| `--skip-scheduler` | Flag | Off | Deploy the job, but not the scheduler. |
+| `--apply` | Flag | Off | Run the commands. |
+
+The job's entrypoint, `src/spot_runner_autoscaler_job.py`, runs one `--once` check for each execution. It
+refuses `--install-launch-agent`, `--github-user`, `--state-file`, `--log-file`, `--once`, `--dry-run`, and
+`--manage-control-vm` in its arguments, and refuses to start without `SPOT_AUTOSCALER_STATE_URI` and
+`SPOT_RUNNER_FLOOR_STATE_URI`.
+
+<!-- vale Google.WordList = YES -->
 
 ## `src/control_vm.py` {#control-vm}
 
