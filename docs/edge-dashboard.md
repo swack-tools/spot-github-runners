@@ -1077,10 +1077,11 @@ VMs that the conditions name.
 
 Deploys before the custom role bound the predefined role with the same conditions. IAM changes take several
 minutes to propagate, so the deploy doesn't revoke the predefined role in the run that first grants the custom
-role: it prints that the custom role is newly bound. Run the deploy again 10 minutes or more later. A deploy that
-finds the custom role binding already in the project policy when it starts removes the predefined role under each
-condition, the unconditional predefined binding that `--no-compute-condition` made, and an unconditional custom
-role binding from such a deploy. It skips any binding that is absent.
+role: it prints that the custom role is newly bound. Run the deploy again 10 minutes or more later. The deploy
+removes each predefined role binding only when the project policy already held its custom role replacement, under
+the same condition, when the deploy started. The control VM binding also takes the unconditional predefined binding
+that `--no-compute-condition` made, and an unconditional custom role binding from such a deploy, with it. With no
+floor targets, the deploy removes both floor bindings without waiting. It skips any binding that is absent.
 
 The service references these secrets:
 

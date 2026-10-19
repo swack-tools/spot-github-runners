@@ -559,30 +559,44 @@ def build_steps(config: DeployConfig) -> list[Step]:
         update=(_c("gcloud", "iam", "roles", "update", ROLE_ID, p, "--file=@FILE:watchdog-compute-role.json",
                    "--format=none", "--quiet"),)))
     # Earlier deploys bound the predefined role with the same conditions (or none, with --no-compute-condition). IAM
-    # changes take minutes to propagate, so the deploy removes those bindings only once the custom role binding
-    # existed before it started: a fresh grant and a revocation in one run could leave the watchdog without access
-    # in between. The same goes for an unconditional custom role binding that a --no-compute-condition deploy made,
-    # which would otherwise keep granting the role on every VM.
-    gate = (f'bindings.role="{config.compute_role}" AND bindings.members="{runtime}" AND '
-            + ('bindings.condition.title="spot-control-vms-only"' if config.compute_condition
-               else "NOT bindings.condition:*"))
-    legacy = [_c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
-                 f"--role={BASE_COMPUTE_ROLE}", condition, "--format=none")
-              for condition in ("--condition-from-file=@FILE:compute-condition.json",
-                                "--condition-from-file=@FILE:floor-condition.json", "--condition=None")]
+    # changes take minutes to propagate, so each old binding goes only once its replacement custom role binding
+    # existed before this deploy started: a fresh grant and a revocation in one run could leave the watchdog without
+    # access in between. The same goes for an unconditional custom role binding that a --no-compute-condition deploy
+    # made, which would otherwise keep granting the role on every VM. With the floor off, its old binding goes
+    # unconditionally in the floor removal step below.
+    def unbind(role: str, condition: str) -> tuple[str, ...]:
+        return _c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
+                  f"--role={role}", condition, "--format=none")
+
+    def bound(title: str | None) -> tuple[str, ...]:
+        """Prints the custom role binding under that condition title (None: the unconditional one), if any."""
+        where = f'bindings.condition.title="{title}"' if title else "NOT bindings.condition:*"
+        return _c("gcloud", "projects", "get-iam-policy", config.project, "--flatten=bindings[].members",
+                  f'--filter=bindings.role="{config.compute_role}" AND bindings.members="{runtime}" AND {where}',
+                  "--format=value(bindings.role)")
+
+    control_file, floor_file = "--condition-from-file=@FILE:compute-condition.json", \
+        "--condition-from-file=@FILE:floor-condition.json"
+    legacy_files = {"compute-condition.json": json.dumps(control_condition(), indent=2),
+                    "floor-condition.json": json.dumps(floor_condition(), indent=2)}
+    newly_bound = (f"{config.compute_role} is newly bound: run this deploy again once IAM has propagated it "
+                   f"(10 minutes or more) to remove the {BASE_COMPUTE_ROLE} bindings it replaces")
+    replaced = [unbind(BASE_COMPUTE_ROLE, control_file), unbind(BASE_COMPUTE_ROLE, "--condition=None")]
     if config.compute_condition:
-        legacy.append(_c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
-                         f"--role={config.compute_role}", "--condition=None", "--format=none"))
+        replaced.append(unbind(config.compute_role, "--condition=None"))
+    elif config.floor_enabled:
+        replaced.append(unbind(BASE_COMPUTE_ROLE, floor_file))  # the unconditional custom binding covers floor hosts
     steps.append(Step(
-        f"Remove the {BASE_COMPUTE_ROLE} bindings earlier deploys made, once the custom role is bound (absent ones "
-        "are skipped)",
-        files={"compute-condition.json": json.dumps(control_condition(), indent=2),
-               "floor-condition.json": json.dumps(floor_condition(), indent=2)},
-        remove=tuple(legacy),
-        remove_when=(_c("gcloud", "projects", "get-iam-policy", config.project, "--flatten=bindings[].members",
-                        f"--filter={gate}", "--format=value(bindings.role)"),
-                     f"{config.compute_role} is newly bound: run this deploy again once IAM has propagated it "
-                     f"(10 minutes or more) to remove the {BASE_COMPUTE_ROLE} bindings")))
+        f"Remove the {BASE_COMPUTE_ROLE} control VM bindings earlier deploys made, once the custom role replaces them "
+        "(absent ones are skipped)",
+        files=legacy_files, remove=tuple(replaced),
+        remove_when=(bound("spot-control-vms-only" if config.compute_condition else None), newly_bound)))
+    if config.floor_enabled and config.compute_condition:
+        steps.append(Step(
+            f"Remove the {BASE_COMPUTE_ROLE} runner floor binding earlier deploys made, once the custom role replaces "
+            "it (an absent one is skipped)",
+            files=legacy_files, remove=(unbind(BASE_COMPUTE_ROLE, floor_file),),
+            remove_when=(bound(FLOOR_CONDITION_TITLE), newly_bound)))
     compute_args = (["--condition-from-file=@FILE:compute-condition.json"] if config.compute_condition
                     else ["--condition=None"])
     iam_runs = [
@@ -610,11 +624,11 @@ def build_steps(config: DeployConfig) -> list[Step]:
     # the accessor on every labeled floor token secret that the service no longer references.
     removals: list[tuple[str, ...]] = []
     removal_files: dict[str, str] = {}
-    if not config.floor_enabled and config.compute_condition:
+    if not config.floor_enabled:
         removal_files["floor-condition.json"] = json.dumps(floor_condition(), indent=2)
-        removals.append(_c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
-                           f"--role={config.compute_role}", "--condition-from-file=@FILE:floor-condition.json",
-                           "--format=none"))
+        removals.append(unbind(BASE_COMPUTE_ROLE, floor_file))
+        if config.compute_condition:
+            removals.append(unbind(config.compute_role, floor_file))
     keep = tuple(sorted(set(refs.values()) | set(mounts.values())))
     prune = ((_c("gcloud", "secrets", "list", p, f"--filter=labels.{FLOOR_SECRET_LABEL}=token",
                  "--format=value(name.basename())"), keep,
