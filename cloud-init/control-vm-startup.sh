@@ -126,6 +126,18 @@ dashboard_image_ok() {
   [[ "$ref" =~ ^[a-z0-9][a-z0-9._/-]*:[0-9a-f]{40}$ ]]
 }
 
+# The dashboard-image checks for this shape: on the e2-micro (1 GB of RAM, never builds) a digest or a published
+# commit tag; elsewhere a digest.
+check_dashboard_image() {
+  local ref="$1"
+  if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then
+    dashboard_image_ok "$ref" \
+      || fail "the e2-micro control VM needs dashboard-image pinned by digest or a 40-hex commit tag; it never builds the image"
+  else
+    [[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"
+  fi
+}
+
 # Origin (https://host[:port]) of the public dashboard URL. The URL must be https:// plus a DNS host name, an
 # optional port 1-65535 without leading zeros and at most a trailing slash: no path, query, fragment or user info. Mirrors
 # public_origin() in src/lib/control_vm.py, which refuses the same values before a VM is created.
@@ -315,6 +327,23 @@ pull_published_image() {
   printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username x-access-token --password-stdin >/dev/null
   docker pull "$DASHBOARD_IMAGE" >/dev/null || fail "could not pull $DASHBOARD_IMAGE"
   docker logout ghcr.io >/dev/null 2>&1 || true
+}
+
+# A pull can take minutes on the e2-micro, and the controller may pin another image meanwhile (a rollback). Read
+# dashboard-image again after the pull and pull that image instead, so this run never starts a superseded image.
+follow_image_changes() {
+  local latest attempt
+  for attempt in 1 2 3 4 5; do
+    latest="$(metadata_attr dashboard-image)"
+    if [[ -z "$latest" || "$latest" == "$DASHBOARD_IMAGE" ]]; then
+      return 0
+    fi
+    check_dashboard_image "$latest"
+    log "dashboard-image changed to $latest during the pull; following it"
+    DASHBOARD_IMAGE="$latest"
+    pull_published_image
+  done
+  fail "dashboard-image kept changing during the pull"
 }
 
 BUILD_DIR=""
@@ -557,12 +586,8 @@ main() {
   GLOBAL_ADMINS="$(global_admins_csv "$GLOBAL_ADMINS_METADATA")" \
     || fail "dashboard-global-admins must be none or ;-separated login:numeric_id entries"
   PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail "dashboard-public-url must be https://host[:port] without a path, query, or user info"
-  if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then
-    # 1 GB of RAM: never build on the box, always pull the published image.
-    dashboard_image_ok "$DASHBOARD_IMAGE" \
-      || fail "the e2-micro control VM needs dashboard-image pinned by digest or a 40-hex commit tag; it never builds the image"
-  elif [[ -n "$DASHBOARD_IMAGE" ]]; then
-    [[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"
+  if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" || -n "$DASHBOARD_IMAGE" ]]; then
+    check_dashboard_image "$DASHBOARD_IMAGE"
   else
     [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] || fail "dashboard-source-ref must be a 40-hex commit"
   fi
@@ -582,6 +607,7 @@ main() {
   install_packages
   if [[ -n "$DASHBOARD_IMAGE" ]]; then
     pull_published_image
+    follow_image_changes
     DASHBOARD_IMAGE_REF="$DASHBOARD_IMAGE"
   else
     build_from_source

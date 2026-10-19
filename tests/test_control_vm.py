@@ -3144,12 +3144,46 @@ class StandardDashboardImageTests(unittest.TestCase):
             expected = not self.std(dashboard_image=value).create_problems() if value else False
             self.assertEqual(result.returncode == 0, expected, value)
         main = re.search(r"^main\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
-        micro_check = main.index('dashboard_image_ok "$DASHBOARD_IMAGE"')
-        self.assertLess(main.index('if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then\n    # 1 GB'), micro_check)
+        micro_check = main.index('check_dashboard_image "$DASHBOARD_IMAGE"')
+        self.assertLess(main.index('if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" || -n "$DASHBOARD_IMAGE" ]]; then'),
+                        micro_check)
         self.assertLess(micro_check, main.index("build_from_source\n"))
-        # Other shapes keep the digest-only check and the source build.
-        self.assertIn('[[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"',
-                      main)
+        # The e2-micro takes a digest or a published commit tag; other shapes keep the digest-only check.
+        check = re.search(r"^check_dashboard_image\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        stubs = 'fail() { echo "FAIL: $*" >&2; exit 1; }\n' + function + check
+        tag = f"ghcr.io/swack-tools/spot-dashboard:{self.SHA}"
+        for machine, value, ok in (("e2-micro", tag, True), ("e2-micro", self.DIGEST, True), ("e2-micro", "", False),
+                                   ("e2-small", self.DIGEST, True), ("e2-small", tag, False)):
+            script = (f'MACHINE_TYPE={machine}\nMICRO_MACHINE_TYPE=e2-micro\n' + stubs
+                      + 'check_dashboard_image "$1"')
+            result = subprocess.run(["bash", "-c", script, "check", value], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode == 0, ok, (machine, value))
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_a_run_follows_an_image_pinned_during_its_pull(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        main = re.search(r"^main\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        self.assertLess(main.index("pull_published_image\n    follow_image_changes"), main.index("run_containers"))
+        function = re.search(r"^follow_image_changes\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        stubs = ('log() { :; }\nfail() { echo "FAIL: $*"; exit 1; }\ncheck_dashboard_image() { [[ $1 != bad ]] || '
+                 'fail bad; }\npull_published_image() { echo "pull $DASHBOARD_IMAGE"; }\n'
+                 'metadata_attr() { n=$(($(cat "$DIR/n" 2>/dev/null || echo 0) + 1)); echo $n > "$DIR/n"; '
+                 'sed -n "${n}p" "$DIR/answers"; }\n')
+        for answers, expected_out, ok in ((["A"], [], True), (["B", "B"], ["pull B"], True), ([""], [], True),
+                                          (["bad"], ["FAIL: bad"], False), (["B", "C", "D", "E", "F", "G"],
+                                                                            ["pull B", "pull C", "pull D", "pull E",
+                                                                             "pull F", "FAIL: dashboard-image kept "
+                                                                             "changing during the pull"], False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "answers").write_text("\n".join(answers) + "\n", encoding="utf-8")
+                script = "DASHBOARD_IMAGE=A\n" + stubs + function + 'follow_image_changes\necho "final $DASHBOARD_IMAGE"\n'
+                result = subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin", "DIR": tmp},
+                                        capture_output=True, text=True, timeout=30)
+            lines = result.stdout.splitlines()
+            self.assertEqual(result.returncode == 0, ok, answers)
+            self.assertEqual(lines[:len(expected_out)], expected_out, answers)
+            if ok:
+                self.assertEqual(lines[-1], f"final {answers[-1] or 'A'}", answers)
 
 
 class StartupScriptZramTests(unittest.TestCase):

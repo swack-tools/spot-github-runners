@@ -2168,6 +2168,19 @@ class ControlVmManager:
         and back off the new digest. The normal health handling takes over once the transition ends."""
         vm = obs.vm(t["new_slot"])
         previous = t.get("from_image") or ""
+        if vm is not None and vm.running and t.get("unfrozen") and t.get("image_written") and not t.get("restored"):
+            # The new container was released (the update failed after its unfreeze): drain it again before the
+            # watcher replaces it.
+            t["freeze_requested"] = True
+            self.save()
+            status, _ = self._control(t["new_slot"], "freeze", "POST")
+            if status == 200:
+                t["unfrozen"] = False
+                self._note("froze slot %s again before the rollback", t["new_slot"])
+            elif not self._fail_attempt(t, f"freeze before the rollback returned {status}"):
+                return "wait"
+            else:
+                self._note("could not freeze slot %s again; rolling back anyway", t["new_slot"], level=logging.ERROR)
         if vm is not None and previous and t.get("image_written") and not t.get("restored"):
             error = self._set_image_metadata(t, vm, previous)
             if error:
@@ -2194,8 +2207,9 @@ class ControlVmManager:
             hold = None
             if t.get("image_written") and health.image == t["dashboard_image"]:
                 hold = f"{vm.name} still runs {t['dashboard_image']}"
-            elif health.hydrated and isinstance(floor, int) and (health.state_version is None
-                                                                 or health.state_version < floor):
+            elif not health.hydrated:
+                hold = f"{vm.name} has not reported hydrated state ({health.detail})"
+            elif isinstance(floor, int) and (health.state_version is None or health.state_version < floor):
                 hold = f"{vm.name} reports state_version {health.state_version} < {floor}"
             if vm.running and hold:
                 if waited < IMAGE_UPDATE_TIMEOUT_SECONDS:
