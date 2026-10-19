@@ -2116,8 +2116,12 @@ class ControlVmManager:
                                   f"update")
         result = obs.health.get(slot) or HealthResult.unknown()
         floor = t.get("state_version_before")
+        # Same state file, so the version can only grow; a lower one means the state did not carry over. Checked
+        # before the unfreeze, so a container with stale state never accepts changes.
+        below_floor = isinstance(floor, int) and (result.state_version is None or result.state_version < floor)
         unfreeze_error = None
-        if vm.running and result.image == image and result.hydrated and result.frozen and t.get("freeze_requested"):
+        if vm.running and result.image == image and result.hydrated and result.frozen and t.get("freeze_requested") \
+                and not below_floor:
             # The new container started frozen from the marker on disk: release it.
             status, _ = self._control(slot, "unfreeze", "POST")
             if status == 200:
@@ -2128,9 +2132,10 @@ class ControlVmManager:
                 unfreeze_error = f"unfreeze of slot {slot} on {image} returned {status}"
         if unfreeze_error:
             t["error"] = unfreeze_error
+        elif vm.running and result.image == image and result.hydrated and below_floor:
+            t["error"] = f"slot {slot} runs {image} at state_version {result.state_version} < {floor}; kept frozen"
         elif vm.running and result.ok and result.image == image:
             if isinstance(floor, int) and (result.state_version is None or result.state_version < floor):
-                # Same state file, so the version can only grow; a lower one means the state did not carry over.
                 t["error"] = f"slot {slot} serves {image} at state_version {result.state_version} < {floor}"
             else:
                 self._note("slot %s serves %s (state_version=%s)", slot, image, result.state_version)
@@ -2181,7 +2186,25 @@ class ControlVmManager:
             # The freeze marker survives container swaps and reboots: unfreeze whichever container serves now, or
             # the dashboard stays read-only. A stopped VM is started first (what the planner would do next anyway).
             waited = self.clock() - t["step_started_at"]
-            if vm.running:
+            health = obs.health.get(t["new_slot"]) or HealthResult.unknown()
+            floor = t.get("state_version_before")
+            # Release only the restored container with the state it froze at: never the failed image (the watcher may
+            # not have swapped back yet) and never state below the floor. Left frozen, it is unhealthy, and the
+            # planner's recovery replaces it from the KV snapshot.
+            hold = None
+            if t.get("image_written") and health.image == t["dashboard_image"]:
+                hold = f"{vm.name} still runs {t['dashboard_image']}"
+            elif health.hydrated and isinstance(floor, int) and (health.state_version is None
+                                                                 or health.state_version < floor):
+                hold = f"{vm.name} reports state_version {health.state_version} < {floor}"
+            if vm.running and hold:
+                if waited < IMAGE_UPDATE_TIMEOUT_SECONDS:
+                    t["error"] = f"waiting to unfreeze: {hold}"
+                    t["updated_at"] = self.clock()
+                    self.save()
+                    return "wait"
+                self._note("leaving slot %s frozen: %s", t["new_slot"], hold, level=logging.ERROR)
+            elif vm.running:
                 status, _ = self._control(t["new_slot"], "unfreeze", "POST")
                 if status == 200:
                     t["unfrozen"] = True

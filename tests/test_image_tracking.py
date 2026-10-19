@@ -426,6 +426,11 @@ class RolloutTests(unittest.TestCase):
         self.assertIn(f"reports image {IMG_B}", h.transition["error"])
         h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
         h.tick()  # timed out: pin the previous image again; the watcher swaps back
+        self.assertIn("still runs", h.transition["error"])
+        self.assertNotIn(("unfreeze", "a"), h.events, "the failed image is never released")
+        h.swapped(image=IMG_A)
+        h.clock[0] += 180
+        h.tick()
         self.assertIsNone(h.transition)
         self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B),
                                          ("set-image", "spot-control-a", IMG_A), ("unfreeze", "a")])
@@ -471,7 +476,8 @@ class RolloutTests(unittest.TestCase):
         h.clock[0] += 180
         h.tick()
         self.assertIsNotNone(h.transition)
-        self.assertIn("state_version 3 < 7", h.transition["error"])
+        self.assertIn("state_version 3 < 7; kept frozen", h.transition["error"])
+        self.assertNotIn(("unfreeze", "a"), h.events)  # stale state never accepts changes
 
     def test_metadata_write_failures_abort_without_a_swap(self):
         h = TrackingHarness()
