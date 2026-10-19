@@ -644,6 +644,19 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(h.mutations(), [("freeze", "a"), ("unfreeze", "a")])
         self.assertEqual(h.image["failed"], [D_B])
 
+    def test_an_oversized_refusal_retries_a_lost_unfreeze_without_capturing(self):
+        h = TrackingHarness()
+        h.active()
+        h.http.unfreeze_status = None  # the rollback's unfreeze lands; its answer is lost
+        with unittest.mock.patch.object(cv, "IMAGE_SNAPSHOT_MAX_BYTES", 10):
+            h.tick()
+            self.assertEqual(h.transition["step"], "abort")
+            h.http.unfreeze_status = 200
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.events.count(("freeze", "a")), 1)
+        self.assertEqual(h.events.count(("unfreeze", "a")), 2)
+
     def test_a_rollback_before_any_metadata_write_needs_no_run_report(self):
         h = TrackingHarness()
         h.active()

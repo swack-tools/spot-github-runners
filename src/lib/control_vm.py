@@ -2125,7 +2125,9 @@ class ControlVmManager:
         replacement: the import persists that state (including changes the freeze drained that never reached the
         state file), raises a container that came up behind it, and clears the freeze. Without a snapshot (the
         container was never replaced), unfreeze it."""
-        if t.get("release_attempted") and not t.get("released"):
+        if t.get("release_attempted") and not t.get("released") and (t.get("frozen_snapshot")
+                                                                     or t.get("snapshot_in_kv")):
+            # (Without a kept snapshot no container was replaced, and the idempotent unfreeze below just runs again.)
             # An earlier release got no confirmation. A container that is still frozen never took it (an import or
             # an unfreeze clears the freeze): retry with the same snapshot, which may hold what its state lacks at
             # the same version. One that is no longer frozen took it, so its state includes the snapshot plus any
