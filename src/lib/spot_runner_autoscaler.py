@@ -520,11 +520,15 @@ def import_deployment_receipt(state, state_path,current=None):
     receipt = operation.get("deployment_receipt")
     if operation.get("kind") == "launch" and not operation.get("receipt_imported") and receipt \
             and not Path(receipt).exists():
-        # A Cloud Run execution that died mid-launch left the receipt only in its Cloud Storage mirror.
+        # A Cloud Run execution that died mid-launch left the receipt only in its Cloud Storage copy, and the path
+        # it recorded may belong to another machine (a workstation's state directory): restore it by name next to
+        # this controller's state file.
         from . import autoscaler_state_store
         store = autoscaler_state_store.active()
         if store is not None:
-            store.restore_receipt(Path(receipt))
+            local = Path(state_path).parent / Path(receipt).name
+            if store.restore_receipt(local):
+                receipt = str(local)
     if (operation.get("kind") != "launch" or operation.get("receipt_imported")
             or not receipt or not Path(receipt).exists()):
         return False

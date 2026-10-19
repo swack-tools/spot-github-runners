@@ -310,6 +310,15 @@ class AutoscalerIntegrationTests(unittest.TestCase):
             self.assertFalse(controller.import_deployment_receipt(state, self.path))
         self.assertEqual(store.restored, [receipt])
 
+    def test_a_receipt_recorded_on_another_machine_is_restored_next_to_this_state_file(self):
+        restored = []
+        store = SimpleNamespace(restore_receipt=lambda path: restored.append(path) or False)
+        foreign = "/Users/someone/Library/Application Support/Spot Runner Autoscaler/" + RECEIPT
+        state = {"host_operation": {"kind": "launch", "deployment_receipt": foreign, "vm": {}}}
+        with patch.object(store_module, "_STORE", store):
+            self.assertFalse(controller.import_deployment_receipt(state, self.path))
+        self.assertEqual(restored, [self.path.parent / RECEIPT])
+
     def test_the_floor_lease_guard_also_proves_the_state_is_durable(self):
         self.fake.write(OBJECT, b"{}")
         store = self.configure()

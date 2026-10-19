@@ -200,6 +200,13 @@ class StepsTests(unittest.TestCase):
         self.assertIn(f"--member=serviceAccount:{RUNTIME_SA}", prune[0])
         self.assertIn("--role=roles/secretmanager.secretAccessor", prune[0])
 
+    def test_secret_grants_are_revoked_only_after_the_job_switches_mounts(self):
+        steps = deploy.build_steps(config())
+        job = next(i for i, s in enumerate(steps) if any(c[:4] == ("gcloud", "run", "jobs", "deploy") for c in s.run))
+        prune = next(i for i, s in enumerate(steps) if s.prune)
+        self.assertGreater(prune, job)
+        self.assertFalse(any(s.prune for s in deploy.build_steps(config(image="", autoscaler_args=()))))
+
     def test_apply_revokes_a_retired_secret_and_keeps_the_current_ones(self):
         runner = FakeGcloud()
         calls = []
