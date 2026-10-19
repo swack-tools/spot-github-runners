@@ -159,6 +159,39 @@ class MainTests(unittest.TestCase):
         self.assertTrue((self.dir / "home" / ".ssh" / "google_compute_engine").exists())
 
 
+class SampleBoundaryTests(unittest.TestCase):
+    """--once tier checks wait for the 300 s sampling boundary that the policy's streaks need."""
+
+    def test_wait_reaches_the_boundary_and_only_when_slightly_early(self):
+        from lib.poll_cadence import once_sample_wait
+        state = {"tier_policy": {"timestamp": 1000.0}}
+        self.assertEqual(once_sample_wait(state, 300, 1295.0), 5.0)
+        self.assertEqual(once_sample_wait(state, 300, 1300.0), 0)
+        self.assertEqual(once_sample_wait(state, 300, 1100.0), 0)  # far too early: never a long wait
+        for policy in ({}, {"timestamp": True}, {"timestamp": float("nan")}, None):
+            self.assertEqual(once_sample_wait({"tier_policy": policy}, 300, 1295.0), 0)
+
+    def test_scheduler_jitter_keeps_every_interval_inside_the_policy_window(self):
+        from lib.poll_cadence import once_sample_wait
+        # Executions start every 300 s; the work before the sample takes 60 to 100 s.
+        offsets = [100, 60, 95, 61, 100, 60, 99, 62, 80, 60]
+        state, samples = {"tier_policy": {}}, []
+        for index, offset in enumerate(offsets):
+            now = index * 300 + offset
+            now += once_sample_wait(state, 300, now)
+            samples.append(now)
+            state["tier_policy"]["timestamp"] = now
+        gaps = [b - a for a, b in zip(samples, samples[1:])]
+        self.assertTrue(all(300 <= gap <= 450 for gap in gaps), gaps)
+
+    def test_the_check_refreshes_runner_inventory_after_waiting(self):
+        source = Path(controller.__file__).read_text()
+        block = source[source.index("once_sample_wait(state"):source.index("check_tiers(vms,runners,args,state,state_path)",
+                                                                         source.index("once_sample_wait(state"))]
+        self.assertIn("runners = list_github_runners(", block)
+        self.assertIn("state['runner_inventory_observed_at'] = time.time()", block)
+
+
 class HostServiceAccountTests(unittest.TestCase):
     """--host-service-account: new hosts run as the dedicated account, never the default Compute Engine one."""
 

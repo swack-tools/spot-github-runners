@@ -3384,7 +3384,16 @@ def _run_controller(args: argparse.Namespace) -> int:
                  current, busy, len(fleet_vms))
         if args.scaling_mode=='tiered':
             from .tier_controller import check_tiers
-            from .poll_cadence import tier_poll_delay
+            from .poll_cadence import once_sample_wait, tier_poll_delay
+            if args.once:
+                wait = once_sample_wait(state, args.interval_seconds, time.time())
+                if wait:
+                    # One check per scheduled execution: keep tier samples at least one interval apart, then take
+                    # a fresh runner inventory, because a fleet change needs one under 120 s old.
+                    LOG.info('Waiting %.0f seconds for the tier sampling boundary', wait)
+                    time.sleep(wait)
+                    runners = list_github_runners(_active_target(args))
+                    state['runner_inventory_observed_at'] = time.time()
             check_started_at = time.time()
             check_tiers(vms,runners,args,state,state_path)
             if args.once:return 0

@@ -52,6 +52,10 @@ Each execution works in this order:
    durable. From then on, the lease guard raises before any `gcloud`, `gh`, `ssh`, or deployment manager child
    process starts, and the execution exits with status 1.
 
+The tier policy counts a sample only when it comes 300 to 450 seconds after the previous one. The work before
+the sample takes a different time in each execution, so an execution that reaches its sample less than 300
+seconds after the previous one waits for that boundary, up to 2 minutes, and then reads the runners again.
+
 Between two executions, the lease is free for about 3 minutes. The floor keeper may act then, but it acts only on
 a target that has no running managed host, as it does whenever the autoscaler isn't running.
 
@@ -69,6 +73,10 @@ it too. The job keeps that path:
 - The runtime account can't write project metadata, so `gcloud compute ssh` falls back to the runner host's own
   metadata. It adds the key once for each host, and never again for that host. Each connection still logs one
   refused project metadata write, `Updating project ssh metadata...failed`.
+- Writing a host's metadata needs `iam.serviceAccounts.actAs` on the account that the host runs as. The job has
+  it only for `spot-runner-host`, so it can reach hosts that run as that account or with no account. A host that
+  runs as the default Compute Engine account blocks the job's SSH evidence, and the tier policy holds. Replace
+  such hosts before the cutover.
 - Port 22 must be open to the internet on runner hosts, as the default network's `default-allow-ssh` rule does,
   because Cloud Run has no fixed outbound address.
 
@@ -198,6 +206,14 @@ The deploy adds `--host-service-account`, and the entrypoint adds `--once` and t
 
 The LaunchAgent and the job must never both run live checks. The LaunchAgent may not take the floor lease, so the
 lease doesn't protect the cutover.
+
+1. List the runner hosts and the account that each runs as. Every host must show no account or
+   `spot-runner-host`; see [Reach runner hosts](#reach-runner-hosts):
+
+   ```bash
+   gcloud compute instances list --project=PROJECT --filter="name~^oxidex-runners-" \
+     --format="table(name,zone.basename(),serviceAccounts[].email.list())"
+   ```
 
 1. Run one read-only check in the job. It takes no lease, writes no state, and changes no provider. Its output is
    the tier plan as JSON:
