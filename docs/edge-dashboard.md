@@ -1042,7 +1042,8 @@ project needs no pull credential at all.
 The alternative, a stock image that downloads a pinned repository archive at start-up, was rejected. It
 would make every recovery depend on GitHub being reachable, and it would need its own checksum
 verification. The custom image fixes the code and its dependencies in one digest, and the Cloud Run service runs
-exactly the digest that the deploy pinned. A pushed image changes nothing until you deploy its digest.
+exactly the digest that the deploy pinned. A pushed image changes nothing until a deploy moves the service to its
+digest: you, or the workflow's deploy job once [automatic deploys](#automatic-watchdog-deploys) are on.
 
 The workflow stays inert until four repository variables are set, which the deploy dry run prints:
 `WATCHDOG_IMAGE`, `WATCHDOG_PUBLISHER_SA`, `WATCHDOG_WIF_PROVIDER`, and `WATCHDOG_BASE_IMAGE`. The workflow
@@ -1063,6 +1064,10 @@ pinned by digest. The OIDC provider admits only that workflow on `main` of `swac
 | `spot-watchdog-invoker` | `roles/run.invoker` | The Cloud Run service only | Let Cloud Scheduler call this one service. No other member, and never `allUsers`. |
 | `spot-watchdog-publisher` | `roles/artifactregistry.writer` | The `spot-control` repository only | Let the image workflow push the watchdog image. |
 | The `swack-tools/spot-github-runners` principal set | `roles/iam.workloadIdentityUser` | The publisher service account only | Let the image workflow on `main` impersonate the publisher. |
+| The `swack-tools/spot-github-runners` principal set | `roles/iam.workloadIdentityUser` | The deployer service account only; only with `SPOT_WATCHDOG_AUTO_DEPLOY=1` | Let the image workflow's deploy job on `main` impersonate the deployer. |
+| `spot-watchdog-deployer` | `roles/run.developer` | The Cloud Run service only; only with `SPOT_WATCHDOG_AUTO_DEPLOY=1` | Read the service and roll it to a new image. No other service. |
+| `spot-watchdog-deployer` | `roles/iam.serviceAccountUser` | The `spot-control-watchdog` account only; only with `SPOT_WATCHDOG_AUTO_DEPLOY=1` | A new revision keeps running as the runtime account. |
+| `spot-watchdog-deployer` | `roles/artifactregistry.reader` | The `spot-control` repository only; only with `SPOT_WATCHDOG_AUTO_DEPLOY=1` | Read the commit tags of the deployed and the new image. |
 
 The service references these secrets:
 
@@ -1156,7 +1161,85 @@ To deploy:
 
 1. Deploy again without `--skip-scheduler` to create the scheduler job.
 
-To update the watchdog later, run the image workflow and deploy the new digest with `--image`.
+To update the watchdog later, run the image workflow and deploy the new digest with `--image`, or turn on
+automatic deploys.
+
+### Automatic watchdog deploys
+
+With automatic deploys on, the image workflow's `deploy` job rolls the Cloud Run service to every image it builds
+from `main`. Nothing else deploys the watchdog, so without them the service keeps running the digest of the last
+manual deploy.
+
+The job runs after the build job has pushed the image and passed its smoke test. It impersonates the
+`spot-watchdog-deployer` account through the same Workload Identity provider, which admits only this workflow on
+`main`, and runs `src/control_watchdog_deploy.py --update-image`. That command:
+
+1. Refuses unless the service is labeled `spot-role=control-watchdog`, runs as `spot-control-watchdog`, and
+   runs an image of the watchdog repository pinned by digest. `--expect-current` adds a compare-and-swap check
+   on the deployed image.
+1. Reads the repository's commit tags. The new digest must carry the commit tag of the workflow run, and the
+   deployed digest must carry exactly one commit tag.
+1. Refuses unless the new commit is strictly ahead of the deployed one, with `git merge-base --is-ancestor` in a
+   full-history checkout. A re-run of an older workflow run never rolls the watchdog back. A rebuild of the
+   deployed commit changes nothing.
+1. Runs `gcloud run services update --image` and nothing else. Settings, secrets, the service account, scaling,
+   IAM, and the scheduler keep what the last full deploy set. Cloud Run moves traffic only to a revision that
+   becomes ready.
+1. Checks that the new image serves from the latest ready revision with all the traffic, that the status
+   describes the current generation, and that the service's generation rose by exactly one. `gcloud` can't make
+   the update conditional on the version it checked, so a larger step means another change landed meanwhile and
+   may have been overwritten. The job then fails and asks you to check the service.
+
+An image that the service names but doesn't serve, for example after a revision that never became ready, is never
+reported as deployed. A refused or failed deploy fails the workflow run, so GitHub reports it like any failed
+check. The job first prints its plan with `--dry-run`.
+
+The build job never moves a commit tag. A re-run of a commit that was already pushed reuses that image, so the
+deployed digest keeps the commit tag that the deploy job reads.
+
+This gives `main` of `swack-tools/spot-github-runners`, through this one workflow, the power to run code as
+the watchdog runtime account. The dashboard already extends the same trust to `main` through
+[image tracking](#image-tracking). The workflow is preferred over a watchdog that updates itself: a revision that
+starts but whose tick is broken can't repair itself, while the workflow deploys the next fix regardless.
+
+To turn automatic deploys on:
+
+1. Set `SPOT_WATCHDOG_AUTO_DEPLOY=1` in the environment file and deploy again, with `--image` set to the digest
+   the service runs now. The deploy creates the deployer account and its four bindings. The dry run prints
+   them, and the `WATCHDOG_DEPLOYER_SA` variable:
+
+   ```bash
+   PYTHONPATH=src python3 src/control_watchdog_deploy.py --project=PROJECT --image="$IMAGE" --dry-run
+   PYTHONPATH=src python3 src/control_watchdog_deploy.py --project=PROJECT --image="$IMAGE"
+   ```
+
+1. Set the repository variable. The deploy job runs only while it's set:
+
+   ```bash
+   gh variable set WATCHDOG_DEPLOYER_SA --repo swack-tools/spot-github-runners \
+     --body spot-watchdog-deployer@PROJECT.iam.gserviceaccount.com
+   ```
+
+While `SPOT_WATCHDOG_AUTO_DEPLOY=1` is set, a full deploy refuses an `--image` other than the one the service
+runs, and prints that digest. It checks again right before `gcloud run deploy`, and afterwards it fails when the
+service's generation rose by more than one, which means the workflow deployed meanwhile. Re-applying settings
+never silently rolls the watchdog back.
+
+To pin another image, turn automatic deploys off first. Delete the `WATCHDOG_DEPLOYER_SA` variable, which skips
+the job, and set `SPOT_WATCHDOG_AUTO_DEPLOY=0`, which lifts the full deploy's image check. To also remove the
+deployer's access, turn off its account:
+
+```bash
+gh variable delete WATCHDOG_DEPLOYER_SA --repo swack-tools/spot-github-runners
+gcloud iam service-accounts disable spot-watchdog-deployer@PROJECT.iam.gserviceaccount.com --project=PROJECT
+```
+
+To preview an image-only update by hand, run:
+
+```bash
+PYTHONPATH=src python3 src/control_watchdog_deploy.py --project=PROJECT --update-image="$IMAGE" \
+  --revision=COMMIT --dry-run
+```
 
 ### Turn on the runner floor
 
@@ -1316,7 +1399,38 @@ container. It never releases the failed image: while the VM is reachable, the ro
 the restored container, and after 20 minutes it reports an error that needs an operator. A VM that stays
 unreachable for 20 minutes is left to the normal recovery, after the manager has made sure that KV holds the
 frozen snapshot, which recovery hydrates from. That rollout's digest is
-backed off: the manager tries again only after `:main` names another digest and the cooldown has passed.
+backed off: the manager tries again only after `:main` names another digest and the cooldown has passed, or
+after you retry it.
+
+#### Aborted rollouts
+
+An aborted rollout is never silent:
+
+- The state's `image.failures` section keeps why each backed-off digest's rollout aborted, its commit, time, and
+  transition. `status` shows it.
+- While `:main` names a backed-off digest, every check logs a warning, `image rollout held`, with the reason
+  the rollout aborted. During the cooldown that follows, the check names the last `:main` digest it saw. The plan reason names it too, so the watchdog's tick output and `src/control_vm.py plan` show it.
+- With `SPOT_DASHBOARD_ROLLOUT_STATUS=1`, the manager reports every rollout as a GitHub commit status with the
+  context `spot-dashboard/rollout` on the image's commit. The status is `pending` when the rollout begins,
+  `success` once the new image serves, and `failure` with the reason when it aborts. The commit on `main`
+  then shows the failure next to its other checks. The token then also needs the `repo:status` scope. A failure
+  to report is logged and never changes the rollout.
+
+For example, a rollout aborts with `slot a did not serve ... healthy within 1200s` when the new image can't start.
+Once you have fixed the cause, lift the back-off instead of editing the state. Without `--apply`, the command
+names the digest and why its rollout aborted, and changes nothing:
+
+```bash
+PYTHONPATH=src python3 src/control_vm.py retry-image
+PYTHONPATH=src python3 src/control_vm.py retry-image --apply
+```
+
+It takes the project lock, the Cloud Storage lease with `SPOT_CONTROL_STATE_URI`, so it never races the
+watchdog. By default it picks the backed-off digest that `:main` names, or the only backed-off one. Name another
+with `--digest sha256:<digest>`. The next check rolls the digest out while `:main` still names it and every other
+condition holds. Aborts before the retry don't hold it for the cooldown, but a completed transition does,
+and any other digest still waits for the cooldown. A
+rollout that aborts again backs the digest off again.
 
 The state's `image` section records the active VM's image, read once from its `dashboard-image` metadata
 or written when a transition or an in-place update completes. It also records the digests that failed and
@@ -1408,6 +1522,8 @@ list.
 | `SPOT_RUNNER_FLOOR_STATE_URI` | The `gs://<bucket>/runner-floor` location of the floor state and leases. The deploy sets it on the service; set it for an autoscaler that manages a floor target. |
 | `SPOT_RUNNER_FLOOR_REGIONS`, `SPOT_RUNNER_FLOOR_MAX_DAILY_USD` | Optional floor host regions (default `us-central1,us-east1,us-west1`) and daily cap per host (default `1.50`). |
 | `SPOT_DASHBOARD_IMAGE_TRACK`, `SPOT_DASHBOARD_IMAGE_TRACK_TOKEN` | Optional `main` to roll out the published `:main` image, and the GitHub token that reads it. See [Image tracking](#image-tracking). |
+| `SPOT_DASHBOARD_ROLLOUT_STATUS` | Optional `1` to report each image rollout as a GitHub commit status. See [Aborted rollouts](#aborted-rollouts). |
+| `SPOT_WATCHDOG_AUTO_DEPLOY` | Optional `1`: the watchdog deploy creates the deployer account for the image workflow's deploy job. Read by `src/control_watchdog_deploy.py` only. See [Automatic watchdog deploys](#automatic-watchdog-deploys). |
 | `SPOT_CONFIG_REPO` | Optional config repository, as `owner/repo`, whose `repos/<owner>/<repo>.yaml` files are controlled targets. The autoscaler's `--config-repo` takes precedence. Default: `<org>/spot-runners-config`. |
 | `DASHBOARD_CONTROLLED_TARGETS` | Optional comma-separated organizations and `owner/repo` targets that the signed-in user must administer. Default: none. |
 
@@ -1445,6 +1561,13 @@ Run one lifecycle step. This command creates, starts, or deletes VMs:
 
 ```bash
 PYTHONPATH=src python3 src/control_vm.py ensure --apply
+```
+
+Lift the back-off of a dashboard image whose rollout aborted, once its cause is fixed. Without `--apply` it only
+reports the digest and why it aborted:
+
+```bash
+PYTHONPATH=src python3 src/control_vm.py retry-image --apply
 ```
 
 Move the control VM state to `SPOT_CONTROL_STATE_URI` once. Without `--apply` it only reports what it would do:

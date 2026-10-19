@@ -8,14 +8,16 @@ hold:
 
 * no transition is in progress, the active control VM is running and healthy, and the other slot is empty;
 * the rotation cooldown (``ROTATION_COOLDOWN_SECONDS`` after the last completed or aborted transition) has passed;
-* the digest differs from the active VM's image and is not backed off (an earlier rollout to it aborted);
+* the digest differs from the active VM's image and is not backed off (an earlier rollout to it aborted; the abort
+  reason is kept, and ``control_vm.py retry-image --apply`` lifts the back-off once its cause is fixed);
 * the image's ``org.opencontainers.image.revision`` label names a commit whose Dashboard image workflow run on
   ``main`` concluded ``success``;
 * that commit is strictly newer than the active image's commit: GitHub's compare API reports it ``ahead``.
   ``identical``, ``behind`` and ``diverged`` never roll, so the manager never moves to an older image.
 
 Every network answer that is missing or malformed is a reason not to roll. Nothing here changes provider state;
-the manager turns a positive decision into an ``update_image`` plan.
+the manager turns a positive decision into an ``update_image`` plan. With ``SPOT_DASHBOARD_ROLLOUT_STATUS=1`` the
+manager also reports each rollout as a GitHub commit status (``ROLLOUT_STATUS_CONTEXT``) on the image's commit.
 
 Standard library only.
 """
@@ -26,13 +28,17 @@ import hashlib
 import json
 import re
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping
 
 from .https_transport import HttpResponse, Transport, TransportError, https_request
 
 ENV_IMAGE_TRACK = "SPOT_DASHBOARD_IMAGE_TRACK"
 ENV_IMAGE_TRACK_TOKEN = "SPOT_DASHBOARD_IMAGE_TRACK_TOKEN"
+ENV_ROLLOUT_STATUS = "SPOT_DASHBOARD_ROLLOUT_STATUS"
+ROLLOUT_STATUS_VALUES = ("", "0", "1")
+ROLLOUT_STATUS_CONTEXT = "spot-dashboard/rollout"
+STATUS_DESCRIPTION_MAX = 140    # GitHub truncates nothing; it refuses a longer description
 TRACK_MAIN = "main"
 TRACK_VALUES = ("", TRACK_MAIN)
 IMAGE_WORKFLOW_FILE = "dashboard-image.yml"
@@ -51,6 +57,7 @@ MANIFEST_ACCEPT = ", ".join((
 ))
 _INDEX_TYPES = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+DIGEST_RE = _DIGEST_RE
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _IMAGE_RE = re.compile(r"^ghcr\.io/([a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*)(?:(@sha256:[0-9a-f]{64})|:([0-9a-f]{40}))$")
 
@@ -190,16 +197,21 @@ class GitHubClient:
         self.transport = transport or https_request
         self.timeout = timeout
 
-    def _json(self, path: str) -> Any:
+    def _json(self, path: str, *, method: str = "GET", body: Mapping[str, Any] | None = None,
+              ok: tuple[int, ...] = (200,)) -> Any:
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
                    "User-Agent": "spot-control-plane/1.0"}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode("utf-8")
         try:
-            response = self.transport("GET", f"{GITHUB_API}{path}", headers, None, self.timeout)
+            response = self.transport(method, f"{GITHUB_API}{path}", headers, data, self.timeout)
         except TransportError as exc:
             raise TrackingError(str(exc)) from exc
-        if response.status != 200:
+        if response.status not in ok:
             raise TrackingError(f"GitHub {path.split('?', 1)[0]} returned HTTP {response.status}")
         try:
             return json.loads(response.body.decode("utf-8"))
@@ -231,6 +243,20 @@ class GitHubClient:
             raise TrackingError(f"GitHub compare returned status {status!r}")
         return status
 
+    def set_status(self, sha: str, state: str, description: str, *, target_url: str = "",
+                   context: str = ROLLOUT_STATUS_CONTEXT) -> None:
+        """Create a commit status on ``sha`` (the token needs commit-status write access, ``repo:status``)."""
+        if not _SHA_RE.match(sha):
+            raise TrackingError(f"not a commit: {sha!r}")
+        if state not in ("pending", "success", "failure", "error"):
+            raise TrackingError(f"not a commit status state: {state!r}")
+        if len(description) > STATUS_DESCRIPTION_MAX:
+            description = description[:STATUS_DESCRIPTION_MAX - 3] + "..."
+        body: dict[str, Any] = {"state": state, "description": description, "context": context}
+        if target_url.startswith("https://"):
+            body["target_url"] = target_url
+        self._json(f"/repos/{self.repository}/statuses/{sha}", method="POST", body=body, ok=(201,))
+
 
 # --------------------------------------------------------------------------------------------
 # Decision
@@ -244,15 +270,23 @@ class RolloutDecision:
     digest: str | None = None
     revision: str | None = None
     from_revision: str | None = None
+    backed_off: bool = False       # the candidate is a digest whose earlier rollout aborted
 
 
 def _no(reason: str, **kw: Any) -> RolloutDecision:
     return RolloutDecision(False, reason, **kw)
 
 
+def backed_off_reason(digest: str, failure_reason: str | None) -> str:
+    why = f" ({failure_reason})" if failure_reason else ""
+    return (f"a rollout to {digest[:19]} aborted earlier{why}; waiting for a new {TRACK_MAIN} digest, or for "
+            f"control_vm.py retry-image --apply once the cause is fixed")
+
+
 def decide(*, transition_active: bool, active_ready: bool, cooling: bool, active_digest: str | None,
            active_revision: str | None, candidate_digest: str | None, candidate_revision: str | None,
-           failed_digests: Any, workflow: str | None, ancestry: str | None, repository: str) -> RolloutDecision:
+           failed_digests: Any, workflow: str | None, ancestry: str | None, repository: str,
+           failure_reason: str | None = None) -> RolloutDecision:
     """Pure rollout decision from gathered facts, checked in a fixed order (the first failing guard wins)."""
     if transition_active:
         return _no("a transition is in progress")
@@ -265,7 +299,7 @@ def decide(*, transition_active: bool, active_ready: bool, cooling: bool, active
     if candidate_digest == active_digest:
         return _no(f"active image is {TRACK_MAIN} ({candidate_digest[:19]})")
     if candidate_digest in (failed_digests or ()):
-        return _no(f"a rollout to {candidate_digest[:19]} aborted earlier; waiting for a new {TRACK_MAIN} digest")
+        return _no(backed_off_reason(candidate_digest, failure_reason), digest=candidate_digest, backed_off=True)
     if not active_revision:
         return _no("the active image's commit is unknown, so a newer image can't be proven newer")
     if not candidate_revision:
@@ -316,22 +350,36 @@ class ImageTracker:
         return digest, revision
 
     def evaluate(self, cache: dict, *, active_image: str | None, transition_active: bool, active_ready: bool,
-                 cooling: bool, now: float | None = None) -> RolloutDecision:
+                 cooling: bool, now: float | None = None, only_digest: str | None = None) -> RolloutDecision:
+        """``only_digest``: the cooldown was waived for an operator's retry of that digest, so any other candidate
+        still waits for the cooldown."""
         now = self.clock() if now is None else now
         gates = dict(transition_active=transition_active, active_ready=active_ready, cooling=cooling,
                      repository=self.repository)
         facts: dict[str, Any] = dict(active_digest=None, active_revision=None, candidate_digest=None,
-                                     candidate_revision=None, failed_digests=(), workflow=None, ancestry=None)
+                                     candidate_revision=None, failed_digests=(), workflow=None, ancestry=None,
+                                     failure_reason=None)
         if transition_active or not active_ready or cooling:
-            return decide(**gates, **facts)  # no network call while any gate is closed
+            decision = decide(**gates, **facts)  # no network call while any gate is closed
+            held = (cache.get("main") or {}).get("digest")
+            if cooling and held and held in (cache.get("failed") or ()):
+                # The last :main digest seen is backed off: say so during the cooldown too, not only after it.
+                return replace(decision, reason=f"{decision.reason}; "
+                                                f"{backed_off_reason(held, failure_of(cache, held).get('reason'))}",
+                               digest=held, backed_off=True)
+            return decision
         if self.registry is None or self.github is None:
             return _no(f"{ENV_IMAGE_TRACK_TOKEN} is not set, so image tracking can't read the registry")
         try:
             facts["candidate_digest"] = candidate = self.registry.resolve(TRACK_MAIN)
             if (cache.get("main") or {}).get("digest") != candidate:
                 cache["main"] = {"digest": candidate, "seen_at": now}
+            if only_digest and candidate != only_digest:
+                return _no(f"rotation cooldown active (the retry of {only_digest[:19]} doesn't cover the new "
+                           f"{TRACK_MAIN} digest {candidate[:19]})")
             facts["active_digest"], facts["active_revision"] = self.active_facts(cache, active_image or "")
             facts["failed_digests"] = list(cache.get("failed") or ())
+            facts["failure_reason"] = failure_of(cache, candidate).get("reason")
             if candidate == facts["active_digest"] or candidate in facts["failed_digests"] \
                     or not facts["active_revision"]:
                 return decide(**gates, **facts)
@@ -359,8 +407,35 @@ class ImageTracker:
             return _no(f"image tracking failed this check: {exc}")
 
 
-def record_failed(cache: dict, digest: str) -> None:
-    """Back off ``digest`` until ``:main`` names another one (bounded list, newest last)."""
+def record_failed(cache: dict, digest: str, *, reason: str | None = None, revision: str | None = None,
+                  at: float | None = None, transition: str | None = None) -> None:
+    """Back off ``digest`` until ``:main`` names another one or an operator retries it (bounded list, newest
+    last). ``failures`` keeps why each backed-off digest aborted, for status output and the plan reason."""
     failed = [d for d in cache.get("failed") or [] if d != digest]
     failed.append(digest)
     cache["failed"] = failed[-FAILED_DIGESTS_KEPT:]
+    failures = cache.get("failures") if isinstance(cache.get("failures"), dict) else {}
+    failures[digest] = {"reason": reason, "revision": revision, "at": at, "transition": transition}
+    cache["failures"] = {d: failures[d] for d in cache["failed"] if d in failures}
+
+
+def failure_of(cache: Mapping[str, Any], digest: str | None) -> dict[str, Any]:
+    """The recorded abort of a backed-off ``digest`` ({} when none is recorded)."""
+    failures = cache.get("failures")
+    record = failures.get(digest) if isinstance(failures, dict) and digest else None
+    return dict(record) if isinstance(record, dict) else {}
+
+
+def retry_failed(cache: dict, digest: str, *, at: float) -> dict[str, Any]:
+    """Lift the back-off of ``digest`` (an operator fixed the cause) and return the abort it had recorded.
+
+    ``retry`` records the request; the manager lets the next rollout skip the cooldown of aborts older than it, and
+    clears it when that rollout begins. A rollout that aborts again backs the digest off again."""
+    if digest not in (cache.get("failed") or ()):
+        raise ValueError(f"{digest} is not backed off")
+    previous = failure_of(cache, digest)
+    cache["failed"] = [d for d in cache.get("failed") or [] if d != digest]
+    if isinstance(cache.get("failures"), dict):
+        cache["failures"].pop(digest, None)
+    cache["retry"] = {"digest": digest, "at": at, "previous": previous}
+    return previous
