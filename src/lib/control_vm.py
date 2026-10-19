@@ -168,6 +168,8 @@ IMAGE_UPDATE_TIMEOUT_SECONDS = 1200  # the new image must serve healthy within t
 # A startup run that reported "running" this long ago died without reporting: its pulls are bounded (15 minutes each,
 # a few per run), so a live run always reports done or failed sooner.
 STARTUP_RUN_STALE_SECONDS = 7200
+# The controller state (with the frozen snapshot an image update keeps) must stay readable from GCS (8 MiB per object).
+IMAGE_SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024
 PRICE_CHECK_INTERVAL_SECONDS = 3600
 MIN_SAVINGS_FRACTION = Decimal("0.30")
 MIN_SAVINGS_DAILY_USD = Decimal("0.05")
@@ -2098,6 +2100,10 @@ class ControlVmManager:
             self.save()
             status, body = self._control(t["new_slot"], "freeze", "POST")
             if not (status == 200 and self._record_freeze(t, body)):
+                if t.get("snapshot_too_large"):
+                    return self._abort(t, f"the frozen snapshot is {t['snapshot_too_large']} bytes, over the "
+                                          f"{IMAGE_SNAPSHOT_MAX_BYTES} the controller state can hold; run rotate to "
+                                          f"move to the new image instead")
                 if self._fail_attempt(t, f"freeze returned {status}"):
                     return self._abort(t, "the dashboard did not freeze")
                 return "wait"
@@ -2228,6 +2234,16 @@ class ControlVmManager:
                 or snapshot["state_version"] < version:
             return False
         kept = t.get("frozen_snapshot")
+        size = len(json.dumps(snapshot, separators=(",", ":")))
+        if size > IMAGE_SNAPSHOT_MAX_BYTES:
+            if not kept:
+                t["snapshot_too_large"] = size  # the first freeze: refuse the update (set_image aborts)
+                self.save()
+                return False
+            # A refreeze: the drain is confirmed, and what the container wrote is on the shared disk; keep the
+            # snapshot already held.
+            self._note("refreeze snapshot is %d bytes; keeping the earlier snapshot", size, level=logging.WARNING)
+            snapshot = kept
         if not kept or snapshot["state_version"] >= kept["state_version"]:
             t["frozen_snapshot"] = snapshot  # never replace a newer snapshot with an older one (a stale container)
         t["frozen_version"] = max(version, t.get("frozen_version") or 0)
@@ -2302,7 +2318,7 @@ class ControlVmManager:
                     # A pending startup run (one that began before the rollback) may still replace the container. Once
                     # runs settled, the last one must not have started the failed image, and a fresh probe (the run
                     # and the observation above may describe different containers) must still show the restored one.
-                    settled, detail = self._startup_run_settled(vm)
+                    settled, detail = self._startup_run_settled(vm) if t.get("image_written") else (True, "")
                     ok = False
                     if settled and t.get("image_written") and detail == f"done {t['dashboard_image']}":
                         detail = (f"the last startup run on {vm.name} started {t['dashboard_image']}; waiting for the "

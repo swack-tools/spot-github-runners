@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import unittest
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -631,6 +632,26 @@ class RolloutTests(unittest.TestCase):
         h.tick()
         self.assertIsNone(h.transition)
         self.assertEqual(h.mutations()[-1], ("import", "a"))
+
+    def test_an_oversized_snapshot_refuses_the_update_and_releases_the_dashboard(self):
+        h = TrackingHarness()
+        h.active()
+        with unittest.mock.patch.object(cv, "IMAGE_SNAPSHOT_MAX_BYTES", 10):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertNotIn("set-image", [e[0] for e in h.events])
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("unfreeze", "a")])
+        self.assertEqual(h.image["failed"], [D_B])
+
+    def test_a_rollback_before_any_metadata_write_needs_no_run_report(self):
+        h = TrackingHarness()
+        h.active()
+        h.http.freeze_status = None  # the freeze may have landed; its answers are lost
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"  # would block a release after a write
+        for _ in range(cv.STEP_RETRY_LIMIT):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("unfreeze", "a"))
 
     def test_a_stale_running_report_does_not_block_forever(self):
         h = TrackingHarness()
