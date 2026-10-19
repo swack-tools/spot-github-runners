@@ -342,6 +342,7 @@ follow_image_changes() {
     check_dashboard_image "$latest"
     log "dashboard-image changed to $latest during the pull; following it"
     DASHBOARD_IMAGE="$latest"
+    read_update_id
     pull_published_image
   done
   fail "dashboard-image kept changing during the pull"
@@ -350,17 +351,34 @@ follow_image_changes() {
 BUILD_DIR=""
 PREVIOUS_IMAGE_ID=""
 # Report this run as the guest attribute spot-dashboard/run (the instance metadata enable-guest-attributes=TRUE
-# allows it): "running <unix time>", then "done <image>" or "failed <unix time>". The controller releases a container
-# only once no run is pending, since a pending run may still replace it. Best effort: a failed write changes nothing.
+# allows it): "running <unix time>", then "done <update id> <image>" or "failed <update id> <unix time>", where the
+# update id is the dashboard-update-id metadata the run applied. The controller releases a container only on the end
+# report of the update it requested, since a pending run may still replace it.
 report_run() {
   curl -fsS -X PUT --max-time 5 -H 'Metadata-Flavor: Google' --data "$1" \
-    "$METADATA/instance/guest-attributes/spot-dashboard/run" >/dev/null 2>&1 || true
+    "$METADATA/instance/guest-attributes/spot-dashboard/run" >/dev/null 2>&1
+}
+
+# The "running" report is required once guest attributes are enabled: a run that can't announce itself stops
+# before it touches a container, so the controller never mistakes it for no run at all.
+report_run_start() {
+  local enabled
+  enabled="$(metadata_attr enable-guest-attributes)"
+  if ! report_run "running $(date +%s)" && [[ "$enabled" == TRUE || "$enabled" == true ]]; then
+    fail "could not report this run (guest attribute spot-dashboard/run)"
+  fi
+}
+
+# The dashboard-update-id metadata: empty, or the controller's <transition id>-<phase>.
+read_update_id() {
+  UPDATE_ID="$(metadata_attr dashboard-update-id)"
+  [[ -z "$UPDATE_ID" || "$UPDATE_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "dashboard-update-id is malformed"
 }
 
 cleanup() {
   local status=$?
   if ((status != 0)); then
-    report_run "failed $(date +%s)"
+    report_run "failed ${UPDATE_ID:--} $(date +%s)" || true
   fi
   if [[ -n "$BUILD_DIR" ]]; then
     rm -rf "$BUILD_DIR"
@@ -538,7 +556,15 @@ while true; do
   rm -f "$headers"
   [[ "$etag" =~ ^[A-Za-z0-9]+$ ]] || etag=NONE
   running="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
-  [[ -n "$value" && "$value" != "$running" ]] || continue
+  if [[ -n "$value" && "$value" == "$running" ]]; then
+    # Nothing to swap: confirm the request (its update id) so the controller knows no run is pending for it.
+    id="$(curl -fsS --max-time 10 -H 'Metadata-Flavor: Google' "${URL%/*}/dashboard-update-id" 2>/dev/null || true)"
+    [[ "$id" =~ ^[a-z0-9-]{1,64}$ ]] || id=-
+    curl -fsS -X PUT --max-time 5 -H 'Metadata-Flavor: Google' --data "done $id $value" \
+      "${URL%/attributes/*}/guest-attributes/spot-dashboard/run" >/dev/null 2>&1 || true
+    continue
+  fi
+  [[ -n "$value" ]] || continue
   log "dashboard-image is $value but $CONTAINER runs ${running:-nothing}; rerunning the startup script"
   google_metadata_script_runner startup || log "the startup script failed; retrying at the next change or in an hour"
 done
@@ -582,7 +608,8 @@ main() {
   exec 9>"$RUN_LOCK"
   flock 9
   wait_for_metadata
-  report_run "running $(date +%s)"
+  report_run_start
+  read_update_id
   PROJECT="$(curl -fsS -H 'Metadata-Flavor: Google' "$METADATA/project/project-id")"
   # projects/<number>/machineTypes/<type>; the shape decides the swap file and the container memory limits.
   MACHINE_TYPE="$(curl -fsS --retry 5 --retry-connrefused --max-time 10 -H 'Metadata-Flavor: Google' \
@@ -650,7 +677,7 @@ main() {
   run_containers
   unset GITHUB_TOKEN
   remove_old_images
-  report_run "done $DASHBOARD_IMAGE_REF"
+  report_run "done ${UPDATE_ID:--} $DASHBOARD_IMAGE_REF" || true
   report_health
 }
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -135,7 +136,10 @@ METADATA_KEYS = (
     "dashboard-global-admins",
     # Lets the startup script report its runs (guest attribute spot-dashboard/run; see _startup_run_settled).
     "enable-guest-attributes",
+    # The in-place image update a run applies; its report names it (see _startup_run_settled). Unset on creation.
+    "dashboard-update-id",
 )
+_UPDATE_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
 # Dashboard target policy. Neither is a secret, so both travel as instance metadata and the startup script
 # writes them to the dashboard env file on every boot. GCE metadata values can't hold commas in a
 # ``--metadata`` list, so the controlled targets travel ``;``-separated and become a comma list on the VM.
@@ -1041,6 +1045,13 @@ def guest_attributes_command(vm: ControlVm, project: str) -> list[str]:
     """Read-only: the guest attributes the control VM startup script reports (namespace spot-dashboard)."""
     return ["gcloud", "compute", "instances", "get-guest-attributes", vm.name, f"--zone={vm.zone}",
             f"--project={project}", "--query-path=spot-dashboard/", "--format=json"]
+
+
+def snapshot_digest(snapshot: Mapping[str, Any]) -> str:
+    """Content identity of a dashboard snapshot (version and state), for a copy kept in KV."""
+    canonical = json.dumps({"state_version": snapshot.get("state_version"), "state": snapshot.get("state")},
+                           sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def reset_command(vm: ControlVm, project: str) -> list[str]:
@@ -2065,9 +2076,10 @@ class ControlVmManager:
         return "wait"
 
     # -- in-place image update (MODE_IMAGE) ----------------------------------------------------
-    def _set_image_metadata(self, t: dict, vm: ControlVm, image: str) -> str | None:
+    def _set_image_metadata(self, t: dict, vm: ControlVm, image: str, phase: str) -> str | None:
         """Write ``dashboard-image`` (with the rest of the current metadata and startup script, as a fresh VM of
-        this slot would get them) to ``vm``. None on success, else the error."""
+        this slot would get them) to ``vm``, with the update id ``<transition id>-<phase>`` that the run applying it
+        reports. Records that id and image as the run to wait for. None on success, else the error."""
         try:
             items = metadata_items(dataclasses.replace(self.config, dashboard_image=image), t["new_slot"])
         except ValueError as exc:
@@ -2078,6 +2090,12 @@ class ControlVmManager:
         # empty when unset (the startup script reads empty as unset), so a cleared setting is cleared on this VM
         # just as it would be absent on a new one.
         items = {key: items.get(key, "") for key in METADATA_KEYS}
+        update_id = f"{t['id']}-{phase}"
+        if not _UPDATE_ID_RE.match(update_id):
+            return f"invalid update id {update_id!r}"
+        items["dashboard-update-id"] = update_id
+        t["expect_run"] = {"id": update_id, "image": image}  # before the call: the write may land unanswered
+        self.save()
         with tempfile.TemporaryDirectory(prefix="spot-control-") as tmp:
             script_path = Path(tmp) / "control-vm-startup.sh"
             script_path.write_text(render_control_startup(), encoding="utf-8")
@@ -2111,7 +2129,7 @@ class ControlVmManager:
         # Recorded before the call: a failed or ambiguous write may still have landed, so the rollback restores.
         t["image_written"] = True
         self.save()
-        error = self._set_image_metadata(t, vm, t["dashboard_image"])
+        error = self._set_image_metadata(t, vm, t["dashboard_image"], "forward")
         if error:
             if self._fail_attempt(t, error):
                 return self._abort(t, error)
@@ -2125,24 +2143,31 @@ class ControlVmManager:
         replacement: the import persists that state (including changes the freeze drained that never reached the
         state file), raises a container that came up behind it, and clears the freeze. Without a snapshot (the
         container was never replaced), unfreeze it."""
-        if t.get("release_attempted") and not t.get("released") and (t.get("frozen_snapshot")
-                                                                     or t.get("snapshot_in_kv")):
-            # (Without a kept snapshot no container was replaced, and the idempotent unfreeze below just runs again.)
-            # An earlier release got no confirmation. A container that is still frozen never took it (an import or
-            # an unfreeze clears the freeze): retry with the same snapshot, which may hold what its state lacks at
-            # the same version. One that is no longer frozen took it, so its state includes the snapshot plus any
-            # changes since: freeze it again and take that state instead of importing the older snapshot over it.
+        if t.get("frozen_snapshot") or t.get("snapshot_in_kv"):
+            # A frozen container never took a release (an import or an unfreeze clears the freeze): import the kept
+            # snapshot, which may hold what its state lacks at the same version. A writable one either took an
+            # earlier release whose answer was lost (its state then includes the snapshot plus changes since) or
+            # started writable (an image whose freeze handling regressed) and may have accepted changes: freeze it
+            # and take its current state rather than importing the older snapshot over it. (Without a kept
+            # snapshot no container was replaced, and the idempotent unfreeze below just runs again.)
             health = probe_health(self.requester, self.config, slot)
             if not health.hydrated:
-                return False, f"slot {slot} is not reachable to retry the release: {health.detail}"
+                return False, f"slot {slot} is not reachable to release it: {health.detail}"
             if not health.frozen or t.get("capture_pending"):
                 # capture_pending: an earlier refreeze may have frozen it without its snapshot reaching us, so frozen
                 # no longer shows the release never landed. A freeze is idempotent and returns the current state.
                 t["capture_pending"] = True
                 self.save()
                 status, body = self._control(slot, "freeze", "POST")
+                version = body.get("state_version") if isinstance(body, dict) else None
+                floor = t.get("frozen_version") or 0
+                if status == 200 and isinstance(version, int) and not isinstance(version, bool) and version < floor \
+                        and not t.get("release_attempted"):
+                    # Writable from the start and behind the frozen state: its changes and the frozen ones diverged.
+                    return False, (f"operator action needed: slot {slot} started writable at state_version {version}, "
+                                   f"below the frozen {floor}")
                 if not (status == 200 and self._record_freeze(t, body)):
-                    return False, f"freeze before retrying the release of slot {slot} returned {status}"
+                    return False, f"freeze before releasing slot {slot} returned {status}"
         t["release_attempted"] = True  # before the call: a lost response may still have released it
         self.save()
         snapshot = t.get("frozen_snapshot")
@@ -2152,8 +2177,9 @@ class ControlVmManager:
                 snapshot = parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None
             except KvError as exc:
                 return False, f"could not read the frozen snapshot from KV: {exc}"
-            if snapshot is None or snapshot["state_version"] < t["snapshot_in_kv"]:
-                return False, "KV no longer holds the frozen snapshot"
+            if snapshot is None or snapshot_digest(snapshot) != t.get("snapshot_in_kv_digest"):
+                # Only that exact snapshot: an equal version can hold other state, and KV propagates slowly.
+                return False, "KV does not (yet) hold the frozen snapshot"
         if snapshot:
             status, body = self._control(slot, "import", "POST", snapshot)
             version = body.get("state_version") if isinstance(body, dict) else None
@@ -2169,12 +2195,17 @@ class ControlVmManager:
             return True, f"unfroze slot {slot}"
         return False, f"unfreeze of slot {slot} returned {status}"
 
-    def _startup_run_settled(self, vm: ControlVm) -> tuple[bool, str]:
-        """Whether no startup script run is pending on ``vm``: a run reports ``running <unix time>`` when it starts
-        and ``done <image>`` or ``failed <unix time>`` when it ends (guest attribute spot-dashboard/run). A pending
-        run may still replace the container, so a container is released only once its run settled. No report (a
-        VM that never ran a reporting script) and a ``running`` report older than STARTUP_RUN_STALE_SECONDS (a run
-        that died without reporting) count as settled."""
+    def _startup_run_settled(self, vm: ControlVm, expect: Mapping[str, str] | None = None) -> tuple[bool, str]:
+        """Whether no startup script run that may still replace the container is pending on ``vm``.
+
+        A run reports (guest attribute spot-dashboard/run) ``running <unix time>`` when it starts, and
+        ``done <update id> <image>`` or ``failed <update id> <unix time>`` when it ends; the image watcher reports
+        ``done <update id> <image>`` when the container already runs the pinned image. With ``expect`` (the update
+        id and image last written), only that run's own end report counts: positive evidence that the request was
+        applied, never an older report. No report at all means no reporting script has run since guest attributes
+        were enabled with the metadata write (once they are, a run that cannot report "running" stops before it
+        touches a container), so nothing is pending. A ``running`` report older than STARTUP_RUN_STALE_SECONDS is
+        a run that died without reporting."""
         result = self.gcloud(guest_attributes_command(vm, self.config.project))
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
@@ -2186,12 +2217,18 @@ class ControlVmManager:
         except ValueError:
             return False, f"unreadable guest attributes of {vm.name}"
         value = next((str(r.get("value") or "") for r in rows if isinstance(r, dict) and r.get("key") == "run"), "")
-        if not value.startswith("running"):
-            return True, value or "no startup run reported"
-        started = value.removeprefix("running").strip()
-        if started.isdigit() and self.clock() - int(started) > STARTUP_RUN_STALE_SECONDS:
-            return True, f"stale report {value!r}"
-        return False, f"a startup run is in progress on {vm.name} ({value})"
+        if not value:
+            return True, "no startup run reported"
+        if value.startswith("running"):
+            started = value.removeprefix("running").strip()
+            if started.isdigit() and self.clock() - int(started) > STARTUP_RUN_STALE_SECONDS:
+                return True, f"stale report {value!r}"
+            return False, f"a startup run is in progress on {vm.name} ({value})"
+        if expect is None:
+            return True, value
+        if value == f"done {expect['id']} {expect['image']}" or value.startswith(f"failed {expect['id']} "):
+            return True, value
+        return False, f"waiting for {vm.name} to report update {expect['id']} ({value})"
 
     def _step_wait_image(self, t: dict, obs: Observation) -> str:
         slot, image = t["new_slot"], t["dashboard_image"]
@@ -2206,7 +2243,7 @@ class ControlVmManager:
         release_error = None
         if vm.running and result.image == image and result.hydrated and not t.get("released"):
             # The new container started frozen from the marker on disk. Released once its startup run settled.
-            settled, detail = self._startup_run_settled(vm)
+            settled, detail = self._startup_run_settled(vm, t.get("expect_run"))
             ok, detail = self._release(t, slot) if settled else (False, detail)
             self._note(detail, level=logging.INFO if ok else logging.WARNING)
             if ok:
@@ -2273,6 +2310,7 @@ class ControlVmManager:
                            level=logging.WARNING)
                 return False
             t["snapshot_in_kv"] = snapshot["state_version"]
+            t["snapshot_in_kv_digest"] = snapshot_digest(snapshot)
             t["frozen_version"] = max(version, t.get("frozen_version") or 0)
             t.pop("capture_pending", None)
             self.save()
@@ -2281,6 +2319,7 @@ class ControlVmManager:
             t["frozen_snapshot"] = snapshot  # never replace a newer snapshot with an older one (a stale container)
             if snapshot["state_version"] >= (t.get("snapshot_in_kv") or 0):
                 t.pop("snapshot_in_kv", None)  # the newest snapshot is this local one again
+                t.pop("snapshot_in_kv_digest", None)
         t["frozen_version"] = max(version, t.get("frozen_version") or 0)
         t.pop("capture_pending", None)
         self.save()
@@ -2339,7 +2378,7 @@ class ControlVmManager:
                            else logging.WARNING)
                 return "wait"
         if vm is not None and previous and t.get("image_written") and not t.get("restored"):
-            error = self._set_image_metadata(t, vm, previous)
+            error = self._set_image_metadata(t, vm, previous, "restore")
             if error:
                 # Keep trying: ending here would leave the VM pinned to the image that failed.
                 t["error"] = f"could not restore dashboard-image {previous}: {error}"
@@ -2362,12 +2401,10 @@ class ControlVmManager:
                     # A pending startup run (one that began before the rollback) may still replace the container. Once
                     # runs settled, the last one must not have started the failed image, and a fresh probe (the run
                     # and the observation above may describe different containers) must still show the restored one.
-                    settled, detail = self._startup_run_settled(vm) if t.get("image_written") else (True, "")
+                    settled, detail = (self._startup_run_settled(vm, t.get("expect_run")) if t.get("image_written")
+                                       else (True, ""))
                     ok = False
-                    if settled and t.get("image_written") and detail == f"done {t['dashboard_image']}":
-                        detail = (f"the last startup run on {vm.name} started {t['dashboard_image']}; waiting for the "
-                                  f"swap back")
-                    elif settled:
+                    if settled:
                         fresh = probe_health(self.requester, self.config, slot)
                         if not fresh.hydrated or (t.get("image_written") and fresh.image == t["dashboard_image"]):
                             detail = f"{vm.name} reports image {fresh.image or 'unknown'}: {fresh.detail}"
@@ -2404,6 +2441,27 @@ class ControlVmManager:
                 return "wait"
             self._note("%s was not reachable within %ss to be released; ending the rollback", vm.name,
                        IMAGE_UPDATE_TIMEOUT_SECONDS, level=logging.ERROR)
+        elif vm is None and t.get("freeze_requested") and not (t.get("frozen_snapshot") or t.get("snapshot_in_kv")):
+            # Frozen (perhaps), snapshot never captured, VM and disk gone: whatever the freeze drained is lost unless
+            # KV has it. Recover only when KV holds at least the state known before the update; otherwise hold.
+            floor = t.get("state_version_before")
+            try:
+                current = parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None
+            except KvError as exc:
+                current = None
+                self._note("could not read KV: %s", exc, level=logging.WARNING)
+            known = current["state_version"] if current else None
+            if not isinstance(floor, int) or known is None or known < floor:
+                t["error"] = (f"held, operator action needed: {control_vm_name(slot)} is gone after a freeze whose "
+                              f"snapshot was never captured, and KV holds state_version {known}, below the "
+                              f"{floor} known before the update; restore the dashboard state to KV to continue")
+                t["updated_at"] = self.clock()
+                self.save()
+                self._note(t["error"], level=logging.ERROR)
+                return "wait"
+            self._note("%s is gone after a freeze whose snapshot was never captured; KV holds state_version %d "
+                       "(>= %d), so recovery continues from it", control_vm_name(slot), known, floor,
+                       level=logging.ERROR)
         elif vm is None and t.get("frozen_snapshot"):
             # The VM is gone with its disk: the frozen snapshot may be the only copy of that state (an import into
             # the lost VM, even a confirmed one, never reached KV).
@@ -2426,8 +2484,9 @@ class ControlVmManager:
                 current = parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None
             except KvError as exc:
                 return f"could not confirm the frozen snapshot in KV: {exc}"
-            if current is None or current["state_version"] < t["snapshot_in_kv"]:
-                return "KV no longer holds the frozen snapshot"
+            if current is None or (current["state_version"] <= t["snapshot_in_kv"]
+                                   and snapshot_digest(current) != t.get("snapshot_in_kv_digest")):
+                return "KV does not (yet) hold the frozen snapshot"
             return None
         snapshot = t.get("frozen_snapshot")
         return self._publish_snapshot(snapshot) if snapshot else None

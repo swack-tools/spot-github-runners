@@ -3171,14 +3171,14 @@ class StandardDashboardImageTests(unittest.TestCase):
         self.assertLess(main.index("pull_published_image\n    follow_image_changes"), main.index("run_containers"))
         function = re.search(r"^follow_image_changes\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         stubs = ('log() { :; }\nfail() { echo "FAIL: $*"; exit 1; }\ncheck_dashboard_image() { [[ $1 != bad ]] || '
-                 'fail bad; }\npull_published_image() { echo "pull $DASHBOARD_IMAGE"; }\n'
+                 'fail bad; }\npull_published_image() { echo "pull $DASHBOARD_IMAGE"; }\nread_update_id() { :; }\n'
                  'metadata_attr() { n=$(($(cat "$DIR/n" 2>/dev/null || echo 0) + 1)); echo $n > "$DIR/n"; '
                  'sed -n "${n}p" "$DIR/answers"; }\n')
+        kept_changing = "FAIL: dashboard-image kept changing during the pull"
         for answers, expected_out, ok in ((["A"], [], True), (["B", "B"], ["pull B"], True), ([""], [], True),
-                                          (["bad"], ["FAIL: bad"], False), (["B", "C", "D", "E", "F", "G"],
-                                                                            ["pull B", "pull C", "pull D", "pull E",
-                                                                             "pull F", "FAIL: dashboard-image kept "
-                                                                             "changing during the pull"], False)):
+                                          (["bad"], ["FAIL: bad"], False),
+                                          (["B", "C", "D", "E", "F", "G"],
+                                           ["pull B", "pull C", "pull D", "pull E", "pull F", kept_changing], False)):
             with tempfile.TemporaryDirectory() as tmp:
                 Path(tmp, "answers").write_text("\n".join(answers) + "\n", encoding="utf-8")
                 script = "DASHBOARD_IMAGE=A\n" + stubs + function + 'follow_image_changes\necho "final $DASHBOARD_IMAGE"\n'
@@ -3298,12 +3298,16 @@ class StartupScriptImageWatcherTests(unittest.TestCase):
         self.watch = re.search(r"<<'WATCH'\n(.*?)^WATCH$", self.text, re.S | re.M).group(1)
 
     def test_each_run_reports_its_progress(self):
-        self.assertLess(self.main.index("wait_for_metadata"), self.main.index('report_run "running $(date +%s)"'))
-        self.assertLess(self.main.index("remove_old_images"), self.main.index('report_run "done $DASHBOARD_IMAGE_REF"'))
-        self.assertLess(self.main.index('report_run "done $DASHBOARD_IMAGE_REF"'), self.main.index("report_health"))
+        done = 'report_run "done ${UPDATE_ID:--} $DASHBOARD_IMAGE_REF"'
+        self.assertLess(self.main.index("wait_for_metadata"), self.main.index("report_run_start\n  read_update_id"))
+        self.assertLess(self.main.index("report_run_start"), self.main.index("run_containers"))
+        self.assertLess(self.main.index("remove_old_images"), self.main.index(done))
+        self.assertLess(self.main.index(done), self.main.index("report_health"))
         cleanup = re.search(r"^cleanup\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
         self.assertTrue(cleanup.startswith('cleanup() {\n  local status=$?\n'))
-        self.assertIn('report_run "failed $(date +%s)"', cleanup)
+        self.assertIn('report_run "failed ${UPDATE_ID:--} $(date +%s)"', cleanup)
+        follow = re.search(r"^follow_image_changes\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.assertIn('DASHBOARD_IMAGE="$latest"\n    read_update_id', follow)  # the id of the image it applies
         self.assertIn('"$METADATA/instance/guest-attributes/spot-dashboard/run"', self.text)
         self.assertEqual(cv.metadata_items(config(), "a")["enable-guest-attributes"], "TRUE")
 
@@ -3361,6 +3365,11 @@ class StartupScriptImageWatcherTests(unittest.TestCase):
         # curl call 1 answers with the value and an ETag; call 2 fails, so the watcher sleeps, which ends the run.
         stubs = {
             "curl": r'''#!/usr/bin/env bash
+if [[ " $* " == *" PUT "* ]]; then
+  while [[ $# -gt 0 ]]; do [[ $1 == --data ]] && echo "$2 -> ${@: -1}" >> "$STUB/puts"; shift; done
+  exit 0
+fi
+if [[ "${@: -1}" == */attributes/dashboard-update-id ]]; then printf 'upd-1'; exit 0; fi
 n=$(($(cat "$STUB/count" 2>/dev/null || echo 0) + 1))
 echo "$n" > "$STUB/count"
 printf '%s\n' "${@: -1}" >> "$STUB/urls"
@@ -3384,6 +3393,7 @@ printf '%s' "$VALUE"
             env = {"PATH": f"{stub}:/usr/bin:/bin", "STUB": str(stub), "VALUE": value, "RUNNING": running}
             subprocess.run(["bash", str(stub / "watch.sh")], env=env, capture_output=True, text=True, timeout=30)
             reruns = (stub / "reruns").read_text() if (stub / "reruns").exists() else ""
+            self.puts = (stub / "puts").read_text().splitlines() if (stub / "puts").exists() else []
             return reruns, (stub / "urls").read_text().splitlines()
 
     @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
@@ -3417,5 +3427,20 @@ printf '%s' "$VALUE"
         self.assertIn("wait_for_change=true", urls[0])
         self.assertIn("last_etag=NONE", urls[0])
         self.assertIn("last_etag=abc123", urls[1])  # the next wait starts from the answer's ETag
+        self.assertEqual(self.puts, [])
         reruns, _ = self.run_watcher(new, new)
         self.assertEqual(reruns, "")
+        # Nothing to swap: it confirms the request, so the controller knows no run is pending for it.
+        self.assertEqual(self.puts, [f"done upd-1 {new} -> http://metadata.google.internal/computeMetadata/v1/instance/"
+                                     "guest-attributes/spot-dashboard/run"])
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_a_run_that_cannot_report_its_start_stops_once_reporting_is_enabled(self):
+        functions = "".join(re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", self.text, re.S | re.M).group(0)
+                            for name in ("report_run", "report_run_start"))
+        for enabled, ok in (("TRUE", False), ("", True)):
+            script = ('METADATA=http://x\nmetadata_attr() { echo "$ENABLED"; }\nfail() { echo "FAIL: $*"; exit 1; }\n'
+                      'curl() { return 22; }\n' + functions + 'report_run_start\necho reached\n')
+            result = subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin", "ENABLED": enabled},
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual("reached" in result.stdout, ok, (enabled, result.stdout))

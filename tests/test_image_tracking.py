@@ -338,6 +338,12 @@ class TrackingHarness(tcv.Harness):
         self.http.health[slot] = (503, {"status": "frozen", "hydrated": True, "frozen": True, "state_version": version,
                                         "slot": slot, "kv_writer": False, "image": image})
 
+    def reported(self, outcome="done", slot="a"):
+        """The startup run (or the watcher) reports the update the controller last requested."""
+        expect = self.transition["expect_run"]
+        detail = expect["image"] if outcome == "done" else str(int(self.clock[0]))
+        self.gcloud.runs[f"spot-control-{slot}"] = f"{outcome} {expect['id']} {detail}"
+
     def finish(self):
         """Drive a started rollout to completion."""
         self.swapped()
@@ -590,7 +596,11 @@ class RolloutTests(unittest.TestCase):
         h.tick()
         self.assertIn("a startup run is in progress", h.transition["error"])
         self.assertNotIn(("import", "a"), h.events)
-        h.gcloud.runs["spot-control-a"] = f"done {IMG_B}"
+        h.gcloud.runs["spot-control-a"] = f"done some-earlier-update {IMG_B}"  # an older request's report
+        h.clock[0] += 180
+        h.tick()
+        self.assertIn("to report update", h.transition["error"])
+        h.reported()
         h.clock[0] += 180
         h.tick()
         self.assertIsNone(h.transition)
@@ -607,7 +617,7 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(h.transition["step"], "abort")
         self.assertIn("a startup run is in progress", h.transition["error"])
         self.assertNotIn(("import", "a"), h.events)
-        h.gcloud.runs["spot-control-a"] = f"done {IMG_A}"  # it followed the restored image
+        h.reported()  # it followed the restored image
         h.clock[0] += 180
         h.tick()
         self.assertIsNone(h.transition)
@@ -617,14 +627,15 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.gcloud.runs["spot-control-a"] = f"done {IMG_B}"  # a late run started the failed image after all
+        forward = h.transition["expect_run"]["id"]
+        h.gcloud.runs["spot-control-a"] = f"done {forward} {IMG_B}"  # a late run started the failed image after all
         h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
-        h.tick()  # rollback; the old image's health was observed, but the run says B started
+        h.tick()  # rollback; the old image's health was observed, but the restore has not been applied
         self.assertEqual(h.transition["step"], "abort")
-        self.assertIn("waiting for the swap back", h.transition["error"])
+        self.assertIn("-restore", h.transition["error"])
         self.assertNotIn(("import", "a"), h.events)
-        h.gcloud.runs["spot-control-a"] = f"done {IMG_A}"
-        h.swapped(image=IMG_B)  # but the probe still shows B
+        h.reported()  # the restore was applied
+        h.swapped(image=IMG_B)  # but a fresh probe still shows B
         h.clock[0] += 180
         h.tick()
         self.assertNotIn(("import", "a"), h.events)
@@ -691,6 +702,7 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual((t["snapshot_in_kv"], t["frozen_version"], t["frozen_snapshot"]["state_version"]), (9, 9, 7))
         self.assertEqual(json.loads(h.kv.store[KV_STATE_KEY])["state_version"], 9)
         h.http.versions["a"] = 0
+        h.swapped(version=0)  # the restored container, frozen
         ok, detail = manager._release(t, "a")
         self.assertTrue(ok, detail)
         self.assertEqual(h.http.versions["a"], 9)  # imported the KV copy, not the older one in the state
@@ -767,11 +779,69 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         manager = h.manager()
         h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({"new": 1}, 9, "a", now=6))
-        t = {"snapshot_in_kv": 9, "frozen_snapshot": build_snapshot({"old": 1}, 9, "a", now=5)}
+        t = {"snapshot_in_kv": 9, "snapshot_in_kv_digest": cv.snapshot_digest(build_snapshot({"new": 1}, 9, "a", now=1)),
+             "frozen_snapshot": build_snapshot({"old": 1}, 9, "a", now=5)}
         self.assertIsNone(manager._preserve_frozen_snapshot(t))
         self.assertEqual(json.loads(h.kv.store[KV_STATE_KEY])["state"], {"new": 1})
         h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 8, "a", now=7))
-        self.assertIn("no longer holds", manager._preserve_frozen_snapshot(t))
+        self.assertIn("does not (yet) hold", manager._preserve_frozen_snapshot(t))
+
+    def test_a_vanished_vm_without_a_captured_snapshot_holds_unless_kv_has_the_known_state(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        for kv_version, holds in ((3, True), (7, False)):
+            h = TrackingHarness()
+            h.active()
+            h.http.freeze_status = None  # the freeze may have landed; its snapshot never arrives
+            h.tick()
+            h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, kv_version, "a", now=1))
+            h.gcloud.vms.pop("spot-control-a")
+            with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+                h.tick()
+            if holds:
+                self.assertIn("operator action needed", h.transition["error"])
+            else:
+                self.assertIsNone(h.transition)
+
+    def test_a_target_that_starts_writable_is_frozen_and_captured_before_the_import(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.healthy("a", version=8, image=IMG_B)  # writable: its freeze handling regressed; took a change
+        h.http.versions["a"] = 8
+        h.clock[0] += 180
+        h.tick()
+        freezes = [i for i, e in enumerate(h.events) if e == ("freeze", "a")]
+        imports = [i for i, e in enumerate(h.events) if e == ("import", "a")]
+        self.assertEqual(len(freezes), 2)
+        self.assertLess(freezes[1], imports[0])
+        posted = [json.loads(c[3]) for c in h.http.calls if c[1].endswith("/api/control/import")]
+        self.assertEqual(posted[-1]["state_version"], 8)  # its own current state, not the older frozen one
+
+    def test_a_target_that_starts_writable_behind_the_frozen_state_holds(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.healthy("a", version=3, image=IMG_B)
+        h.http.versions["a"] = 3
+        h.clock[0] += 180
+        h.tick()
+        self.assertIn("operator action needed", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events)
+
+    def test_a_release_imports_only_the_exact_snapshot_kept_in_kv(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        kept = build_snapshot({"records": ["done"]}, 9, "a", now=6)
+        t = {"snapshot_in_kv": 9, "snapshot_in_kv_digest": cv.snapshot_digest(kept), "frozen_version": 9,
+             "frozen_snapshot": build_snapshot({}, 7, "a", now=5)}
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 9, "a", now=7))  # same version, other state
+        h.swapped(version=0)
+        ok, detail = manager._release(t, "a")
+        self.assertFalse(ok)
+        self.assertIn("does not (yet) hold", detail)
+        h.kv.store[KV_STATE_KEY] = json.dumps(kept)
+        self.assertTrue(manager._release(t, "a")[0])
 
     def test_a_stale_running_report_does_not_block_forever(self):
         h = TrackingHarness()

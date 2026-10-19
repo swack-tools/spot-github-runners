@@ -1293,9 +1293,16 @@ free-tier e2-micro. The VM keeps its slot, boot disk, state file, and `origin:ac
    reached the state file, and clears the freeze. The rollout completes when the container serves healthy with at
    least the frozen `state_version`.
 
-Each startup script run reports its progress in the guest attribute `spot-dashboard/run`, which the
-`enable-guest-attributes=TRUE` metadata allows: `running`, then `done` or `failed`. A run in progress may still
-replace the container, so the manager releases a container, in a rollout or a rollback, only after its run ends.
+Each metadata write carries an update ID in `dashboard-update-id`. Each startup script run reports its progress in
+the guest attribute `spot-dashboard/run`, which the `enable-guest-attributes=TRUE` metadata allows: `running`, then
+`done` or `failed` with the update ID it applied. Once reporting is on, a run that can't report its start stops
+before it touches a container. When the container already runs the pinned image, the watcher reports `done` for
+that ID itself. A run in progress may still replace the container, so the manager releases a container, in a
+rollout or a rollback, only after the run for its own update ID ends.
+
+A container that starts writable, for example an image whose freeze handling regressed, may have accepted
+changes. The manager freezes it and imports its current state instead of the older frozen snapshot. When that state
+is behind the frozen one, the update holds for an operator.
 
 A VM created before the watcher existed doesn't swap its container. When the VM still serves another image
 after 5 minutes, the manager resets it once. The reset boots the refreshed startup script, which pulls the new
