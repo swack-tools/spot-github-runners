@@ -318,6 +318,7 @@ pull_published_image() {
 }
 
 BUILD_DIR=""
+PREVIOUS_IMAGE_ID=""
 cleanup() {
   if [[ -n "$BUILD_DIR" ]]; then
     rm -rf "$BUILD_DIR"
@@ -407,6 +408,7 @@ run_containers() {
 
   # Recreate on every run so changed metadata, secrets, or images always take effect. The image is pulled
   # before this point, so the old container serves until here. A graceful stop first lets it finish requests.
+  PREVIOUS_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$DASHBOARD_CONTAINER" 2>/dev/null || true)"
   docker stop --time 20 "$DASHBOARD_CONTAINER" >/dev/null 2>&1 || true
   docker rm -f "$DASHBOARD_CONTAINER" >/dev/null 2>&1 || true
   # DASHBOARD_IMAGE is reported by /api/health, so the controller can confirm which image serves.
@@ -424,6 +426,19 @@ run_containers() {
     "${TUNNEL_RUN_ARGS[@]}" \
     --cap-drop ALL --security-opt no-new-privileges \
     --env-file "$TUNNEL_ENV_FILE" "$CLOUDFLARED_IMAGE" tunnel --no-autoupdate run >/dev/null
+}
+
+# In-place image updates pull each new image onto the same small boot disk. Remove every image except the one the
+# dashboard now runs and the one it ran before this run (a rollback then needs no pull). Images that a container
+# uses, such as cloudflared's, can't be removed without --force, so docker keeps them.
+remove_old_images() {
+  local current id
+  current="$(docker inspect --format '{{.Image}}' "$DASHBOARD_CONTAINER" 2>/dev/null || true)"
+  [[ -n "$current" ]] || return 0
+  while read -r id; do
+    [[ -z "$id" || "$id" == "$current" || "$id" == "$PREVIOUS_IMAGE_ID" ]] && continue
+    docker image rm "$id" >/dev/null 2>&1 || true
+  done < <(docker image ls --no-trunc --quiet | sort -u)
 }
 
 # Atomically replace a root-owned file with stdin, with the given mode. A rename never changes the file a running
@@ -574,6 +589,7 @@ main() {
   unset TOKEN
   run_containers
   unset GITHUB_TOKEN
+  remove_old_images
   install_image_watcher
   report_health
 }

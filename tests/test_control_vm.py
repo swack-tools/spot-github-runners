@@ -3309,6 +3309,28 @@ printf '%s' "$VALUE"
             return reruns, (stub / "urls").read_text().splitlines()
 
     @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_old_images_are_removed_but_the_current_and_previous_are_kept(self):
+        function = re.search(r"^remove_old_images\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.assertLess(self.main.index("run_containers"), self.main.index("remove_old_images"))
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp)
+            (stub / "docker").write_text(
+                '#!/usr/bin/env bash\n'
+                'case "$1 $2" in\n'
+                '  "inspect --format") echo sha256:cur ;;\n'
+                '  "image ls") printf "sha256:old1\\nsha256:cur\\nsha256:prev\\nsha256:cloudflared\\nsha256:old1\\n" ;;\n'
+                '  "image rm") echo "$3" >> "$STUB/removed"; [[ $3 != sha256:cloudflared ]] ;;\n'
+                'esac\n', encoding="utf-8")
+            (stub / "docker").chmod(0o755)
+            script = ('DASHBOARD_CONTAINER=spot-dashboard\nPREVIOUS_IMAGE_ID=sha256:prev\n' + function
+                      + "remove_old_images\n")
+            result = subprocess.run(["bash", "-c", script], env={"PATH": f"{stub}:/usr/bin:/bin", "STUB": tmp},
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            removed = (stub / "removed").read_text().split()
+        self.assertEqual(sorted(removed), ["sha256:cloudflared", "sha256:old1"])  # in use: docker refuses, kept
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
     def test_watcher_reruns_the_startup_script_only_for_another_image(self):
         new = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "b" * 64
         old = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "a" * 64

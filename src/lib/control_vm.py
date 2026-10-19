@@ -2060,6 +2060,10 @@ class ControlVmManager:
             return f"invalid control VM settings: {exc}"
         if items.get("dashboard-image") != image:
             return f"metadata would not pin {image}"
+        # add-metadata keeps keys it isn't given, and metadata_items omits unset settings. Write every managed key,
+        # empty when unset (the startup script reads empty as unset), so a cleared setting is cleared on this VM
+        # just as it would be absent on a new one.
+        items = {key: items.get(key, "") for key in METADATA_KEYS}
         with tempfile.TemporaryDirectory(prefix="spot-control-") as tmp:
             script_path = Path(tmp) / "control-vm-startup.sh"
             script_path.write_text(render_control_startup(), encoding="utf-8")
@@ -2088,6 +2092,11 @@ class ControlVmManager:
     def _step_wait_image(self, t: dict, obs: Observation) -> str:
         slot, image = t["new_slot"], t["dashboard_image"]
         vm = obs.vm(slot)
+        if vm is None or vm.status in STOPPED_STATES:
+            # Preempted, stopped, or gone: end the update now so the normal restart and recovery run, instead of
+            # holding them for the whole update timeout. The rollback pins the previous image again.
+            return self._abort(t, f"{control_vm_name(slot)} is {vm.status if vm else 'missing'} during the image "
+                                  f"update")
         result = obs.health.get(slot) or HealthResult.unknown()
         floor = t.get("state_version_before")
         if vm is not None and vm.running and result.ok and result.image == image:
@@ -2098,14 +2107,13 @@ class ControlVmManager:
                 self._note("slot %s serves %s (state_version=%s)", slot, image, result.state_version)
                 return self._advance_step(t)
         else:
-            t["error"] = (f"slot {slot} reports image {result.image or 'unknown'}: {result.detail}"
-                          if vm is not None and vm.running else f"{control_vm_name(slot)} is "
-                                                                f"{vm.status if vm else 'missing'}")
+            t["error"] = (f"slot {slot} reports image {result.image or 'unknown'}: {result.detail}" if vm.running
+                          else f"{vm.name} is {vm.status}")
         elapsed = self.clock() - t["step_started_at"]
         if elapsed >= IMAGE_UPDATE_TIMEOUT_SECONDS:
             return self._abort(t, f"slot {slot} did not serve {image} healthy within {IMAGE_UPDATE_TIMEOUT_SECONDS}s"
                                   f" ({t['error']})")
-        if (vm is not None and vm.running and not t.get("reset_at") and result.image != image
+        if (vm.running and not t.get("reset_at") and result.image != image
                 and elapsed >= IMAGE_SWAP_GRACE_SECONDS):
             # Still the old container: the VM booted before the image watcher existed. A reset reruns the (just
             # refreshed) startup script, which pulls the new image and installs the watcher for the next update.

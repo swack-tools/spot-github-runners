@@ -487,6 +487,32 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
         self.assertEqual(h.image["failed"], [D_B])
 
+    def test_a_vm_preempted_during_the_update_ends_it_at_once(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.status("a", "TERMINATED")
+        h.clock[0] += 180
+        h.tick()  # no 20-minute wait: roll back now so the normal restart runs
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
+        self.assertEqual(h.image["failed"], [D_B])
+        h.clock[0] += cv.START_RETRY_SECONDS
+        self.assertEqual(h.tick().action, "start")
+
+    def test_every_managed_key_is_written_so_cleared_settings_clear(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        call = next(c for c in h.gcloud.calls if c[2:4] == ["instances", "add-metadata"])
+        items = dict(item.split("=", 1) for item in
+                     next(a for a in call if a.startswith("--metadata="))[len("--metadata="):].split(","))
+        self.assertEqual(list(items), list(cv.METADATA_KEYS))
+        self.assertEqual(items["dashboard-image"], IMG_B)
+        for key in ("dashboard-config-repo", "dashboard-controlled-targets", "dashboard-global-admins",
+                    "dashboard-session-not-before", "dashboard-source-ref"):
+            self.assertEqual(items[key], "", key)  # unset here: cleared on the VM rather than left as it was
+
     def test_a_vm_recreated_during_the_update_is_held(self):
         h = TrackingHarness()
         h.active()
