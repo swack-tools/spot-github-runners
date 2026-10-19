@@ -248,6 +248,9 @@ class FakeHttp:
                 self.versions[slot] = max(self.versions[slot], envelope["state_version"])
             return self.import_status, json.dumps({"state_version": self.versions[slot], "imported": True}).encode()
         if op == "unfreeze":
+            if self.unfreeze_status == 200 and slot in self.health and self.health[slot][1].get("frozen"):
+                status, data = self.health[slot]
+                self.health[slot] = (200, dict(data, status="ok", frozen=False))
             return self.unfreeze_status, b'{"frozen": false}'
         raise AssertionError(path)
 

@@ -2077,6 +2077,23 @@ class ControlVmManager:
         if vm is None or not vm.running:
             return self._abort(t, f"{control_vm_name(t['new_slot'])} is {vm.status if vm else 'missing'}; "
                                   f"the image update needs the running VM")
+        if t.get("frozen_version") is None:
+            # Freeze first, as a rotation freezes the old VM: it drains in-flight changes (such as a patch save that
+            # opens a pull request) before the container is replaced. The freeze marker is on the boot disk, so the
+            # new container starts frozen and wait_image unfreezes it. Recorded before the call, so a rollback
+            # unfreezes even when the response is lost.
+            t["freeze_requested"] = True
+            self.save()
+            status, body = self._control(t["new_slot"], "freeze", "POST")
+            version = body.get("state_version") if isinstance(body, dict) else None
+            if not (status == 200 and isinstance(version, int) and not isinstance(version, bool)):
+                if self._fail_attempt(t, f"freeze returned {status}"):
+                    return self._abort(t, "the dashboard did not freeze")
+                return "wait"
+            t["frozen_version"] = version
+            t["state_version_before"] = max(version, t.get("state_version_before") or 0)
+            self.save()
+            self._note("froze slot %s at state_version %d for the image update", t["new_slot"], version)
         # Recorded before the call: a failed or ambiguous write may still have landed, so the rollback restores.
         t["image_written"] = True
         self.save()
@@ -2099,7 +2116,19 @@ class ControlVmManager:
                                   f"update")
         result = obs.health.get(slot) or HealthResult.unknown()
         floor = t.get("state_version_before")
-        if vm is not None and vm.running and result.ok and result.image == image:
+        unfreeze_error = None
+        if vm.running and result.image == image and result.hydrated and result.frozen and t.get("freeze_requested"):
+            # The new container started frozen from the marker on disk: release it.
+            status, _ = self._control(slot, "unfreeze", "POST")
+            if status == 200:
+                t["unfrozen"] = True
+                self._note("unfroze slot %s on %s", slot, image)
+                result = probe_health(self.requester, self.config, slot)
+            else:
+                unfreeze_error = f"unfreeze of slot {slot} on {image} returned {status}"
+        if unfreeze_error:
+            t["error"] = unfreeze_error
+        elif vm.running and result.ok and result.image == image:
             if isinstance(floor, int) and (result.state_version is None or result.state_version < floor):
                 # Same state file, so the version can only grow; a lower one means the state did not carry over.
                 t["error"] = f"slot {slot} serves {image} at state_version {result.state_version} < {floor}"
@@ -2148,6 +2177,30 @@ class ControlVmManager:
         elif t.get("image_written") and not previous:
             self._note("no previous image recorded for slot %s; leaving its metadata as it is", t["new_slot"],
                        level=logging.WARNING)
+        if t.get("freeze_requested") and not t.get("unfrozen") and vm is not None:
+            # The freeze marker survives container swaps and reboots: unfreeze whichever container serves now, or
+            # the dashboard stays read-only. A stopped VM is started first (what the planner would do next anyway).
+            waited = self.clock() - t["step_started_at"]
+            if vm.running:
+                status, _ = self._control(t["new_slot"], "unfreeze", "POST")
+                if status == 200:
+                    t["unfrozen"] = True
+                    self._note("unfroze slot %s after the rollback", t["new_slot"])
+                elif not self._fail_attempt(t, f"unfreeze returned {status}"):
+                    return "wait"
+                else:
+                    self._note("could not unfreeze slot %s; ending the rollback", t["new_slot"], level=logging.ERROR)
+            elif waited < IMAGE_UPDATE_TIMEOUT_SECONDS:
+                last = self.cstate.get("last_start_at", {}).get(t["new_slot"])
+                if vm.status in STOPPED_STATES and (last is None or self.clock() - last >= START_RETRY_SECONDS):
+                    self._start(vm)
+                t["error"] = f"waiting for {vm.name} ({vm.status}) to unfreeze it"
+                t["updated_at"] = self.clock()
+                self.save()
+                return "wait"
+            else:
+                self._note("%s did not come back within %ss to be unfrozen; ending the rollback", vm.name,
+                           IMAGE_UPDATE_TIMEOUT_SECONDS, level=logging.ERROR)
         return self._end_abort(t)
 
     def _control(self, slot: str, op: str, method: str, body: Mapping[str, Any] | None = None,

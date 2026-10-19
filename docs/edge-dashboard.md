@@ -1276,21 +1276,25 @@ while the repository is private. The manager starts a rollout only when all of t
 The rollout updates the active VM in place. It creates no second VM, so a rollout costs nothing extra on the
 free-tier e2-micro. The VM keeps its slot, boot disk, state file, and `origin:active`:
 
+1. The manager freezes the dashboard, as a rotation freezes the old VM, so changes in flight finish and new
+   ones wait.
 1. The manager writes the new digest to the VM's `dashboard-image` metadata. The same call refreshes the
-   VM's other metadata and its startup script, as a new VM of that slot would get them.
+   VM's other metadata and its startup script, as a new VM of that slot would get them. Settings that are no
+   longer set are written empty.
 1. On the VM, the `spot-dashboard-image-watch` service waits on the metadata server for that value to change.
    It then reruns the startup script, which pulls the new image while the old container still serves, stops
    the old container, and starts the new one. The dashboard is unavailable for a few seconds. The script then
    removes every image except the new one and the one it replaced, so updates don't fill the boot disk.
-1. The dashboard reports its image in `/api/health`. The manager completes the rollout once the VM reports the
-   new image, healthy, at a `state_version` no lower than before the update.
+1. The dashboard reports its image in `/api/health`. The new container starts frozen, because the freeze marker
+   is on the boot disk. Once it reports the new image, the manager unfreezes it, and the rollout completes when it
+   serves healthy at a `state_version` no lower than the frozen one.
 
 A VM created before the watcher existed doesn't swap its container. When the VM still reports another image
 after 5 minutes, the manager resets it once. The reset boots the refreshed startup script, which pulls the new
 image and installs the watcher for the next rollout. A reset takes the dashboard offline for a few minutes.
 
-When the VM stops or disappears during the update, the manager ends the update at once, so the normal restart
-and recovery run. When the new image doesn't serve healthy within 20 minutes, the manager writes the previous image back to
+When the VM stops or disappears during the update, the manager ends the update at once: it pins the previous
+image, starts a stopped VM, and unfreezes it once it's back. When the new image doesn't serve healthy within 20 minutes, the manager writes the previous image back to
 `dashboard-image`, and the watcher swaps back. That rollout's digest is backed off: the manager tries again only
 after `:main` names another digest and the cooldown has passed.
 

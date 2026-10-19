@@ -324,8 +324,10 @@ class TrackingHarness(tcv.Harness):
         return self.state.get(cv.STATE_KEY, {}).get("image", {})
 
     def swapped(self, image=IMG_B, slot="a", version=7):
-        """The VM's image watcher replaced the dashboard container, which now reports ``image``."""
-        self.http.healthy(slot, version=version, image=image)
+        """The VM's image watcher replaced the dashboard container, which now reports ``image``. It starts frozen:
+        the freeze marker the update set lives on the boot disk."""
+        self.http.health[slot] = (503, {"status": "frozen", "hydrated": True, "frozen": True, "state_version": version,
+                                        "slot": slot, "kv_writer": False, "image": image})
 
     def finish(self):
         """Drive a started rollout to completion."""
@@ -356,8 +358,8 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNotNone(h.transition)
         h.finish()
         self.assertIsNone(h.transition)
-        # No second VM, freeze, import, cutover, or reset: one metadata write.
-        self.assertEqual(h.mutations(), [("set-image", "spot-control-a", IMG_B)])
+        # No second VM, import, cutover, or reset: drain (freeze), one metadata write, release (unfreeze).
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B), ("unfreeze", "a")])
         self.assertEqual(sorted(h.gcloud.vms), ["spot-control-a"])
         self.assertEqual(h.kv.origin_slot(), "a")
         self.assertEqual((h.image["active"]["image"], h.image["active"]["slot"], h.image["active"]["instance_id"]),
@@ -425,8 +427,8 @@ class RolloutTests(unittest.TestCase):
         h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
         h.tick()  # timed out: pin the previous image again; the watcher swaps back
         self.assertIsNone(h.transition)
-        self.assertEqual(h.mutations(), [("set-image", "spot-control-a", IMG_B),
-                                         ("set-image", "spot-control-a", IMG_A)])
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B),
+                                         ("set-image", "spot-control-a", IMG_A), ("unfreeze", "a")])
         self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
         self.assertEqual(h.image["failed"], [D_B])
         self.assertEqual(h.image["active"]["image"], IMG_A)
@@ -493,12 +495,29 @@ class RolloutTests(unittest.TestCase):
         h.tick()
         h.gcloud.status("a", "TERMINATED")
         h.clock[0] += 180
-        h.tick()  # no 20-minute wait: roll back now so the normal restart runs
-        self.assertIsNone(h.transition)
+        h.tick()  # no 20-minute wait: roll back now, start the VM, and unfreeze it once it is back
+        self.assertEqual(h.transition["step"], "abort")
         self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
+        self.assertIn(("start", "spot-control-a"), h.events)
+        h.gcloud.status("a", "RUNNING")
+        h.swapped(image=IMG_A)  # booted the restored image, still frozen
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("unfreeze", "a"))
         self.assertEqual(h.image["failed"], [D_B])
-        h.clock[0] += cv.START_RETRY_SECONDS
-        self.assertEqual(h.tick().action, "start")
+        self.assertEqual(h.tick().action, "noop")
+
+    def test_a_dashboard_that_does_not_freeze_is_never_updated(self):
+        h = TrackingHarness()
+        h.active()
+        h.http.freeze_status = 503
+        for _ in range(cv.STEP_RETRY_LIMIT):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertNotIn("set-image", [e[0] for e in h.events])
+        self.assertEqual(h.mutations()[-1], ("unfreeze", "a"))  # in case a freeze landed without its answer
+        self.assertEqual(h.image["failed"], [D_B])
 
     def test_every_managed_key_is_written_so_cleared_settings_clear(self):
         h = TrackingHarness()
