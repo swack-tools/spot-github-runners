@@ -1055,14 +1055,30 @@ pinned by digest. The OIDC provider admits only that workflow on `main` of `swac
 
 | Member | Role | Resource | Why |
 | --- | --- | --- | --- |
-| `spot-control-watchdog` | `roles/compute.instanceAdmin.v1` | Project, with the IAM condition `spot-control-vms-only` | List, describe, create, start, stop, set scheduling on, and delete the control VMs and their boot disks; list machine types; use the subnetwork and an external IP. The condition limits instances and disks to names that start with `spot-control-`. |
-| `spot-control-watchdog` | `roles/compute.instanceAdmin.v1` | Project, with the IAM condition `spot-runner-floor-hosts`; only with floor targets | Create, describe, start, set metadata and labels on, and delete runner floor hosts and their disks. The condition limits instances to names that start with `oxidex-runners-`, and disks to those names and names that start with `runner-data`. The control VM binding stays as it is, so removing this binding turns the floor's compute access off. |
+| `spot-control-watchdog` | `spotControlWatchdogCompute` (custom) | Project, with the IAM condition `spot-control-vms-only` | List, describe, create, start, stop, set scheduling on, and delete the control VMs and their boot disks; list machine types; use the subnetwork and an external IP. The condition limits instances and disks to names that start with `spot-control-`. |
+| `spot-control-watchdog` | `spotControlWatchdogCompute` (custom) | Project, with the IAM condition `spot-runner-floor-hosts`; only with floor targets | Create, describe, start, set metadata and labels on, and delete runner floor hosts and their disks. The condition limits instances to names that start with `oxidex-runners-`, and disks to those names and names that start with `runner-data`. The control VM binding stays as it is, so removing this binding turns the floor's compute access off. |
 | `spot-control-watchdog` | `roles/iam.serviceAccountUser` | The control VM service account only | Create control VMs that run as that account. Floor hosts run with no service account, so the floor needs no `actAs` on any account. |
 | `spot-control-watchdog` | `roles/storage.objectAdmin` | The state bucket only | Read and conditionally write the state and lease objects. |
 | `spot-control-watchdog` | `roles/secretmanager.secretAccessor` | Each referenced secret only | Read the service's secrets when an instance starts. |
 | `spot-watchdog-invoker` | `roles/run.invoker` | The Cloud Run service only | Let Cloud Scheduler call this one service. No other member, and never `allUsers`. |
 | `spot-watchdog-publisher` | `roles/artifactregistry.writer` | The `spot-control` repository only | Let the image workflow push the watchdog image. |
 | The `swack-tools/spot-github-runners` principal set | `roles/iam.workloadIdentityUser` | The publisher service account only | Let the image workflow on `main` impersonate the publisher. |
+
+Both compute bindings use the custom role `spotControlWatchdogCompute`, not the predefined
+`roles/compute.instanceAdmin.v1`. The predefined role includes `compute.projects.setCommonInstanceMetadata`. An
+IAM condition narrows only instances and disks, and the project always passes it. With that permission, the
+watchdog's account could write project-wide `ssh-keys` or a `startup-script`, which every VM in the project trusts,
+so it would have root on all of them. The custom role holds the predefined role's permissions without
+`compute.projects.setCommonInstanceMetadata`, `compute.instances.osAdminLogin`, `compute.instances.osLogin`, and
+every `*.setIamPolicy`, and without the permissions that a project custom role can't hold. The deploy reads the
+predefined role each time it runs, as the autoscaler deploy does for `spotRunnerHostAdmin`. The watchdog needs
+none of the dropped permissions: it never runs `gcloud compute ssh`, and it writes only instance metadata on the
+VMs that the conditions name.
+
+Deploys before the custom role bound the predefined role with the same conditions. Every deploy removes those
+bindings after it adds the custom role bindings, so the watchdog keeps its compute access throughout. It removes
+the binding under each condition and the unconditional one that `--no-compute-condition` made, and skips any that
+is absent.
 
 The service references these secrets:
 

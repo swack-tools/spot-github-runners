@@ -12,7 +12,9 @@ minimum per execution, which at this cadence leaves the free tier. This module c
    account that GitHub Actions impersonates through Workload Identity Federation.
 4. The Artifact Registry Docker repository for the watchdog image.
 5. A check that every Secret Manager secret the service references has an enabled version (it never writes one).
-6. IAM, each binding on the narrowest resource that works (see :func:`iam_bindings`).
+6. The custom compute role (``roles/compute.instanceAdmin.v1`` without project metadata, OS Login, or IAM policy
+   writes), then IAM, each binding on the narrowest resource that works (see :func:`iam_bindings`), then the removal
+   of the predefined compute role bindings that earlier deploys made.
 7. The Workload Identity pool and GitHub OIDC provider, limited to the image workflow on ``main``.
 8. With ``--image``: the Cloud Run service (no unauthenticated access, concurrency 1, at most one instance, secrets
    as Secret Manager references only), its invoker binding, and the Cloud Scheduler job with an OIDC target.
@@ -34,7 +36,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -77,7 +79,6 @@ APIS = ("run.googleapis.com", "cloudscheduler.googleapis.com", "artifactregistry
         "secretmanager.googleapis.com", "storage.googleapis.com", "iam.googleapis.com",
         "iamcredentials.googleapis.com", "sts.googleapis.com", "compute.googleapis.com")
 
-ROLE_COMPUTE = "roles/compute.instanceAdmin.v1"
 ROLE_ACT_AS = "roles/iam.serviceAccountUser"
 ROLE_SECRET = "roles/secretmanager.secretAccessor"
 ROLE_OBJECTS = "roles/storage.objectAdmin"
@@ -103,6 +104,16 @@ FLOOR_CONDITION_EXPRESSION = (
     f'resource.name.extract("/disks/{{name}}").startsWith("{floor.HOST_PREFIX}") || '
     'resource.name.extract("/disks/{name}").startsWith("runner-data")'
 )
+
+# Both compute bindings use a custom role: roles/compute.instanceAdmin.v1 without the permissions that reach past the
+# VMs the conditions name. A condition can only narrow instances and disks; the project itself always passes it, so
+# the base role's compute.projects.setCommonInstanceMetadata would let this account write project-wide ssh-keys or a
+# startup-script, which every VM in the project trusts: root on all of them. The role's permissions are read from
+# the base role at deploy time (read_role_permissions); the autoscaler deploy builds its role the same way.
+BASE_COMPUTE_ROLE = "roles/compute.instanceAdmin.v1"
+EXCLUDED_PERMISSIONS = ("compute.projects.setCommonInstanceMetadata", "compute.instances.osAdminLogin",
+                        "compute.instances.osLogin")
+ROLE_ID = "spotControlWatchdogCompute"
 _TOKEN_VALUE_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
@@ -143,6 +154,12 @@ class DeployConfig:
     verify_signature: bool = True
     secrets: Mapping[str, str] = field(default_factory=dict)
     env: Mapping[str, str] = field(default_factory=dict)  # plain service env (validated, never a secret)
+    # The custom compute role's permissions; read from the base role when the deploy runs (see role_permissions).
+    role_permissions: tuple[str, ...] = ()
+
+    @property
+    def compute_role(self) -> str:
+        return f"projects/{self.project}/roles/{ROLE_ID}"
 
     @property
     def state_bucket(self) -> str:
@@ -377,6 +394,55 @@ def orphaned_secret_volumes(service: Mapping) -> list[str]:
                   if volume.get("secret") and volume.get("name") and volume["name"] not in mounted)
 
 
+def role_permissions(base: Sequence[str], support: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The base role's permissions minus project metadata, OS Login and IAM policy writes, and minus those custom
+    roles can't hold (``support``: permission -> customRolesSupportLevel, from list-testable-permissions)."""
+    keep = []
+    for permission in base:
+        if permission in EXCLUDED_PERMISSIONS or permission.endswith(".setIamPolicy"):
+            continue
+        # A permission a project-level custom role can't hold (not testable on the project, or NOT_SUPPORTED, such
+        # as resourcemanager.projects.list) would make the whole role definition fail.
+        if support is not None and support.get(permission, "NOT_SUPPORTED") == "NOT_SUPPORTED":
+            continue
+        keep.append(permission)
+    return tuple(sorted(set(keep)))
+
+
+def custom_role_file(title: str, permissions: Sequence[str]) -> str:
+    """A custom compute role definition (``gcloud iam roles create --file``), as JSON (a YAML subset); without
+    ``permissions`` (a dry run) it shows what the deploy computes in their place."""
+    included = list(permissions) or [
+        f"<computed at deploy time: {BASE_COMPUTE_ROLE} minus {', '.join(EXCLUDED_PERMISSIONS)} and *.setIamPolicy>"]
+    return json.dumps({"title": title,
+                       "description": f"{BASE_COMPUTE_ROLE} without project metadata, OS Login, or IAM policy writes",
+                       "stage": "GA", "includedPermissions": included}, indent=2)
+
+
+def read_role_permissions(project: str, runner: Runner) -> tuple[str, ...]:
+    """Read the base role and the project's custom-role support levels; raises DeployError on failure."""
+    described = runner(["gcloud", "iam", "roles", "describe", BASE_COMPUTE_ROLE, "--format=json"])
+    testable = runner(["gcloud", "iam", "list-testable-permissions",
+                       f"//cloudresourcemanager.googleapis.com/projects/{project}",
+                       "--format=json(name,customRolesSupportLevel)"])
+    try:
+        if described.returncode != 0 or testable.returncode != 0:
+            raise ValueError((described.stderr or testable.stderr or "").strip()[:300])
+        base = json.loads(described.stdout).get("includedPermissions") or []
+        support = {row["name"]: row.get("customRolesSupportLevel", "SUPPORTED") for row in json.loads(testable.stdout)}
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise DeployError(f"could not read {BASE_COMPUTE_ROLE}'s permissions: {exc}") from exc
+    permissions = role_permissions(base, support)
+    if not any(p == "compute.instances.create" for p in permissions):
+        raise DeployError(f"{BASE_COMPUTE_ROLE} returned no usable permissions")
+    return permissions
+
+
+def control_condition() -> dict[str, str]:
+    return {"expression": COMPUTE_CONDITION_EXPRESSION, "title": "spot-control-vms-only",
+            "description": "Instances and disks named spot-control-*; other resource types unrestricted"}
+
+
 def floor_condition() -> dict[str, str]:
     """The floor compute binding's condition; the same file adds it and, once the floor is off, removes it."""
     return {"expression": FLOOR_CONDITION_EXPRESSION, "title": FLOOR_CONDITION_TITLE,
@@ -388,9 +454,10 @@ def iam_bindings(config: DeployConfig) -> list[tuple[str, str, str, str]]:
     runtime = f"serviceAccount:{config.runtime_email}"
     bindings = [
         (f"project {config.project}" + (" (condition: instances and disks named spot-control-*)"
-                                        if config.compute_condition else ""), runtime, ROLE_COMPUTE,
+                                        if config.compute_condition else ""), runtime, config.compute_role,
          "list, describe, create, start, stop, set-scheduling, and delete the spot-control-a/b VMs and their boot "
-         "disks; list machine types and use the subnetwork and an external IP"),
+         f"disks; list machine types and use the subnetwork and an external IP ({BASE_COMPUTE_ROLE} without project "
+         "metadata, OS Login and IAM policy writes)"),
         (f"service account {config.control_vm_service_account}", runtime, ROLE_ACT_AS,
          "create control VMs that run as that account (iam.serviceAccounts.actAs), and no other"),
         (f"bucket gs://{config.state_bucket}", runtime, ROLE_OBJECTS,
@@ -398,7 +465,7 @@ def iam_bindings(config: DeployConfig) -> list[tuple[str, str, str, str]]:
     ]
     if config.floor_enabled and config.compute_condition:
         bindings.insert(1, (f"project {config.project} (condition: instances oxidex-runners-*, disks oxidex-runners-* "
-                            "and runner-data*)", runtime, ROLE_COMPUTE,
+                            "and runner-data*)", runtime, config.compute_role,
                             "the runner floor: create, start, set metadata and labels on, and delete runner floor "
                             "hosts and their disks; no service account is attached to them"))
     for env_name, secret in sorted(config.secret_refs().items()):
@@ -468,23 +535,30 @@ def build_steps(config: DeployConfig) -> list[Step]:
                        f"{secret} --data-file=- --replication-policy=automatic {p}")
                       for secret in sorted(by_secret))))
 
-    condition = {"expression": COMPUTE_CONDITION_EXPRESSION, "title": "spot-control-vms-only",
-                 "description": "Instances and disks named spot-control-*; other resource types unrestricted"}
+    steps.append(Step(
+        f"Custom role {config.compute_role} ({BASE_COMPUTE_ROLE} minus project metadata, OS Login, IAM policy)",
+        files={"watchdog-compute-role.json": custom_role_file("Spot control watchdog compute",
+                                                              config.role_permissions)},
+        check=_c("gcloud", "iam", "roles", "describe", ROLE_ID, p, "--format=value(name)"),
+        create=(_c("gcloud", "iam", "roles", "create", ROLE_ID, p, "--file=@FILE:watchdog-compute-role.json",
+                   "--format=none"),),
+        update=(_c("gcloud", "iam", "roles", "update", ROLE_ID, p, "--file=@FILE:watchdog-compute-role.json",
+                   "--format=none", "--quiet"),)))
     compute_args = (["--condition-from-file=@FILE:compute-condition.json"] if config.compute_condition
                     else ["--condition=None"])
     iam_runs = [
         _c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={runtime}",
-           f"--role={ROLE_COMPUTE}", *compute_args, "--format=none"),
+           f"--role={config.compute_role}", *compute_args, "--format=none"),
         _c("gcloud", "iam", "service-accounts", "add-iam-policy-binding", config.control_vm_service_account, p,
            f"--member={runtime}", f"--role={ROLE_ACT_AS}", "--format=none"),
         _c("gcloud", "storage", "buckets", "add-iam-policy-binding", bucket, f"--member={runtime}",
            f"--role={ROLE_OBJECTS}", "--format=none"),
     ]
-    files = {"compute-condition.json": json.dumps(condition, indent=2)} if config.compute_condition else {}
+    files = {"compute-condition.json": json.dumps(control_condition(), indent=2)} if config.compute_condition else {}
     if config.floor_enabled and config.compute_condition:
         files["floor-condition.json"] = json.dumps(floor_condition(), indent=2)
         iam_runs.insert(1, _c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={runtime}",
-                              f"--role={ROLE_COMPUTE}", "--condition-from-file=@FILE:floor-condition.json",
+                              f"--role={config.compute_role}", "--condition-from-file=@FILE:floor-condition.json",
                               "--format=none"))
     iam_runs += [_c("gcloud", "secrets", "add-iam-policy-binding", secret, p, f"--member={runtime}",
                     f"--role={ROLE_SECRET}", "--format=none")
@@ -493,6 +567,17 @@ def build_steps(config: DeployConfig) -> list[Step]:
                     "--format=none") for secret in sorted(set(mounts.values()))]
     steps.append(Step("Runtime service account IAM (narrowest resource for each role)", run=tuple(iam_runs),
                       files=files))
+    # Earlier deploys bound the predefined role with the same conditions (or none, with --no-compute-condition).
+    # The custom role bindings above are in place first, so the watchdog keeps its access throughout.
+    legacy_files = {"compute-condition.json": json.dumps(control_condition(), indent=2),
+                    "floor-condition.json": json.dumps(floor_condition(), indent=2)}
+    steps.append(Step(
+        f"Remove the {BASE_COMPUTE_ROLE} bindings earlier deploys made (absent ones are skipped)",
+        files=legacy_files, remove=tuple(
+            _c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
+               f"--role={BASE_COMPUTE_ROLE}", condition, "--format=none")
+            for condition in ("--condition-from-file=@FILE:compute-condition.json",
+                              "--condition-from-file=@FILE:floor-condition.json", "--condition=None"))))
     # Grants the runner floor no longer needs: the floor compute binding once no floor target is configured, and
     # the accessor on every labeled floor token secret that the service no longer references.
     removals: list[tuple[str, ...]] = []
@@ -500,7 +585,7 @@ def build_steps(config: DeployConfig) -> list[Step]:
     if not config.floor_enabled and config.compute_condition:
         removal_files["floor-condition.json"] = json.dumps(floor_condition(), indent=2)
         removals.append(_c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
-                           f"--role={ROLE_COMPUTE}", "--condition-from-file=@FILE:floor-condition.json",
+                           f"--role={config.compute_role}", "--condition-from-file=@FILE:floor-condition.json",
                            "--format=none"))
     keep = tuple(sorted(set(refs.values()) | set(mounts.values())))
     prune = ((_c("gcloud", "secrets", "list", p, f"--filter=labels.{FLOOR_SECRET_LABEL}=token",
@@ -797,6 +882,8 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner = default_runner,
         problems = validate(config)
         if problems:
             raise DeployError("refusing to deploy:\n  - " + "\n  - ".join(problems))
+        if not args.dry_run:
+            config = replace(config, role_permissions=read_role_permissions(config.project, runner))
         steps = build_steps(config)
         if args.dry_run:
             sys.stdout.write(render(config, steps))
