@@ -2125,6 +2125,12 @@ class ControlVmManager:
         replacement: the import persists that state (including changes the freeze drained that never reached the
         state file), raises a container that came up behind it, and clears the freeze. Without a snapshot (the
         container was never replaced), unfreeze it."""
+        if t.get("release_attempted") and not t.get("released"):
+            # An earlier release may have landed without its answer, and the container may have accepted changes
+            # since: freeze it again and take its current state, rather than importing the older snapshot over it.
+            status, body = self._control(slot, "freeze", "POST")
+            if not (status == 200 and self._record_freeze(t, body)):
+                return False, f"freeze before retrying the release of slot {slot} returned {status}"
         t["release_attempted"] = True  # before the call: a lost response may still have released it
         self.save()
         snapshot = t.get("frozen_snapshot")
@@ -2389,6 +2395,16 @@ class ControlVmManager:
     def _preserve_frozen_snapshot(self, t: dict) -> str | None:
         """Before a rollback ends without releasing a container: make sure KV holds the frozen snapshot, so a
         recovery that hydrates from KV keeps it. None when it does."""
+        if t.get("snapshot_in_kv"):
+            # The newest snapshot already lives in KV (too large for the controller state); never overwrite it with
+            # the older local copy, only confirm it is still there.
+            try:
+                current = parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None
+            except KvError as exc:
+                return f"could not confirm the frozen snapshot in KV: {exc}"
+            if current is None or current["state_version"] < t["snapshot_in_kv"]:
+                return "KV no longer holds the frozen snapshot"
+            return None
         snapshot = t.get("frozen_snapshot")
         return self._publish_snapshot(snapshot) if snapshot else None
 

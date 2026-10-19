@@ -681,6 +681,34 @@ class RolloutTests(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertEqual(h.http.versions["a"], 9)  # imported the KV copy, not the older one in the state
 
+    def test_a_retried_release_refreezes_first(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_status = None  # the import may have landed
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        h.http.import_status = 200
+        h.clock[0] += 180
+        h.tick()
+        imports = [i for i, e in enumerate(h.events) if e == ("import", "a")]
+        freezes = [i for i, e in enumerate(h.events) if e == ("freeze", "a")]
+        self.assertEqual(len(imports), 2)
+        self.assertTrue(any(imports[0] < f < imports[1] for f in freezes), h.events)
+        self.assertIsNone(h.transition)
+
+    def test_preservation_never_overwrites_a_snapshot_kept_in_kv(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({"new": 1}, 9, "a", now=6))
+        t = {"snapshot_in_kv": 9, "frozen_snapshot": build_snapshot({"old": 1}, 9, "a", now=5)}
+        self.assertIsNone(manager._preserve_frozen_snapshot(t))
+        self.assertEqual(json.loads(h.kv.store[KV_STATE_KEY])["state"], {"new": 1})
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 8, "a", now=7))
+        self.assertIn("no longer holds", manager._preserve_frozen_snapshot(t))
+
     def test_a_stale_running_report_does_not_block_forever(self):
         h = TrackingHarness()
         h.active()
