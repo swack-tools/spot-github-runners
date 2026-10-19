@@ -559,6 +559,17 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
 
+    def test_a_vanished_vm_ends_the_rollback_only_after_kv_holds_the_frozen_state(self):
+        from lib.edge_state import KV_STATE_KEY, parse_snapshot
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.kv.store.pop(KV_STATE_KEY, None)
+        h.gcloud.vms.pop("spot-control-a")
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
     def test_a_reset_that_reports_failure_is_never_repeated(self):
         h = TrackingHarness()
         h.active()

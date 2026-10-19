@@ -2276,6 +2276,15 @@ class ControlVmManager:
                 return "wait"
             self._note("%s was not reachable within %ss to be released; ending the rollback", vm.name,
                        IMAGE_UPDATE_TIMEOUT_SECONDS, level=logging.ERROR)
+        elif vm is None and t.get("freeze_requested") and not t.get("released"):
+            # The VM is gone with its disk: the frozen snapshot may be the only copy of that state.
+            problem = self._preserve_frozen_snapshot(t)
+            if problem:
+                t["error"] = f"holding the rollback: {problem}"
+                t["updated_at"] = self.clock()
+                self.save()
+                self._note(t["error"], level=logging.ERROR)
+                return "wait"
         return self._end_abort(t)
 
     def _preserve_frozen_snapshot(self, t: dict) -> str | None:
