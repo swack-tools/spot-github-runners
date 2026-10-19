@@ -22,6 +22,12 @@ minimum per execution, which at this cadence leaves the free tier. This module c
    ``--set-secrets`` replaces the mounts but keeps the volume of every dropped mount, so the deploy then removes
    the secret volumes nothing mounts (a dropped runner floor token's, for example).
 
+With ``SPOT_WATCHDOG_AUTO_DEPLOY=1`` it also creates the image deployer account that the image workflow's deploy job
+impersonates, with ``run.developer`` on the one service, ``iam.serviceAccountUser`` on the runtime account, and
+``artifactregistry.reader`` on the repository. The job runs ``--update-image``, which swaps only the service's image
+(see :func:`update_image`) and refuses anything but a strictly newer commit. While auto-deploy is on, a full deploy
+refuses an ``--image`` other than the deployed one, so re-applying settings never rolls the watchdog back.
+
 ``--dry-run`` prints every command as a reviewable shell script and runs nothing. Without it, every resource is
 described first and created only when missing; bindings and updates are idempotent.
 
@@ -73,8 +79,11 @@ PASSTHROUGH_ENV = (
     "DASHBOARD_CONTROLLED_TARGETS", "DASHBOARD_GLOBAL_ADMINS", "DASHBOARD_SESSION_NOT_BEFORE",
     "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_KV_NAMESPACE_ID", image_tracking.ENV_IMAGE_TRACK,
     # Runner floor (src/runner_floor.py): targets name each account's Secret Manager secret, never a token.
-    floor.ENV_TARGETS, floor.ENV_REGIONS, floor.ENV_MAX_DAILY_USD,
+    floor.ENV_TARGETS, floor.ENV_REGIONS, floor.ENV_MAX_DAILY_USD, image_tracking.ENV_ROLLOUT_STATUS,
 )
+# Deploy-tool setting only (never passed to the service): "1" creates the image deployer account and its bindings.
+ENV_AUTO_DEPLOY = "SPOT_WATCHDOG_AUTO_DEPLOY"
+SERVICE_LABEL = ("spot-role", "control-watchdog")
 
 APIS = ("run.googleapis.com", "cloudscheduler.googleapis.com", "artifactregistry.googleapis.com",
         "secretmanager.googleapis.com", "storage.googleapis.com", "iam.googleapis.com",
@@ -86,6 +95,8 @@ ROLE_OBJECTS = "roles/storage.objectAdmin"
 ROLE_INVOKER = "roles/run.invoker"
 ROLE_AR_WRITER = "roles/artifactregistry.writer"
 ROLE_WIF_USER = "roles/iam.workloadIdentityUser"
+ROLE_RUN_DEVELOPER = "roles/run.developer"
+ROLE_AR_READER = "roles/artifactregistry.reader"
 
 # IAM condition on the compute binding: Compute Engine instances and disks only when named spot-control-*; every
 # other resource the role covers (subnetworks, machine types, zone operations, the project for list calls) as is.
@@ -125,6 +136,7 @@ _SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
 _GH_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SCHEDULE_RE = re.compile(r"^[0-9*/,\- ]+$")
 _VOLUME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class DeployError(RuntimeError):
@@ -140,6 +152,8 @@ class DeployConfig:
     runtime_account: str = "spot-control-watchdog"
     invoker_account: str = "spot-watchdog-invoker"
     publisher_account: str = "spot-watchdog-publisher"
+    deployer_account: str = "spot-watchdog-deployer"
+    auto_deploy: str = ""   # SPOT_WATCHDOG_AUTO_DEPLOY: "" or "0" (off) or "1"
     repository: str = "spot-control"
     image_name: str = "control-watchdog"
     service: str = "spot-control-watchdog"
@@ -188,6 +202,14 @@ class DeployConfig:
     @property
     def publisher_email(self) -> str:
         return self.email(self.publisher_account)
+
+    @property
+    def deployer_email(self) -> str:
+        return self.email(self.deployer_account)
+
+    @property
+    def deploys_automatically(self) -> bool:
+        return self.auto_deploy == "1"
 
     @property
     def image_repo(self) -> str:
@@ -283,7 +305,10 @@ def validate(config: DeployConfig) -> list[str]:
         problems.append(f"invalid region {config.region!r}")
     if not _BUCKET_RE.match(config.state_bucket):
         problems.append(f"invalid bucket name {config.state_bucket!r}")
-    for account in (config.runtime_account, config.invoker_account, config.publisher_account):
+    if config.auto_deploy not in ("", "0", "1"):
+        problems.append(f"{ENV_AUTO_DEPLOY} must be empty, 0, or 1, not {config.auto_deploy!r}")
+    for account in (config.runtime_account, config.invoker_account, config.publisher_account,
+                    config.deployer_account):
         if not _NAME_RE.match(account):
             problems.append(f"service account name {account!r} must be 6-30 lower-case letters, digits or hyphens")
     for name in (config.service, config.scheduler_job, config.repository, config.image_name, config.wif_pool,
@@ -363,6 +388,9 @@ class Step:
     # (read command, message): the remove commands run only when the read prints something; otherwise the deploy
     # prints the message and removes nothing.
     remove_when: tuple[tuple[str, ...], str] | None = None
+    # SPOT_WATCHDOG_AUTO_DEPLOY=1: right before the run commands, the service must be absent or run the deploy's
+    # image; right after them, it must run that image and no other change may have landed (see auto_deploy_guard).
+    image_guard: bool = False
 
 
 def _c(*argv: str) -> tuple[str, ...]:
@@ -500,6 +528,20 @@ def iam_bindings(config: DeployConfig) -> list[tuple[str, str, str, str]]:
                      f"principalSet://iam.googleapis.com/projects/{config.number}/locations/global/"
                      f"workloadIdentityPools/{config.wif_pool}/attribute.repository/{config.github_repo}",
                      ROLE_WIF_USER, f"only {config.github_repo} workflows that the provider admits may impersonate it"))
+    if config.deploys_automatically:
+        deployer = f"serviceAccount:{config.deployer_email}"
+        bindings += [
+            (f"service account {config.deployer_email}",
+             f"principalSet://iam.googleapis.com/projects/{config.number}/locations/global/"
+             f"workloadIdentityPools/{config.wif_pool}/attribute.repository/{config.github_repo}",
+             ROLE_WIF_USER, "the image workflow's deploy job (main only, as the provider admits) may impersonate it"),
+            (f"Cloud Run service {config.service}", deployer, ROLE_RUN_DEVELOPER,
+             "read the service and roll it to a new image (run.services.get/update); no other service"),
+            (f"service account {config.runtime_email}", deployer, ROLE_ACT_AS,
+             "a new revision keeps running as the runtime account (iam.serviceAccounts.actAs on it only)"),
+            (f"repository {config.repository}", deployer, ROLE_AR_READER,
+             "read the commit tags of the deployed and the new image to prove the new commit is newer"),
+        ]
     return bindings
 
 
@@ -523,9 +565,12 @@ def build_steps(config: DeployConfig) -> list[Step]:
                    "--uniform-bucket-level-access", "--public-access-prevention"),),
         run=(_c("gcloud", "storage", "buckets", "update", bucket, p, "--uniform-bucket-level-access",
                 "--public-access-prevention"),)))
-    for account, display in ((config.runtime_account, "Control VM watchdog (Cloud Run service)"),
-                             (config.invoker_account, "Control VM watchdog scheduler invoker"),
-                             (config.publisher_account, "Control VM watchdog image publisher (GitHub Actions)")):
+    accounts = [(config.runtime_account, "Control VM watchdog (Cloud Run service)"),
+                (config.invoker_account, "Control VM watchdog scheduler invoker"),
+                (config.publisher_account, "Control VM watchdog image publisher (GitHub Actions)")]
+    if config.deploys_automatically:
+        accounts.append((config.deployer_account, "Control VM watchdog image deployer (GitHub Actions)"))
+    for account, display in accounts:
         steps.append(Step(
             f"Service account {config.email(account)}",
             check=_c("gcloud", "iam", "service-accounts", "describe", config.email(account), p, "--format=value(email)"),
@@ -673,6 +718,16 @@ def build_steps(config: DeployConfig) -> list[Step]:
         _c("gcloud", "artifacts", "repositories", "add-iam-policy-binding", config.repository, location, p,
            f"--member=serviceAccount:{config.publisher_email}", f"--role={ROLE_AR_WRITER}", "--format=none"),
     )))
+    deployer = f"serviceAccount:{config.deployer_email}"
+    if config.deploys_automatically:
+        steps.append(Step(f"Image deployer IAM ({ENV_AUTO_DEPLOY}=1)", run=(
+            _c("gcloud", "iam", "service-accounts", "add-iam-policy-binding", config.deployer_email, p,
+               f"--member={principal}", f"--role={ROLE_WIF_USER}", "--format=none"),
+            _c("gcloud", "iam", "service-accounts", "add-iam-policy-binding", config.runtime_email, p,
+               f"--member={deployer}", f"--role={ROLE_ACT_AS}", "--format=none"),
+            _c("gcloud", "artifacts", "repositories", "add-iam-policy-binding", config.repository, location, p,
+               f"--member={deployer}", f"--role={ROLE_AR_READER}", "--format=none"),
+        )))
     if not config.image:
         return steps
 
@@ -691,8 +746,12 @@ def build_steps(config: DeployConfig) -> list[Step]:
            "--labels=spot-role=control-watchdog", "--quiet"),
         _c("gcloud", "run", "services", "add-iam-policy-binding", config.service, p, region,
            f"--member=serviceAccount:{config.invoker_email}", f"--role={ROLE_INVOKER}", "--format=none"),
+        *((_c("gcloud", "run", "services", "add-iam-policy-binding", config.service, p, region,
+              f"--member={deployer}", f"--role={ROLE_RUN_DEVELOPER}", "--format=none"),)
+          if config.deploys_automatically else ()),
     ), volume_prune=(_c("gcloud", "run", "services", "describe", config.service, p, region, "--format=json"),
-                     _c("gcloud", "run", "services", "update", config.service, p, region, "--quiet"))))
+                     _c("gcloud", "run", "services", "update", config.service, p, region, "--quiet")),
+        image_guard=config.deploys_automatically))
     if config.skip_scheduler:
         return steps
     scheduler = (p, location, f"--schedule={config.schedule}", "--time-zone=Etc/UTC",
@@ -744,6 +803,9 @@ def render(config: DeployConfig, steps: Sequence[Step], *, title: str = "Control
             lines += [f"#   {line}" for line in content.splitlines()]
         for command, hint in step.require:
             lines.append(f"test \"$({_shell(command)})\" = ENABLED || {{ echo {shlex.quote(hint)} >&2; exit 1; }}")
+        if step.image_guard:
+            lines.append(f"# Here and again after the commands below, the deploy refuses unless the service runs "
+                         f"{config.image} (or doesn't exist yet) and nothing else changed it meanwhile.")
         if step.check:
             lines.append(f"if {_shell(step.check)} >/dev/null 2>&1; then")
             lines += [f"  {_shell(c)}" for c in step.update] or ["  :  # exists"]
@@ -774,6 +836,9 @@ def render(config: DeployConfig, steps: Sequence[Step], *, title: str = "Control
     if not config.image:
         lines += ["", "# The Cloud Run service and the scheduler need --image: build the watchdog image first (see the",
                   "# Control watchdog image workflow), then run this deploy again with --image=<digest>."]
+    elif config.deploys_automatically:
+        lines += ["", f"# {ENV_AUTO_DEPLOY}=1: before step 1 the deploy refuses unless the service is absent or already",
+                  f"# runs {config.image}, so re-applying settings never rolls the watchdog back."]
     lines += ["", "# GitHub repository variables for the image workflow (set them yourself with gh):"]
     for name, value in workflow_variables(config).items():
         lines.append(f"#   gh variable set {name} --repo {config.github_repo} --body {_quote(value)}")
@@ -781,9 +846,13 @@ def render(config: DeployConfig, steps: Sequence[Step], *, title: str = "Control
 
 
 def workflow_variables(config: DeployConfig) -> dict[str, str]:
-    return {"WATCHDOG_IMAGE": config.image_repo, "WATCHDOG_PUBLISHER_SA": config.publisher_email,
-            "WATCHDOG_WIF_PROVIDER": config.wif_provider_name,
-            "WATCHDOG_BASE_IMAGE": "gcr.io/google.com/cloudsdktool/google-cloud-cli:<version>-slim@sha256:<digest>"}
+    variables = {"WATCHDOG_IMAGE": config.image_repo, "WATCHDOG_PUBLISHER_SA": config.publisher_email,
+                 "WATCHDOG_WIF_PROVIDER": config.wif_provider_name,
+                 "WATCHDOG_BASE_IMAGE": "gcr.io/google.com/cloudsdktool/google-cloud-cli:<version>-slim@sha256:<digest>"}
+    if config.deploys_automatically:
+        # The deploy job runs only once this is set; delete the variable to stop automatic deploys.
+        variables["WATCHDOG_DEPLOYER_SA"] = config.deployer_email
+    return variables
 
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
@@ -841,8 +910,11 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
                     run(command, step.files, step.title)
                 if exists and not step.update:
                     out("  exists")
+            generation = auto_deploy_guard(config, runner) if step.image_guard else None
             for command in step.run:
                 run(command, step.files, step.title)
+            if step.image_guard:
+                full_deploy_check(config, runner, generation)
             if step.volume_prune:
                 describe, update = step.volume_prune
                 result = runner(materialize(describe, step.files))
@@ -882,6 +954,254 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
 
 
 # --------------------------------------------------------------------------------------------
+# Image-only update (the image workflow's deploy job) and the auto-deploy guard of a full deploy
+# --------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ImageUpdate:
+    image: str                  # <image_repo>@sha256:<digest>
+    revision: str               # the 40-hex commit the image was built from (its commit tag)
+    expect_current: str = ""    # compare-and-swap: refuse unless the service runs exactly this image
+    repo_dir: str = "."         # a checkout with the history of both commits (fetch-depth 0)
+
+
+def _basename(value: Any) -> str:
+    return str(value or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def service_image(service: Mapping) -> str:
+    """The image of the service's only container ("" unless there is exactly one)."""
+    containers = (((service.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers") or []
+    if len(containers) != 1 or not isinstance(containers[0], dict):
+        return ""
+    return str(containers[0].get("image") or "")
+
+
+def _pinned(config: DeployConfig, image: str) -> bool:
+    return bool(re.match(rf"^{re.escape(config.image_repo)}@sha256:[0-9a-f]{{64}}$", image or ""))
+
+
+def service_problems(config: DeployConfig, service: Mapping) -> list[str]:
+    """Why the described service is not the watchdog this tool manages (empty when it is)."""
+    problems = []
+    labels = (service.get("metadata") or {}).get("labels") or {}
+    if not isinstance(labels, dict) or labels.get(SERVICE_LABEL[0]) != SERVICE_LABEL[1]:
+        problems.append(f"it has no {SERVICE_LABEL[0]}={SERVICE_LABEL[1]} label")
+    template = ((service.get("spec") or {}).get("template") or {}).get("spec") or {}
+    if template.get("serviceAccountName") != config.runtime_email:
+        problems.append(f"it runs as {template.get('serviceAccountName')!r}, not {config.runtime_email}")
+    image = service_image(service)
+    if not _pinned(config, image):
+        problems.append(f"its image {image!r} is not {config.image_repo}@sha256:<digest>")
+    return problems
+
+
+def rollout_problems(service: Mapping, image: str) -> list[str]:
+    """After the update: why the service is not serving ``image`` from a ready revision with all traffic."""
+    problems = []
+    if service_image(service) != image:
+        problems.append(f"its template image is {service_image(service)!r}")
+    status = service.get("status") or {}
+    generation = _generation(service)
+    if generation is None or status.get("observedGeneration") != generation:
+        # Status of an older generation says nothing about this template.
+        problems.append(f"its status describes generation {status.get('observedGeneration')!r}, not {generation!r}")
+    ready, created = status.get("latestReadyRevisionName"), status.get("latestCreatedRevisionName")
+    if not ready or ready != created:
+        problems.append(f"the latest revision {created!r} is not ready (ready: {ready!r})")
+    traffic = sum(int(t.get("percent") or 0) for t in status.get("traffic") or []
+                  if isinstance(t, dict) and (t.get("latestRevision") or (ready and t.get("revisionName") == ready)))
+    if traffic != 100:
+        problems.append(f"the ready revision serves {traffic}% of traffic, not 100%")
+    conditions = {c.get("type"): c.get("status") for c in status.get("conditions") or [] if isinstance(c, dict)}
+    if conditions.get("Ready") != "True":
+        problems.append(f"the service's Ready condition is {conditions.get('Ready')!r}")
+    return problems
+
+
+def commit_tags(listing: Any) -> dict[str, set[str]]:
+    """digest -> its 40-hex commit tags, from ``gcloud artifacts docker tags list --format=json``."""
+    tags: dict[str, set[str]] = {}
+    for entry in listing if isinstance(listing, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        tag, digest = _basename(entry.get("tag") or entry.get("name")), _basename(entry.get("version")
+                                                                                  or entry.get("digest"))
+        if _SHA_RE.match(tag) and image_tracking.DIGEST_RE.match(digest):
+            tags.setdefault(digest, set()).add(tag)
+    return tags
+
+
+def update_problems(config: DeployConfig, update: ImageUpdate) -> list[str]:
+    problems = []
+    try:
+        cv.project_control_paths(config.project, ".")
+    except ValueError as exc:
+        problems.append(str(exc))
+    if not _REGION_RE.match(config.region):
+        problems.append(f"invalid region {config.region!r}")
+    if not _JOB_RE.match(config.service):
+        problems.append(f"invalid resource name {config.service!r}")
+    if not _pinned(config, update.image):
+        problems.append(f"--update-image must be {config.image_repo}@sha256:<64 hex> (pinned by digest)")
+    if not _SHA_RE.match(update.revision):
+        problems.append("--revision must be the image's 40-hex commit")
+    if update.expect_current and not _pinned(config, update.expect_current):
+        problems.append(f"--expect-current must be {config.image_repo}@sha256:<64 hex>")
+    return problems
+
+
+def _describe_service(config: DeployConfig) -> tuple[str, ...]:
+    return _c("gcloud", "run", "services", "describe", config.service, f"--project={config.project}",
+              f"--region={config.region}", "--format=json")
+
+
+def _tags_command(config: DeployConfig) -> tuple[str, ...]:
+    return _c("gcloud", "artifacts", "docker", "tags", "list", config.image_repo, "--format=json")
+
+
+def _update_command(config: DeployConfig, image: str) -> tuple[str, ...]:
+    # Only the image: env, secrets, the service account, scaling, and IAM stay exactly as the last full deploy set
+    # them, and Cloud Run keeps traffic on the old revision unless the new one becomes ready.
+    return _c("gcloud", "run", "services", "update", config.service, f"--project={config.project}",
+              f"--region={config.region}", f"--image={image}", "--quiet")
+
+
+def render_update(config: DeployConfig, update: ImageUpdate) -> str:
+    """The dry-run script of an image-only update; nothing runs."""
+    lines = ["#!/usr/bin/env bash", "# Control watchdog image update (dry run): nothing below has run.",
+             "set -euo pipefail", "",
+             f"# 1. Read the service; refuse unless it is labeled {'='.join(SERVICE_LABEL)}, runs as",
+             f"#    {config.runtime_email}, and runs an image of {config.image_repo} pinned by digest"
+             + (f" (exactly {update.expect_current})" if update.expect_current else ""),
+             _shell(_describe_service(config)), "",
+             f"# 2. Commit tags: the new digest must carry the tag {update.revision}; DEPLOYED_COMMIT is the deployed",
+             "#    digest's commit tag (refuse when it has none)",
+             _shell(_tags_command(config)), "",
+             f"# 3. Refuse unless {update.revision[:12]} is strictly ahead of the deployed commit (same commit: done)",
+             _shell(_c("git", "-C", update.repo_dir, "merge-base", "--is-ancestor")) + ' "$DEPLOYED_COMMIT" '
+             + shlex.quote(update.revision), "",
+             "# 4. Swap the image only (env, secrets, account, scaling, IAM unchanged)",
+             _shell(_update_command(config, update.image)), "",
+             "# 5. Verify: the new image serves from a ready revision with 100% of traffic",
+             _shell(_describe_service(config))]
+    return "\n".join(lines) + "\n"
+
+
+def _json_of(result: subprocess.CompletedProcess, what: str) -> Any:
+    if result.returncode != 0:
+        raise DeployError(f"{what} failed: {(result.stderr or '').strip()[:500]}")
+    try:
+        return json.loads(result.stdout or "")
+    except ValueError as exc:
+        raise DeployError(f"{what} did not print JSON") from exc
+
+
+def update_image(config: DeployConfig, update: ImageUpdate, runner: Runner = default_runner,
+                 out: Callable[[str], None] = print) -> str:
+    """Roll the watchdog service to ``update.image`` when it is built from a commit strictly ahead of the deployed
+    image's commit, and verify it serves. Returns what happened; raises DeployError on every refusal or failure."""
+    service = _json_of(runner(_describe_service(config)), f"describe of service {config.service}")
+    if not isinstance(service, dict):
+        raise DeployError(f"describe of service {config.service} did not print an object")
+    problems = service_problems(config, service)
+    if problems:
+        raise DeployError(f"refusing to update service {config.service}: " + "; ".join(problems))
+    current = service_image(service)
+    if update.expect_current and current != update.expect_current:
+        raise DeployError(f"service {config.service} runs {current}, not the expected {update.expect_current}")
+    if current == update.image:
+        # A failed earlier attempt can leave the template naming the image while traffic stays on the old revision.
+        _require_serving(config, service, update.image)
+        return f"service {config.service} already runs {update.image}"
+    tags = commit_tags(_json_of(runner(_tags_command(config)), f"tag listing of {config.image_repo}"))
+    new_digest, current_digest = update.image.rsplit("@", 1)[1], current.rsplit("@", 1)[1]
+    if update.revision not in tags.get(new_digest, set()):
+        raise DeployError(f"{update.image} does not carry the commit tag {update.revision}")
+    current_commits = sorted(tags.get(current_digest, set()))
+    if len(current_commits) != 1:
+        raise DeployError(f"the deployed image {current} has {len(current_commits) or 'no'} commit tags, so the new "
+                          "image can't be proven newer; deploy by hand with --image")
+    deployed = current_commits[0]
+    if deployed == update.revision:
+        _require_serving(config, service, current)
+        return f"service {config.service} already runs commit {deployed} ({current}); not rebuilding over it"
+    ancestry = runner(_c("git", "-C", update.repo_dir, "merge-base", "--is-ancestor", deployed, update.revision))
+    if ancestry.returncode == 1:
+        raise DeployError(f"commit {update.revision[:12]} is not a descendant of the deployed {deployed[:12]}; "
+                          "refusing to move the watchdog to an older or unrelated commit")
+    if ancestry.returncode != 0:
+        raise DeployError(f"could not order {deployed[:12]} and {update.revision[:12]} (a full-history checkout is "
+                          f"needed): {(ancestry.stderr or '').strip()[:300]}")
+    generation = _generation(service)
+    command = _update_command(config, update.image)
+    out(f"+ {shlex.join(command)}")
+    result = runner(command)
+    if result.returncode != 0:
+        raise DeployError(f"update of service {config.service} failed (traffic stays on the ready revision): "
+                          f"{(result.stderr or '').strip()[:500]}")
+    after = _json_of(runner(_describe_service(config)), f"describe of service {config.service}")
+    after = after if isinstance(after, dict) else {}
+    problems = rollout_problems(after, update.image)
+    if problems:
+        raise DeployError(f"service {config.service} did not settle on {update.image}: " + "; ".join(problems))
+    # gcloud can't make the update conditional on the version it checked. One generation more than the checked one
+    # proves nothing else changed the service in between; anything else may have been overwritten, so say so.
+    if generation is None or _generation(after) != generation + 1:
+        raise DeployError(f"service {config.service} went from generation {generation} to {_generation(after)} during "
+                          f"this update: another change landed meanwhile, and {update.image} may have replaced a "
+                          "newer image. Check the service and deploy the newest image by hand")
+    return f"service {config.service} moved from commit {deployed} to {update.revision} ({update.image})"
+
+
+def _generation(service: Mapping) -> int | None:
+    value = (service.get("metadata") or {}).get("generation")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _require_serving(config: DeployConfig, service: Mapping, image: str) -> None:
+    problems = rollout_problems(service, image)
+    if problems:
+        raise DeployError(f"service {config.service} names {image} but does not serve it: " + "; ".join(problems))
+
+
+def auto_deploy_guard(config: DeployConfig, runner: Runner = default_runner) -> int | None:
+    """With auto-deploy on, a full deploy must pass the deployed image: the workflow owns the image, and an older
+    ``--image`` would silently roll the watchdog back. A service that doesn't exist yet passes (generation 0).
+    Returns the service's generation, which :func:`full_deploy_check` compares after the deploy."""
+    if not (config.deploys_automatically and config.image):
+        return None
+    result = runner(_describe_service(config))
+    stderr = (result.stderr or "").lower()
+    if result.returncode != 0 and any(text in stderr for text in ("not found", "could not be found", "cannot find")):
+        return 0
+    service = _json_of(result, f"describe of service {config.service}")
+    current = service_image(service) if isinstance(service, dict) else ""
+    if current != config.image:
+        raise DeployError(f"{ENV_AUTO_DEPLOY}=1: the image workflow deploys the watchdog, and the service runs "
+                          f"{current or 'an unknown image'}; pass --image={current} to re-apply settings, or turn "
+                          f"auto-deploy off to pin another image: delete the WATCHDOG_DEPLOYER_SA repository variable "
+                          f"and set {ENV_AUTO_DEPLOY}=0")
+    return _generation(service)
+
+
+def full_deploy_check(config: DeployConfig, runner: Runner, generation: int | None) -> None:
+    """After a full deploy's ``gcloud run deploy`` with auto-deploy on: the service runs the deploy's image, and its
+    generation rose by at most one since :func:`auto_deploy_guard` (a deploy that changed nothing doesn't raise it).
+    The workflow's deploy job may have run in between; a larger step means a change was overwritten."""
+    if generation is None:
+        raise DeployError(f"service {config.service} reported no generation before the deploy")
+    after = _json_of(runner(_describe_service(config)), f"describe of service {config.service}")
+    after = after if isinstance(after, dict) else {}
+    now = _generation(after)
+    if service_image(after) != config.image or now is None or not generation <= now <= generation + 1:
+        raise DeployError(f"service {config.service} went from generation {generation} to {now} and runs "
+                          f"{service_image(after) or 'an unknown image'} after this deploy of {config.image}: the image "
+                          "workflow may have deployed a newer image meanwhile. Check the service and deploy the "
+                          "newest image")
+
+
+# --------------------------------------------------------------------------------------------
 # Command-line interface
 # --------------------------------------------------------------------------------------------
 
@@ -913,6 +1233,16 @@ def args_parser() -> argparse.ArgumentParser:
                         help="Check the OIDC token's claims but not its signature in the server (Cloud Run IAM still "
                              "verifies it); only if requests arrive with the signature stripped")
     parser.add_argument("--dry-run", action="store_true", help="Print the commands; run nothing")
+    update = parser.add_argument_group(
+        "image-only update", "What the image workflow's deploy job runs: swap the service's image, nothing else")
+    update.add_argument("--update-image", default="", metavar="IMAGE",
+                        help="Roll the existing service to this image (pinned by digest) when its commit is strictly "
+                             "ahead of the deployed image's commit; env, secrets, IAM, and the scheduler stay as they are")
+    update.add_argument("--revision", default="", help="With --update-image: the 40-hex commit the image was built from")
+    update.add_argument("--expect-current", default="", metavar="IMAGE",
+                        help="With --update-image: refuse unless the service runs exactly this image")
+    update.add_argument("--repo-dir", default=".",
+                        help="With --update-image: a checkout with both commits' history (default: %(default)s)")
     return parser
 
 
@@ -927,6 +1257,7 @@ def config_from_args(args: argparse.Namespace, env: Mapping[str, str] | None = N
         secrets[name] = secret
     plain = {key: str(env.get(key, "") or "") for key in PASSTHROUGH_ENV}
     return DeployConfig(
+        auto_deploy=str(env.get(ENV_AUTO_DEPLOY, "") or "").strip(),
         project=args.project, region=args.region, bucket=args.bucket, image=args.image,
         control_vm_service_account=args.control_vm_service_account or plain.get("SPOT_CONTROL_SERVICE_ACCOUNT", ""),
         github_repo=args.github_repo, project_number=args.project_number, schedule=args.schedule,
@@ -937,18 +1268,20 @@ def config_from_args(args: argparse.Namespace, env: Mapping[str, str] | None = N
 def main(argv: Sequence[str] | None = None, *, runner: Runner = default_runner,
          env: Mapping[str, str] | None = None) -> int:
     args = args_parser().parse_args(argv)
+    if args.update_image:
+        return _main_update(args, runner, env)
     try:
         config = config_from_args(args, env)
         problems = validate(config)
         if problems:
             raise DeployError("refusing to deploy:\n  - " + "\n  - ".join(problems))
-        if not args.dry_run:
-            config = replace(config, role_permissions=read_role_permissions(config.project, runner, apis(config)))
-        steps = build_steps(config)
         if args.dry_run:
-            sys.stdout.write(render(config, steps))
+            sys.stdout.write(render(config, build_steps(config)))
             return 0
-        execute(config, steps, runner)
+        # Before the role read, which enables APIs: an older --image is refused before anything changes.
+        auto_deploy_guard(config, runner)
+        config = replace(config, role_permissions=read_role_permissions(config.project, runner, apis(config)))
+        execute(config, build_steps(config), runner)
     except DeployError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -957,4 +1290,22 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner = default_runner,
     if not config.image:
         print("Build the watchdog image, then run again with --image=<digest> to deploy the service and the "
               "scheduler.")
+    return 0
+
+
+def _main_update(args: argparse.Namespace, runner: Runner, env: Mapping[str, str] | None) -> int:
+    try:
+        config = config_from_args(args, env)
+        update = ImageUpdate(image=args.update_image, revision=args.revision, expect_current=args.expect_current,
+                             repo_dir=args.repo_dir)
+        problems = update_problems(config, update)
+        if problems:
+            raise DeployError("refusing to update:\n  - " + "\n  - ".join(problems))
+        if args.dry_run:
+            sys.stdout.write(render_update(config, update))
+            return 0
+        print(update_image(config, update, runner))
+    except DeployError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     return 0

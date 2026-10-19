@@ -222,6 +222,8 @@ class ControlConfig:
     # SPOT_DASHBOARD_IMAGE_TRACK: "" (off) or "main" (roll out the published :main image; see image_tracking).
     image_track: str = ""
     image_track_token: str = field(default="", repr=False)
+    # SPOT_DASHBOARD_ROLLOUT_STATUS: "1" reports each image rollout as a GitHub commit status on its commit.
+    rollout_status: str = ""
 
     @classmethod
     def from_env(cls, project: str, env: Mapping[str, str] | None = None, **overrides: Any) -> ControlConfig:
@@ -260,6 +262,7 @@ class ControlConfig:
             # Normalized but never defaulted when set, like the provisioning mode: a misspelt value pauses changes.
             image_track=str(env.get(image_tracking.ENV_IMAGE_TRACK, "") or "").strip().lower(),
             image_track_token=str(env.get(image_tracking.ENV_IMAGE_TRACK_TOKEN, "") or "").strip(),
+            rollout_status=str(env.get(image_tracking.ENV_ROLLOUT_STATUS, "") or "").strip(),
         )
         values.update({key: value for key, value in overrides.items() if value is not None})
         values["provisioning"] = provisioning
@@ -309,7 +312,14 @@ class ControlConfig:
         if self.tracking and self.dashboard_repo != DEFAULT_DASHBOARD_REPO:
             return [f"{image_tracking.ENV_IMAGE_TRACK}=main follows {DEFAULT_DASHBOARD_IMAGE_REPO}, which only "
                     f"{DEFAULT_DASHBOARD_REPO} publishes; SPOT_DASHBOARD_REPO is {self.dashboard_repo}"]
+        if self.rollout_status not in image_tracking.ROLLOUT_STATUS_VALUES:
+            return [f"{image_tracking.ENV_ROLLOUT_STATUS} must be empty, 0, or 1, not {self.rollout_status!r}"]
         return []
+
+    @property
+    def reports_rollouts(self) -> bool:
+        """True when image rollouts are reported as GitHub commit statuses."""
+        return self.tracking and self.rollout_status == "1"
 
     def runtime_problems(self) -> list[str]:
         """Settings without which the manager cannot observe or control the VMs safely."""
@@ -1449,15 +1459,30 @@ class ControlVmManager:
         ready = (active is not None and active.running and other is None
                  and (obs.health.get(obs.origin.slot) or HealthResult.unknown()).ok)
         now = self.clock()
-        last_end = max(self.cstate.get("last_transition_end_at") or 0, self.cstate.get("last_abort_at") or 0)
+        last_abort = self.cstate.get("last_abort_at") or 0
+        retry = (self.cstate.get("image") or {}).get("retry")
+        only_digest = None
+        if isinstance(retry, dict) and retry.get("digest") and float(retry.get("at") or 0) >= last_abort:
+            # An operator lifted a back-off after fixing its cause (retry-image): aborts before that request don't
+            # hold a rollout of that digest for the cooldown. Any other digest still waits, a completed transition
+            # still counts, and so does a later abort.
+            last_end = self.cstate.get("last_transition_end_at") or 0
+            if not (last_end and now - last_end < ROTATION_COOLDOWN_SECONDS) and \
+                    last_abort and now - last_abort < ROTATION_COOLDOWN_SECONDS:
+                only_digest = str(retry["digest"])
+            last_abort = 0
+        last_end = max(self.cstate.get("last_transition_end_at") or 0, last_abort)
         cooling = bool(last_end and now - last_end < ROTATION_COOLDOWN_SECONDS)
         active_image = self._active_image(active) if (ready and not cooling) else ""  # may record it in state
         cache = copy.deepcopy(self.cstate.get("image") or {})
         before = copy.deepcopy(cache)
         decision = self._tracker().evaluate(cache, active_image=active_image, transition_active=False,
-                                            active_ready=ready, cooling=cooling, now=now)
+                                            active_ready=ready, cooling=cooling, now=now, only_digest=only_digest)
         if cache != before:
             self.cstate["image"] = cache
+        if decision.backed_off:
+            # Logged on every check while :main names it, so an aborted rollout never goes quiet.
+            self._note("image rollout held: %s", decision.reason, level=logging.WARNING)
         if not decision.roll:
             return Plan(plan.action, f"{plan.reason}; image tracking: {decision.reason}", slot=plan.slot,
                         target_slot=plan.target_slot, offer=plan.offer)
@@ -1571,9 +1596,28 @@ class ControlVmManager:
             if rollout:
                 transition["image_rollout"] = {"image": rollout.image, "digest": rollout.digest,
                                                "revision": rollout.revision, "from_revision": rollout.from_revision}
+                # A retry request is used up once its rollout begins.
+                (self.cstate.get("image") or {}).pop("retry", None)
         self.cstate["transition"] = transition
         self.save()
         self._note("began %s transition %s -> slot %s: %s", mode, plan.slot or "-", new_slot, plan.reason)
+        if transition.get("image_rollout"):
+            self._report_rollout(transition, "pending",
+                                 f"rolling out to {control_vm_name(new_slot)} (make-before-break)")
+
+    def _report_rollout(self, t: Mapping[str, Any], state: str, description: str) -> None:
+        """Best effort: the rollout's GitHub commit status (SPOT_DASHBOARD_ROLLOUT_STATUS=1). A failure to report is
+        logged and never changes the transition."""
+        revision = str((t.get("image_rollout") or {}).get("revision") or "")
+        if not self.config.reports_rollouts or not revision:
+            return
+        github = self._tracker().github
+        if github is None:
+            return
+        try:
+            github.set_status(revision, state, description, target_url=self.config.public_url)
+        except image_tracking.TrackingError as exc:
+            self._note("could not report the image rollout to GitHub: %s", exc, level=logging.WARNING)
 
     def _retained_zones(self, slot: str) -> list[str]:
         """Zones holding a retained boot disk for ``slot``; creating the VM there would collide on its name."""
@@ -1714,6 +1758,8 @@ class ControlVmManager:
         self.cstate["history"] = self.cstate["history"][-20:]
         self.save()
         self._note("%s transition to slot %s completed", t["mode"], t["new_slot"])
+        if t.get("image_rollout"):
+            self._report_rollout(t, "success", f"serving on {control_vm_name(t['new_slot'])}")
         return "done"
 
     def _abort(self, t: dict, reason: str) -> str:
@@ -2511,9 +2557,13 @@ class ControlVmManager:
                 return "wait"
         rollout = t.get("image_rollout") or {}
         if rollout.get("digest"):
-            # Never retry this digest automatically; the next :main digest gets a fresh chance (after the cooldown).
-            image_tracking.record_failed(self.cstate.setdefault("image", {}), rollout["digest"])
-            self._note("image rollout to %s aborted; backing off that digest until %s:main moves", rollout["digest"],
+            # Never retry this digest automatically; the next :main digest gets a fresh chance (after the cooldown),
+            # or an operator lifts the back-off with retry-image once the cause is fixed.
+            image_tracking.record_failed(self.cstate.setdefault("image", {}), rollout["digest"],
+                                         reason=t.get("abort_reason"), revision=rollout.get("revision"),
+                                         at=self.clock(), transition=t.get("id"))
+            self._note("image rollout to %s aborted (%s); backing off that digest until %s:main moves or "
+                       "control_vm.py retry-image --apply", rollout["digest"], t.get("abort_reason"),
                        DEFAULT_DASHBOARD_IMAGE_REPO, level=logging.WARNING)
         self.cstate["transition"] = None
         self.cstate["last_abort_at"] = self.clock()
@@ -2523,6 +2573,8 @@ class ControlVmManager:
         self.cstate["history"] = self.cstate["history"][-20:]
         self.save()
         self._note("%s transition aborted: %s", t["mode"], t.get("abort_reason"))
+        if rollout.get("digest"):
+            self._report_rollout(t, "failure", f"aborted: {t.get('abort_reason') or 'unknown reason'}")
         return "done"
 
     # -- reporting -----------------------------------------------------------------------
@@ -2762,6 +2814,61 @@ def load_project_control_state(project: str, directory: Path | str | None = None
     return ProjectControlState(state_path).load()
 
 
+def retry_image_target(cstate: Mapping[str, Any], digest: str | None) -> tuple[str, dict[str, Any]]:
+    """(digest, recorded abort) whose back-off ``retry-image`` lifts: ``digest`` when given, else the backed-off
+    digest ``:main`` names, else the only backed-off digest. Raises ValueError when there is nothing to retry."""
+    image = cstate.get("image") if isinstance(cstate.get("image"), dict) else {}
+    failed = [d for d in image.get("failed") or [] if isinstance(d, str)]
+    listed = ", ".join(failed) or "none"
+    if digest:
+        if not image_tracking.DIGEST_RE.match(digest):
+            raise ValueError(f"--digest must be sha256:<64 hex>, not {digest!r}")
+    elif (image.get("main") or {}).get("digest") in failed:
+        digest = image["main"]["digest"]
+    elif len(failed) == 1:
+        digest = failed[0]
+    elif not failed:
+        raise ValueError("no image rollout is backed off")
+    else:
+        raise ValueError(f"name one with --digest; backed-off digests: {listed}")
+    if digest not in failed:
+        raise ValueError(f"{digest} is not backed off (backed-off digests: {listed})")
+    return digest, image_tracking.failure_of(image, digest)
+
+
+def _retry_image(args: Any, apply: bool) -> int:
+    """``control_vm.py retry-image``: lift an aborted rollout's back-off under the project lock (or preview it)."""
+    if not apply:
+        project = load_project_control_state(args.project, args.control_state_dir)
+        try:
+            digest, failure = retry_image_target(project.state.get(STATE_KEY) or {}, args.digest)
+        except ValueError as exc:
+            print(f"Nothing to retry: {exc}")
+            return 1
+        print(f"Would lift the back-off of {digest} (aborted: {failure.get('reason') or 'reason not recorded'}). "
+              "Fix the cause first, then re-run with --apply.")
+        return 0
+    lock = open_project_control_lock(args.project, args.control_state_dir)
+    with lock as project:
+        if project is None:
+            raise RuntimeError(f"Another controller is managing the control VM of project {args.project}; try again "
+                               "after its check")
+        cstate = project.state.setdefault(STATE_KEY, {})
+        try:
+            digest, failure = retry_image_target(cstate, args.digest)
+        except ValueError as exc:
+            print(f"Nothing to retry: {exc}")
+            return 1
+        now = time.time()
+        image_tracking.retry_failed(cstate.setdefault("image", {}), digest, at=now)
+        cstate["updated_at"] = now
+        project.save()
+    print(f"Lifted the back-off of {digest} (it aborted: {failure.get('reason') or 'reason not recorded'}). The next "
+          "check rolls it out while it is still the :main image and every other guard holds; aborts before now don't "
+          "hold it for the cooldown.")
+    return 0
+
+
 # --------------------------------------------------------------------------------------------
 # Command-line interface (src/control_vm.py)
 # --------------------------------------------------------------------------------------------
@@ -2827,6 +2934,11 @@ def args_parser() -> "argparse.ArgumentParser":
                              help=f"Upload the local project state to {ENV_CONTROL_STATE_URI} once; refuses when "
                                   "both exist and differ")
     migrate.add_argument("--apply", action="store_true", help="Upload; without it only report what would happen")
+    retry = sub.add_parser("retry-image", parents=[common],
+                           help="Lift the back-off of a dashboard image whose rollout aborted, once its cause is fixed")
+    retry.add_argument("--digest", help="Backed-off digest, sha256:<64 hex> (default: the :main digest, or the only "
+                                        "backed-off one)")
+    retry.add_argument("--apply", action="store_true", help="Change the state; without it only report the digest")
     return parser
 
 
@@ -2862,6 +2974,8 @@ def main(argv: Sequence[str] | None = None, *, manager_factory: Callable[..., Co
         code, message = migrate_local_state(args.project, args.control_state_dir, uri, apply=apply)
         print(message)
         return code
+    if args.command == "retry-image":
+        return _retry_image(args, apply)
 
     def run(state: dict, save: Callable[[], None], guard: Callable[[], None] | None = None) -> int:
         manager = factory(args.project, state, save, **_overrides(args), **({"guard": guard} if guard else {}))
