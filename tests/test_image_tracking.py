@@ -611,6 +611,27 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         self.assertEqual(h.mutations()[-1], ("import", "a"))
 
+    def test_a_rollback_never_releases_a_failed_image_that_a_late_run_started(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.runs["spot-control-a"] = f"done {IMG_B}"  # a late run started the failed image after all
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback; the old image's health was observed, but the run says B started
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertIn("waiting for the swap back", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events)
+        h.gcloud.runs["spot-control-a"] = f"done {IMG_A}"
+        h.swapped(image=IMG_B)  # but the probe still shows B
+        h.clock[0] += 180
+        h.tick()
+        self.assertNotIn(("import", "a"), h.events)
+        h.swapped(image=IMG_A)
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+
     def test_a_stale_running_report_does_not_block_forever(self):
         h = TrackingHarness()
         h.active()

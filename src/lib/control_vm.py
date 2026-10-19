@@ -2299,9 +2299,20 @@ class ControlVmManager:
                 if t.get("image_written") and health.image == t["dashboard_image"]:
                     detail = f"{vm.name} still runs {t['dashboard_image']}"  # the watcher has not swapped back yet
                 else:
-                    # A pending startup run (one that began before the rollback) may still replace the container.
+                    # A pending startup run (one that began before the rollback) may still replace the container. Once
+                    # runs settled, the last one must not have started the failed image, and a fresh probe (the run
+                    # and the observation above may describe different containers) must still show the restored one.
                     settled, detail = self._startup_run_settled(vm)
-                    ok, detail = self._release(t, slot) if settled else (False, detail)
+                    ok = False
+                    if settled and t.get("image_written") and detail == f"done {t['dashboard_image']}":
+                        detail = (f"the last startup run on {vm.name} started {t['dashboard_image']}; waiting for the "
+                                  f"swap back")
+                    elif settled:
+                        fresh = probe_health(self.requester, self.config, slot)
+                        if not fresh.hydrated or (t.get("image_written") and fresh.image == t["dashboard_image"]):
+                            detail = f"{vm.name} reports image {fresh.image or 'unknown'}: {fresh.detail}"
+                        else:
+                            ok, detail = self._release(t, slot)
                     if ok:
                         self._note("%s after the rollback", detail)
                         return self._end_abort(t)
