@@ -598,9 +598,12 @@ def _shell(argv: Sequence[str]) -> str:
     return " ".join(_quote(arg) for arg in argv)
 
 
-def render(config: DeployConfig, steps: Sequence[Step]) -> str:
-    """The dry-run script: every command, in order, as it would run. Nothing runs."""
-    lines = ["#!/usr/bin/env bash", "# Control VM watchdog deploy (dry run): nothing below has run.", "set -euo pipefail"]
+def render(config: DeployConfig, steps: Sequence[Step], *, title: str = "Control VM watchdog deploy (dry run)",
+           footer: Sequence[str] | None = None) -> str:
+    """The dry-run script: every command, in order, as it would run. Nothing runs.
+
+    ``footer`` replaces the watchdog's closing comments (other deploys reuse this renderer and ``execute``)."""
+    lines = ["#!/usr/bin/env bash", f"# {title}: nothing below has run.", "set -euo pipefail"]
     if not config.project_number:
         lines.append(f"PROJECT_NUMBER=\"$(gcloud projects describe {shlex.quote(config.project)} "
                      "--format='value(projectNumber)')\"")
@@ -629,6 +632,9 @@ def render(config: DeployConfig, steps: Sequence[Step]) -> str:
             lines += [f"  {_shell(c).replace(shlex.quote(NAME_ARG), '"$name"')} 2>/dev/null || echo 'already absent'"
                       for c in commands]
             lines.append("done")
+    if footer is not None:
+        lines += list(footer)
+        return "\n".join(lines) + "\n"
     if not config.image:
         lines += ["", "# The Cloud Run service and the scheduler need --image: build the watchdog image first (see the",
                   "# Control watchdog image workflow), then run this deploy again with --image=<digest>."]

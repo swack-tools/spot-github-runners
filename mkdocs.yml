@@ -61,6 +61,7 @@ nav:
   - Runner fleet:
       - Provision runner hosts: provisioning.md
       - Fleet and autoscaler: fleet-and-autoscaler.md
+      - Serverless autoscaler: cloud-run-autoscaler.md
       - Runner patches: runner-patches.md
   - Dashboard:
       - Dashboard: dashboard.md

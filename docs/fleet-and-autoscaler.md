@@ -781,6 +781,10 @@ The controller loads `.env` from the repository root. See
 
 ### Install the launch agent { #run-as-a-macos-launchagent }
 
+!!! note "Serverless controller"
+    The `tiered` controller can also run as a serverless job, one `--once` check every 5 minutes, with its state in
+    a storage bucket. See [Serverless autoscaler](cloud-run-autoscaler.md). Never run both against one target.
+
 `--install-launch-agent` writes
 `~/Library/LaunchAgents/com.swacktools.spot-runner-autoscaler.plist` and runs
 `launchctl bootstrap` for the current user. It then exits without running a
