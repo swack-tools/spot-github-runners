@@ -1277,29 +1277,33 @@ The rollout updates the active VM in place. It creates no second VM, so a rollou
 free-tier e2-micro. The VM keeps its slot, boot disk, state file, and `origin:active`:
 
 1. The manager freezes the dashboard, as a rotation freezes the old VM, so changes in flight finish and new
-   ones wait.
+   ones wait. It keeps the snapshot that the freeze returns.
 1. The manager writes the new digest to the VM's `dashboard-image` metadata. The same call refreshes the
    VM's other metadata and its startup script, as a new VM of that slot would get them. Settings that are no
    longer set are written empty.
 1. On the VM, the `spot-dashboard-image-watch` service waits on the metadata server for that value to change.
    It then reruns the startup script, which pulls the new image while the old container still serves, stops
-   the old container, and starts the new one. The dashboard is unavailable for a few seconds. The script then
-   removes every image except the new one and the one it replaced, so updates don't fill the boot disk.
+   the old container, and starts the new one. The dashboard is unavailable for a few seconds. When the value
+   changes again during the pull, the script follows the newer value. A container whose image, arguments, and
+   settings are unchanged keeps running. The script then removes every image except the new one and the one it
+   replaced, so updates don't fill the boot disk.
 1. The dashboard reports its image in `/api/health`. The new container starts frozen, because the freeze marker
-   is on the boot disk. Once it reports the new image, the manager unfreezes it, and the rollout completes when it
-   serves healthy at a `state_version` no lower than the frozen one.
+   is on the boot disk. Once it reports the new image, the manager imports the frozen snapshot into it, as a
+   rotation imports into its replacement. The import stores the frozen state, including changes that never
+   reached the state file, and clears the freeze. The rollout completes when the container serves healthy with at
+   least the frozen `state_version`.
 
-A VM created before the watcher existed doesn't swap its container. When the VM still reports another image
+A VM created before the watcher existed doesn't swap its container. When the VM still serves another image
 after 5 minutes, the manager resets it once. The reset boots the refreshed startup script, which pulls the new
 image and installs the watcher for the next rollout. A reset takes the dashboard offline for a few minutes.
 
 When the VM stops or disappears during the update, the manager ends the update at once: it pins the previous
-image, starts a stopped VM, and unfreezes it once it's back. When the new image doesn't serve healthy within 20 minutes, the manager writes the previous image back to
-`dashboard-image`, and the watcher swaps back. That rollout's digest is backed off: the manager tries again only
-after `:main` names another digest and the cooldown has passed. The manager unfreezes the restored container
-only when it reports hydrated state with at least the frozen `state_version`. A container that reports lower state
-stays frozen, and the update holds with an error that needs an operator; it never ends into a recovery that could
-adopt that state.
+image, starts a stopped VM, and releases it once it's back. When the new image doesn't serve healthy within
+20 minutes, the manager freezes it again if it may have been released, writes the previous image back to
+`dashboard-image`, and the watcher swaps back. The manager then imports the frozen snapshot into the restored
+container. It never releases the failed image: while the VM is reachable, the rollback holds until it can release
+the restored container, and after 20 minutes it reports an error that needs an operator. That rollout's digest is
+backed off: the manager tries again only after `:main` names another digest and the cooldown has passed.
 
 The state's `image` section records the active VM's image, read once from its `dashboard-image` metadata
 or written when a transition or an in-place update completes. It also records the digests that failed and

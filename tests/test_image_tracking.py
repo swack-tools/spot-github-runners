@@ -358,8 +358,9 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNotNone(h.transition)
         h.finish()
         self.assertIsNone(h.transition)
-        # No second VM, import, cutover, or reset: drain (freeze), one metadata write, release (unfreeze).
-        self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B), ("unfreeze", "a")])
+        # No second VM, cutover, or reset: drain (freeze), one metadata write, and release by importing the frozen
+        # snapshot into the new container.
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B), ("import", "a")])
         self.assertEqual(sorted(h.gcloud.vms), ["spot-control-a"])
         self.assertEqual(h.kv.origin_slot(), "a")
         self.assertEqual((h.image["active"]["image"], h.image["active"]["slot"], h.image["active"]["instance_id"]),
@@ -418,7 +419,7 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.http.health["a"] = (503, {"status": "starting", "hydrated": False, "frozen": False, "state_version": 7,
+        h.http.health["a"] = (503, {"status": "starting", "hydrated": False, "frozen": True, "state_version": 7,
                                     "slot": "a", "image": IMG_B})  # swapped, but the new image never gets ready
         h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
         h.tick()
@@ -426,14 +427,14 @@ class RolloutTests(unittest.TestCase):
         self.assertIn(f"reports image {IMG_B}", h.transition["error"])
         h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
         h.tick()  # timed out: pin the previous image again; the watcher swaps back
-        self.assertIn("still runs", h.transition["error"])
-        self.assertNotIn(("unfreeze", "a"), h.events, "the failed image is never released")
+        self.assertIn("to release it", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events, "the failed image is never released")
         h.swapped(image=IMG_A)
         h.clock[0] += 180
         h.tick()
         self.assertIsNone(h.transition)
         self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B),
-                                         ("set-image", "spot-control-a", IMG_A), ("unfreeze", "a")])
+                                         ("set-image", "spot-control-a", IMG_A), ("import", "a")])
         self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
         self.assertEqual(h.image["failed"], [D_B])
         self.assertEqual(h.image["active"]["image"], IMG_A)
@@ -448,7 +449,6 @@ class RolloutTests(unittest.TestCase):
         plan = h.tick()
         self.assertEqual(plan.action, "update_image")
         self.assertEqual(h.transition["dashboard_image"], IMG_C)
-
     def test_a_vm_without_the_image_watcher_is_reset_once(self):
         h = TrackingHarness()
         h.active()
@@ -467,51 +467,53 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         self.assertEqual(h.image["active"]["image"], IMG_B)
 
-    def test_a_rollback_to_stale_state_holds_until_an_operator_acts(self):
+    def test_a_restored_container_behind_the_frozen_state_is_raised_by_the_import(self):
         h = TrackingHarness()
         h.active()
         h.tick()
         h.gcloud.reset_rc = 0
-        h.swapped(image=IMG_A, version=3)  # the old image came back with state behind the frozen version
+        h.swapped(image=IMG_A, version=3)  # the old image came back behind the frozen version
         h.http.versions["a"] = 3
-        for _ in range(3):
-            h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
-            with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
-                h.tick()
-        self.assertIn("operator action needed", h.transition["error"])
-        self.assertNotIn(("unfreeze", "a"), h.events)
-
-    def test_a_failed_image_with_stale_state_also_holds(self):
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.http.versions["a"], 7)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+    def test_a_rollback_never_releases_the_failed_image_and_holds_for_an_operator(self):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.http.health["a"] = (503, {"status": "starting", "hydrated": True, "frozen": True, "state_version": 3,
-                                    "slot": "a", "image": IMG_B})
-        h.http.versions["a"] = 3
-        for _ in range(3):
+        h.http.import_status = 500
+        h.swapped()  # the new image runs, but its release keeps failing
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: freeze it again, pin the previous image
+        self.assertEqual(h.mutations()[-2:], [("freeze", "a"), ("set-image", "spot-control-a", IMG_A)])
+        for _ in range(2):
             h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
             with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
-                h.tick()
+                h.tick()  # the watcher never swapped back: reachable, so never ended into a recovery
         self.assertIn("operator action needed", h.transition["error"])
-        self.assertNotIn(("unfreeze", "a"), h.events)
-
-    def test_an_unanswered_unfreeze_means_no_reset_and_a_refreeze_before_rollback(self):
+        self.assertIn("still runs", h.transition["error"])
+        h.swapped(image=IMG_A)
+        h.http.import_status = 200
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+    def test_an_unanswered_release_means_no_reset_and_a_refreeze_before_rollback(self):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.http.unfreeze_status = None  # the response is lost; the release may have landed
+        h.http.import_status = None  # the response is lost; the release may have landed
         h.swapped()
         h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
         h.tick()
         self.assertNotIn(("reset", "spot-control-a"), h.events)
-        h.http.unfreeze_status = 200
-        h.http.healthy("a", version=7, image=IMG_B)
-        h.http.health["a"] = (503, dict(h.http.health["a"][1], status="starting"))  # released, not ready
+        h.http.import_status = 200
+        h.http.health["a"] = (503, dict(h.http.health["a"][1], status="starting", frozen=False))  # released, not ready
         h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
         h.tick()
         mutations = h.mutations()
         self.assertLess(mutations.index(("freeze", "a"), 1), mutations.index(("set-image", "spot-control-a", IMG_A)))
-
     def test_a_reset_that_reports_failure_is_never_repeated(self):
         h = TrackingHarness()
         h.active()
@@ -524,18 +526,28 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(h.events.count(("reset", "spot-control-a")), 1)
         self.assertIsNotNone(h.transition["reset_at"])
 
-    def test_a_lower_state_version_after_the_swap_is_not_success(self):
+    def test_a_new_container_behind_the_frozen_state_is_raised_by_the_import(self):
         h = TrackingHarness()
         h.active()
         h.tick()
         h.swapped(version=3)
-        h.http.versions["a"] = 3  # the new container came up without the state file's changes
+        h.http.versions["a"] = 3  # came up without changes the freeze drained
         h.clock[0] += 180
         h.tick()
-        self.assertIsNotNone(h.transition)
-        self.assertIn("state_version 3 < 7; kept frozen", h.transition["error"])
-        self.assertNotIn(("unfreeze", "a"), h.events)  # stale state never accepts changes
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.http.versions["a"], 7)  # the frozen snapshot, imported
+        self.assertEqual(h.image["active"]["image"], IMG_B)
 
+    def test_a_failed_import_is_never_success(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_status = 500
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        self.assertIn("import into slot a returned 500", h.transition["error"])
+        self.assertEqual(h.transition["step"], "wait_image")
     def test_metadata_write_failures_abort_without_a_swap(self):
         h = TrackingHarness()
         h.active()
@@ -567,7 +579,7 @@ class RolloutTests(unittest.TestCase):
         h.clock[0] += 180
         h.tick()
         self.assertIsNone(h.transition)
-        self.assertEqual(h.mutations()[-1], ("unfreeze", "a"))
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
         self.assertEqual(h.image["failed"], [D_B])
         self.assertEqual(h.tick().action, "noop")
 

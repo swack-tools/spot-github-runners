@@ -246,6 +246,8 @@ class FakeHttp:
             envelope = json.loads(body)
             if self.import_status == 200:
                 self.versions[slot] = max(self.versions[slot], envelope["state_version"])
+                if slot in self.health and self.health[slot][1].get("frozen"):  # an import clears the freeze
+                    self.health[slot] = (200, dict(self.health[slot][1], status="ok", frozen=False))
             return self.import_status, json.dumps({"state_version": self.versions[slot], "imported": True}).encode()
         if op == "unfreeze":
             if self.unfreeze_status == 200 and slot in self.health and self.health[slot][1].get("frozen"):
@@ -2308,15 +2310,15 @@ class StartupScriptTests(unittest.TestCase):
         self.assertNotIn("metadata-from", self.text)
 
     def test_containers_match_contract(self):
-        self.assertIn('docker rm -f "$DASHBOARD_CONTAINER"', self.text)
-        self.assertIn('docker rm -f "$TUNNEL_CONTAINER"', self.text)
+        self.assertIn('ensure_container "$DASHBOARD_CONTAINER" "$ENV_FILE" "${dashboard_args[@]}"', self.text)
+        self.assertIn('ensure_container "$TUNNEL_CONTAINER" "$TUNNEL_ENV_FILE" "${tunnel_args[@]}"', self.text)
         self.assertIn("readonly DASHBOARD_CONTAINER=spot-dashboard", self.text)
         self.assertIn("readonly TUNNEL_CONTAINER=spot-cloudflared", self.text)
         self.assertEqual(self.text.count("--restart unless-stopped --network host"), 2)
         self.assertIn('--env-file "$ENV_FILE" -e "DASHBOARD_IMAGE=$DASHBOARD_IMAGE_REF" -v "$STATE_DIR:/state"',
                       self.text)
-        self.assertIn('--host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" \\\n'
-                      '    --project "$PROJECT"', self.text)
+        self.assertIn('--host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" '
+                      '--project "$PROJECT"', self.text)
         self.assertIn('(umask 022 && git -C "$workdir" -c advice.detachedHead=false checkout -q FETCH_HEAD)',
                       self.text)
         self.assertIn("tunnel --no-autoupdate run", self.text)
@@ -3062,8 +3064,8 @@ swapon() {
                                                "T": logs + " --memory=160m --memory-swap=320m"})
         self.assertEqual(outputs["e2-small"], {"D": logs, "T": logs})
         run = self._function("run_containers")
-        self.assertIn('--network host \\\n    "${DASHBOARD_RUN_ARGS[@]}" \\\n    --user', run)
-        self.assertIn('--network host \\\n    "${TUNNEL_RUN_ARGS[@]}" \\\n    --cap-drop', run)
+        self.assertIn('--network host\n    "${DASHBOARD_RUN_ARGS[@]}"\n    --user', run)
+        self.assertIn('--network host\n    "${TUNNEL_RUN_ARGS[@]}"\n    --cap-drop', run)
         self.assertLess(self.main.index("set_container_limits"), self.main.index("run_containers"))
 
 
@@ -3313,10 +3315,34 @@ class StartupScriptImageWatcherTests(unittest.TestCase):
         self.assertIn('mv -f "$temp" "$target"', self.text)
 
     def test_the_old_container_stops_gracefully_after_the_pull(self):
-        run = re.search(r"^run_containers\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
-        self.assertLess(run.index('docker stop --time 20 "$DASHBOARD_CONTAINER"'),
-                        run.index('docker rm -f "$DASHBOARD_CONTAINER"'))
+        ensure = re.search(r"^ensure_container\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.assertLess(ensure.index('docker stop --time 20 "$name"'), ensure.index('docker rm -f "$name"'))
         self.assertLess(self.main.index("pull_published_image"), self.main.index("run_containers"))
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_an_unchanged_container_is_kept_and_a_changed_one_replaced(self):
+        ensure = re.search(r"^ensure_container\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp)
+            (stub / "env").write_text("A=1\n", encoding="utf-8")
+            # docker inspect answers with the label recorded by the last docker run; every call is logged.
+            (stub / "docker").write_text(
+                '#!/usr/bin/env bash\necho "$1" >> "$STUB/calls"\n'
+                'if [[ $1 == inspect ]]; then [[ -f "$STUB/label" ]] || exit 1; echo "$(cat "$STUB/label") true"; fi\n'
+                'if [[ $1 == run ]]; then for a in "$@"; do [[ $a == spot-run-hash=* ]] && '
+                'echo "${a#spot-run-hash=}" > "$STUB/label"; done; fi\nexit 0\n', encoding="utf-8")
+            (stub / "docker").chmod(0o755)
+            script = 'log() { :; }\n' + ensure + 'ensure_container spot-dashboard "$STUB/env" --network host img:1\n'
+
+            def run():
+                Path(tmp, "calls").unlink(missing_ok=True)
+                subprocess.run(["bash", "-c", script], env={"PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin", "STUB": tmp},
+                               check=True, capture_output=True, text=True, timeout=30)
+                return Path(tmp, "calls").read_text().split()
+            self.assertEqual(run(), ["inspect", "stop", "rm", "run"])  # nothing ran it yet
+            self.assertEqual(run(), ["inspect"])  # the same run again keeps it
+            (stub / "env").write_text("A=2\n", encoding="utf-8")  # a changed setting or secret replaces it
+            self.assertEqual(run(), ["inspect", "stop", "rm", "run"])
 
     def run_watcher(self, value, running):
         # curl call 1 answers with the value and an ETag; call 2 fails, so the watcher sleeps, which ends the run.

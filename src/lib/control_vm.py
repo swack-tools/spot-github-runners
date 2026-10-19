@@ -2079,21 +2079,17 @@ class ControlVmManager:
                                   f"the image update needs the running VM")
         if t.get("frozen_version") is None:
             # Freeze first, as a rotation freezes the old VM: it drains in-flight changes (such as a patch save that
-            # opens a pull request) before the container is replaced. The freeze marker is on the boot disk, so the
-            # new container starts frozen and wait_image unfreezes it. Recorded before the call, so a rollback
-            # unfreezes even when the response is lost.
+            # opens a pull request) before the container is replaced, and its snapshot is what the release imports.
+            # The freeze marker is on the boot disk, so the new container starts frozen. Recorded before the call,
+            # so a rollback releases it even when the response is lost.
             t["freeze_requested"] = True
             self.save()
             status, body = self._control(t["new_slot"], "freeze", "POST")
-            version = body.get("state_version") if isinstance(body, dict) else None
-            if not (status == 200 and isinstance(version, int) and not isinstance(version, bool)):
+            if not (status == 200 and self._record_freeze(t, body)):
                 if self._fail_attempt(t, f"freeze returned {status}"):
                     return self._abort(t, "the dashboard did not freeze")
                 return "wait"
-            t["frozen_version"] = version
-            t["state_version_before"] = max(version, t.get("state_version_before") or 0)
-            self.save()
-            self._note("froze slot %s at state_version %d for the image update", t["new_slot"], version)
+            self._note("froze slot %s at state_version %d for the image update", t["new_slot"], t["frozen_version"])
         # Recorded before the call: a failed or ambiguous write may still have landed, so the rollback restores.
         t["image_written"] = True
         self.save()
@@ -2106,6 +2102,30 @@ class ControlVmManager:
                    t["dashboard_image"])
         return self._advance_step(t)
 
+    def _release(self, t: dict, slot: str) -> tuple[bool, str]:
+        """Release a frozen container by importing the snapshot taken at the freeze, as a rotation imports into its
+        replacement: the import persists that state (including changes the freeze drained that never reached the
+        state file), raises a container that came up behind it, and clears the freeze. Without a snapshot (the
+        container was never replaced), unfreeze it."""
+        t["release_attempted"] = True  # before the call: a lost response may still have released it
+        self.save()
+        snapshot = t.get("frozen_snapshot")
+        floor = t.get("frozen_version") or 0
+        if snapshot:
+            status, body = self._control(slot, "import", "POST", snapshot)
+            version = body.get("state_version") if isinstance(body, dict) else None
+            if status == 200 and isinstance(version, int) and not isinstance(version, bool) and version >= floor:
+                t["released"] = True
+                self.save()
+                return True, f"imported state_version {version} into slot {slot}"
+            return False, f"import into slot {slot} returned {status} (state_version={version}, need >= {floor})"
+        status, _ = self._control(slot, "unfreeze", "POST")
+        if status == 200:
+            t["released"] = True
+            self.save()
+            return True, f"unfroze slot {slot}"
+        return False, f"unfreeze of slot {slot} returned {status}"
+
     def _step_wait_image(self, t: dict, obs: Observation) -> str:
         slot, image = t["new_slot"], t["dashboard_image"]
         vm = obs.vm(slot)
@@ -2115,30 +2135,20 @@ class ControlVmManager:
             return self._abort(t, f"{control_vm_name(slot)} is {vm.status if vm else 'missing'} during the image "
                                   f"update")
         result = obs.health.get(slot) or HealthResult.unknown()
-        floor = t.get("state_version_before")
-        # Same state file, so the version can only grow; a lower one means the state did not carry over. Checked
-        # before the unfreeze, so a container with stale state never accepts changes.
-        below_floor = isinstance(floor, int) and (result.state_version is None or result.state_version < floor)
-        unfreeze_error = None
-        if vm.running and result.image == image and result.hydrated and result.frozen and t.get("freeze_requested") \
-                and not below_floor:
-            # The new container started frozen from the marker on disk: release it. Recorded before the call: a lost
-            # response may still have released it, so a later rollback freezes it again before replacing it.
-            t["unfreeze_attempted"] = True
-            self.save()
-            status, _ = self._control(slot, "unfreeze", "POST")
-            if status == 200:
-                t["unfrozen"] = True
-                self._note("unfroze slot %s on %s", slot, image)
+        floor = t.get("frozen_version") or 0
+        release_error = None
+        if vm.running and result.image == image and result.hydrated and not t.get("released"):
+            # The new container started frozen from the marker on disk.
+            ok, detail = self._release(t, slot)
+            self._note(detail, level=logging.INFO if ok else logging.WARNING)
+            if ok:
                 result = probe_health(self.requester, self.config, slot)
             else:
-                unfreeze_error = f"unfreeze of slot {slot} on {image} returned {status}"
-        if unfreeze_error:
-            t["error"] = unfreeze_error
-        elif vm.running and result.image == image and result.hydrated and below_floor:
-            t["error"] = f"slot {slot} runs {image} at state_version {result.state_version} < {floor}; kept frozen"
-        elif vm.running and result.ok and result.image == image:
-            if isinstance(floor, int) and (result.state_version is None or result.state_version < floor):
+                release_error = detail
+        if release_error:
+            t["error"] = release_error
+        elif vm.running and t.get("released") and result.ok and result.image == image:
+            if result.state_version is None or result.state_version < floor:
                 t["error"] = f"slot {slot} serves {image} at state_version {result.state_version} < {floor}"
             else:
                 self._note("slot %s serves %s (state_version=%s)", slot, image, result.state_version)
@@ -2153,7 +2163,7 @@ class ControlVmManager:
         # Only on positive evidence that the old container still serves (reachable, hydrated, another image), and
         # never after a release attempt: a reset must not cut off a container that may be accepting changes.
         old_still_serves = result.hydrated and result.status_code is not None and result.image != image
-        if (vm.running and not t.get("reset_at") and old_still_serves and not t.get("unfreeze_attempted")
+        if (vm.running and not t.get("reset_at") and old_still_serves and not t.get("release_attempted")
                 and elapsed >= IMAGE_SWAP_GRACE_SECONDS):
             # Still the old container: the VM booted before the image watcher existed. A reset reruns the (just
             # refreshed) startup script, which pulls the new image and installs the watcher for the next update.
@@ -2172,25 +2182,42 @@ class ControlVmManager:
         self.save()
         return "wait"
 
+    def _record_freeze(self, t: dict, body: Any) -> bool:
+        """Record a freeze response: its version and snapshot (what a release imports). False when malformed."""
+        version = body.get("state_version") if isinstance(body, dict) else None
+        snapshot = parse_snapshot(body.get("snapshot")) if isinstance(body, dict) else None
+        if not (isinstance(version, int) and not isinstance(version, bool)) or snapshot is None \
+                or snapshot["state_version"] < version:
+            return False
+        t["frozen_version"] = max(version, t.get("frozen_version") or 0)
+        t["frozen_snapshot"] = snapshot
+        self.save()
+        return True
+
     def _step_image_abort(self, t: dict, obs: Observation) -> str:
-        """Roll an in-place update back: pin the previous image again (the watcher, or the next boot, swaps back)
-        and back off the new digest. The normal health handling takes over once the transition ends."""
-        vm = obs.vm(t["new_slot"])
+        """Roll an in-place update back: pin the previous image again (the watcher, or the next boot, swaps back),
+        release the restored container with the frozen state, and back off the new digest."""
+        slot = t["new_slot"]
+        vm = obs.vm(slot)
         previous = t.get("from_image") or ""
-        if (vm is not None and vm.running and t.get("unfreeze_attempted") and not t.get("refrozen")
+        waited = self.clock() - t["step_started_at"]
+        if (vm is not None and vm.running and t.get("release_attempted") and not t.get("refrozen")
                 and t.get("image_written") and not t.get("restored")):
-            # The new container was released (the update failed after its unfreeze): drain it again before the
-            # watcher replaces it.
+            # The new container may have been released and accepted changes: drain it again before the watcher
+            # replaces it, and carry what it accepted (the new snapshot) into the restored container. Marked not
+            # released first, so the rollback always releases the restored container before it ends.
+            t["released"] = False
             t["freeze_requested"] = True
             self.save()
-            status, _ = self._control(t["new_slot"], "freeze", "POST")
-            if status == 200:
-                t["unfrozen"], t["refrozen"] = False, True
-                self._note("froze slot %s again before the rollback", t["new_slot"])
+            status, body = self._control(slot, "freeze", "POST")
+            if status == 200 and self._record_freeze(t, body):
+                t["refrozen"] = True
+                self._note("froze slot %s again at state_version %s before the rollback", slot, t["frozen_version"])
             elif not self._fail_attempt(t, f"freeze before the rollback returned {status}"):
                 return "wait"
             else:
-                self._note("could not freeze slot %s again; rolling back anyway", t["new_slot"], level=logging.ERROR)
+                t["refrozen"] = True
+                self._note("could not freeze slot %s again; rolling back anyway", slot, level=logging.ERROR)
         if vm is not None and previous and t.get("image_written") and not t.get("restored"):
             error = self._set_image_metadata(t, vm, previous)
             if error:
@@ -2203,61 +2230,39 @@ class ControlVmManager:
             t["restored"] = True
             self._note("restored dashboard-image of %s to %s", vm.name, previous)
         elif t.get("image_written") and not previous:
-            self._note("no previous image recorded for slot %s; leaving its metadata as it is", t["new_slot"],
+            self._note("no previous image recorded for slot %s; leaving its metadata as it is", slot,
                        level=logging.WARNING)
-        if t.get("freeze_requested") and not t.get("unfrozen") and vm is not None:
-            # The freeze marker survives container swaps and reboots: unfreeze whichever container serves now, or
-            # the dashboard stays read-only. A stopped VM is started first (what the planner would do next anyway).
-            waited = self.clock() - t["step_started_at"]
-            health = obs.health.get(t["new_slot"]) or HealthResult.unknown()
-            floor = t.get("state_version_before")
-            # Release only the restored container with the state it froze at: never the failed image (the watcher may
-            # not have swapped back yet) and never state below the floor. Left frozen, it is unhealthy, and the
-            # planner's recovery replaces it from the KV snapshot.
-            hold, stale = None, False
-            if health.hydrated and isinstance(floor, int) and (health.state_version is None
-                                                               or health.state_version < floor):
-                # First: whichever image serves, state behind the frozen version is never released.
-                hold, stale = f"{vm.name} reports state_version {health.state_version} < {floor}", True
-            elif t.get("image_written") and health.image == t["dashboard_image"]:
-                hold = f"{vm.name} still runs {t['dashboard_image']}"
-            elif not health.hydrated:
-                hold = f"{vm.name} has not reported hydrated state ({health.detail})"
-            if vm.running and hold:
-                if stale:
-                    # Reachable but behind the state it froze at: never release it, and never end the transition,
-                    # which would let a recovery adopt this state as its floor. An operator must resolve it.
-                    t["error"] = f"held frozen, operator action needed: {hold}"
-                    t["updated_at"] = self.clock()
-                    self.save()
-                    self._note(t["error"], level=logging.ERROR)
-                    return "wait"
-                if waited < IMAGE_UPDATE_TIMEOUT_SECONDS:
-                    t["error"] = f"waiting to unfreeze: {hold}"
-                    t["updated_at"] = self.clock()
-                    self.save()
-                    return "wait"
-                self._note("leaving slot %s frozen: %s", t["new_slot"], hold, level=logging.ERROR)
-            elif vm.running:
-                status, _ = self._control(t["new_slot"], "unfreeze", "POST")
-                if status == 200:
-                    t["unfrozen"] = True
-                    self._note("unfroze slot %s after the rollback", t["new_slot"])
-                elif not self._fail_attempt(t, f"unfreeze returned {status}"):
-                    return "wait"
+        if t.get("freeze_requested") and not t.get("released") and vm is not None:
+            # The freeze marker survives container swaps and reboots, so the restored container starts frozen.
+            health = obs.health.get(slot) or HealthResult.unknown()
+            if vm.running and health.hydrated:
+                if t.get("image_written") and health.image == t["dashboard_image"]:
+                    detail = f"{vm.name} still runs {t['dashboard_image']}"  # the watcher has not swapped back yet
                 else:
-                    self._note("could not unfreeze slot %s; ending the rollback", t["new_slot"], level=logging.ERROR)
-            elif waited < IMAGE_UPDATE_TIMEOUT_SECONDS:
-                last = self.cstate.get("last_start_at", {}).get(t["new_slot"])
+                    ok, detail = self._release(t, slot)
+                    if ok:
+                        self._note("%s after the rollback", detail)
+                        return self._end_abort(t)
+                # Reachable: never end without releasing the restored container, or a recovery could adopt the state
+                # it holds. Past the timeout an operator must look.
+                t["error"] = (f"held frozen, operator action needed: {detail}" if waited >= IMAGE_UPDATE_TIMEOUT_SECONDS
+                              else f"waiting to release slot {slot}: {detail}")
+                t["updated_at"] = self.clock()
+                self.save()
+                if waited >= IMAGE_UPDATE_TIMEOUT_SECONDS:
+                    self._note(t["error"], level=logging.ERROR)
+                return "wait"
+            if waited < IMAGE_UPDATE_TIMEOUT_SECONDS:
+                last = self.cstate.get("last_start_at", {}).get(slot)
                 if vm.status in STOPPED_STATES and (last is None or self.clock() - last >= START_RETRY_SECONDS):
-                    self._start(vm)
-                t["error"] = f"waiting for {vm.name} ({vm.status}) to unfreeze it"
+                    self._start(vm)  # what the planner would do next anyway
+                t["error"] = f"waiting for {vm.name} ({vm.status}; {health.detail}) to release it"
                 t["updated_at"] = self.clock()
                 self.save()
                 return "wait"
-            else:
-                self._note("%s did not come back within %ss to be unfrozen; ending the rollback", vm.name,
-                           IMAGE_UPDATE_TIMEOUT_SECONDS, level=logging.ERROR)
+            # Unreachable for the whole timeout: end, leaving it frozen; the planner's recovery takes over.
+            self._note("%s was not reachable within %ss to be released; ending the rollback", vm.name,
+                       IMAGE_UPDATE_TIMEOUT_SECONDS, level=logging.ERROR)
         return self._end_abort(t)
 
     def _control(self, slot: str, op: str, method: str, body: Mapping[str, Any] | None = None,

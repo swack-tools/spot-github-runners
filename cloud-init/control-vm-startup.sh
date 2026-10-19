@@ -430,31 +430,48 @@ write_dashboard_env() {
   printf 'TUNNEL_TOKEN=%s\n' "$tunnel_token" | write_private_file "$TUNNEL_ENV_FILE"
 }
 
+# Run container NAME from the docker run arguments that follow, unless it already runs exactly them: same image,
+# arguments, and env file (metadata and secrets), recorded as a hash in a label. A run that changes nothing (a boot,
+# or a rerun superseded by a rollback) keeps the running container, so it is never stopped undrained. Otherwise a
+# graceful stop lets it finish requests before it is replaced.
+ensure_container() {
+  local name="$1" env_file="$2" hash current
+  shift 2
+  hash="$({ printf '%s\0' "$@"; cat "$env_file"; } | sha256sum | cut -d' ' -f1)"
+  current="$(docker inspect --format '{{index .Config.Labels "spot-run-hash"}} {{.State.Running}}' "$name" 2>/dev/null \
+    || true)"
+  if [[ -n "$hash" && "$current" == "$hash true" ]]; then
+    log "keeping $name: its image, arguments, and settings are unchanged"
+    return 0
+  fi
+  docker stop --time 20 "$name" >/dev/null 2>&1 || true
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label "spot-run-hash=$hash" "$@" >/dev/null
+}
+
 run_containers() {
   install -d -m 0750 -o "$CONTAINER_UID" -g "$CONTAINER_UID" "$STATE_DIR"
   chown "$CONTAINER_UID:$CONTAINER_UID" "$STATE_DIR"
   chmod 0750 "$STATE_DIR"
 
-  # Recreate on every run so changed metadata, secrets, or images always take effect. The image is pulled
-  # before this point, so the old container serves until here. A graceful stop first lets it finish requests.
+  # Changed metadata, secrets, or images always take effect (see ensure_container). The image is pulled before
+  # this point, so the old container serves until here.
   PREVIOUS_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$DASHBOARD_CONTAINER" 2>/dev/null || true)"
-  docker stop --time 20 "$DASHBOARD_CONTAINER" >/dev/null 2>&1 || true
-  docker rm -f "$DASHBOARD_CONTAINER" >/dev/null 2>&1 || true
   # DASHBOARD_IMAGE is reported by /api/health, so the controller can confirm which image serves.
-  docker run -d --name "$DASHBOARD_CONTAINER" --restart unless-stopped --network host \
-    "${DASHBOARD_RUN_ARGS[@]}" \
-    --user "$CONTAINER_UID:$CONTAINER_UID" --cap-drop ALL --security-opt no-new-privileges \
-    --env-file "$ENV_FILE" -e "DASHBOARD_IMAGE=$DASHBOARD_IMAGE_REF" -v "$STATE_DIR:/state" "$DASHBOARD_IMAGE_REF" \
-    --host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" \
-    --project "$PROJECT" >/dev/null
+  local -a dashboard_args=(--restart unless-stopped --network host
+    "${DASHBOARD_RUN_ARGS[@]}"
+    --user "$CONTAINER_UID:$CONTAINER_UID" --cap-drop ALL --security-opt no-new-privileges
+    --env-file "$ENV_FILE" -e "DASHBOARD_IMAGE=$DASHBOARD_IMAGE_REF" -v "$STATE_DIR:/state" "$DASHBOARD_IMAGE_REF"
+    --host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" --project "$PROJECT")
+  ensure_container "$DASHBOARD_CONTAINER" "$ENV_FILE" "${dashboard_args[@]}"
 
   image_present "$CLOUDFLARED_IMAGE" || docker pull "$CLOUDFLARED_IMAGE" >/dev/null
-  docker rm -f "$TUNNEL_CONTAINER" >/dev/null 2>&1 || true
   # cloudflared reads the slot's tunnel token from TUNNEL_TOKEN, keeping it out of argv.
-  docker run -d --name "$TUNNEL_CONTAINER" --restart unless-stopped --network host \
-    "${TUNNEL_RUN_ARGS[@]}" \
-    --cap-drop ALL --security-opt no-new-privileges \
-    --env-file "$TUNNEL_ENV_FILE" "$CLOUDFLARED_IMAGE" tunnel --no-autoupdate run >/dev/null
+  local -a tunnel_args=(--restart unless-stopped --network host
+    "${TUNNEL_RUN_ARGS[@]}"
+    --cap-drop ALL --security-opt no-new-privileges
+    --env-file "$TUNNEL_ENV_FILE" "$CLOUDFLARED_IMAGE" tunnel --no-autoupdate run)
+  ensure_container "$TUNNEL_CONTAINER" "$TUNNEL_ENV_FILE" "${tunnel_args[@]}"
 }
 
 # In-place image updates pull each new image onto the same small boot disk. Remove every image except the one the
