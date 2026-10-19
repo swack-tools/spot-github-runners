@@ -171,10 +171,35 @@ class AutoscalerDeployConfig:
         return f"https://run.googleapis.com/v2/projects/{self.project}/locations/{self.region}/jobs/{self.job}:run"
 
     def job_args(self) -> list[str]:
-        """The container args: the operator's autoscaler flags plus the dedicated host account."""
-        args = list(self.autoscaler_args)
+        """The container args: the operator's autoscaler flags plus the dedicated host account, each flag that takes
+        a value joined to it (``--job-repository=owner/repo``): ``gcloud run jobs deploy --args`` refuses a list
+        that holds one item twice, and repeated flags such as --job-repository would otherwise repeat."""
+        from .spot_runner_autoscaler import args_parser
+
+        actions = args_parser()._option_string_actions
+
+        def action_for(flag: str):
+            # The flag itself, or the one long option it abbreviates, as argparse resolves it.
+            if flag in actions:
+                return flag, actions[flag]
+            matches = [name for name in actions if name.startswith("--") and name.startswith(flag)]
+            return (matches[0], actions[matches[0]]) if flag.startswith("--") and len(matches) == 1 else (flag, None)
+
+        source = list(self.autoscaler_args)
+        args: list[str] = []
+        index = 0
+        while index < len(source):
+            arg = source[index]
+            name, action = action_for(arg)
+            if (action is not None and action.nargs is None and index + 1 < len(source)
+                    and not source[index + 1].startswith("--")):
+                args.append(f"{name}={source[index + 1]}")
+                index += 2
+                continue
+            args.append(arg)
+            index += 1
         if not any(a == "--host-service-account" or a.startswith("--host-service-account=") for a in args):
-            args += ["--host-service-account", self.host_email]
+            args.append(f"--host-service-account={self.host_email}")
         return args
 
     def job_env(self) -> dict[str, str]:
@@ -241,6 +266,9 @@ def validate_args(config: AutoscalerDeployConfig) -> list[str]:
     for arg in args:
         if any(c in arg for c in "|\n\r") or not arg:
             problems.append(f"autoscaler argument {arg!r} is empty or holds '|' or a newline")
+    repeated = sorted({arg for arg in args if args.count(arg) > 1})
+    if repeated:
+        problems.append(f"autoscaler argument(s) {', '.join(repeated)} appear twice; gcloud refuses repeated --args")
     try:
         autoscaler_argv(args, {})
     except JobConfigError as exc:
