@@ -1186,9 +1186,9 @@ The job runs after the build job has pushed the image and passed its smoke test.
    IAM, and the scheduler keep what the last full deploy set. Cloud Run moves traffic only to a revision that
    becomes ready.
 1. Checks that the new image serves from the latest ready revision with all the traffic, that the status
-   describes the current generation, and that the service's generation rose by exactly one. `gcloud` can't make the update conditional on the version it checked, so a
-   larger step means another change landed meanwhile and may have been overwritten. The job then fails and asks
-   you to check the service.
+   describes the current generation, and that the service's generation rose by exactly one. `gcloud` can't make
+   the update conditional on the version it checked, so a larger step means another change landed meanwhile and
+   may have been overwritten. The job then fails and asks you to check the service.
 
 An image that the service names but doesn't serve, for example after a revision that never became ready, is never
 reported as deployed. A refused or failed deploy fails the workflow run, so GitHub reports it like any failed
