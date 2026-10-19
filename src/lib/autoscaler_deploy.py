@@ -450,13 +450,17 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
     steps.append(wd.Step(
         "Remove grants that are no longer configured (absent ones are skipped)", files=files,
         remove=(c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
-                  f"--role={config.compute_role}", *other, "--format=none"),),
+                  f"--role={config.compute_role}", *other, "--format=none"),)))
+    # Revoking a retired secret waits until the job mounts the new ones: an infrastructure-only deploy (no --image)
+    # keeps every grant, so the deployed job can still read what it mounts.
+    secret_prune = wd.Step(
+        "Revoke the job's access to secrets it no longer mounts (absent ones are skipped)",
         prune=((c("gcloud", "secrets", "list", p, f"--filter=labels.{SECRET_LABEL}=mounted",
                   "--format=value(name.basename())"), keep,
                 (c("gcloud", "secrets", "remove-iam-policy-binding", wd.NAME_ARG, p, f"--member={runtime}",
                    f"--role={wd.ROLE_SECRET}", "--format=none"),
                  c("gcloud", "secrets", "update", wd.NAME_ARG, p, f"--remove-labels={SECRET_LABEL}",
-                   "--format=none"))),)))
+                   "--format=none"))),))
     if not config.image:
         return steps
     env_arg = "--set-env-vars=^|^" + "|".join(f"{k}={v}" for k, v in sorted(config.job_env().items()))
@@ -471,6 +475,7 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
         c("gcloud", "run", "jobs", "add-iam-policy-binding", config.job, p, region,
           f"--member=serviceAccount:{config.invoker_email}", f"--role={wd.ROLE_INVOKER}", "--format=none"),
     )))
+    steps.append(secret_prune)
     if config.skip_scheduler:
         return steps
     scheduler = (p, location, f"--schedule={config.schedule}", "--time-zone=Etc/UTC", f"--uri={config.run_uri}",

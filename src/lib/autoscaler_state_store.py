@@ -36,7 +36,8 @@ from .gcs_control_state import GcsAmbiguous, GcsClient, GcsError, GcsPreconditio
 LOG = logging.getLogger("spot_runner_autoscaler.state_store")
 
 ENV_STATE_URI = "SPOT_AUTOSCALER_STATE_URI"
-WRITE_ATTEMPTS = 3
+WRITE_ATTEMPTS = 4
+WRITE_BACKOFF_SECONDS = 1.5
 
 _URI_RE = re.compile(r"^gs://([a-z0-9][a-z0-9_.-]{1,220}[a-z0-9])/((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.json)$")
 _RECEIPT_NAME_RE = re.compile(r"^[a-z0-9-]+-[0-9a-f]{32}-deployment\.json$")
@@ -107,7 +108,10 @@ class GcsStateStore:
                     if settled == "written":
                         return
                     if settled == "unchanged" and attempt + 1 < WRITE_ATTEMPTS:
+                        # Cloud Storage takes about one write per second per object (HTTP 429 beyond that), and
+                        # a check can save several times a second: back off before the next attempt.
                         LOG.warning("Autoscaler state write was not confirmed (%s); retrying", exc)
+                        self.client.sleep(WRITE_BACKOFF_SECONDS * (attempt + 1))
                         continue
                     raise self._fail(f"write not confirmed: {exc}")
                 except GcsError as exc:
