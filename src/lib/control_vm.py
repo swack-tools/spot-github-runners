@@ -2349,6 +2349,17 @@ class ControlVmManager:
             t["capture_pending"] = True  # until its snapshot is recorded, frozen proves nothing (see above)
             self.save()
             status, body = self._control(slot, "freeze", "POST")
+            version = body.get("state_version") if isinstance(body, dict) else None
+            floor = t.get("frozen_version") or 0
+            if status == 200 and isinstance(version, int) and not isinstance(version, bool) and version < floor:
+                # Behind the frozen state while writable: its changes and the frozen ones diverged. Replacing it would
+                # lose its changes; keep it frozen and hold for an operator.
+                t["error"] = (f"held frozen, operator action needed: slot {slot} ran writable at state_version "
+                              f"{version}, below the frozen {floor}")
+                t["updated_at"] = self.clock()
+                self.save()
+                self._note(t["error"], level=logging.ERROR)
+                return "wait"
             if status == 200 and self._record_freeze(t, body):
                 t["refrozen"] = True
                 self._note("froze slot %s again at state_version %s before the rollback", slot, t["frozen_version"])

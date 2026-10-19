@@ -614,6 +614,10 @@ main() {
   wait_for_metadata
   report_run_start
   read_update_id
+  # Before anything that can fail (metadata checks, secrets, packages, the pull, container replacement), so a later
+  # metadata change always has a watcher to apply it and to confirm it, including a rollback after this run fails.
+  # A failed run is also retried by the watcher when it starts and finds the pinned image not running.
+  install_image_watcher
   PROJECT="$(curl -fsS -H 'Metadata-Flavor: Google' "$METADATA/project/project-id")"
   # projects/<number>/machineTypes/<type>; the shape decides the swap file and the container memory limits.
   MACHINE_TYPE="$(curl -fsS --retry 5 --retry-connrefused --max-time 10 -H 'Metadata-Flavor: Google' \
@@ -667,9 +671,6 @@ main() {
   write_dashboard_env
 
   install_packages
-  # Before anything that can fail (pull, build, container replacement), so a later metadata change always has a
-  # watcher to apply it, including a rollback after this run fails.
-  install_image_watcher
   if [[ -n "$DASHBOARD_IMAGE" ]]; then
     pull_published_image
     follow_image_changes

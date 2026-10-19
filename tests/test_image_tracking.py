@@ -847,6 +847,20 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("operator action needed", h.transition["error"])
         self.assertNotIn(("import", "a"), h.events)
 
+    def test_a_rollback_holds_a_container_that_diverged_below_the_frozen_state(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.healthy("a", version=3, image=IMG_B)  # started writable, behind the frozen 7
+        h.http.versions["a"] = 3
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        for _ in range(2):
+            with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+                h.tick()
+        self.assertIn("operator action needed", h.transition["error"])
+        self.assertNotIn(("set-image", "spot-control-a", IMG_A), h.events)
+        self.assertEqual(h.transition["frozen_snapshot"]["state_version"], 7)
+
     def test_a_release_imports_only_the_exact_snapshot_kept_in_kv(self):
         from lib.edge_state import KV_STATE_KEY, build_snapshot
         h = TrackingHarness()

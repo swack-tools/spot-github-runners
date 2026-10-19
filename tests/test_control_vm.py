@@ -3316,8 +3316,9 @@ class StartupScriptImageWatcherTests(unittest.TestCase):
         lock = self.main.index('exec 9>"$RUN_LOCK"\n  flock 9')
         self.assertLess(lock, self.main.index("wait_for_metadata"))
         watcher = self.main.index("install_image_watcher")
-        self.assertLess(self.main.index("install_packages"), watcher)  # needs docker for its inspect
-        for later in ("pull_published_image", "build_from_source", "run_containers"):
+        self.assertLess(self.main.index("read_update_id"), watcher)
+        for later in ("check_dashboard_image", "write_dashboard_env", "install_packages", "pull_published_image",
+                      "build_from_source", "run_containers"):
             self.assertLess(watcher, self.main.index(later), later)  # installed even when these fail
 
     def test_the_watcher_unit_waits_for_the_boot_run_and_is_started_without_blocking(self):
