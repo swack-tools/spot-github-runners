@@ -540,14 +540,17 @@ install_image_watcher() {
 # Installed by the control VM startup script (cloud-init/control-vm-startup.sh); reruns it when the dashboard-image
 # instance metadata names an image the dashboard container does not run.
 set -uo pipefail
-readonly URL=http://metadata.google.internal/computeMetadata/v1/instance/attributes/dashboard-image
+readonly ATTRS=http://metadata.google.internal/computeMetadata/v1/instance/attributes
+readonly RUN_REPORT=http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/spot-dashboard/run
 readonly CONTAINER=spot-dashboard
 log() { printf 'spot-dashboard-image-watch: %s\n' "$*" >&2; }
+attr() { curl -fsS --max-time 10 -H 'Metadata-Flavor: Google' "$ATTRS/$1" 2>/dev/null || true; }
 etag=NONE
 while true; do
+  # Wakes on any metadata change: a request can change only dashboard-update-id (a restore of the running image).
   headers="$(mktemp)"
-  if ! value="$(curl -fsS --max-time 3700 -D "$headers" -H 'Metadata-Flavor: Google' \
-      "$URL?wait_for_change=true&timeout_sec=3600&last_etag=$etag")"; then
+  if ! curl -fsS --max-time 3700 -D "$headers" -H 'Metadata-Flavor: Google' \
+      "$ATTRS/?recursive=true&wait_for_change=true&timeout_sec=3600&last_etag=$etag" >/dev/null; then
     rm -f "$headers"
     sleep 15
     continue
@@ -555,16 +558,17 @@ while true; do
   etag="$(tr -d '\r' <"$headers" | sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//p' | tail -n 1)"
   rm -f "$headers"
   [[ "$etag" =~ ^[A-Za-z0-9]+$ ]] || etag=NONE
+  value="$(attr dashboard-image)"
+  [[ -n "$value" ]] || continue
   running="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
-  if [[ -n "$value" && "$value" == "$running" ]]; then
+  if [[ "$value" == "$running" ]]; then
     # Nothing to swap: confirm the request (its update id) so the controller knows no run is pending for it.
-    id="$(curl -fsS --max-time 10 -H 'Metadata-Flavor: Google' "${URL%/*}/dashboard-update-id" 2>/dev/null || true)"
+    id="$(attr dashboard-update-id)"
     [[ "$id" =~ ^[a-z0-9-]{1,64}$ ]] || id=-
-    curl -fsS -X PUT --max-time 5 -H 'Metadata-Flavor: Google' --data "done $id $value" \
-      "${URL%/attributes/*}/guest-attributes/spot-dashboard/run" >/dev/null 2>&1 || true
+    curl -fsS -X PUT --max-time 5 -H 'Metadata-Flavor: Google' --data "done $id $value" "$RUN_REPORT" \
+      >/dev/null 2>&1 || true
     continue
   fi
-  [[ -n "$value" ]] || continue
   log "dashboard-image is $value but $CONTAINER runs ${running:-nothing}; rerunning the startup script"
   google_metadata_script_runner startup || log "the startup script failed; retrying at the next change or in an hour"
 done

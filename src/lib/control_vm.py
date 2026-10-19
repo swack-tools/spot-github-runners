@@ -2339,8 +2339,8 @@ class ControlVmManager:
             # kept snapshot.
             t["refrozen"] = True
             self.save()
-        if (vm is not None and vm.running and t.get("release_attempted") and not t.get("refrozen")
-                and t.get("image_written") and not t.get("restored")):
+        if (vm is not None and vm.running and (t.get("release_attempted") or t.get("capture_pending"))
+                and not t.get("refrozen") and t.get("image_written") and not t.get("restored")):
             # The new container may have been released and accepted changes: drain it again before the watcher
             # replaces it, and carry what it accepted (the new snapshot) into the restored container. Marked not
             # released first, so the rollback always releases the restored container before it ends.

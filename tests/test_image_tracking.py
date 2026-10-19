@@ -817,6 +817,25 @@ class RolloutTests(unittest.TestCase):
         posted = [json.loads(c[3]) for c in h.http.calls if c[1].endswith("/api/control/import")]
         self.assertEqual(posted[-1]["state_version"], 8)  # its own current state, not the older frozen one
 
+    def test_a_rollback_drains_a_pending_capture_before_the_swap_back(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.healthy("a", version=8, image=IMG_B)  # started writable
+        h.http.versions["a"] = 8
+        h.http.freeze_status = 409  # busy: the capture can't drain it yet
+        h.clock[0] += 180
+        h.tick()
+        self.assertTrue(h.transition["capture_pending"])
+        self.assertFalse(h.transition.get("release_attempted"))
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: no swap back before a confirmed drain
+        self.assertNotIn(("set-image", "spot-control-a", IMG_A), h.events)
+        h.http.freeze_status = 200
+        h.tick()
+        self.assertIn(("set-image", "spot-control-a", IMG_A), h.events)
+        self.assertEqual(h.transition["frozen_snapshot"]["state_version"], 8)  # what it accepted is kept
+
     def test_a_target_that_starts_writable_behind_the_frozen_state_holds(self):
         h = TrackingHarness()
         h.active()

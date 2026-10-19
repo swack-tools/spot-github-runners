@@ -3370,6 +3370,7 @@ if [[ " $* " == *" PUT "* ]]; then
   exit 0
 fi
 if [[ "${@: -1}" == */attributes/dashboard-update-id ]]; then printf 'upd-1'; exit 0; fi
+if [[ "${@: -1}" == */attributes/dashboard-image ]]; then printf '%s' "$VALUE"; exit 0; fi
 n=$(($(cat "$STUB/count" 2>/dev/null || echo 0) + 1))
 echo "$n" > "$STUB/count"
 printf '%s\n' "${@: -1}" >> "$STUB/urls"
@@ -3378,7 +3379,7 @@ while [[ $# -gt 0 ]]; do
   if [[ $1 == -D ]]; then printf 'ETag: abc123\r\n' > "$2"; fi
   shift
 done
-printf '%s' "$VALUE"
+printf '{}'
 ''',
             "sleep": "#!/usr/bin/env bash\nkill -TERM $PPID\n",
             "docker": "#!/usr/bin/env bash\nprintf '%s\\n' \"$RUNNING\"\n",
@@ -3424,7 +3425,7 @@ printf '%s' "$VALUE"
         old = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "a" * 64
         reruns, urls = self.run_watcher(new, old)
         self.assertEqual(reruns, "startup\n")
-        self.assertIn("wait_for_change=true", urls[0])
+        self.assertIn("/instance/attributes/?recursive=true&wait_for_change=true", urls[0])  # any metadata change
         self.assertIn("last_etag=NONE", urls[0])
         self.assertIn("last_etag=abc123", urls[1])  # the next wait starts from the answer's ETag
         self.assertEqual(self.puts, [])
