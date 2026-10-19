@@ -223,8 +223,10 @@ lease doesn't protect the cutover.
      --update-env-vars=SPOT_AUTOSCALER_DRY_RUN=1 --wait
    ```
 
-   The check starts from an empty state, because the state object doesn't exist yet, and it proves the image, the
-   GitHub token, the IAM bindings, and SSH to the hosts. Read its log in Cloud Logging.
+   The check starts from an empty state, because the state object doesn't exist yet. It proves the image, the
+   GitHub token, and the read access of the IAM bindings. Read its log in Cloud Logging. Its `gcloud` calls use a
+   token with only the `cloud-platform.read-only` scope, so its `gcloud compute ssh` can't add the job's key to a
+   host: hosts show missing SSH evidence until the first live check connects.
 
 1. Stop the LaunchAgent. `launchctl` sends `SIGTERM`, and the controller saves its state before each provider
    change, so a stop in the middle of a check is safe:
@@ -249,7 +251,8 @@ lease doesn't protect the cutover.
 
    The preview prints the exact object name on its `State object:` line.
 
-1. Run one live check and read its log:
+1. Run one live check and read its log. Its first connection to each host adds the job's SSH key to that host's
+   metadata:
 
    ```bash
    gcloud run jobs execute spot-runner-autoscaler --region=us-central1 --project=PROJECT --wait
@@ -279,8 +282,11 @@ lease doesn't protect the cutover.
 ## Operate
 
 - **Pause:** `gcloud scheduler jobs pause spot-runner-autoscaler`; resume it with `resume`.
-- **One read-only check:** run the job with `--update-env-vars=SPOT_AUTOSCALER_DRY_RUN=1`.
+- **One read-only check:** run the job with `--update-env-vars=SPOT_AUTOSCALER_DRY_RUN=1`. It changes no
+  provider resource, not even host metadata.
 - **Update the image:** run the deploy again with the new digest. The next execution uses it.
+- **Schedule:** the deploy always schedules every 5 minutes, because the tier policy counts a sample only 300 to
+  450 seconds after the previous one.
 - **Logs:** each execution writes to Cloud Logging. A check whose state stopped being durable exits with status 1;
   a refused configuration exits with status 2.
 - **State conflicts:** a conflict means that another controller wrote the object. Find that controller before

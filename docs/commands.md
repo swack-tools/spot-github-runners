@@ -345,7 +345,6 @@ script and runs nothing. See [Serverless autoscaler](cloud-run-autoscaler.md).
 | `--autoscaler-args-file` | Path | None | Autoscaler flags for the job: shell words on each line, `#` comments. Needed with `--image`. |
 | `--github-secret` | String | `spot-floor-github-swack-tools` | Secret Manager secret with the GitHub token. |
 | `--ssh-secret` | String | `spot-runner-autoscaler-ssh-key` | Secret Manager secret with the autoscaler's SSH private key. |
-| `--schedule` | Cron expression | `*/5 * * * *` | When Cloud Scheduler starts an execution. |
 | `--cpu` | Integer | `1` | vCPUs for each execution. |
 | `--memory` | Quantity | `2Gi` | Memory for each execution. |
 | `--task-timeout` | Integer | `3600` | Seconds before Cloud Run stops an execution. |

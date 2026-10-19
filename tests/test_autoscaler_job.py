@@ -139,6 +139,33 @@ class MainTests(unittest.TestCase):
         return patch.object(job.subprocess, "run", return_value=SimpleNamespace(
             returncode=0, stdout="ssh-ed25519 AAAA\n", stderr=""))
 
+    def test_a_dry_run_gives_gcloud_only_a_read_only_token(self):
+        seen, urls = {}, []
+
+        def metadata(url):
+            urls.append(url)
+            return '{"access_token": "ya29.read-only", "expires_in": 3599}'
+
+        def autoscaler(argv):
+            seen["argv"], seen["file"] = argv, os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE")
+            return 0
+        saved = os.environ.get("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE")
+        self.addCleanup(lambda: os.environ.pop("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", None) if saved is None
+                        else os.environ.__setitem__("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", saved))
+        with self.keygen(), patch("lib.compute_api._metadata_get", side_effect=metadata), \
+                patch.object(controller, "main", side_effect=autoscaler):
+            self.assertEqual(job.main(BASE, env={**self.env, job.ENV_DRY_RUN: "1"}), 0)
+        self.assertIn("--dry-run", seen["argv"])
+        self.assertEqual(Path(seen["file"]).read_text(), "ya29.read-only")
+        self.assertEqual(stat.S_IMODE(Path(seen["file"]).stat().st_mode), 0o600)
+        self.assertEqual(len(urls), 1)
+        self.assertTrue(urls[0].endswith("?scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform.read-only"))
+
+    def test_a_dry_run_without_a_read_only_token_does_not_start(self):
+        with self.keygen(), patch("lib.compute_api._metadata_get", side_effect=RuntimeError("no metadata server")), \
+                patch.object(controller, "main", side_effect=AssertionError("must not run")):
+            self.assertEqual(job.main(BASE, env={**self.env, job.ENV_DRY_RUN: "1"}), 2)
+
     def test_a_refused_configuration_exits_2_before_the_autoscaler_starts(self):
         with patch.object(controller, "main", side_effect=AssertionError("must not run")):
             self.assertEqual(job.main(BASE + ["--once"], env=self.env), 2)

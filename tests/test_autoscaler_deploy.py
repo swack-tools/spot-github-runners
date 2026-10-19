@@ -86,6 +86,12 @@ class ConfigTests(unittest.TestCase):
                          "gs://homelab-424523-spot-control-state/autoscaler/state-swack-tools-a7245ac03c.json")
         self.assertNotEqual(config(autoscaler_args=ARGS + ("--target", "swack-tools/oxidex")).state_uri, c.state_uri)
 
+    def test_the_target_resolves_like_the_runtime_parser_even_abbreviated(self):
+        repo = config(autoscaler_args=ARGS + ("--tar", "other-owner/repo"))
+        self.assertEqual(repo.target, "other-owner/repo")
+        self.assertNotEqual(repo.state_uri, config().state_uri)
+        self.assertEqual(config(autoscaler_args=("--scaling-mode", "tiered")).target, "swack-tools")
+
     def test_job_args_add_the_dedicated_host_account_and_nothing_per_execution(self):
         args = config().job_args()
         self.assertEqual(args[args.index("--host-service-account") + 1], HOST_SA)
@@ -121,6 +127,7 @@ class ValidateTests(unittest.TestCase):
             "two different secrets": config(ssh_secret=deploy.DEFAULT_GITHUB_SECRET),
             "--memory": config(memory="lots"),
             "--task-timeout": config(task_timeout=60),
+            "schedule must be": config(schedule="*/10 * * * *"),
         }
         for needle, c in cases.items():
             with self.subTest(needle=needle), redirect_stderr(io.StringIO()):

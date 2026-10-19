@@ -140,16 +140,19 @@ class AutoscalerDeployConfig:
 
     @property
     def target(self) -> str:
-        """The GitHub target the job manages (--target, else --org), exactly as the autoscaler resolves it."""
-        args = list(self.autoscaler_args)
-        found = {"--target": None, "--org": None}
-        for index, arg in enumerate(args):
-            for flag in found:
-                if arg == flag and index + 1 < len(args):
-                    found[flag] = args[index + 1]
-                elif arg.startswith(flag + "="):
-                    found[flag] = arg.split("=", 1)[1]
-        return found["--target"] or found["--org"] or DEFAULT_ORG
+        """The GitHub target the job manages (--target, else --org), parsed by the autoscaler's own parser, so an
+        abbreviated flag resolves exactly as it will at run time (unparsable flags fail validation instead)."""
+        import contextlib
+        import io
+
+        from .spot_runner_autoscaler import args_parser
+
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                parsed = args_parser().parse_args(list(self.autoscaler_args))
+        except SystemExit:
+            return DEFAULT_ORG
+        return parsed.target or parsed.org or DEFAULT_ORG
 
     @property
     def state_uri(self) -> str:
@@ -210,8 +213,8 @@ def validate(config: AutoscalerDeployConfig) -> list[str]:
         problems.append("the GitHub token and the SSH key need two different secrets")
     if not wd._GH_REPO_RE.match(config.github_repo):
         problems.append("--github-repo must be owner/repo")
-    if not wd._SCHEDULE_RE.match(config.schedule) or len(config.schedule.split()) != 5:
-        problems.append("--schedule must be a five-field cron expression")
+    if config.schedule != DEFAULT_SCHEDULE:
+        problems.append(f"the schedule must be {DEFAULT_SCHEDULE!r}: the tier policy counts samples 300-450 s apart")
     if config.project_number and not re.match(r"^[0-9]{6,20}$", config.project_number):
         problems.append("--project-number must be numeric")
     if config.image and not re.match(rf"^{re.escape(config.image_repo)}@sha256:[0-9a-f]{{64}}$", config.image):
@@ -466,7 +469,6 @@ def args_parser() -> argparse.ArgumentParser:
                         help="Secret Manager secret with the GitHub token (default: %(default)s)")
     parser.add_argument("--ssh-secret", default=DEFAULT_SSH_SECRET,
                         help="Secret Manager secret with the autoscaler's SSH private key (default: %(default)s)")
-    parser.add_argument("--schedule", default=DEFAULT_SCHEDULE, help="Cron schedule (default: %(default)s)")
     parser.add_argument("--cpu", default="1", help="vCPUs per execution (default: %(default)s)")
     parser.add_argument("--memory", default="2Gi", help="Memory per execution (default: %(default)s)")
     parser.add_argument("--task-timeout", type=int, default=TASK_TIMEOUT_SECONDS,
@@ -491,7 +493,7 @@ def main(argv: Sequence[str] | None = None, *, runner: wd.Runner = wd.default_ru
         config = AutoscalerDeployConfig(
             project=args.project, region=args.region, bucket=args.bucket, image=args.image,
             project_number=args.project_number, github_repo=args.github_repo, github_secret=args.github_secret,
-            ssh_secret=args.ssh_secret, schedule=args.schedule, cpu=args.cpu, memory=args.memory,
+            ssh_secret=args.ssh_secret, cpu=args.cpu, memory=args.memory,
             task_timeout=args.task_timeout, compute_condition=args.compute_condition,
             skip_scheduler=args.skip_scheduler,
             autoscaler_args=args_from_file(args.autoscaler_args_file) if args.autoscaler_args_file else (),

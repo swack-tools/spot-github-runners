@@ -15,7 +15,10 @@ execution runs exactly one ``spot_runner_autoscaler.py --once`` check with the c
   metadata, so it adds the key once to each runner host's own metadata (the conditional compute role allows that on
   ``oxidex-runners-*`` only) and never again, instead of a new key on every execution.
 * ``SPOT_AUTOSCALER_DRY_RUN=1`` (``gcloud run jobs execute ... --update-env-vars``) runs the read-only
-  ``--dry-run`` check instead: no lease, no state write, no provider change.
+  ``--dry-run`` check instead: no lease, no state write, no provider change. Its ``gcloud`` calls use an access
+  token with only the ``cloud-platform.read-only`` scope (``CLOUDSDK_AUTH_ACCESS_TOKEN_FILE``), so not even
+  ``gcloud compute ssh`` can add the key to a host's metadata; a host that doesn't have the key yet shows up as
+  missing SSH evidence until a live check has connected once.
 
 The flags that only make sense on a workstation (``--install-launch-agent``, ``--github-user``, ``--state-file``,
 ``--log-file``, ``--once``, ``--dry-run``, ``--manage-control-vm``) are refused in the container arguments: the
@@ -40,6 +43,7 @@ ENV_GITHUB_TOKEN_FILE = "SPOT_AUTOSCALER_GITHUB_TOKEN_FILE"
 ENV_SSH_KEY_FILE = "SPOT_AUTOSCALER_SSH_KEY_FILE"
 ENV_FLOOR_STATE_URI = "SPOT_RUNNER_FLOOR_STATE_URI"
 STATE_DIR = Path("/tmp/spot-runner-autoscaler")
+READ_ONLY_SCOPE = "https://www.googleapis.com/auth/cloud-platform.read-only"
 GITHUB_SECRET_ROOT = "/secrets/autoscaler-github"
 SSH_SECRET_ROOT = "/secrets/autoscaler-ssh"
 _TRUE = ("1", "true", "yes", "on")
@@ -146,6 +150,29 @@ def install_ssh_key(env: Mapping[str, str], home: Path,
     return private
 
 
+def install_read_only_gcloud_token(directory: Path, fetch: Callable[[str], str] | None = None) -> Path:
+    """Write a read-only-scoped access token of the job's account for gcloud (``CLOUDSDK_AUTH_ACCESS_TOKEN_FILE``)."""
+    import json
+    import urllib.parse
+
+    from . import compute_api
+
+    url = f"{compute_api.METADATA_TOKEN_URL}?scopes={urllib.parse.quote(READ_ONLY_SCOPE, safe='')}"
+    try:
+        raw = (fetch or compute_api._metadata_get)(url)
+        token = json.loads(raw).get("access_token")
+    except (OSError, RuntimeError, ValueError, AttributeError) as exc:
+        raise JobConfigError(f"could not get a read-only access token for the dry run: {exc}") from exc
+    if not isinstance(token, str) or not token.strip() or any(c.isspace() for c in token.strip()):
+        raise JobConfigError("the metadata server returned no read-only access token for the dry run")
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "gcloud-read-only-token"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(token.strip())
+    return path
+
+
 def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = None) -> int:
     from .log_format import configure_logging
 
@@ -157,10 +184,14 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         final = autoscaler_argv(args, env)
         token = read_github_token(env)
         install_ssh_key(env, Path(str(env.get("HOME") or Path.home())))
+        read_only_token = install_read_only_gcloud_token(STATE_DIR) if "--dry-run" in final else None
     except JobConfigError as exc:
         LOG.error("Autoscaler job refused to start: %s", exc)
         return 2
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if read_only_token is not None:
+        # A preview never changes a provider: gcloud, including gcloud compute ssh, can only read.
+        os.environ["CLOUDSDK_AUTH_ACCESS_TOKEN_FILE"] = str(read_only_token)
     # The token is visible to this process and its children (gh reads GH_TOKEN), never to the job's spec.
     os.environ["GH_TOKEN"] = token
     os.environ.setdefault("GH_CONFIG_DIR", "/tmp/gh-config")
