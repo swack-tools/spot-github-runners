@@ -1302,7 +1302,9 @@ image, starts a stopped VM, and releases it once it's back. When the new image d
 20 minutes, the manager freezes it again if it may have been released, writes the previous image back to
 `dashboard-image`, and the watcher swaps back. The manager then imports the frozen snapshot into the restored
 container. It never releases the failed image: while the VM is reachable, the rollback holds until it can release
-the restored container, and after 20 minutes it reports an error that needs an operator. That rollout's digest is
+the restored container, and after 20 minutes it reports an error that needs an operator. A VM that stays
+unreachable for 20 minutes is left to the normal recovery, after the manager has made sure that KV holds the
+frozen snapshot, which recovery hydrates from. That rollout's digest is
 backed off: the manager tries again only after `:main` names another digest and the cooldown has passed.
 
 The state's `image` section records the active VM's image, read once from its `dashboard-image` metadata

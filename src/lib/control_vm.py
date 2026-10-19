@@ -2189,8 +2189,10 @@ class ControlVmManager:
         if not (isinstance(version, int) and not isinstance(version, bool)) or snapshot is None \
                 or snapshot["state_version"] < version:
             return False
+        kept = t.get("frozen_snapshot")
+        if not kept or snapshot["state_version"] >= kept["state_version"]:
+            t["frozen_snapshot"] = snapshot  # never replace a newer snapshot with an older one (a stale container)
         t["frozen_version"] = max(version, t.get("frozen_version") or 0)
-        t["frozen_snapshot"] = snapshot
         self.save()
         return True
 
@@ -2213,11 +2215,14 @@ class ControlVmManager:
             if status == 200 and self._record_freeze(t, body):
                 t["refrozen"] = True
                 self._note("froze slot %s again at state_version %s before the rollback", slot, t["frozen_version"])
-            elif not self._fail_attempt(t, f"freeze before the rollback returned {status}"):
-                return "wait"
             else:
-                t["refrozen"] = True
-                self._note("could not freeze slot %s again; rolling back anyway", slot, level=logging.ERROR)
+                # Never replace a container that may accept changes without a confirmed drain: keep trying.
+                t["error"] = f"freeze before the rollback returned {status}"
+                t["updated_at"] = self.clock()
+                self.save()
+                self._note(t["error"], level=logging.ERROR if waited >= IMAGE_UPDATE_TIMEOUT_SECONDS
+                           else logging.WARNING)
+                return "wait"
         if vm is not None and previous and t.get("image_written") and not t.get("restored"):
             error = self._set_image_metadata(t, vm, previous)
             if error:
@@ -2260,10 +2265,38 @@ class ControlVmManager:
                 t["updated_at"] = self.clock()
                 self.save()
                 return "wait"
-            # Unreachable for the whole timeout: end, leaving it frozen; the planner's recovery takes over.
+            # Unreachable for the whole timeout: end, leaving it frozen, and let the planner's recovery take over.
+            # Recovery hydrates from KV, so first make sure KV holds the frozen state.
+            problem = self._preserve_frozen_snapshot(t)
+            if problem:
+                t["error"] = f"holding the rollback: {problem}"
+                t["updated_at"] = self.clock()
+                self.save()
+                self._note(t["error"], level=logging.ERROR)
+                return "wait"
             self._note("%s was not reachable within %ss to be released; ending the rollback", vm.name,
                        IMAGE_UPDATE_TIMEOUT_SECONDS, level=logging.ERROR)
         return self._end_abort(t)
+
+    def _preserve_frozen_snapshot(self, t: dict) -> str | None:
+        """Before a rollback ends without releasing a container: publish the frozen snapshot to KV when KV holds
+        older state, so a recovery that hydrates from KV keeps it. None when KV holds at least that state."""
+        snapshot = t.get("frozen_snapshot")
+        if not snapshot or self.kv is None:
+            return None if not snapshot else "Cloudflare KV is not configured"
+        try:
+            current = parse_snapshot(self.kv.get(KV_STATE_KEY))
+            if current is not None and current["state_version"] >= snapshot["state_version"]:
+                return None
+            self.kv.put(KV_STATE_KEY, json.dumps(snapshot, separators=(",", ":")))
+            stored = parse_snapshot(self.kv.get(KV_STATE_KEY))
+        except KvError as exc:
+            return f"could not publish the frozen snapshot to KV: {exc}"
+        if stored is None or stored["state_version"] < snapshot["state_version"]:
+            return "KV does not show the frozen snapshot yet"
+        self._note("published the frozen snapshot (state_version %d) to KV for recovery", snapshot["state_version"],
+                   level=logging.WARNING)
+        return None
 
     def _control(self, slot: str, op: str, method: str, body: Mapping[str, Any] | None = None,
                  timeout: float = 60.0) -> tuple[int | None, Any]:

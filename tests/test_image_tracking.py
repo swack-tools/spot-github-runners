@@ -514,6 +514,51 @@ class RolloutTests(unittest.TestCase):
         h.tick()
         mutations = h.mutations()
         self.assertLess(mutations.index(("freeze", "a"), 1), mutations.index(("set-image", "spot-control-a", IMG_A)))
+    def test_a_refreeze_never_replaces_a_newer_snapshot(self):
+        from lib.edge_state import build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        t = {}
+        self.assertTrue(manager._record_freeze(t, {"state_version": 7, "snapshot": build_snapshot({}, 7, "a", now=5)}))
+        self.assertTrue(manager._record_freeze(t, {"state_version": 3, "snapshot": build_snapshot({}, 3, "a", now=6)}))
+        self.assertEqual((t["frozen_version"], t["frozen_snapshot"]["state_version"]), (7, 7))
+        self.assertFalse(manager._record_freeze({}, {"state_version": 7}))  # no snapshot: not a usable freeze
+
+    def test_a_rollback_never_swaps_a_released_container_without_a_confirmed_refreeze(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_status = None  # the release may have landed
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        h.http.freeze_status = 503
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        for _ in range(cv.STEP_RETRY_LIMIT + 2):
+            h.tick()
+            h.clock[0] += 180
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertNotIn(("set-image", "spot-control-a", IMG_A), h.events)
+        h.http.freeze_status = 200
+        h.tick()
+        self.assertIn(("set-image", "spot-control-a", IMG_A), h.events)
+
+    def test_an_unreachable_vm_ends_the_rollback_only_after_kv_holds_the_frozen_state(self):
+        from lib.edge_state import KV_STATE_KEY, parse_snapshot
+        h = TrackingHarness()
+        h.active()
+        h.tick()  # frozen at state_version 7
+        h.kv.store.pop(KV_STATE_KEY, None)
+        del h.http.health["a"]  # unreachable from here on
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: pin the previous image, wait for the VM
+        self.assertEqual(h.transition["step"], "abort")
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
     def test_a_reset_that_reports_failure_is_never_repeated(self):
         h = TrackingHarness()
         h.active()
