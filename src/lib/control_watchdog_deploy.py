@@ -367,6 +367,9 @@ class Step:
     # (command printing the Cloud Run service as JSON, update command): after the run commands, the update runs with
     # --remove-volume=<names> when the service has secret volumes that no container mounts.
     volume_prune: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+    # SPOT_WATCHDOG_AUTO_DEPLOY=1: right before the run commands, the service must be absent or run the deploy's
+    # image; right after them, it must run that image and no other change may have landed (see auto_deploy_guard).
+    image_guard: bool = False
 
 
 def _c(*argv: str) -> tuple[str, ...]:
@@ -617,7 +620,8 @@ def build_steps(config: DeployConfig) -> list[Step]:
               f"--member={deployer}", f"--role={ROLE_RUN_DEVELOPER}", "--format=none"),)
           if config.deploys_automatically else ()),
     ), volume_prune=(_c("gcloud", "run", "services", "describe", config.service, p, region, "--format=json"),
-                     _c("gcloud", "run", "services", "update", config.service, p, region, "--quiet"))))
+                     _c("gcloud", "run", "services", "update", config.service, p, region, "--quiet")),
+        image_guard=config.deploys_automatically))
     if config.skip_scheduler:
         return steps
     scheduler = (p, location, f"--schedule={config.schedule}", "--time-zone=Etc/UTC",
@@ -666,6 +670,9 @@ def render(config: DeployConfig, steps: Sequence[Step]) -> str:
             lines += [f"#   {line}" for line in content.splitlines()]
         for command, hint in step.require:
             lines.append(f"test \"$({_shell(command)})\" = ENABLED || {{ echo {shlex.quote(hint)} >&2; exit 1; }}")
+        if step.image_guard:
+            lines.append(f"# Here and again after the commands below, the deploy refuses unless the service runs "
+                         f"{config.image} (or doesn't exist yet) and nothing else changed it meanwhile.")
         if step.check:
             lines.append(f"if {_shell(step.check)} >/dev/null 2>&1; then")
             lines += [f"  {_shell(c)}" for c in step.update] or ["  :  # exists"]
@@ -761,8 +768,11 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
                     run(command, step.files, step.title)
                 if exists and not step.update:
                     out("  exists")
+            generation = auto_deploy_guard(config, runner) if step.image_guard else None
             for command in step.run:
                 run(command, step.files, step.title)
+            if step.image_guard:
+                full_deploy_check(config, runner, generation)
             if step.volume_prune:
                 describe, update = step.volume_prune
                 result = runner(materialize(describe, step.files))
@@ -841,6 +851,10 @@ def rollout_problems(service: Mapping, image: str) -> list[str]:
     if service_image(service) != image:
         problems.append(f"its template image is {service_image(service)!r}")
     status = service.get("status") or {}
+    generation = _generation(service)
+    if generation is None or status.get("observedGeneration") != generation:
+        # Status of an older generation says nothing about this template.
+        problems.append(f"its status describes generation {status.get('observedGeneration')!r}, not {generation!r}")
     ready, created = status.get("latestReadyRevisionName"), status.get("latestCreatedRevisionName")
     if not ready or ready != created:
         problems.append(f"the latest revision {created!r} is not ready (ready: {ready!r})")
@@ -1000,21 +1014,39 @@ def _require_serving(config: DeployConfig, service: Mapping, image: str) -> None
         raise DeployError(f"service {config.service} names {image} but does not serve it: " + "; ".join(problems))
 
 
-def auto_deploy_guard(config: DeployConfig, runner: Runner = default_runner) -> None:
+def auto_deploy_guard(config: DeployConfig, runner: Runner = default_runner) -> int | None:
     """With auto-deploy on, a full deploy must pass the deployed image: the workflow owns the image, and an older
-    ``--image`` would silently roll the watchdog back. A service that doesn't exist yet passes."""
+    ``--image`` would silently roll the watchdog back. A service that doesn't exist yet passes (generation 0).
+    Returns the service's generation, which :func:`full_deploy_check` compares after the deploy."""
     if not (config.deploys_automatically and config.image):
-        return
+        return None
     result = runner(_describe_service(config))
     stderr = (result.stderr or "").lower()
     if result.returncode != 0 and any(text in stderr for text in ("not found", "could not be found", "cannot find")):
-        return
+        return 0
     service = _json_of(result, f"describe of service {config.service}")
     current = service_image(service) if isinstance(service, dict) else ""
     if current != config.image:
         raise DeployError(f"{ENV_AUTO_DEPLOY}=1: the image workflow deploys the watchdog, and the service runs "
                           f"{current or 'an unknown image'}; pass --image={current} to re-apply settings, or turn "
                           "auto-deploy off (delete the WATCHDOG_DEPLOYER_SA repository variable) to pin another image")
+    return _generation(service)
+
+
+def full_deploy_check(config: DeployConfig, runner: Runner, generation: int | None) -> None:
+    """After a full deploy's ``gcloud run deploy`` with auto-deploy on: the service runs the deploy's image, and its
+    generation rose by at most one since :func:`auto_deploy_guard` (a deploy that changed nothing doesn't raise it).
+    The workflow's deploy job may have run in between; a larger step means a change was overwritten."""
+    if generation is None:
+        raise DeployError(f"service {config.service} reported no generation before the deploy")
+    after = _json_of(runner(_describe_service(config)), f"describe of service {config.service}")
+    after = after if isinstance(after, dict) else {}
+    now = _generation(after)
+    if service_image(after) != config.image or now is None or not generation <= now <= generation + 1:
+        raise DeployError(f"service {config.service} went from generation {generation} to {now} and runs "
+                          f"{service_image(after) or 'an unknown image'} after this deploy of {config.image}: the image "
+                          "workflow may have deployed a newer image meanwhile. Check the service and deploy the "
+                          "newest image")
 
 
 # --------------------------------------------------------------------------------------------

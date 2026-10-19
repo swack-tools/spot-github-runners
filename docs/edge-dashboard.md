@@ -1185,8 +1185,8 @@ The job runs after the build job has pushed the image and passed its smoke test.
 1. Runs `gcloud run services update --image` and nothing else. Settings, secrets, the service account, scaling,
    IAM, and the scheduler keep what the last full deploy set. Cloud Run moves traffic only to a revision that
    becomes ready.
-1. Checks that the new image serves from the latest ready revision with all the traffic, and that the service's
-   generation rose by exactly one. `gcloud` can't make the update conditional on the version it checked, so a
+1. Checks that the new image serves from the latest ready revision with all the traffic, that the status
+   describes the current generation, and that the service's generation rose by exactly one. `gcloud` can't make the update conditional on the version it checked, so a
    larger step means another change landed meanwhile and may have been overwritten. The job then fails and asks
    you to check the service.
 
@@ -1221,7 +1221,9 @@ To turn automatic deploys on:
    ```
 
 While `SPOT_WATCHDOG_AUTO_DEPLOY=1` is set, a full deploy refuses an `--image` other than the one the service
-runs, and prints that digest. Re-applying settings never rolls the watchdog back. To pin another image, stop
+runs, and prints that digest. It checks again right before `gcloud run deploy`, and afterwards it fails when the
+service's generation rose by more than one, which means the workflow deployed meanwhile. Re-applying settings
+never silently rolls the watchdog back. To pin another image, stop
 automatic deploys first: delete the `WATCHDOG_DEPLOYER_SA` variable, which skips the job. To also remove the
 deployer's access, turn off its account:
 

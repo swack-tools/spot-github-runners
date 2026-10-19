@@ -734,7 +734,7 @@ def live_service(image=OLD_IMAGE, *, labels=None, account=RUNTIME, ready=True, g
     return {"metadata": {"labels": {"cloud.googleapis.com/location": "us-central1", "spot-role": "control-watchdog"}
                          if labels is None else labels, "generation": generation},
             "spec": {"template": {"spec": {"serviceAccountName": account, "containers": [{"image": image}]}}},
-            "status": {"latestReadyRevisionName": revision if ready else "old",
+            "status": {"observedGeneration": generation, "latestReadyRevisionName": revision if ready else "old",
                        "latestCreatedRevisionName": revision,
                        "traffic": [{"latestRevision": True, "percent": 100, "revisionName": revision}],
                        "conditions": [{"type": "Ready", "status": "True" if ready else "False"}]}}
@@ -788,7 +788,7 @@ class AutoDeployIamTests(unittest.TestCase):
 
 
 class AutoDeployGuardTests(unittest.TestCase):
-    def deploy(self, service, env=AUTO_ENV, image=IMAGE):
+    def deploy(self, service, env=AUTO_ENV, image=IMAGE, after=None, race=None):
         calls = []
 
         def run(argv):
@@ -796,9 +796,18 @@ class AutoDeployGuardTests(unittest.TestCase):
             if argv[:3] == ["gcloud", "projects", "describe"]:
                 return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
             if list(argv[1:4]) == ["run", "services", "describe"]:
-                if service is None and not any(c[1:3] == ["run", "deploy"] for c in calls):
+                deployed = any(c[1:3] == ["run", "deploy"] for c in calls)
+                if race is not None and not deployed and sum(c[1:4] == ["run", "services", "describe"]
+                                                              for c in calls) > 1:
+                    current = race  # the workflow deployed between the early guard and the deploy step
+                elif deployed:
+                    current = after if after is not None else live_service(
+                        image, generation=1 if service is None else service["metadata"]["generation"] + 1)
+                elif service is None:
                     return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: Service [x] could not be found.")
-                return SimpleNamespace(returncode=0, stdout=json.dumps(service or SERVICE), stderr="")
+                else:
+                    current = service
+                return SimpleNamespace(returncode=0, stdout=json.dumps(current), stderr="")
             if "describe" in argv and "versions" in argv:
                 return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -819,6 +828,21 @@ class AutoDeployGuardTests(unittest.TestCase):
         code, _, calls = self.deploy(live_service(NEW_IMAGE), env=ENV)
         self.assertEqual(code, 0)
         self.assertEqual(calls[0][:3], ["gcloud", "projects", "describe"])  # no guard describe first
+
+    def test_the_workflow_deploying_meanwhile_is_never_overwritten_silently(self):
+        # Between the early guard and the deploy step: the step's own guard refuses before gcloud run deploy.
+        code, err, calls = self.deploy(live_service(IMAGE), race=live_service(NEW_IMAGE, generation=8))
+        self.assertEqual(code, 1)
+        self.assertIn(f"pass --image={NEW_IMAGE}", err)
+        self.assertFalse([c for c in calls if c[1:3] == ["run", "deploy"]])
+        # During the deploy step: the generation jumped, so the deploy fails loudly.
+        code, err, _ = self.deploy(live_service(IMAGE), after=live_service(IMAGE, generation=9))
+        self.assertEqual(code, 1)
+        self.assertIn("may have deployed a newer image meanwhile", err)
+        code, err, _ = self.deploy(live_service(IMAGE), after=live_service(NEW_IMAGE, generation=9))
+        self.assertEqual(code, 1)
+        # A deploy that changed nothing keeps the generation, and passes.
+        self.assertEqual(self.deploy(live_service(IMAGE), after=live_service(IMAGE, generation=7))[0], 0)
 
     def test_an_unreadable_service_is_refused(self):
         def run(argv):
@@ -932,12 +956,21 @@ class UpdateImageTests(unittest.TestCase):
         self.assertIn("50% of traffic", self.update(run)[2])
 
     def test_a_concurrent_change_during_the_update_fails_loudly(self):
-        for after in (live_service(NEW_IMAGE, generation=9), {**live_service(NEW_IMAGE), "metadata": {
-                "labels": {"spot-role": "control-watchdog"}}}):
-            run, calls = self.runner(after=after)
-            code, _, err = self.update(run)
-            self.assertEqual(code, 1)
-            self.assertIn("another change landed meanwhile", err)
+        run, _ = self.runner(after=live_service(NEW_IMAGE, generation=9))
+        code, _, err = self.update(run)
+        self.assertEqual(code, 1)
+        self.assertIn("another change landed meanwhile", err)
+        # No generation at all can't prove anything either.
+        run, _ = self.runner(after={**live_service(NEW_IMAGE), "metadata": {"labels": {"spot-role": "control-watchdog"}}})
+        self.assertEqual(self.update(run)[0], 1)
+
+    def test_status_of_an_older_generation_is_not_trusted(self):
+        reconciling = live_service(NEW_IMAGE, generation=8)
+        reconciling["status"]["observedGeneration"] = 7
+        run, calls = self.runner(service=reconciling)
+        code, _, err = self.update(run)
+        self.assertEqual(code, 1)
+        self.assertIn("describes generation 7, not 8", err)
 
     def test_a_named_but_unserved_image_is_not_reported_as_deployed(self):
         stuck = live_service(NEW_IMAGE, ready=False)  # an earlier attempt's revision never became ready
