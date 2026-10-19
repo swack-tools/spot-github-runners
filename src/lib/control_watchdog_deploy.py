@@ -1029,7 +1029,8 @@ def auto_deploy_guard(config: DeployConfig, runner: Runner = default_runner) -> 
     if current != config.image:
         raise DeployError(f"{ENV_AUTO_DEPLOY}=1: the image workflow deploys the watchdog, and the service runs "
                           f"{current or 'an unknown image'}; pass --image={current} to re-apply settings, or turn "
-                          "auto-deploy off (delete the WATCHDOG_DEPLOYER_SA repository variable) to pin another image")
+                          f"auto-deploy off to pin another image: delete the WATCHDOG_DEPLOYER_SA repository variable "
+                          f"and set {ENV_AUTO_DEPLOY}=0")
     return _generation(service)
 
 

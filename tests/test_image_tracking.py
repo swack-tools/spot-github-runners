@@ -723,6 +723,34 @@ class AbortVisibilityTests(unittest.TestCase):
         manager = h.manager()
         self.assertIn(D_B, manager.status(manager.observe())["image"]["failures"])
 
+    def test_the_abort_is_reported_during_the_cooldown_too(self):
+        h = TrackingHarness()
+        h.active()
+        abort_rollout(h)
+        h.registry.calls.clear()
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "WARNING") as logs:
+            plan = h.tick()
+        self.assertIn("cooldown", plan.reason)
+        self.assertIn("not healthy after", plan.reason)
+        self.assertTrue(any("image rollout held" in line for line in logs.output))
+        self.assertEqual(h.registry.calls, [])  # still no registry call while the cooldown holds
+
+    def test_a_retry_never_waives_the_cooldown_for_another_digest(self):
+        h = TrackingHarness()
+        h.active()
+        abort_rollout(h)
+        it.retry_failed(h.image, D_B, at=h.clock[0])
+        h.registry.tags["main"] = D_C  # :main moved before the retried digest could roll
+        plan = h.tick()
+        self.assertEqual(plan.action, "noop")
+        self.assertIn("doesn't cover", plan.reason)
+        self.assertIsNone(h.transition)
+        h.clock[0] += cv.ROTATION_COOLDOWN_SECONDS
+        plan = h.tick()  # after the cooldown the new digest rolls as usual, and uses the retry up
+        self.assertEqual(plan.action, "rotate")
+        self.assertEqual(h.transition["dashboard_image"], IMG_C)
+        self.assertNotIn("retry", h.image)
+
     def test_failures_stay_bounded_to_the_backed_off_digests(self):
         cache = {}
         for i in range(it.FAILED_DIGESTS_KEPT + 3):

@@ -1223,8 +1223,10 @@ To turn automatic deploys on:
 While `SPOT_WATCHDOG_AUTO_DEPLOY=1` is set, a full deploy refuses an `--image` other than the one the service
 runs, and prints that digest. It checks again right before `gcloud run deploy`, and afterwards it fails when the
 service's generation rose by more than one, which means the workflow deployed meanwhile. Re-applying settings
-never silently rolls the watchdog back. To pin another image, stop
-automatic deploys first: delete the `WATCHDOG_DEPLOYER_SA` variable, which skips the job. To also remove the
+never silently rolls the watchdog back.
+
+To pin another image, turn automatic deploys off first. Delete the `WATCHDOG_DEPLOYER_SA` variable, which skips
+the job, and set `SPOT_WATCHDOG_AUTO_DEPLOY=0`, which lifts the full deploy's image check. To also remove the
 deployer's access, turn off its account:
 
 ```bash
@@ -1366,7 +1368,7 @@ An aborted rollout is never silent:
 - The state's `image.failures` section keeps why each backed-off digest's rollout aborted, its commit, time, and
   transition. `status` shows it.
 - While `:main` names a backed-off digest, every check logs a warning, `image rollout held`, with the reason
-  the rollout aborted. The plan reason names it too, so the watchdog's tick output and `src/control_vm.py plan` show it.
+  the rollout aborted. During the cooldown that follows, the check names the last `:main` digest it saw. The plan reason names it too, so the watchdog's tick output and `src/control_vm.py plan` show it.
 - With `SPOT_DASHBOARD_ROLLOUT_STATUS=1`, the manager reports every rollout as a GitHub commit status with the
   context `spot-dashboard/rollout` on the image's commit. The status is `pending` when the rollout begins,
   `success` once the new VM serves, and `failure` with the reason when it aborts. The commit on `main`
@@ -1385,7 +1387,8 @@ PYTHONPATH=src python3 src/control_vm.py retry-image --apply
 It takes the project lock, the Cloud Storage lease with `SPOT_CONTROL_STATE_URI`, so it never races the
 watchdog. By default it picks the backed-off digest that `:main` names, or the only backed-off one. Name another
 with `--digest sha256:<digest>`. The next check rolls the digest out while `:main` still names it and every other
-condition holds. Aborts before the retry don't hold it for the cooldown, but a completed transition does. A
+condition holds. Aborts before the retry don't hold it for the cooldown, but a completed transition does,
+and any other digest still waits for the cooldown. A
 rollout that aborts again backs the digest off again.
 
 The state's `image` section records the active VM's image, read once from its `dashboard-image` metadata

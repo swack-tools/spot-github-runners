@@ -821,6 +821,7 @@ class AutoDeployGuardTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"pass --image={NEW_IMAGE}", err)
         self.assertEqual(len(calls), 1)
+        self.assertIn("delete the WATCHDOG_DEPLOYER_SA repository variable and set SPOT_WATCHDOG_AUTO_DEPLOY=0", err)
 
     def test_the_deployed_image_or_a_new_service_passes_and_off_never_checks(self):
         self.assertEqual(self.deploy(live_service(IMAGE))[0], 0)

@@ -27,7 +27,7 @@ import hashlib
 import json
 import re
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping
 
 from .https_transport import HttpResponse, Transport, TransportError, https_request
@@ -276,6 +276,12 @@ def _no(reason: str, **kw: Any) -> RolloutDecision:
     return RolloutDecision(False, reason, **kw)
 
 
+def backed_off_reason(digest: str, failure_reason: str | None) -> str:
+    why = f" ({failure_reason})" if failure_reason else ""
+    return (f"a rollout to {digest[:19]} aborted earlier{why}; waiting for a new {TRACK_MAIN} digest, or for "
+            f"control_vm.py retry-image --apply once the cause is fixed")
+
+
 def decide(*, transition_active: bool, active_ready: bool, cooling: bool, active_digest: str | None,
            active_revision: str | None, candidate_digest: str | None, candidate_revision: str | None,
            failed_digests: Any, workflow: str | None, ancestry: str | None, repository: str,
@@ -292,10 +298,7 @@ def decide(*, transition_active: bool, active_ready: bool, cooling: bool, active
     if candidate_digest == active_digest:
         return _no(f"active image is {TRACK_MAIN} ({candidate_digest[:19]})")
     if candidate_digest in (failed_digests or ()):
-        why = f" ({failure_reason})" if failure_reason else ""
-        return _no(f"a rollout to {candidate_digest[:19]} aborted earlier{why}; waiting for a new {TRACK_MAIN} "
-                   f"digest, or for control_vm.py retry-image --apply once the cause is fixed",
-                   digest=candidate_digest, backed_off=True)
+        return _no(backed_off_reason(candidate_digest, failure_reason), digest=candidate_digest, backed_off=True)
     if not active_revision:
         return _no("the active image's commit is unknown, so a newer image can't be proven newer")
     if not candidate_revision:
@@ -346,7 +349,9 @@ class ImageTracker:
         return digest, revision
 
     def evaluate(self, cache: dict, *, active_image: str | None, transition_active: bool, active_ready: bool,
-                 cooling: bool, now: float | None = None) -> RolloutDecision:
+                 cooling: bool, now: float | None = None, only_digest: str | None = None) -> RolloutDecision:
+        """``only_digest``: the cooldown was waived for an operator's retry of that digest, so any other candidate
+        still waits for the cooldown."""
         now = self.clock() if now is None else now
         gates = dict(transition_active=transition_active, active_ready=active_ready, cooling=cooling,
                      repository=self.repository)
@@ -354,13 +359,23 @@ class ImageTracker:
                                      candidate_revision=None, failed_digests=(), workflow=None, ancestry=None,
                                      failure_reason=None)
         if transition_active or not active_ready or cooling:
-            return decide(**gates, **facts)  # no network call while any gate is closed
+            decision = decide(**gates, **facts)  # no network call while any gate is closed
+            held = (cache.get("main") or {}).get("digest")
+            if cooling and held and held in (cache.get("failed") or ()):
+                # The last :main digest seen is backed off: say so during the cooldown too, not only after it.
+                return replace(decision, reason=f"{decision.reason}; "
+                                                f"{backed_off_reason(held, failure_of(cache, held).get('reason'))}",
+                               digest=held, backed_off=True)
+            return decision
         if self.registry is None or self.github is None:
             return _no(f"{ENV_IMAGE_TRACK_TOKEN} is not set, so image tracking can't read the registry")
         try:
             facts["candidate_digest"] = candidate = self.registry.resolve(TRACK_MAIN)
             if (cache.get("main") or {}).get("digest") != candidate:
                 cache["main"] = {"digest": candidate, "seen_at": now}
+            if only_digest and candidate != only_digest:
+                return _no(f"rotation cooldown active (the retry of {only_digest[:19]} doesn't cover the new "
+                           f"{TRACK_MAIN} digest {candidate[:19]})")
             facts["active_digest"], facts["active_revision"] = self.active_facts(cache, active_image or "")
             facts["failed_digests"] = list(cache.get("failed") or ())
             facts["failure_reason"] = failure_of(cache, candidate).get("reason")

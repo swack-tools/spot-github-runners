@@ -1461,9 +1461,15 @@ class ControlVmManager:
         now = self.clock()
         last_abort = self.cstate.get("last_abort_at") or 0
         retry = (self.cstate.get("image") or {}).get("retry")
-        if isinstance(retry, dict) and float(retry.get("at") or 0) >= last_abort:
+        only_digest = None
+        if isinstance(retry, dict) and retry.get("digest") and float(retry.get("at") or 0) >= last_abort:
             # An operator lifted a back-off after fixing its cause (retry-image): aborts before that request don't
-            # hold the retry for the cooldown; a completed transition still does, and so does a later abort.
+            # hold a rollout of that digest for the cooldown. Any other digest still waits, a completed transition
+            # still counts, and so does a later abort.
+            last_end = self.cstate.get("last_transition_end_at") or 0
+            if not (last_end and now - last_end < ROTATION_COOLDOWN_SECONDS) and \
+                    last_abort and now - last_abort < ROTATION_COOLDOWN_SECONDS:
+                only_digest = str(retry["digest"])
             last_abort = 0
         last_end = max(self.cstate.get("last_transition_end_at") or 0, last_abort)
         cooling = bool(last_end and now - last_end < ROTATION_COOLDOWN_SECONDS)
@@ -1471,7 +1477,7 @@ class ControlVmManager:
         cache = copy.deepcopy(self.cstate.get("image") or {})
         before = copy.deepcopy(cache)
         decision = self._tracker().evaluate(cache, active_image=active_image, transition_active=False,
-                                            active_ready=ready, cooling=cooling, now=now)
+                                            active_ready=ready, cooling=cooling, now=now, only_digest=only_digest)
         if cache != before:
             self.cstate["image"] = cache
         if decision.backed_off:
