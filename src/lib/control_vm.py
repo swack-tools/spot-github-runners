@@ -2207,14 +2207,22 @@ class ControlVmManager:
             # Release only the restored container with the state it froze at: never the failed image (the watcher may
             # not have swapped back yet) and never state below the floor. Left frozen, it is unhealthy, and the
             # planner's recovery replaces it from the KV snapshot.
-            hold = None
+            hold, stale = None, False
             if t.get("image_written") and health.image == t["dashboard_image"]:
                 hold = f"{vm.name} still runs {t['dashboard_image']}"
             elif not health.hydrated:
                 hold = f"{vm.name} has not reported hydrated state ({health.detail})"
             elif isinstance(floor, int) and (health.state_version is None or health.state_version < floor):
-                hold = f"{vm.name} reports state_version {health.state_version} < {floor}"
+                hold, stale = f"{vm.name} reports state_version {health.state_version} < {floor}", True
             if vm.running and hold:
+                if stale:
+                    # Reachable but behind the state it froze at: never release it, and never end the transition,
+                    # which would let a recovery adopt this state as its floor. An operator must resolve it.
+                    t["error"] = f"held frozen, operator action needed: {hold}"
+                    t["updated_at"] = self.clock()
+                    self.save()
+                    self._note(t["error"], level=logging.ERROR)
+                    return "wait"
                 if waited < IMAGE_UPDATE_TIMEOUT_SECONDS:
                     t["error"] = f"waiting to unfreeze: {hold}"
                     t["updated_at"] = self.clock()

@@ -605,6 +605,9 @@ main() {
   write_dashboard_env
 
   install_packages
+  # Before anything that can fail (pull, build, container replacement), so a later metadata change always has a
+  # watcher to apply it, including a rollback after this run fails.
+  install_image_watcher
   if [[ -n "$DASHBOARD_IMAGE" ]]; then
     pull_published_image
     follow_image_changes
@@ -616,7 +619,6 @@ main() {
   run_containers
   unset GITHUB_TOKEN
   remove_old_images
-  install_image_watcher
   report_health
 }
 

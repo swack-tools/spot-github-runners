@@ -467,6 +467,20 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         self.assertEqual(h.image["active"]["image"], IMG_B)
 
+    def test_a_rollback_to_stale_state_holds_until_an_operator_acts(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.reset_rc = 0
+        h.swapped(image=IMG_A, version=3)  # the old image came back with state behind the frozen version
+        h.http.versions["a"] = 3
+        for _ in range(3):
+            h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+            with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+                h.tick()
+        self.assertIn("operator action needed", h.transition["error"])
+        self.assertNotIn(("unfreeze", "a"), h.events)
+
     def test_a_reset_that_reports_failure_is_never_repeated(self):
         h = TrackingHarness()
         h.active()

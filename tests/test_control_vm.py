@@ -3296,8 +3296,10 @@ class StartupScriptImageWatcherTests(unittest.TestCase):
         self.assertIn("readonly RUN_LOCK=/run/spot-control-startup.lock", self.text)
         lock = self.main.index('exec 9>"$RUN_LOCK"\n  flock 9')
         self.assertLess(lock, self.main.index("wait_for_metadata"))
-        self.assertLess(self.main.index("run_containers"), self.main.index("install_image_watcher"))
-        self.assertLess(self.main.index("install_image_watcher"), self.main.index("report_health"))
+        watcher = self.main.index("install_image_watcher")
+        self.assertLess(self.main.index("install_packages"), watcher)  # needs docker for its inspect
+        for later in ("pull_published_image", "build_from_source", "run_containers"):
+            self.assertLess(watcher, self.main.index(later), later)  # installed even when these fail
 
     def test_the_watcher_unit_waits_for_the_boot_run_and_is_started_without_blocking(self):
         self.assertIn("After=google-startup-scripts.service docker.service network-online.target", self.text)
