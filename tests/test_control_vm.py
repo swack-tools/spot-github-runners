@@ -3294,6 +3294,16 @@ class StartupScriptImageWatcherTests(unittest.TestCase):
         self.main = re.search(r"^main\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
         self.watch = re.search(r"<<'WATCH'\n(.*?)^WATCH$", self.text, re.S | re.M).group(1)
 
+    def test_each_run_reports_its_progress(self):
+        self.assertLess(self.main.index("wait_for_metadata"), self.main.index('report_run "running $(date +%s)"'))
+        self.assertLess(self.main.index("remove_old_images"), self.main.index('report_run "done $DASHBOARD_IMAGE_REF"'))
+        self.assertLess(self.main.index('report_run "done $DASHBOARD_IMAGE_REF"'), self.main.index("report_health"))
+        cleanup = re.search(r"^cleanup\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.assertTrue(cleanup.startswith('cleanup() {\n  local status=$?\n'))
+        self.assertIn('report_run "failed $(date +%s)"', cleanup)
+        self.assertIn('"$METADATA/instance/guest-attributes/spot-dashboard/run"', self.text)
+        self.assertEqual(cv.metadata_items(config(), "a")["enable-guest-attributes"], "TRUE")
+
     def test_runs_never_overlap_and_the_watcher_starts_after_the_containers(self):
         self.assertIn("readonly RUN_LOCK=/run/spot-control-startup.lock", self.text)
         lock = self.main.index('exec 9>"$RUN_LOCK"\n  flock 9')

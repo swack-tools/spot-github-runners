@@ -1293,6 +1293,10 @@ free-tier e2-micro. The VM keeps its slot, boot disk, state file, and `origin:ac
    reached the state file, and clears the freeze. The rollout completes when the container serves healthy with at
    least the frozen `state_version`.
 
+Each startup script run reports its progress in the guest attribute `spot-dashboard/run`, which the
+`enable-guest-attributes=TRUE` metadata allows: `running`, then `done` or `failed`. A run in progress may still
+replace the container, so the manager releases a container, in a rollout or a rollback, only after its run ends.
+
 A VM created before the watcher existed doesn't swap its container. When the VM still serves another image
 after 5 minutes, the manager resets it once. The reset boots the refreshed startup script, which pulls the new
 image and installs the watcher for the next rollout. A reset takes the dashboard offline for a few minutes.

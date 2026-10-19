@@ -254,9 +254,17 @@ class WatchdogGcloud(tcv.FakeGcloud):
         self.metadata_rc = 0
         self.reset_rc = 0
         self.metadata_scripts: list[str] = []
+        self.runs: dict[str, str] = {}  # guest attribute spot-dashboard/run by VM name
 
     def __call__(self, argv):
         verb = argv[2:4]
+        if verb == ["instances", "get-guest-attributes"]:
+            self.calls.append(list(argv))
+            assert "--query-path=spot-dashboard/" in argv
+            if argv[4] not in self.runs:
+                return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: The resource was not found")
+            rows = [{"namespace": "spot-dashboard", "key": "run", "value": self.runs[argv[4]]}]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
         if verb == ["instances", "add-metadata"]:
             self.calls.append(list(argv))
             items = dict(item.split("=", 1) for item in
@@ -569,6 +577,49 @@ class RolloutTests(unittest.TestCase):
         h.tick()
         self.assertIsNone(h.transition)
         self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
+    def test_a_container_is_released_only_once_its_startup_run_settled(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        self.assertIn("a startup run is in progress", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events)
+        h.gcloud.runs["spot-control-a"] = f"done {IMG_B}"
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertIn(("import", "a"), h.events)
+
+    def test_a_rollback_waits_for_a_pending_startup_run(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"  # still pulling the new image
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"
+        h.tick()  # rollback: the old container still serves, but the run may yet replace it
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertIn("a startup run is in progress", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events)
+        h.gcloud.runs["spot-control-a"] = f"done {IMG_A}"  # it followed the restored image
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+
+    def test_a_stale_running_report_does_not_block_forever(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0]) - cv.IMAGE_UPDATE_TIMEOUT_SECONDS - 1}"
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
 
     def test_a_reset_that_reports_failure_is_never_repeated(self):
         h = TrackingHarness()

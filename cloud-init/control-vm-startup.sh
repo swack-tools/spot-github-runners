@@ -348,7 +348,19 @@ follow_image_changes() {
 
 BUILD_DIR=""
 PREVIOUS_IMAGE_ID=""
+# Report this run as the guest attribute spot-dashboard/run (the instance metadata enable-guest-attributes=TRUE
+# allows it): "running <unix time>", then "done <image>" or "failed <unix time>". The controller releases a container
+# only once no run is pending, since a pending run may still replace it. Best effort: a failed write changes nothing.
+report_run() {
+  curl -fsS -X PUT --max-time 5 -H 'Metadata-Flavor: Google' --data "$1" \
+    "$METADATA/instance/guest-attributes/spot-dashboard/run" >/dev/null 2>&1 || true
+}
+
 cleanup() {
+  local status=$?
+  if ((status != 0)); then
+    report_run "failed $(date +%s)"
+  fi
   if [[ -n "$BUILD_DIR" ]]; then
     rm -rf "$BUILD_DIR"
   fi
@@ -569,6 +581,7 @@ main() {
   exec 9>"$RUN_LOCK"
   flock 9
   wait_for_metadata
+  report_run "running $(date +%s)"
   PROJECT="$(curl -fsS -H 'Metadata-Flavor: Google' "$METADATA/project/project-id")"
   # projects/<number>/machineTypes/<type>; the shape decides the swap file and the container memory limits.
   MACHINE_TYPE="$(curl -fsS --retry 5 --retry-connrefused --max-time 10 -H 'Metadata-Flavor: Google' \
@@ -636,6 +649,7 @@ main() {
   run_containers
   unset GITHUB_TOKEN
   remove_old_images
+  report_run "done $DASHBOARD_IMAGE_REF"
   report_health
 }
 

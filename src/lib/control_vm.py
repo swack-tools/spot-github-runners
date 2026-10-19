@@ -133,6 +133,8 @@ METADATA_KEYS = (
     "dashboard-config-repo",
     "dashboard-controlled-targets",
     "dashboard-global-admins",
+    # Lets the startup script report its runs (guest attribute spot-dashboard/run; see _startup_run_settled).
+    "enable-guest-attributes",
 )
 # Dashboard target policy. Neither is a secret, so both travel as instance metadata and the startup script
 # writes them to the dashboard env file on every boot. GCE metadata values can't hold commas in a
@@ -524,6 +526,7 @@ def metadata_items(config: ControlConfig, slot: str) -> dict[str, str]:
         "dashboard-config-repo": config.config_repo,
         "dashboard-controlled-targets": ";".join(controlled_target_names(config.controlled_targets)),
         "dashboard-global-admins": global_admins_metadata(config.global_admins),
+        "enable-guest-attributes": "TRUE",
     }
     problems = config_repo_problems(config.config_repo)
     if problems:
@@ -1027,6 +1030,12 @@ def set_metadata_command(vm: ControlVm, project: str, items: Mapping[str, str],
     if startup_script_path:
         command.append(f"--metadata-from-file=startup-script={startup_script_path}")
     return command + ["--quiet"]
+
+
+def guest_attributes_command(vm: ControlVm, project: str) -> list[str]:
+    """Read-only: the guest attributes the control VM startup script reports (namespace spot-dashboard)."""
+    return ["gcloud", "compute", "instances", "get-guest-attributes", vm.name, f"--zone={vm.zone}",
+            f"--project={project}", "--query-path=spot-dashboard/", "--format=json"]
 
 
 def reset_command(vm: ControlVm, project: str) -> list[str]:
@@ -2126,6 +2135,30 @@ class ControlVmManager:
             return True, f"unfroze slot {slot}"
         return False, f"unfreeze of slot {slot} returned {status}"
 
+    def _startup_run_settled(self, vm: ControlVm) -> tuple[bool, str]:
+        """Whether no startup script run is pending on ``vm``: a run reports ``running <unix time>`` when it starts
+        and ``done <image>`` or ``failed <unix time>`` when it ends (guest attribute spot-dashboard/run). A pending
+        run may still replace the container, so a container is released only once its run settled. No report (a
+        VM that never ran a reporting script) and a ``running`` report older than the update timeout (a run that
+        died without reporting) count as settled."""
+        result = self.gcloud(guest_attributes_command(vm, self.config.project))
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            if _NOT_FOUND_RE.search(stderr):
+                return True, "no startup run reported"
+            return False, f"could not read the startup run of {vm.name}: {stderr[:200]}"
+        try:
+            rows = json.loads(result.stdout or "[]")
+        except ValueError:
+            return False, f"unreadable guest attributes of {vm.name}"
+        value = next((str(r.get("value") or "") for r in rows if isinstance(r, dict) and r.get("key") == "run"), "")
+        if not value.startswith("running"):
+            return True, value or "no startup run reported"
+        started = value.removeprefix("running").strip()
+        if started.isdigit() and self.clock() - int(started) > IMAGE_UPDATE_TIMEOUT_SECONDS:
+            return True, f"stale report {value!r}"
+        return False, f"a startup run is in progress on {vm.name} ({value})"
+
     def _step_wait_image(self, t: dict, obs: Observation) -> str:
         slot, image = t["new_slot"], t["dashboard_image"]
         vm = obs.vm(slot)
@@ -2138,8 +2171,9 @@ class ControlVmManager:
         floor = t.get("frozen_version") or 0
         release_error = None
         if vm.running and result.image == image and result.hydrated and not t.get("released"):
-            # The new container started frozen from the marker on disk.
-            ok, detail = self._release(t, slot)
+            # The new container started frozen from the marker on disk. Released once its startup run settled.
+            settled, detail = self._startup_run_settled(vm)
+            ok, detail = self._release(t, slot) if settled else (False, detail)
             self._note(detail, level=logging.INFO if ok else logging.WARNING)
             if ok:
                 result = probe_health(self.requester, self.config, slot)
@@ -2244,7 +2278,9 @@ class ControlVmManager:
                 if t.get("image_written") and health.image == t["dashboard_image"]:
                     detail = f"{vm.name} still runs {t['dashboard_image']}"  # the watcher has not swapped back yet
                 else:
-                    ok, detail = self._release(t, slot)
+                    # A pending startup run (one that began before the rollback) may still replace the container.
+                    settled, detail = self._startup_run_settled(vm)
+                    ok, detail = self._release(t, slot) if settled else (False, detail)
                     if ok:
                         self._note("%s after the rollback", detail)
                         return self._end_abort(t)
