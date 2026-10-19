@@ -209,6 +209,7 @@ class FakeHttp:
         self.versions = {"a": 7, "b": 0}
         self.freeze_status = 200
         self.import_status = 200
+        self.import_response_lost = False  # the import applies, but the caller sees no answer
         self.unfreeze_status = 200
         self.snapshot_status = 200
 
@@ -248,6 +249,8 @@ class FakeHttp:
                 self.versions[slot] = max(self.versions[slot], envelope["state_version"])
                 if slot in self.health and self.health[slot][1].get("frozen"):  # an import clears the freeze
                     self.health[slot] = (200, dict(self.health[slot][1], status="ok", frozen=False))
+            if self.import_response_lost:
+                return None, b""
             return self.import_status, json.dumps({"state_version": self.versions[slot], "imported": True}).encode()
         if op == "unfreeze":
             if self.unfreeze_status == 200 and slot in self.health and self.health[slot][1].get("frozen"):

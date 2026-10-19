@@ -2126,11 +2126,17 @@ class ControlVmManager:
         state file), raises a container that came up behind it, and clears the freeze. Without a snapshot (the
         container was never replaced), unfreeze it."""
         if t.get("release_attempted") and not t.get("released"):
-            # An earlier release may have landed without its answer, and the container may have accepted changes
-            # since: freeze it again and take its current state, rather than importing the older snapshot over it.
-            status, body = self._control(slot, "freeze", "POST")
-            if not (status == 200 and self._record_freeze(t, body)):
-                return False, f"freeze before retrying the release of slot {slot} returned {status}"
+            # An earlier release got no confirmation. A container that is still frozen never took it (an import or
+            # an unfreeze clears the freeze): retry with the same snapshot, which may hold what its state lacks at
+            # the same version. One that is no longer frozen took it, so its state includes the snapshot plus any
+            # changes since: freeze it again and take that state instead of importing the older snapshot over it.
+            health = probe_health(self.requester, self.config, slot)
+            if not health.hydrated:
+                return False, f"slot {slot} is not reachable to retry the release: {health.detail}"
+            if not health.frozen:
+                status, body = self._control(slot, "freeze", "POST")
+                if not (status == 200 and self._record_freeze(t, body)):
+                    return False, f"freeze before retrying the release of slot {slot} returned {status}"
         t["release_attempted"] = True  # before the call: a lost response may still have released it
         self.save()
         snapshot = t.get("frozen_snapshot")
@@ -2277,6 +2283,13 @@ class ControlVmManager:
         vm = obs.vm(slot)
         previous = t.get("from_image") or ""
         waited = self.clock() - t["step_started_at"]
+        if (vm is not None and vm.running and t.get("release_attempted") and not t.get("refrozen")
+                and t.get("image_written") and not t.get("restored")
+                and (obs.health.get(slot) or HealthResult.unknown()).frozen):
+            # Still frozen: no release landed, so it is drained and its (possibly stale) state must not replace the
+            # kept snapshot.
+            t["refrozen"] = True
+            self.save()
         if (vm is not None and vm.running and t.get("release_attempted") and not t.get("refrozen")
                 and t.get("image_written") and not t.get("restored")):
             # The new container may have been released and accepted changes: drain it again before the watcher

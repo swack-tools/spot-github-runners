@@ -495,8 +495,9 @@ class RolloutTests(unittest.TestCase):
         h.http.import_status = 500
         h.swapped()  # the new image runs, but its release keeps failing
         h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
-        h.tick()  # rollback: freeze it again, pin the previous image
-        self.assertEqual(h.mutations()[-2:], [("freeze", "a"), ("set-image", "spot-control-a", IMG_A)])
+        h.tick()  # rollback: pin the previous image (still frozen, so no refreeze is needed)
+        self.assertEqual(h.mutations()[-1], ("set-image", "spot-control-a", IMG_A))
+        self.assertEqual(h.events.count(("freeze", "a")), 1)
         for _ in range(2):
             h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
             with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
@@ -512,12 +513,12 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.http.import_status = None  # the response is lost; the release may have landed
+        h.http.import_response_lost = True  # the release lands; its answer is lost
         h.swapped()
         h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
         h.tick()
         self.assertNotIn(("reset", "spot-control-a"), h.events)
-        h.http.import_status = 200
+        h.http.import_response_lost = False
         h.http.health["a"] = (503, dict(h.http.health["a"][1], status="starting", frozen=False))  # released, not ready
         h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
         h.tick()
@@ -537,7 +538,7 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.http.import_status = None  # the release may have landed
+        h.http.import_response_lost = True  # the release lands; its answer is lost
         h.swapped()
         h.clock[0] += 180
         h.tick()
@@ -685,11 +686,11 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.http.import_status = None  # the import may have landed
+        h.http.import_response_lost = True  # the import lands; its answer is lost
         h.swapped()
         h.clock[0] += 180
         h.tick()
-        h.http.import_status = 200
+        h.http.import_response_lost = False
         h.clock[0] += 180
         h.tick()
         imports = [i for i, e in enumerate(h.events) if e == ("import", "a")]
@@ -697,6 +698,23 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(len(imports), 2)
         self.assertTrue(any(imports[0] < f < imports[1] for f in freezes), h.events)
         self.assertIsNone(h.transition)
+
+    def test_a_failed_import_into_a_stale_container_keeps_the_original_snapshot(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        original = h.transition["frozen_snapshot"]
+        h.http.import_status = 500  # a definite failure: still frozen
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        h.http.import_status = 200
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual([e for e in h.events if e == ("freeze", "a")], [("freeze", "a")])  # no refreeze
+        posted = [json.loads(c[3]) for c in h.http.calls if c[1].endswith("/api/control/import")]
+        self.assertEqual(posted[-1], original)
 
     def test_preservation_never_overwrites_a_snapshot_kept_in_kv(self):
         from lib.edge_state import KV_STATE_KEY, build_snapshot
@@ -742,7 +760,7 @@ class RolloutTests(unittest.TestCase):
         h.active()
         h.tick()
         h.kv.store.pop(KV_STATE_KEY, None)
-        h.http.import_status = None  # the release may have landed
+        h.http.import_response_lost = True  # the release lands; its answer is lost
         h.swapped()
         h.clock[0] += 180
         h.tick()
@@ -776,7 +794,7 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.http.import_status = None
+        h.http.import_response_lost = True
         h.swapped()
         h.clock[0] += 180
         h.tick()
