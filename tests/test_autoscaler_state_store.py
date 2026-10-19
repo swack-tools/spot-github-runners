@@ -16,9 +16,20 @@ from lib import spot_runner_autoscaler as controller
 from lib.autoscaler_state_store import AutoscalerStateError, GcsStateStore
 from lib.gcs_control_state import GcsAmbiguous, GcsError, GcsObject, GcsPreconditionFailed, ObjectInfo
 
-URI = "gs://homelab-424523-spot-control-state/autoscaler/state-swack-tools-a7245ac03c.json"
+# A bucket name under the reserved example domain: a request that escaped a fake could reach no real bucket.
+URI = "gs://spot-control-state.example.com/autoscaler/state-swack-tools-a7245ac03c.json"
 OBJECT = "autoscaler/state-swack-tools-a7245ac03c.json"
 RECEIPT = "oxidex-runners-uswest1-a-grks-tn3q3cvuy4y-" + "0" * 32 + "-deployment.json"
+
+
+def setUpModule():
+    # No test here may reach Cloud Storage: any real HTTPS request fails the test.
+    patcher = patch("lib.gcs_control_state.https_request", side_effect=AssertionError("live Cloud Storage request"))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    token = patch("lib.gcs_control_state.AccessToken.__call__", side_effect=AssertionError("live access token"))
+    token.start()
+    unittest.addModuleCleanup(token.stop)
 
 
 class FakeGcs:
@@ -67,7 +78,7 @@ def make_store(fake=None, read_only=False):
 
 class UriTests(unittest.TestCase):
     def test_parses_a_json_object_uri(self):
-        self.assertEqual(store_module.parse_uri(URI), ("homelab-424523-spot-control-state", OBJECT))
+        self.assertEqual(store_module.parse_uri(URI), ("spot-control-state.example.com", OBJECT))
 
     def test_refuses_anything_else(self):
         for uri in ("", "gs://bucket", "gs://bucket/", "gs://bucket/state", "s3://bucket/state.json",
@@ -166,21 +177,34 @@ class ReceiptTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.dir = Path(directory.name)
 
-    def test_receipts_are_mirrored_once_and_restored_when_missing(self):
+    def test_a_receipt_is_uploaded_and_restored_when_missing(self):
         store, fake = make_store()
         receipt = self.dir / RECEIPT
         receipt.write_text('{"name": "vm"}')
-        (self.dir / "state.json").write_text("{}")
-        (self.dir / "other-deployment.json").write_text("{}")  # not a receipt name: never uploaded
-        store.mirror_once(self.dir)
-        store.mirror_once(self.dir)
-        names = [name for name, _ in fake.puts]
-        self.assertEqual(names, [store.receipt_object(RECEIPT)])
+        store.upload_receipt(receipt)
+        self.assertEqual([name for name, _ in fake.puts], [store.receipt_object(RECEIPT)])
         self.assertEqual(store.receipt_object(RECEIPT),
                          "autoscaler/state-swack-tools-a7245ac03c/receipts/" + RECEIPT)
+        receipt.write_text('{"name": "vm", "tier": "small"}')  # the manager writes it a second time
+        store.upload_receipt(receipt)
         receipt.unlink()
         self.assertTrue(store.restore_receipt(receipt))
-        self.assertEqual(receipt.read_text(), '{"name": "vm"}')
+        self.assertEqual(receipt.read_text(), '{"name": "vm", "tier": "small"}')
+
+    def test_an_upload_that_is_not_proven_raises(self):
+        store, fake = make_store()
+        receipt = self.dir / RECEIPT
+        receipt.write_text("{}")
+        fake.fail_put = GcsError("HTTP 503")
+        with self.assertRaisesRegex(AutoscalerStateError, "could not save deployment receipt"):
+            store.upload_receipt(receipt)
+        fake.fail_put = None
+        fake.ambiguous, fake.ambiguous_lands = [True], [True]
+        store.upload_receipt(receipt)  # landed: the read-back proves it
+        bad = self.dir / "other-deployment.json"
+        bad.write_text("{}")
+        with self.assertRaises(AutoscalerStateError):
+            store.upload_receipt(bad)
 
     def test_restore_of_an_unknown_or_unsafe_name_does_nothing(self):
         store, _ = make_store()
@@ -188,18 +212,33 @@ class ReceiptTests(unittest.TestCase):
         self.assertFalse(store.restore_receipt(self.dir / "../escape-deployment.json"))
         self.assertFalse((self.dir / RECEIPT).exists())
 
-    def test_a_read_only_store_does_not_mirror(self):
+    def test_a_read_only_store_never_uploads(self):
         store, fake = make_store(read_only=True)
         (self.dir / RECEIPT).write_text("{}")
-        store.mirror_once(self.dir)
+        with self.assertRaises(AutoscalerStateError):
+            store.upload_receipt(self.dir / RECEIPT)
         self.assertEqual(fake.puts, [])
 
-    def test_stop_mirror_copies_what_the_thread_has_not(self):
-        store, fake = make_store()
-        store.start_mirror(self.dir, interval=3600)
-        (self.dir / RECEIPT).write_text("{}")
-        store.stop_mirror(self.dir)
-        self.assertEqual([name for name, _ in fake.puts], [store.receipt_object(RECEIPT)])
+    def test_the_deployment_manager_saves_its_receipt_before_it_goes_on(self):
+        from lib import runner_manager as manager
+        from lib.runner_fleet import GceVm
+        fake = FakeGcs()
+        receipt = self.dir / RECEIPT
+        args = SimpleNamespace(deployment_receipt=receipt, instance_name="oxidex-runners-uswest1-a-grks-tn3q3cvuy4y",
+                               runner_count=2, runner_memory_gb=15)
+        vm = GceVm(name=args.instance_name, zone="us-west1-a", status="RUNNING", machine_type="n4d-standard-4",
+                   instance_id="5829028809981797700", spot=True)
+        factory = lambda uri: GcsStateStore(uri, client=fake)  # noqa: E731
+        with patch.dict("os.environ", {store_module.ENV_STATE_URI: URI}), \
+                patch.object(store_module, "GcsStateStore", side_effect=factory):
+            manager.write_deployment_receipt(args, vm)
+            self.assertEqual([name for name, _ in fake.puts],
+                             ["autoscaler/state-swack-tools-a7245ac03c/receipts/" + RECEIPT])
+            fake.fail_put = GcsError("HTTP 403")
+            with self.assertRaises(AutoscalerStateError):
+                manager.write_deployment_receipt(args, vm)
+        with patch.dict("os.environ", {store_module.ENV_STATE_URI: ""}):
+            self.assertFalse(store_module.save_receipt_from_env(receipt))
 
 
 class AutoscalerIntegrationTests(unittest.TestCase):

@@ -423,11 +423,14 @@ def custom_role_file(title: str, permissions: Sequence[str]) -> str:
                        "stage": "GA", "includedPermissions": included}, indent=2)
 
 
-def read_role_permissions(project: str, runner: Runner, apis: Sequence[str] = ()) -> tuple[str, ...]:
+def read_role_permissions(project: str, runner: Runner, apis: Sequence[str] = (),
+                          select: Callable[[Sequence[str], Mapping[str, str]], tuple[str, ...]] | None = None
+                          ) -> tuple[str, ...]:
     """Read the base role and the project's custom-role support levels; raises DeployError on failure.
 
     ``apis`` are enabled first: on a fresh project the IAM API is off, and a permission whose service API is off may
-    be missing from the testable permissions."""
+    be missing from the testable permissions. ``select`` picks the role's permissions from the base role's and the
+    support levels (default :func:`role_permissions`; the autoscaler deploy passes a narrower one)."""
     if apis:
         enabled = runner(["gcloud", "services", "enable", *apis, f"--project={project}"])
         if enabled.returncode != 0:
@@ -443,7 +446,7 @@ def read_role_permissions(project: str, runner: Runner, apis: Sequence[str] = ()
         support = {row["name"]: row.get("customRolesSupportLevel", "SUPPORTED") for row in json.loads(testable.stdout)}
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise DeployError(f"could not read {BASE_COMPUTE_ROLE}'s permissions: {exc}") from exc
-    permissions = role_permissions(base, support)
+    permissions = (select or role_permissions)(base, support)
     if not any(p == "compute.instances.create" for p in permissions):
         raise DeployError(f"{BASE_COMPUTE_ROLE} returned no usable permissions")
     return permissions

@@ -799,10 +799,15 @@ class CustomComputeRoleTests(unittest.TestCase):
         # The predefined role, which can write project metadata, is never granted.
         self.assertFalse([c for c in calls if "add-iam-policy-binding" in c and flag(c, "role") == PREDEFINED_ROLE])
 
-    def test_the_autoscaler_reuses_the_same_permission_filter(self):
+    def test_the_autoscaler_reads_its_role_through_the_same_code_with_its_own_filter(self):
         from lib import autoscaler_deploy
-        self.assertIs(autoscaler_deploy.role_permissions, deploy.role_permissions)
-        self.assertEqual(autoscaler_deploy.EXCLUDED_PERMISSIONS, deploy.EXCLUDED_PERMISSIONS)
+        self.assertIs(autoscaler_deploy.EXCLUDED_PERMISSIONS, deploy.EXCLUDED_PERMISSIONS)
+        run, calls, _ = self.runner()
+        config = autoscaler_deploy.AutoscalerDeployConfig(project=PROJECT)
+        self.assertEqual(autoscaler_deploy.read_role_permissions(config, run),
+                         autoscaler_deploy.role_permissions(BASE_ROLE, {r["name"]: r["customRolesSupportLevel"]
+                                                                        for r in TESTABLE}))
+        self.assertEqual(calls[0][1:3], ["services", "enable"])
 
     def test_the_apis_are_enabled_before_the_base_role_is_read(self):
         run, calls, _ = self.runner()

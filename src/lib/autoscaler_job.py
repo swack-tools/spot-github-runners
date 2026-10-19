@@ -44,6 +44,7 @@ ENV_SSH_KEY_FILE = "SPOT_AUTOSCALER_SSH_KEY_FILE"
 ENV_FLOOR_STATE_URI = "SPOT_RUNNER_FLOOR_STATE_URI"
 STATE_DIR = Path("/tmp/spot-runner-autoscaler")
 READ_ONLY_SCOPE = "https://www.googleapis.com/auth/cloud-platform.read-only"
+TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 GITHUB_SECRET_ROOT = "/secrets/autoscaler-github"
 SSH_SECRET_ROOT = "/secrets/autoscaler-ssh"
 _TRUE = ("1", "true", "yes", "on")
@@ -150,14 +151,39 @@ def install_ssh_key(env: Mapping[str, str], home: Path,
     return private
 
 
-def install_read_only_gcloud_token(directory: Path, fetch: Callable[[str], str] | None = None) -> Path:
-    """Write a read-only-scoped access token of the job's account for gcloud (``CLOUDSDK_AUTH_ACCESS_TOKEN_FILE``)."""
+def token_scopes(token: str, transport: Callable[..., object] | None = None) -> set[str]:
+    """The scopes Google's tokeninfo endpoint reports for ``token`` (sent in the POST body, never in a URL)."""
+    import json
+    import urllib.parse
+
+    from .https_transport import TransportError, https_request
+
+    body = urllib.parse.urlencode({"access_token": token}).encode("ascii")
+    try:
+        response = (transport or https_request)("POST", TOKENINFO_URL,
+                                                {"Content-Type": "application/x-www-form-urlencoded"}, body, 10.0)
+        info = json.loads(response.body.decode("utf-8")) if response.status == 200 else None
+    except (TransportError, ValueError, UnicodeDecodeError) as exc:
+        raise JobConfigError(f"could not check the dry run token's scopes: {exc}") from exc
+    if not isinstance(info, dict) or not isinstance(info.get("scope"), str):
+        raise JobConfigError("tokeninfo did not report the dry run token's scopes")
+    return set(info["scope"].split())
+
+
+def install_read_only_gcloud_token(directory: Path, fetch: Callable[[str], str] | None = None,
+                                   scopes: Callable[[str], set[str]] | None = None) -> Path:
+    """Write a read-only-scoped access token of the job's account for gcloud (``CLOUDSDK_AUTH_ACCESS_TOKEN_FILE``).
+
+    The metadata server narrows a token only when ``scopes`` comes with ``enforce_scopes=true``; without it the
+    token keeps the account's full scope. Tokeninfo then proves the token holds the read-only scope and no other,
+    or the dry run doesn't start."""
     import json
     import urllib.parse
 
     from . import compute_api
 
-    url = f"{compute_api.METADATA_TOKEN_URL}?scopes={urllib.parse.quote(READ_ONLY_SCOPE, safe='')}"
+    url = (f"{compute_api.METADATA_TOKEN_URL}?scopes={urllib.parse.quote(READ_ONLY_SCOPE, safe='')}"
+           "&enforce_scopes=true")
     try:
         raw = (fetch or compute_api._metadata_get)(url)
         token = json.loads(raw).get("access_token")
@@ -165,6 +191,10 @@ def install_read_only_gcloud_token(directory: Path, fetch: Callable[[str], str] 
         raise JobConfigError(f"could not get a read-only access token for the dry run: {exc}") from exc
     if not isinstance(token, str) or not token.strip() or any(c.isspace() for c in token.strip()):
         raise JobConfigError("the metadata server returned no read-only access token for the dry run")
+    granted = (scopes or token_scopes)(token.strip())
+    if granted != {READ_ONLY_SCOPE}:
+        raise JobConfigError(f"the dry run token has scopes {sorted(granted)}, not only {READ_ONLY_SCOPE}; the dry "
+                             "run does not start")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "gcloud-read-only-token"
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)

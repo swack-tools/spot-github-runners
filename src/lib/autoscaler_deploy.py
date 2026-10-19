@@ -69,15 +69,18 @@ ROLE_MONITORING_VIEWER = "roles/monitoring.viewer"
 ROLE_METRIC_WRITER = "roles/monitoring.metricWriter"
 ROLE_LOG_WRITER = "roles/logging.logWriter"
 HOSTS_CONDITION_TITLE = "spot-runner-autoscaler-hosts"
+SECRET_LABEL = "spot-runner-autoscaler"
 # The compute role is roles/compute.instanceAdmin.v1 without the permissions that reach past runner hosts. The IAM
 # condition can only narrow instances and disks; the project itself always passes it, and the base role's
 # compute.projects.setCommonInstanceMetadata would let gcloud compute ssh put the autoscaler's key (or anyone with
 # this account a startup script) into project metadata, which every VM in the project trusts. Without it gcloud
-# falls back to the runner host's own metadata. The watchdog deploy builds its compute role the same way.
+# falls back to the runner host's own metadata. The base role is read through the watchdog deploy's
+# read_role_permissions, with this module's narrower role_permissions.
 BASE_COMPUTE_ROLE = wd.BASE_COMPUTE_ROLE
 ROLE_ID = "spotRunnerHostAdmin"
+# Resource types the role may change; the IAM condition limits them to oxidex-runners-* and runner-data*.
+HOST_RESOURCES = ("instances", "disks")
 EXCLUDED_PERMISSIONS = wd.EXCLUDED_PERMISSIONS
-role_permissions = wd.role_permissions
 
 _MEMORY_RE = re.compile(r"^[1-9][0-9]*(Mi|Gi)$")
 _CPU_RE = re.compile(r"^[1-8]$")
@@ -255,14 +258,49 @@ def validate_args(config: AutoscalerDeployConfig) -> list[str]:
     return problems
 
 
+def role_permissions(base: Sequence[str], support: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The base role's permissions that the autoscaler needs, and that a project custom role can hold
+    (``support``: permission -> customRolesSupportLevel, from list-testable-permissions):
+
+    * every permission on instances and disks (the binding's condition narrows those to runner hosts), except OS
+      Login and IAM policy writes;
+    * on every other Compute Engine resource type only reads and uses (``get*``, ``list*``, ``use*``: a subnetwork,
+      an external IP, a public image), so images, snapshots, templates and instance groups stay untouched; no
+      project metadata write;
+    * on other services only reads (``get*``, ``list*``).
+    """
+    keep = []
+    for permission in base:
+        if permission in EXCLUDED_PERMISSIONS or permission.endswith(".setIamPolicy"):
+            continue
+        service, _, rest = permission.partition(".")
+        resource, _, verb = rest.rpartition(".")
+        if service == "compute" and resource in HOST_RESOURCES:
+            pass
+        elif not verb.startswith(("get", "list") if service != "compute" else ("get", "list", "use")):
+            continue
+        # A permission a project-level custom role can't hold (not testable on the project, or NOT_SUPPORTED, such
+        # as resourcemanager.projects.list) would make the whole role definition fail.
+        if support is not None and support.get(permission, "NOT_SUPPORTED") == "NOT_SUPPORTED":
+            continue
+        keep.append(permission)
+    return tuple(sorted(set(keep)))
+
+
 def role_file(config: AutoscalerDeployConfig) -> str:
     """The custom role definition (``gcloud iam roles create --file``), as JSON (a YAML subset)."""
-    return wd.custom_role_file("Spot runner host admin", config.role_permissions)
+    permissions = list(config.role_permissions) or [
+        f"<computed at --apply time from {BASE_COMPUTE_ROLE}: instance and disk permissions except "
+        f"{', '.join(EXCLUDED_PERMISSIONS[1:])} and *.setIamPolicy; get*, list* and use* on other compute "
+        "resources; get* and list* on other services>"]
+    return json.dumps({"title": "Spot runner host admin",
+                       "description": f"{BASE_COMPUTE_ROLE}: instances and disks; reads and uses only on the rest",
+                       "stage": "GA", "includedPermissions": permissions}, indent=2)
 
 
 def read_role_permissions(config: AutoscalerDeployConfig, runner: wd.Runner) -> tuple[str, ...]:
     """Read the base role and the project's custom-role support levels; raises DeployError on failure."""
-    return wd.read_role_permissions(config.project, runner, APIS)
+    return wd.read_role_permissions(config.project, runner, APIS, select=role_permissions)
 
 
 def hosts_condition() -> dict[str, str]:
@@ -277,7 +315,7 @@ def iam_bindings(config: AutoscalerDeployConfig) -> list[tuple[str, str, str, st
     return [
         (f"project {config.project}" + (" (condition: instances oxidex-runners-*, disks oxidex-runners-* and "
                                         "runner-data*)" if config.compute_condition else ""), runtime,
-         f"{config.compute_role} ({BASE_COMPUTE_ROLE} without project metadata, OS Login and IAM policy writes)",
+         f"{config.compute_role} ({BASE_COMPUTE_ROLE}'s instance and disk permissions; reads and uses elsewhere)",
          "list, create, start, stop, label, set metadata on (drain markers and the SSH key), and delete runner "
          "hosts and their disks; list zones, machine types and CPU platforms"),
         (f"project {config.project}", runtime, ROLE_MONITORING_VIEWER,
@@ -332,7 +370,7 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
                       for secret, (what, how) in sorted(hints.items()))))
     role_files = {"runner-host-role.json": role_file(config)}
     steps.append(wd.Step(
-        f"Custom role {config.compute_role} ({BASE_COMPUTE_ROLE} minus project metadata, OS Login, IAM policy)",
+        f"Custom role {config.compute_role} (changes instances and disks only; no project metadata, OS Login, IAM)",
         files=role_files,
         check=c("gcloud", "iam", "roles", "describe", ROLE_ID, p, "--format=value(name)"),
         create=(c("gcloud", "iam", "roles", "create", ROLE_ID, p, "--file=@FILE:runner-host-role.json",
@@ -341,7 +379,8 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
                   "--format=none", "--quiet"),)))
     compute_args = (["--condition-from-file=@FILE:hosts-condition.json"] if config.compute_condition
                     else ["--condition=None"])
-    files = {"hosts-condition.json": json.dumps(hosts_condition(), indent=2)} if config.compute_condition else {}
+    # The condition file is also needed to remove the conditional binding after a switch to --no-compute-condition.
+    files = {"hosts-condition.json": json.dumps(hosts_condition(), indent=2)}
     steps.append(wd.Step("Runtime and host service account IAM (narrowest resource for each role)", files=files, run=(
         c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={runtime}",
           f"--role={config.compute_role}", *compute_args, "--format=none"),
@@ -358,7 +397,24 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
           f"--role={ROLE_METRIC_WRITER}", "--condition=None", "--format=none"),
         c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={host}",
           f"--role={ROLE_LOG_WRITER}", "--condition=None", "--format=none"),
+        # Labels mark the secrets this deploy grants access to, so a later deploy finds and revokes stale ones.
+        *(c("gcloud", "secrets", "update", secret, p, f"--update-labels={SECRET_LABEL}=mounted", "--format=none")
+          for secret in sorted({config.github_secret, config.ssh_secret})),
     )))
+    # Grants a previous deploy made that this configuration doesn't: the compute binding of the other condition
+    # setting (add-iam-policy-binding never replaces it), and the accessor on labeled secrets no longer mounted.
+    other = ["--condition=None"] if config.compute_condition else ["--condition-from-file=@FILE:hosts-condition.json"]
+    keep = tuple(sorted({config.github_secret, config.ssh_secret}))
+    steps.append(wd.Step(
+        "Remove grants that are no longer configured (absent ones are skipped)", files=files,
+        remove=(c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
+                  f"--role={config.compute_role}", *other, "--format=none"),),
+        prune=((c("gcloud", "secrets", "list", p, f"--filter=labels.{SECRET_LABEL}=mounted",
+                  "--format=value(name.basename())"), keep,
+                (c("gcloud", "secrets", "remove-iam-policy-binding", wd.NAME_ARG, p, f"--member={runtime}",
+                   f"--role={wd.ROLE_SECRET}", "--format=none"),
+                 c("gcloud", "secrets", "update", wd.NAME_ARG, p, f"--remove-labels={SECRET_LABEL}",
+                   "--format=none"))),)))
     if not config.image:
         return steps
     env_arg = "--set-env-vars=^|^" + "|".join(f"{k}={v}" for k, v in sorted(config.job_env().items()))
