@@ -2122,7 +2122,10 @@ class ControlVmManager:
         unfreeze_error = None
         if vm.running and result.image == image and result.hydrated and result.frozen and t.get("freeze_requested") \
                 and not below_floor:
-            # The new container started frozen from the marker on disk: release it.
+            # The new container started frozen from the marker on disk: release it. Recorded before the call: a lost
+            # response may still have released it, so a later rollback freezes it again before replacing it.
+            t["unfreeze_attempted"] = True
+            self.save()
             status, _ = self._control(slot, "unfreeze", "POST")
             if status == 200:
                 t["unfrozen"] = True
@@ -2147,7 +2150,10 @@ class ControlVmManager:
         if elapsed >= IMAGE_UPDATE_TIMEOUT_SECONDS:
             return self._abort(t, f"slot {slot} did not serve {image} healthy within {IMAGE_UPDATE_TIMEOUT_SECONDS}s"
                                   f" ({t['error']})")
-        if (vm.running and not t.get("reset_at") and result.image != image
+        # Only on positive evidence that the old container still serves (reachable, hydrated, another image), and
+        # never after a release attempt: a reset must not cut off a container that may be accepting changes.
+        old_still_serves = result.hydrated and result.status_code is not None and result.image != image
+        if (vm.running and not t.get("reset_at") and old_still_serves and not t.get("unfreeze_attempted")
                 and elapsed >= IMAGE_SWAP_GRACE_SECONDS):
             # Still the old container: the VM booted before the image watcher existed. A reset reruns the (just
             # refreshed) startup script, which pulls the new image and installs the watcher for the next update.
@@ -2171,14 +2177,15 @@ class ControlVmManager:
         and back off the new digest. The normal health handling takes over once the transition ends."""
         vm = obs.vm(t["new_slot"])
         previous = t.get("from_image") or ""
-        if vm is not None and vm.running and t.get("unfrozen") and t.get("image_written") and not t.get("restored"):
+        if (vm is not None and vm.running and t.get("unfreeze_attempted") and not t.get("refrozen")
+                and t.get("image_written") and not t.get("restored")):
             # The new container was released (the update failed after its unfreeze): drain it again before the
             # watcher replaces it.
             t["freeze_requested"] = True
             self.save()
             status, _ = self._control(t["new_slot"], "freeze", "POST")
             if status == 200:
-                t["unfrozen"] = False
+                t["unfrozen"], t["refrozen"] = False, True
                 self._note("froze slot %s again before the rollback", t["new_slot"])
             elif not self._fail_attempt(t, f"freeze before the rollback returned {status}"):
                 return "wait"
@@ -2208,12 +2215,14 @@ class ControlVmManager:
             # not have swapped back yet) and never state below the floor. Left frozen, it is unhealthy, and the
             # planner's recovery replaces it from the KV snapshot.
             hold, stale = None, False
-            if t.get("image_written") and health.image == t["dashboard_image"]:
+            if health.hydrated and isinstance(floor, int) and (health.state_version is None
+                                                               or health.state_version < floor):
+                # First: whichever image serves, state behind the frozen version is never released.
+                hold, stale = f"{vm.name} reports state_version {health.state_version} < {floor}", True
+            elif t.get("image_written") and health.image == t["dashboard_image"]:
                 hold = f"{vm.name} still runs {t['dashboard_image']}"
             elif not health.hydrated:
                 hold = f"{vm.name} has not reported hydrated state ({health.detail})"
-            elif isinstance(floor, int) and (health.state_version is None or health.state_version < floor):
-                hold, stale = f"{vm.name} reports state_version {health.state_version} < {floor}", True
             if vm.running and hold:
                 if stale:
                     # Reachable but behind the state it froze at: never release it, and never end the transition,

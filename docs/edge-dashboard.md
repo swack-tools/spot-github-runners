@@ -1297,7 +1297,7 @@ When the VM stops or disappears during the update, the manager ends the update a
 image, starts a stopped VM, and unfreezes it once it's back. When the new image doesn't serve healthy within 20 minutes, the manager writes the previous image back to
 `dashboard-image`, and the watcher swaps back. That rollout's digest is backed off: the manager tries again only
 after `:main` names another digest and the cooldown has passed. The manager unfreezes the restored container
-only when it reports hydrated state at or above the frozen `state_version`. A container that reports lower state
+only when it reports hydrated state with at least the frozen `state_version`. A container that reports lower state
 stays frozen, and the update holds with an error that needs an operator; it never ends into a recovery that could
 adopt that state.
 

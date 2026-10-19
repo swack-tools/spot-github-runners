@@ -481,6 +481,37 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("operator action needed", h.transition["error"])
         self.assertNotIn(("unfreeze", "a"), h.events)
 
+    def test_a_failed_image_with_stale_state_also_holds(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.health["a"] = (503, {"status": "starting", "hydrated": True, "frozen": True, "state_version": 3,
+                                    "slot": "a", "image": IMG_B})
+        h.http.versions["a"] = 3
+        for _ in range(3):
+            h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+            with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+                h.tick()
+        self.assertIn("operator action needed", h.transition["error"])
+        self.assertNotIn(("unfreeze", "a"), h.events)
+
+    def test_an_unanswered_unfreeze_means_no_reset_and_a_refreeze_before_rollback(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.unfreeze_status = None  # the response is lost; the release may have landed
+        h.swapped()
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        self.assertNotIn(("reset", "spot-control-a"), h.events)
+        h.http.unfreeze_status = 200
+        h.http.healthy("a", version=7, image=IMG_B)
+        h.http.health["a"] = (503, dict(h.http.health["a"][1], status="starting"))  # released, not ready
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()
+        mutations = h.mutations()
+        self.assertLess(mutations.index(("freeze", "a"), 1), mutations.index(("set-image", "spot-control-a", IMG_A)))
+
     def test_a_reset_that_reports_failure_is_never_repeated(self):
         h = TrackingHarness()
         h.active()
