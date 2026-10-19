@@ -572,10 +572,10 @@ class FloorRemovalTests(unittest.TestCase):
             return SimpleNamespace(returncode=1 if "describe" in argv else 0, stdout="", stderr="")
         return run, calls
 
-    def deploy(self, run, env):
+    def deploy(self, run, env, *extra):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}"], runner=run, env=env)
+            code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}", *extra], runner=run, env=env)
         return code, err.getvalue()
 
     def removed(self, calls):
@@ -595,6 +595,12 @@ class FloorRemovalTests(unittest.TestCase):
         self.assertEqual(removed, ["spot-floor-github-old", "spot-floor-github-swackhamer"])
         self.assertTrue(all(flag(c, "role") == "roles/secretmanager.secretAccessor"
                             for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"]))
+        # An unconditional deploy removes both conditioned floor bindings an earlier deploy made too.
+        run, calls = self.runner()
+        code, err = self.deploy(run, ENV, "--no-compute-condition")
+        self.assertEqual(code, 0, err)
+        compute = [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]]
+        self.assertEqual(sorted(flag(c, "role") for c in compute), [CUSTOM_ROLE, PREDEFINED_ROLE])
 
     def test_floor_on_keeps_current_secrets_and_removes_a_dropped_one(self):
         run, calls = self.runner()

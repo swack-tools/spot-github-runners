@@ -12,8 +12,8 @@ minimum per execution, which at this cadence leaves the free tier. This module c
    account that GitHub Actions impersonates through Workload Identity Federation.
 4. The Artifact Registry Docker repository for the watchdog image.
 5. A check that every Secret Manager secret the service references has an enabled version (it never writes one).
-6. The custom compute role (``roles/compute.instanceAdmin.v1`` without project metadata, OS Login, or IAM policy
-   writes); the removal of the predefined compute role bindings that earlier deploys made, once the custom role's
+6. The custom compute role (``roles/compute.instanceAdmin.v1``'s instance and disk permissions, and only reads and
+   uses on the rest: no project metadata, OS Login, or IAM policy writes); the removal of the predefined compute role bindings that earlier deploys made, once the custom role's
    binding predates this deploy; then IAM, each binding on the narrowest resource that works (see
    :func:`iam_bindings`).
 7. The Workload Identity pool and GitHub OIDC provider, limited to the image workflow on ``main``.
@@ -519,8 +519,8 @@ def iam_bindings(config: DeployConfig) -> list[tuple[str, str, str, str]]:
         (f"project {config.project}" + (" (condition: instances and disks named spot-control-*)"
                                         if config.compute_condition else ""), runtime, config.compute_role,
          "list, describe, create, start, stop, set-scheduling, and delete the spot-control-a/b VMs and their boot "
-         f"disks; list machine types and use the subnetwork and an external IP ({BASE_COMPUTE_ROLE} without project "
-         "metadata, OS Login and IAM policy writes)"),
+         f"disks; list machine types and use the subnetwork and an external IP ({BASE_COMPUTE_ROLE}'s instance and "
+         "disk permissions, and only reads and uses on the rest)"),
         (f"service account {config.control_vm_service_account}", runtime, ROLE_ACT_AS,
          "create control VMs that run as that account (iam.serviceAccounts.actAs), and no other"),
         (f"bucket gs://{config.state_bucket}", runtime, ROLE_OBJECTS,
@@ -695,9 +695,7 @@ def build_steps(config: DeployConfig) -> list[Step]:
     removal_files: dict[str, str] = {}
     if not config.floor_enabled:
         removal_files["floor-condition.json"] = json.dumps(floor_condition(), indent=2)
-        removals.append(unbind(BASE_COMPUTE_ROLE, floor_file))
-        if config.compute_condition:
-            removals.append(unbind(config.compute_role, floor_file))
+        removals += [unbind(BASE_COMPUTE_ROLE, floor_file), unbind(config.compute_role, floor_file)]
     keep = tuple(sorted(set(refs.values()) | set(mounts.values())))
     prune = ((_c("gcloud", "secrets", "list", p, f"--filter=labels.{FLOOR_SECRET_LABEL}=token",
                  "--format=value(name.basename())"), keep,
