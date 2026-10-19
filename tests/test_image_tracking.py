@@ -467,6 +467,18 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         self.assertEqual(h.image["active"]["image"], IMG_B)
 
+    def test_a_reset_that_reports_failure_is_never_repeated(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.reset_rc = 1  # it may still have landed
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        h.clock[0] += 180
+        h.tick()
+        self.assertEqual(h.events.count(("reset", "spot-control-a")), 1)
+        self.assertIsNotNone(h.transition["reset_at"])
+
     def test_a_lower_state_version_after_the_swap_is_not_success(self):
         h = TrackingHarness()
         h.active()

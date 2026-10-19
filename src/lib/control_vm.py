@@ -2151,13 +2151,16 @@ class ControlVmManager:
                 and elapsed >= IMAGE_SWAP_GRACE_SECONDS):
             # Still the old container: the VM booted before the image watcher existed. A reset reruns the (just
             # refreshed) startup script, which pulls the new image and installs the watcher for the next update.
+            # Recorded before the call: a reset that lands but reports failure (or a crash after it) must never be
+            # followed by a second one while the VM boots. A reset that truly failed times out into the rollback.
+            t["reset_at"] = self.clock()
+            self.save()
             reset = self.gcloud(reset_command(vm, self.config.project))
             if reset.returncode == 0:
-                t["reset_at"] = self.clock()
                 self._note("%s did not swap its container within %ss; reset it to boot %s", vm.name,
                            IMAGE_SWAP_GRACE_SECONDS, image, level=logging.WARNING)
             else:
-                self._note("reset of %s failed: %s", vm.name, (reset.stderr or "").strip()[:200],
+                self._note("reset of %s failed (not retried): %s", vm.name, (reset.stderr or "").strip()[:200],
                            level=logging.WARNING)
         t["updated_at"] = self.clock()
         self.save()
