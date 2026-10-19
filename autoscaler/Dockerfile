@@ -62,10 +62,13 @@ RUN set -eu; \
     useradd --system --uid 10002 --gid 10002 --home-dir /home/autoscaler --create-home --shell /usr/sbin/nologin \
         autoscaler; \
     python3 -B -c "import lib.spot_runner_autoscaler, lib.autoscaler_job, lib.autoscaler_state_store, lib.runner_manager, lib.tier_controller"; \
-    gcloud --version >/dev/null; \
-    gh --version >/dev/null; \
+    # Build-time checks run as root: give them their own config directories and remove them, so the runtime user
+    # finds CLOUDSDK_CONFIG and GH_CONFIG_DIR absent (and creates them) instead of root-owned.
+    CLOUDSDK_CONFIG=/tmp/build-gcloud gcloud --version >/dev/null; \
+    GH_CONFIG_DIR=/tmp/build-gh gh --version >/dev/null; \
     ssh -V; \
-    ssh-keygen --help 2>&1 | grep -q usage
+    ssh-keygen --help 2>&1 | grep -q usage; \
+    rm -rf /tmp/build-gcloud /tmp/build-gh /tmp/gcloud-config /tmp/gh-config
 
 USER 10002:10002
 
