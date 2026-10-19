@@ -1294,8 +1294,37 @@ class MisroutedSlotTests(unittest.TestCase):
         self.assertIn("answered as slot 'b'", result.detail)
         h.http.healthy("a", version=4, image=IMG_B)
         self.assertTrue(cv.health_for_slot(cv.probe_health(h.http, h.config, "a"), "a").ok)
+        self.assertTrue(result.misrouted)
         unreachable = cv.HealthResult.unknown("unreachable")
         self.assertIs(cv.health_for_slot(unreachable, "a"), unreachable)
+        edge_error = cv.HealthResult(False, status_code=502, detail="HTTP 502 without health JSON")
+        self.assertIs(cv.health_for_slot(edge_error, "a"), edge_error)  # no dashboard answered: not misrouted
+        unnamed = cv.health_for_slot(cv.HealthResult(True, 200, 4, hydrated=True, detail="healthy"), "a")
+        self.assertEqual((unnamed.ok, unnamed.hydrated, unnamed.misrouted), (False, False, False))
+
+    def test_a_rollback_holds_rather_than_ending_on_a_misrouted_answer(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.health["a"] = (503, {"status": "starting", "hydrated": False, "frozen": True, "state_version": 7,
+                                    "slot": "a", "image": h.transition["dashboard_image"]})
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # timed out: the previous image is pinned again
+        self.assertEqual(h.transition["step"], "abort")
+        h.swapped(image=IMG_A)
+        h.http.health["a"][1]["slot"] = "b"  # the restored container, but answered through a misrouted tunnel
+        for _ in range(3):
+            h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+            h.tick()
+            self.assertIsNotNone(h.transition)  # never ended as unreachable: the release is still owed
+        self.assertIn("answered as slot 'b'", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.mutations())
+        self.assertFalse([m for m in h.mutations() if m[0] == "stop"])
+        h.swapped(image=IMG_A)  # routed correctly again
+        h.reported()
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
 
     def test_a_rollout_never_starts_through_a_misrouted_tunnel(self):
         h = TrackingHarness()

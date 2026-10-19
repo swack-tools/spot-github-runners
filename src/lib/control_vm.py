@@ -664,6 +664,7 @@ class HealthResult:
     detail: str = ""
     slot: str | None = None
     image: str | None = None  # the image the dashboard container runs (DASHBOARD_IMAGE), when it reports one
+    misrouted: bool = False  # answered as another slot (see health_for_slot): reachable, but not this slot's health
 
     @classmethod
     def unknown(cls, detail: str = "not probed") -> HealthResult:
@@ -1194,9 +1195,9 @@ def probe_health(requester: edge_state.Requester, config: ControlConfig, slot: s
 def health_for_slot(result: HealthResult, slot: str) -> HealthResult:
     """The probe result only when the dashboard answered as ``slot``: a misrouted tunnel that reaches the other
     slot's VM must never count as this slot ready, frozen, hydrated, or serving an image."""
-    if result.slot == slot or (result.status_code is None and not result.hydrated):
-        return result
-    return HealthResult(False, status_code=result.status_code,
+    if result.slot == slot or (result.slot is None and not result.hydrated):
+        return result  # this slot's answer, or no dashboard answer at all (unreachable, an edge error page)
+    return HealthResult(False, status_code=result.status_code, misrouted=result.slot is not None,
                         detail=f"the slot {slot} hostname answered as slot {result.slot!r}")
 
 
@@ -2424,7 +2425,7 @@ class ControlVmManager:
                 self._note("froze slot %s again at state_version %s before the rollback", slot, t["frozen_version"])
             else:
                 health = health_for_slot(obs.health.get(slot) or HealthResult.unknown(), slot)
-                if waited >= IMAGE_UPDATE_TIMEOUT_SECONDS and not health.hydrated:
+                if waited >= IMAGE_UPDATE_TIMEOUT_SECONDS and not (health.hydrated or health.misrouted):
                     # Unreachable for the whole timeout: HTTP can't drain it, and it takes no changes through the edge
                     # either. Fence it by stop (as a recovery fences an old VM); the rollback then ends through the
                     # stopped-VM path below, which publishes the frozen snapshot to KV first.
@@ -2464,7 +2465,8 @@ class ControlVmManager:
         if t.get("freeze_requested") and not t.get("released") and vm is not None:
             # The freeze marker survives container swaps and reboots, so the restored container starts frozen.
             health = health_for_slot(obs.health.get(slot) or HealthResult.unknown(), slot)
-            if vm.running and health.hydrated:
+            # A misrouted answer is no evidence the VM is unreachable: hold as for a reachable one, never end.
+            if vm.running and (health.hydrated or health.misrouted):
                 if t.get("image_written") and health.image == t["dashboard_image"]:
                     detail = f"{vm.name} still runs {t['dashboard_image']}"  # the watcher has not swapped back yet
                 else:
