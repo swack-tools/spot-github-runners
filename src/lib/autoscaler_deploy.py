@@ -177,15 +177,23 @@ class AutoscalerDeployConfig:
         from .spot_runner_autoscaler import args_parser
 
         actions = args_parser()._option_string_actions
+
+        def action_for(flag: str):
+            # The flag itself, or the one long option it abbreviates, as argparse resolves it.
+            if flag in actions:
+                return flag, actions[flag]
+            matches = [name for name in actions if name.startswith("--") and name.startswith(flag)]
+            return (matches[0], actions[matches[0]]) if flag.startswith("--") and len(matches) == 1 else (flag, None)
+
         source = list(self.autoscaler_args)
         args: list[str] = []
         index = 0
         while index < len(source):
             arg = source[index]
-            action = actions.get(arg)
+            name, action = action_for(arg)
             if (action is not None and action.nargs is None and index + 1 < len(source)
                     and not source[index + 1].startswith("--")):
-                args.append(f"{arg}={source[index + 1]}")
+                args.append(f"{name}={source[index + 1]}")
                 index += 2
                 continue
             args.append(arg)

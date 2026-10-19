@@ -105,6 +105,13 @@ class ConfigTests(unittest.TestCase):
         from lib.spot_runner_autoscaler import args_parser
         self.assertEqual(vars(args_parser().parse_args(args)),
                          vars(args_parser().parse_args(list(ARGS) + ["--host-service-account", HOST_SA])))
+
+    def test_abbreviated_repeated_flags_are_resolved_before_joining(self):
+        c = config(autoscaler_args=ARGS + ("--job-rep", "swack-tools/a", "--job-rep", "swack-tools/b"))
+        args = c.job_args()
+        self.assertIn("--job-repository=swack-tools/a", args)
+        self.assertIn("--job-repository=swack-tools/b", args)
+        self.assertEqual(deploy.validate(c), [])
         for refused in ("--once", "--dry-run", "--state-file", "--log-file", "--github-user"):
             self.assertNotIn(refused, args)
 

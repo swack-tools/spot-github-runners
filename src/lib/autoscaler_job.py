@@ -195,9 +195,9 @@ def install_read_only_gcloud_token(directory: Path, fetch: Callable[[str], str] 
     if not isinstance(token, str) or not token.strip() or any(c.isspace() for c in token.strip()):
         raise JobConfigError("the metadata server returned no read-only access token for the dry run")
     granted = (scopes or token_scopes)(token.strip())
-    if not granted or not granted <= set(READ_ONLY_SCOPES):
-        raise JobConfigError(f"the dry run token has scopes {sorted(granted)}, not only read-only ones "
-                             f"({', '.join(READ_ONLY_SCOPES)}); the dry run does not start")
+    if granted != set(READ_ONLY_SCOPES):
+        raise JobConfigError(f"the dry run token has scopes {sorted(granted)}, not exactly "
+                             f"{', '.join(READ_ONLY_SCOPES)}; the dry run does not start")
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "gcloud-read-only-token"
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
