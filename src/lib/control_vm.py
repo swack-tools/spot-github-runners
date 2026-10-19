@@ -2250,6 +2250,22 @@ class ControlVmManager:
                 t["refrozen"] = True
                 self._note("froze slot %s again at state_version %s before the rollback", slot, t["frozen_version"])
             else:
+                health = obs.health.get(slot) or HealthResult.unknown()
+                if waited >= IMAGE_UPDATE_TIMEOUT_SECONDS and not health.hydrated:
+                    # Unreachable for the whole timeout: HTTP can't drain it, and it takes no changes through the edge
+                    # either. Fence it by stop (as a recovery fences an old VM); the rollback then ends through the
+                    # stopped-VM path below, which publishes the frozen snapshot to KV first.
+                    if not t.get("fence_stop_at"):
+                        t["fence_stop_at"] = self.clock()
+                        self.save()
+                        stop = self.gcloud(stop_command(vm, self.config.project))
+                        self._note("stopping unreachable %s to fence it before the rollback: %s", vm.name,
+                                   "requested" if stop.returncode == 0 else (stop.stderr or "").strip()[:200],
+                                   level=logging.ERROR)
+                    t["error"] = f"fencing unreachable {vm.name} by stop before the rollback"
+                    t["updated_at"] = self.clock()
+                    self.save()
+                    return "wait"
                 # Never replace a container that may accept changes without a confirmed drain: keep trying.
                 t["error"] = f"freeze before the rollback returned {status}"
                 t["updated_at"] = self.clock()
@@ -2312,8 +2328,9 @@ class ControlVmManager:
                 return "wait"
             self._note("%s was not reachable within %ss to be released; ending the rollback", vm.name,
                        IMAGE_UPDATE_TIMEOUT_SECONDS, level=logging.ERROR)
-        elif vm is None and t.get("freeze_requested") and not t.get("released"):
-            # The VM is gone with its disk: the frozen snapshot may be the only copy of that state.
+        elif vm is None and t.get("frozen_snapshot"):
+            # The VM is gone with its disk: the frozen snapshot may be the only copy of that state (an import into
+            # the lost VM, even a confirmed one, never reached KV).
             problem = self._preserve_frozen_snapshot(t)
             if problem:
                 t["error"] = f"holding the rollback: {problem}"

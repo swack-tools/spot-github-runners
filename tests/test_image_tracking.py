@@ -621,6 +621,50 @@ class RolloutTests(unittest.TestCase):
         h.tick()
         self.assertIsNone(h.transition)
 
+    def test_a_vanished_vm_preserves_the_snapshot_even_after_a_release(self):
+        from lib.edge_state import KV_STATE_KEY, parse_snapshot
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.kv.store.pop(KV_STATE_KEY, None)
+        h.swapped()
+        h.http.health["a"] = (503, {"status": "starting", "hydrated": True, "frozen": False, "state_version": 7,
+                                    "slot": "a", "image": IMG_B})  # the import lands, but it never gets healthy
+        h.clock[0] += 180
+        h.tick()
+        self.assertTrue(h.transition["released"])
+        h.gcloud.vms.pop("spot-control-a")
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
+    def test_an_unreachable_vm_that_cannot_be_refrozen_is_fenced_by_stop(self):
+        from lib.edge_state import KV_STATE_KEY, parse_snapshot
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.kv.store.pop(KV_STATE_KEY, None)
+        h.http.import_status = None  # the release may have landed
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        del h.http.health["a"]  # then the dashboard became unreachable
+        h.http.freeze_status = None
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: the refreeze can't reach it, so it waits
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertNotIn(("stop", "spot-control-a"), h.events)
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()
+        self.assertIn(("stop", "spot-control-a"), h.events)
+        h.gcloud.status("a", "TERMINATED")
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
     def test_a_reset_that_reports_failure_is_never_repeated(self):
         h = TrackingHarness()
         h.active()
