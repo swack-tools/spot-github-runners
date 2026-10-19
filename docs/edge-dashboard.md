@@ -1185,10 +1185,17 @@ The job runs after the build job has pushed the image and passed its smoke test.
 1. Runs `gcloud run services update --image` and nothing else. Settings, secrets, the service account, scaling,
    IAM, and the scheduler keep what the last full deploy set. Cloud Run moves traffic only to a revision that
    becomes ready.
-1. Checks that the new image serves from the latest ready revision with all the traffic.
+1. Checks that the new image serves from the latest ready revision with all the traffic, and that the service's
+   generation rose by exactly one. `gcloud` can't make the update conditional on the version it checked, so a
+   larger step means another change landed meanwhile and may have been overwritten. The job then fails and asks
+   you to check the service.
 
-A refused or failed deploy fails the workflow run, so GitHub reports it like any failed check. The job first
-prints its plan with `--dry-run`.
+An image that the service names but doesn't serve, for example after a revision that never became ready, is never
+reported as deployed. A refused or failed deploy fails the workflow run, so GitHub reports it like any failed
+check. The job first prints its plan with `--dry-run`.
+
+The build job never moves a commit tag. A re-run of a commit that was already pushed reuses that image, so the
+deployed digest keeps the commit tag that the deploy job reads.
 
 This gives `main` of `swack-tools/spot-github-runners`, through this one workflow, the power to run code as
 the watchdog runtime account. The dashboard already extends the same trust to `main` through

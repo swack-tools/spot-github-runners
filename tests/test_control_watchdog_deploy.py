@@ -728,11 +728,11 @@ OLD_SHA, NEW_SHA = "1" * 40, "2" * 40
 OLD_IMAGE, NEW_IMAGE = f"{IMAGE_REPO}@sha256:{'c' * 64}", f"{IMAGE_REPO}@sha256:{'d' * 64}"
 
 
-def live_service(image=OLD_IMAGE, *, labels=None, account=RUNTIME, ready=True):
+def live_service(image=OLD_IMAGE, *, labels=None, account=RUNTIME, ready=True, generation=7):
     """`gcloud run services describe --format=json`, shaped like the live service."""
     revision = "spot-control-watchdog-00007-7dz"
     return {"metadata": {"labels": {"cloud.googleapis.com/location": "us-central1", "spot-role": "control-watchdog"}
-                         if labels is None else labels},
+                         if labels is None else labels, "generation": generation},
             "spec": {"template": {"spec": {"serviceAccountName": account, "containers": [{"image": image}]}}},
             "status": {"latestReadyRevisionName": revision if ready else "old",
                        "latestCreatedRevisionName": revision,
@@ -839,7 +839,8 @@ class UpdateImageTests(unittest.TestCase):
             argv = list(argv)
             calls.append(argv)
             if argv[1:4] == ["run", "services", "describe"]:
-                current = (after if after is not None else live_service(NEW_IMAGE)) if state["updated"] else service
+                current = (after if after is not None else live_service(NEW_IMAGE, generation=8)) \
+                    if state["updated"] else service
                 return SimpleNamespace(returncode=0, stdout=json.dumps(current), stderr="")
             if argv[1:5] == ["artifacts", "docker", "tags", "list"]:
                 listing = tags if tags is not None else tag_listing([(OLD_SHA, OLD_IMAGE), (NEW_SHA, NEW_IMAGE),
@@ -921,14 +922,36 @@ class UpdateImageTests(unittest.TestCase):
         code, _, err = self.update(run)
         self.assertEqual(code, 1)
         self.assertIn("traffic stays on the ready revision", err)
-        run, _ = self.runner(after=live_service(NEW_IMAGE, ready=False))
+        run, _ = self.runner(after=live_service(NEW_IMAGE, ready=False, generation=8))
         code, _, err = self.update(run)
         self.assertEqual(code, 1)
         self.assertIn("is not ready", err)
-        split = live_service(NEW_IMAGE)
+        split = live_service(NEW_IMAGE, generation=8)
         split["status"]["traffic"] = [{"revisionName": "spot-control-watchdog-00007-7dz", "percent": 50}]
         run, _ = self.runner(after=split)
         self.assertIn("50% of traffic", self.update(run)[2])
+
+    def test_a_concurrent_change_during_the_update_fails_loudly(self):
+        for after in (live_service(NEW_IMAGE, generation=9), {**live_service(NEW_IMAGE), "metadata": {
+                "labels": {"spot-role": "control-watchdog"}}}):
+            run, calls = self.runner(after=after)
+            code, _, err = self.update(run)
+            self.assertEqual(code, 1)
+            self.assertIn("another change landed meanwhile", err)
+
+    def test_a_named_but_unserved_image_is_not_reported_as_deployed(self):
+        stuck = live_service(NEW_IMAGE, ready=False)  # an earlier attempt's revision never became ready
+        run, calls = self.runner(service=stuck)
+        code, _, err = self.update(run)
+        self.assertEqual(code, 1)
+        self.assertIn("does not serve it", err)
+        self.assertEqual(self.updates(calls), [])
+        rebuilt = f"{IMAGE_REPO}@sha256:{'e' * 64}"
+        run, calls = self.runner(service=live_service(ready=False),
+                                 tags=tag_listing([(OLD_SHA, OLD_IMAGE), (OLD_SHA, rebuilt)]))
+        code, _, err = self.update(run, image=rebuilt, revision=OLD_SHA)
+        self.assertEqual(code, 1)
+        self.assertIn("does not serve it", err)
 
     def test_the_dry_run_runs_nothing_and_bad_arguments_are_refused(self):
         out, err = io.StringIO(), io.StringIO()
@@ -967,3 +990,7 @@ class AutoDeployWorkflowTests(unittest.TestCase):
         self.assertIn("serviceAccounts/${DEPLOYER_SA}:generateAccessToken", job)
         self.assertNotIn("${{ vars.", job.split("steps:", 1)[1])  # settings reach scripts through env only
         self.assertIn("digest: ${{ steps.push.outputs.digest }}", text)
+        # A re-run never moves a commit tag off the deployed digest.
+        push = text[text.index("- name: Push"):text.index("- name: Log out")]
+        self.assertLess(push.index('docker manifest inspect "${IMAGE}:${GITHUB_SHA}"'),
+                        push.index('docker push "${IMAGE}:${GITHUB_SHA}"'))

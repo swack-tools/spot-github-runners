@@ -946,6 +946,8 @@ def update_image(config: DeployConfig, update: ImageUpdate, runner: Runner = def
     if update.expect_current and current != update.expect_current:
         raise DeployError(f"service {config.service} runs {current}, not the expected {update.expect_current}")
     if current == update.image:
+        # A failed earlier attempt can leave the template naming the image while traffic stays on the old revision.
+        _require_serving(config, service, update.image)
         return f"service {config.service} already runs {update.image}"
     tags = commit_tags(_json_of(runner(_tags_command(config)), f"tag listing of {config.image_repo}"))
     new_digest, current_digest = update.image.rsplit("@", 1)[1], current.rsplit("@", 1)[1]
@@ -957,6 +959,7 @@ def update_image(config: DeployConfig, update: ImageUpdate, runner: Runner = def
                           "image can't be proven newer; deploy by hand with --image")
     deployed = current_commits[0]
     if deployed == update.revision:
+        _require_serving(config, service, current)
         return f"service {config.service} already runs commit {deployed} ({current}); not rebuilding over it"
     ancestry = runner(_c("git", "-C", update.repo_dir, "merge-base", "--is-ancestor", deployed, update.revision))
     if ancestry.returncode == 1:
@@ -965,6 +968,7 @@ def update_image(config: DeployConfig, update: ImageUpdate, runner: Runner = def
     if ancestry.returncode != 0:
         raise DeployError(f"could not order {deployed[:12]} and {update.revision[:12]} (a full-history checkout is "
                           f"needed): {(ancestry.stderr or '').strip()[:300]}")
+    generation = _generation(service)
     command = _update_command(config, update.image)
     out(f"+ {shlex.join(command)}")
     result = runner(command)
@@ -972,10 +976,28 @@ def update_image(config: DeployConfig, update: ImageUpdate, runner: Runner = def
         raise DeployError(f"update of service {config.service} failed (traffic stays on the ready revision): "
                           f"{(result.stderr or '').strip()[:500]}")
     after = _json_of(runner(_describe_service(config)), f"describe of service {config.service}")
-    problems = rollout_problems(after if isinstance(after, dict) else {}, update.image)
+    after = after if isinstance(after, dict) else {}
+    problems = rollout_problems(after, update.image)
     if problems:
         raise DeployError(f"service {config.service} did not settle on {update.image}: " + "; ".join(problems))
+    # gcloud can't make the update conditional on the version it checked. One generation more than the checked one
+    # proves nothing else changed the service in between; anything else may have been overwritten, so say so.
+    if generation is None or _generation(after) != generation + 1:
+        raise DeployError(f"service {config.service} went from generation {generation} to {_generation(after)} during "
+                          f"this update: another change landed meanwhile, and {update.image} may have replaced a "
+                          "newer image. Check the service and deploy the newest image by hand")
     return f"service {config.service} moved from commit {deployed} to {update.revision} ({update.image})"
+
+
+def _generation(service: Mapping) -> int | None:
+    value = (service.get("metadata") or {}).get("generation")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _require_serving(config: DeployConfig, service: Mapping, image: str) -> None:
+    problems = rollout_problems(service, image)
+    if problems:
+        raise DeployError(f"service {config.service} names {image} but does not serve it: " + "; ".join(problems))
 
 
 def auto_deploy_guard(config: DeployConfig, runner: Runner = default_runner) -> None:
