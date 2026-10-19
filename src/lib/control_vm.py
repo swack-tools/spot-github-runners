@@ -165,6 +165,9 @@ ROTATION_COOLDOWN_SECONDS = 6 * 3600
 # existed), so it is reset once and its startup script pulls the new image.
 IMAGE_SWAP_GRACE_SECONDS = 300
 IMAGE_UPDATE_TIMEOUT_SECONDS = 1200  # the new image must serve healthy within this, or the update rolls back
+# A startup run that reported "running" this long ago died without reporting: its pulls are bounded (15 minutes each,
+# a few per run), so a live run always reports done or failed sooner.
+STARTUP_RUN_STALE_SECONDS = 7200
 PRICE_CHECK_INTERVAL_SECONDS = 3600
 MIN_SAVINGS_FRACTION = Decimal("0.30")
 MIN_SAVINGS_DAILY_USD = Decimal("0.05")
@@ -2139,8 +2142,8 @@ class ControlVmManager:
         """Whether no startup script run is pending on ``vm``: a run reports ``running <unix time>`` when it starts
         and ``done <image>`` or ``failed <unix time>`` when it ends (guest attribute spot-dashboard/run). A pending
         run may still replace the container, so a container is released only once its run settled. No report (a
-        VM that never ran a reporting script) and a ``running`` report older than the update timeout (a run that
-        died without reporting) count as settled."""
+        VM that never ran a reporting script) and a ``running`` report older than STARTUP_RUN_STALE_SECONDS (a run
+        that died without reporting) count as settled."""
         result = self.gcloud(guest_attributes_command(vm, self.config.project))
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
@@ -2155,7 +2158,7 @@ class ControlVmManager:
         if not value.startswith("running"):
             return True, value or "no startup run reported"
         started = value.removeprefix("running").strip()
-        if started.isdigit() and self.clock() - int(started) > IMAGE_UPDATE_TIMEOUT_SECONDS:
+        if started.isdigit() and self.clock() - int(started) > STARTUP_RUN_STALE_SECONDS:
             return True, f"stale report {value!r}"
         return False, f"a startup run is in progress on {vm.name} ({value})"
 
@@ -2198,8 +2201,9 @@ class ControlVmManager:
         # never after a release attempt: a reset must not cut off a container that may be accepting changes.
         old_still_serves = result.hydrated and result.status_code is not None and result.image != image
         if (vm.running and not t.get("reset_at") and old_still_serves and not t.get("release_attempted")
-                and elapsed >= IMAGE_SWAP_GRACE_SECONDS):
-            # Still the old container: the VM booted before the image watcher existed. A reset reruns the (just
+                and elapsed >= IMAGE_SWAP_GRACE_SECONDS and self._startup_run_settled(vm)[0]):
+            # Still the old container and no startup run in progress (a slow pull is left alone): the VM booted
+            # before the image watcher existed. A reset reruns the (just
             # refreshed) startup script, which pulls the new image and installs the watcher for the next update.
             # Recorded before the call: a reset that lands but reports failure (or a crash after it) must never be
             # followed by a second one while the VM boots. A reset that truly failed times out into the rollback.
@@ -2255,7 +2259,8 @@ class ControlVmManager:
                     # Unreachable for the whole timeout: HTTP can't drain it, and it takes no changes through the edge
                     # either. Fence it by stop (as a recovery fences an old VM); the rollback then ends through the
                     # stopped-VM path below, which publishes the frozen snapshot to KV first.
-                    if not t.get("fence_stop_at"):
+                    last_stop = t.get("fence_stop_at")
+                    if not last_stop or self.clock() - last_stop >= STOP_RETRY_SECONDS:  # retried until it stops
                         t["fence_stop_at"] = self.clock()
                         self.save()
                         stop = self.gcloud(stop_command(vm, self.config.project))

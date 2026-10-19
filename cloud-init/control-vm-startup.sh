@@ -325,7 +325,8 @@ pull_published_image() {
   fi
   log "pulling $DASHBOARD_IMAGE"
   printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username x-access-token --password-stdin >/dev/null
-  docker pull "$DASHBOARD_IMAGE" >/dev/null || fail "could not pull $DASHBOARD_IMAGE"
+  # Bounded, so every run ends and reports (the controller treats an old "running" report as a dead run).
+  timeout 900 docker pull "$DASHBOARD_IMAGE" >/dev/null || fail "could not pull $DASHBOARD_IMAGE"
   docker logout ghcr.io >/dev/null 2>&1 || true
 }
 

@@ -615,7 +615,7 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0]) - cv.IMAGE_UPDATE_TIMEOUT_SECONDS - 1}"
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0]) - cv.STARTUP_RUN_STALE_SECONDS - 1}"
         h.swapped()
         h.clock[0] += 180
         h.tick()
@@ -664,6 +664,39 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
         self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
+    def test_no_reset_while_a_startup_run_is_pulling(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"  # a slow pull on a VM with the watcher
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        self.assertNotIn(("reset", "spot-control-a"), h.events)
+
+    def test_a_failed_fencing_stop_is_retried(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_status = None
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        del h.http.health["a"]
+        h.http.freeze_status = None
+        h.gcloud.stop_rc = 1
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback begins; the refreeze can't reach it
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()  # the first stop fails
+        h.tick()  # inside the retry interval: no second stop yet
+        self.assertEqual(h.events.count(("stop", "spot-control-a")), 1)
+        h.gcloud.stop_rc = 0
+        h.clock[0] += cv.STOP_RETRY_SECONDS
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()
+        self.assertEqual(h.events.count(("stop", "spot-control-a")), 2)
 
     def test_a_reset_that_reports_failure_is_never_repeated(self):
         h = TrackingHarness()
