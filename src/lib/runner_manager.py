@@ -460,6 +460,10 @@ def write_deployment_receipt(args: argparse.Namespace, vm: GceVm) -> None:
         os.fsync(temp.fileno())
         temporary = Path(temp.name)
     temporary.replace(path)
+    # The autoscaler's Cloud Run job keeps its state in Cloud Storage: the receipt must be there too before the
+    # launch goes on, or an execution that dies during the bootstrap wait would take the only copy with it.
+    from .autoscaler_state_store import save_receipt_from_env
+    save_receipt_from_env(path)
 
 
 def launch_target_label(args: argparse.Namespace) -> str:

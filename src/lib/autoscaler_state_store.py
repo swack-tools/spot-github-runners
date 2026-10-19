@@ -14,8 +14,10 @@ JSON document lives in one Cloud Storage object instead:
   hooks it into its mutation fence: no mutating child process (``gcloud``, ``gh``, ``ssh``, the deployment manager)
   starts after the state stopped being durable, whichever ``except`` clause caught the write error.
 * Deployment receipts (``<instance>-<uuid>-deployment.json``, written next to the state file by the deployment
-  manager while a launch runs) are mirrored to ``<object path without .json>/receipts/`` every few seconds and
-  restored on demand, so an execution that dies mid-launch leaves the next one the provider identity it recorded.
+  manager while a launch runs) are uploaded to ``<object path without .json>/receipts/`` by the deployment manager
+  itself, right after it writes them and before it waits for the bootstrap (:func:`save_receipt_from_env`). An
+  upload that fails fails the launch, whose VM the autoscaler then removes, so a launch never continues with its
+  only receipt on an execution's disk. A missing local receipt is restored on demand.
 
 The object holds exactly the JSON the local file holds, so ``gcloud storage cp`` moves state between a workstation
 and Cloud Storage in either direction. Standard library only.
@@ -34,8 +36,6 @@ from .gcs_control_state import GcsAmbiguous, GcsClient, GcsError, GcsPreconditio
 LOG = logging.getLogger("spot_runner_autoscaler.state_store")
 
 ENV_STATE_URI = "SPOT_AUTOSCALER_STATE_URI"
-RECEIPT_GLOB = "*-deployment.json"
-MIRROR_SECONDS = 5.0
 WRITE_ATTEMPTS = 3
 
 _URI_RE = re.compile(r"^gs://([a-z0-9][a-z0-9_.-]{1,220}[a-z0-9])/((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.json)$")
@@ -65,9 +65,6 @@ class GcsStateStore:
         self.generation: int | None = None  # None: not loaded yet; 0: the object does not exist
         self.failure: str | None = None
         self._lock = threading.Lock()
-        self._mirror_stop = threading.Event()
-        self._mirror_thread: threading.Thread | None = None
-        self._mirrored: dict[str, tuple[int, int]] = {}
 
     # State ------------------------------------------------------------------------------------
 
@@ -135,28 +132,31 @@ class GcsStateStore:
     def receipt_object(self, name: str) -> str:
         return f"{self.object_name[:-len('.json')]}/receipts/{name}"
 
-    def upload_receipt(self, path: Path) -> bool:
-        """Copy one receipt file to Cloud Storage (overwriting); False when it is not a receipt or can't be read."""
-        if self.read_only or not _RECEIPT_NAME_RE.match(path.name):
-            return False
-        try:
-            data = path.read_bytes()
-            stat = path.stat()
-        except OSError:
-            return False
-        key = (stat.st_mtime_ns, stat.st_size)
-        if self._mirrored.get(path.name) == key:
-            return True
-        current = None
-        try:
-            current = self.client.stat(self.receipt_object(path.name))
-            self.client.put(self.receipt_object(path.name), data,
-                            if_generation_match=current.generation if current else 0)
-        except GcsError as exc:
-            LOG.warning("Could not mirror deployment receipt %s to %s: %s", path.name, self.uri, exc)
-            return False
-        self._mirrored[path.name] = key
-        return True
+    def upload_receipt(self, path: Path) -> None:
+        """Copy one receipt file to Cloud Storage (overwriting it), proven by reading it back; raises otherwise."""
+        if self.read_only:
+            raise AutoscalerStateError(f"autoscaler state {self.uri} was opened read-only (--dry-run)")
+        if not _RECEIPT_NAME_RE.match(path.name):
+            raise AutoscalerStateError(f"{path.name} is not a deployment receipt name")
+        data = path.read_bytes()
+        name = self.receipt_object(path.name)
+        last = ""
+        for _attempt in range(WRITE_ATTEMPTS):
+            try:
+                current = self.client.stat(name)
+                self.client.put(name, data, if_generation_match=current.generation if current else 0)
+                return
+            except GcsAmbiguous as exc:
+                last = str(exc)
+                try:
+                    stored = self.client.get(name)
+                except GcsError:
+                    stored = None
+                if stored is not None and stored.data == data:
+                    return
+            except GcsError as exc:
+                last = str(exc)
+        raise AutoscalerStateError(f"could not save deployment receipt {path.name} to {self.uri}: {last}")
 
     def restore_receipt(self, path: Path) -> bool:
         """Download the mirrored copy of a receipt that is missing locally; True when ``path`` now exists."""
@@ -178,30 +178,6 @@ class GcsStateStore:
         LOG.info("Restored deployment receipt %s from %s", path.name, self.uri)
         return True
 
-    def mirror_once(self, directory: Path) -> None:
-        for path in sorted(directory.glob(RECEIPT_GLOB)):
-            self.upload_receipt(path)
-
-    def start_mirror(self, directory: Path, interval: float = MIRROR_SECONDS) -> None:
-        """Mirror new or changed receipts in ``directory`` from a daemon thread until :meth:`stop_mirror`."""
-        if self.read_only or self._mirror_thread is not None:
-            return
-
-        def loop() -> None:
-            while not self._mirror_stop.wait(interval):
-                self.mirror_once(directory)
-
-        self._mirror_thread = threading.Thread(target=loop, name="receipt-mirror", daemon=True)
-        self._mirror_thread.start()
-
-    def stop_mirror(self, directory: Path) -> None:
-        """Stop the mirror thread and copy whatever it has not copied yet."""
-        if self._mirror_thread is None:
-            return
-        self._mirror_stop.set()
-        self._mirror_thread.join(timeout=30)
-        self._mirror_thread = None
-        self.mirror_once(directory)
 
 
 # --------------------------------------------------------------------------------------------
@@ -233,3 +209,16 @@ def reset() -> None:
 def check() -> None:
     if _STORE is not None:
         _STORE.check()
+
+
+def save_receipt_from_env(path: Path, env: Mapping[str, str] | None = None,
+                          factory: Callable[..., GcsStateStore] | None = None) -> bool:
+    """Called by the deployment manager after it writes a receipt: with ``SPOT_AUTOSCALER_STATE_URI`` in its
+    environment (inherited from the autoscaler), upload the receipt before anything else happens. Raises when the
+    upload is not proven; False when no Cloud Storage state is configured."""
+    env = os.environ if env is None else env
+    uri = str(env.get(ENV_STATE_URI, "") or "").strip()
+    if not uri:
+        return False
+    (factory or GcsStateStore)(uri).upload_receipt(Path(path))
+    return True

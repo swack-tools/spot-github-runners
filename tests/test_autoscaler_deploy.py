@@ -28,7 +28,10 @@ ARGS = ("--scaling-mode", "tiered", "--maximum-hosts", "5", "--max-daily-usd", "
 BASE_ROLE = ["compute.instances.create", "compute.instances.setMetadata", "compute.projects.get",
              "compute.projects.setCommonInstanceMetadata", "compute.instances.osAdminLogin",
              "compute.instances.osLogin", "compute.instances.setIamPolicy", "compute.disks.create",
-             "resourcemanager.projects.get", "resourcemanager.projects.list", "compute.untestable.permission"]
+             "resourcemanager.projects.get", "resourcemanager.projects.list", "compute.untestable.permission",
+             "compute.images.create", "compute.images.delete", "compute.images.useReadOnly", "compute.images.get",
+             "compute.snapshots.delete", "compute.instanceTemplates.create", "compute.subnetworks.use",
+             "compute.subnetworks.useExternalIp", "backupdr.backupPlans.useForComputeDisk", "backupdr.operations.get"]
 TESTABLE = [{"name": p, "customRolesSupportLevel": "SUPPORTED"} for p in BASE_ROLE
             if p not in ("resourcemanager.projects.list", "compute.untestable.permission")]
 TESTABLE.append({"name": "resourcemanager.projects.list", "customRolesSupportLevel": "NOT_SUPPORTED"})
@@ -136,11 +139,13 @@ class ValidateTests(unittest.TestCase):
 
 
 class RoleTests(unittest.TestCase):
-    def test_the_custom_role_drops_project_metadata_os_login_and_iam_policy_writes(self):
+    def test_the_custom_role_changes_only_hosts_and_never_project_metadata(self):
         support = {row["name"]: row["customRolesSupportLevel"] for row in TESTABLE}
         permissions = deploy.role_permissions(BASE_ROLE, support)
-        self.assertEqual(permissions, ("compute.disks.create", "compute.instances.create",
+        self.assertEqual(permissions, ("backupdr.operations.get", "compute.disks.create", "compute.images.get",
+                                       "compute.images.useReadOnly", "compute.instances.create",
                                        "compute.instances.setMetadata", "compute.projects.get",
+                                       "compute.subnetworks.use", "compute.subnetworks.useExternalIp",
                                        "resourcemanager.projects.get"))
 
     def test_the_compute_binding_uses_the_custom_role_under_the_runner_host_condition(self):
@@ -157,6 +162,44 @@ class RoleTests(unittest.TestCase):
 
 
 class StepsTests(unittest.TestCase):
+    def test_a_switch_of_the_condition_setting_removes_the_other_binding(self):
+        for condition, removed in ((True, "--condition=None"),
+                                   (False, "--condition-from-file=@FILE:hosts-condition.json")):
+            with self.subTest(condition=condition):
+                steps = deploy.build_steps(config(compute_condition=condition))
+                step = next(s for s in steps if s.remove)
+                (command,) = step.remove
+                self.assertEqual(command[:3], ("gcloud", "projects", "remove-iam-policy-binding"))
+                self.assertIn(f"--role=projects/{PROJECT}/roles/spotRunnerHostAdmin", command)
+                self.assertIn(removed, command)
+                self.assertIn("hosts-condition.json", step.files)
+
+    def test_secrets_no_longer_mounted_lose_the_runtime_accessor(self):
+        steps = deploy.build_steps(config(ssh_secret="new-ssh-key"))
+        labels = [c for c in commands(steps) if c[:3] == ["gcloud", "secrets", "update"]]
+        self.assertEqual(sorted(c[3] for c in labels), ["new-ssh-key", "spot-floor-github-swack-tools"])
+        self.assertTrue(all("--update-labels=spot-runner-autoscaler=mounted" in c for c in labels))
+        ((listing, keep, prune),) = next(s for s in steps if s.prune).prune
+        self.assertIn("--filter=labels.spot-runner-autoscaler=mounted", listing)
+        self.assertEqual(keep, ("new-ssh-key", "spot-floor-github-swack-tools"))
+        self.assertIn(f"--member=serviceAccount:{RUNTIME_SA}", prune[0])
+        self.assertIn("--role=roles/secretmanager.secretAccessor", prune[0])
+
+    def test_apply_revokes_a_retired_secret_and_keeps_the_current_ones(self):
+        runner = FakeGcloud()
+        calls = []
+
+        def listing(argv):
+            calls.append(list(argv))
+            if list(argv[:3]) == ["gcloud", "secrets", "list"]:
+                return SimpleNamespace(returncode=0, stdout="spot-floor-github-swack-tools\nold-ssh-key\n", stderr="")
+            return runner(argv)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            wd.execute(config(), deploy.build_steps(config()), listing, out=lambda line: None)
+        removed = [c for c in calls if c[:3] == ["gcloud", "secrets", "remove-iam-policy-binding"]]
+        self.assertEqual([c[3] for c in removed], ["old-ssh-key"])
+
     def test_iam_bindings_are_exactly_the_documented_ones(self):
         steps = deploy.build_steps(config())
         granted = sorted((flag(c, "--member").split(":", 1)[1], flag(c, "--role")) for c in commands(steps)

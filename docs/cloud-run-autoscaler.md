@@ -59,9 +59,9 @@ seconds after the previous one waits for that boundary, up to 2 minutes, and the
 Between two executions, the lease is free for about 3 minutes. The floor keeper may act then, but it acts only on
 a target that has no running managed host, as it does whenever the autoscaler isn't running.
 
-A launch writes a deployment receipt next to the state file. A thread copies new receipts to Cloud Storage every
-5 seconds. When an execution dies during a launch, the next one restores the receipt before it reconciles the
-pending launch.
+A launch writes a deployment receipt next to the state file. The deployment manager uploads it to Cloud Storage
+before it waits for the host to boot, and a failed upload fails the launch, whose VM the autoscaler then removes.
+When an execution dies during a launch, the next one restores the receipt before it reconciles the pending launch.
 
 ### Reach runner hosts
 
@@ -85,12 +85,21 @@ such as the workstation's, stop working on hosts that turn it on.
 
 ### Least privilege
 
-The predefined `roles/compute.instanceAdmin.v1` includes `compute.projects.setCommonInstanceMetadata`. An IAM
-condition narrows only instances and disks, and the project always passes it. With that permission, `gcloud
-compute ssh` would put the autoscaler's key into project metadata, which every VM in the project trusts. The deploy
-therefore creates the custom role `spotRunnerHostAdmin`: the predefined role's permissions without
-`compute.projects.setCommonInstanceMetadata`, `compute.instances.osAdminLogin`, `compute.instances.osLogin`, and
-every `*.setIamPolicy`. It reads the predefined role when you run `--apply`.
+The predefined `roles/compute.instanceAdmin.v1` also changes images, snapshots, instance templates, and project
+metadata, including `compute.projects.setCommonInstanceMetadata`. An IAM condition narrows only instances and disks,
+and every other resource type passes it. With that permission, `gcloud compute ssh` would put the autoscaler's key
+into project metadata, which every VM in the project trusts. The deploy therefore creates the custom role
+`spotRunnerHostAdmin` from the predefined role's permissions:
+
+- Every permission on instances and disks, which the condition narrows to runner hosts, except
+  `compute.instances.osAdminLogin`, `compute.instances.osLogin`, and `*.setIamPolicy`.
+- On other Compute Engine resources, only `get*`, `list*`, and `use*` permissions, such as using a subnetwork, an
+  external IP address, or a public image.
+- On other services, only `get*` and `list*` permissions.
+
+It reads the predefined role when you run `--apply`. Each deploy also removes what an earlier deploy granted and
+this one doesn't: the compute binding of the other `--no-compute-condition` setting, and access to secrets that
+carry the `spot-runner-autoscaler` label but are no longer mounted.
 
 The autoscaler used to create hosts as the project's default Compute Engine account. That account usually holds
 broad roles, and acting as it would give the job those roles. The job instead passes

@@ -3196,13 +3196,9 @@ def run_controller(args: argparse.Namespace) -> int:
         holder = acquire_floor_lease(args) if live else None
         if holder is False:
             return 0
-        if store is not None and live:
-            store.start_mirror(state_path.parent)
         try:
             code = _run_controller(args)
         finally:
-            if store is not None and live:
-                store.stop_mirror(state_path.parent)
             if holder:
                 release_floor_lease(holder)
         if store is not None and store.failure:
