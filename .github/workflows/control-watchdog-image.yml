@@ -6,7 +6,11 @@ name: Control watchdog image
 #   WATCHDOG_PUBLISHER_SA   the publisher service account e-mail
 #   WATCHDOG_WIF_PROVIDER   projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
 #   WATCHDOG_BASE_IMAGE     gcr.io/google.com/cloudsdktool/google-cloud-cli:<version>-slim@sha256:<digest>
-# A pushed image changes nothing by itself: the Cloud Run job runs the digest the deploy pinned.
+# A pushed image changes nothing by itself. The deploy job rolls the Cloud Run service to it only when this variable
+# is also set (a deploy with SPOT_WATCHDOG_AUTO_DEPLOY=1 creates the account and prints it):
+#   WATCHDOG_DEPLOYER_SA    the deployer service account e-mail
+# The deploy job swaps only the service's image, after the build and smoke test passed, and refuses any image whose
+# commit is not strictly ahead of the deployed image's commit (a re-run of an older run never rolls back).
 
 on:
   push:
@@ -34,6 +38,8 @@ jobs:
     if: ${{ vars.WATCHDOG_IMAGE != '' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     env:
       IMAGE: ${{ vars.WATCHDOG_IMAGE }}
       BASE_IMAGE: ${{ vars.WATCHDOG_BASE_IMAGE }}
@@ -112,9 +118,15 @@ jobs:
           printf '%s' "${access}" | docker login --username oauth2accesstoken --password-stdin "https://${registry}"
 
       - name: Push
+        id: push
+        env:
+          DEPLOYER_SA: ${{ vars.WATCHDOG_DEPLOYER_SA }}
         run: |
           docker push "${IMAGE}:${GITHUB_SHA}"
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${GITHUB_SHA}")"
+          [[ "$digest" == "${IMAGE}@sha256:"* && "$digest" =~ @sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::unexpected digest ${digest}"; exit 1; }
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
           {
             echo "### Control watchdog image"
             echo
@@ -124,9 +136,97 @@ jobs:
             echo "| Digest | \`${digest}\` |"
             echo "| Base | \`${BASE_IMAGE}\` |"
             echo
-            echo "Deploy it with \`src/control_watchdog_deploy.py --image=${digest}\` (dry run first)."
+            if [[ -n "${DEPLOYER_SA}" ]]; then
+              echo "The deploy job rolls the watchdog to it."
+            else
+              echo "Deploy it with \`src/control_watchdog_deploy.py --image=${digest}\` (dry run first)."
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Log out
         if: always()
         run: docker logout "${IMAGE%%/*}" || true
+
+  deploy:
+    needs: build
+    if: ${{ vars.WATCHDOG_DEPLOYER_SA != '' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      IMAGE: ${{ vars.WATCHDOG_IMAGE }}
+      DEPLOYER_SA: ${{ vars.WATCHDOG_DEPLOYER_SA }}
+      WIF_PROVIDER: ${{ vars.WATCHDOG_WIF_PROVIDER }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - name: Check settings
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$IMAGE" =~ ^([a-z0-9-]+)-docker\.pkg\.dev/([a-z][a-z0-9-]+)/[a-z][a-z0-9-]*/control-watchdog$ ]] \
+            || fail "WATCHDOG_IMAGE must be <region>-docker.pkg.dev/<project>/<repository>/control-watchdog"
+          echo "REGION=${BASH_REMATCH[1]}" >> "${GITHUB_ENV}"
+          echo "PROJECT=${BASH_REMATCH[2]}" >> "${GITHUB_ENV}"
+          [[ "$DEPLOYER_SA" =~ ^[a-z][a-z0-9-]+@[a-z][a-z0-9-]+\.iam\.gserviceaccount\.com$ ]] \
+            || fail "WATCHDOG_DEPLOYER_SA must be a service account e-mail"
+          [[ "$WIF_PROVIDER" =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+$ ]] \
+            || fail "WATCHDOG_WIF_PROVIDER must be the provider's full resource name"
+          [[ "$DIGEST" == "${IMAGE}@sha256:"* && "$DIGEST" =~ @sha256:[0-9a-f]{64}$ ]] \
+            || fail "the build job did not report a digest of ${IMAGE}"
+
+      - name: Check out
+        # actions/checkout v4, pinned to the commit the v4 tag resolved to on 2026-10-17. Full history: the deploy
+        # proves the new commit descends from the deployed one.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Plan
+        run: |
+          python3 -B src/control_watchdog_deploy.py --dry-run --project="${PROJECT}" --region="${REGION}" \
+            --update-image="${DIGEST}" --revision="${GITHUB_SHA}"
+
+      - name: Authenticate as the deployer
+        run: |
+          set -euo pipefail
+          audience="https://iam.googleapis.com/${WIF_PROVIDER}"
+          oidc="$(curl -fsS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}" | jq -r '.value')"
+          echo "::add-mask::${oidc}"
+          federated="$(jq -n --arg aud "//iam.googleapis.com/${WIF_PROVIDER}" --arg token "${oidc}" '{
+              audience: $aud,
+              grantType: "urn:ietf:params:oauth:grant-type:token-exchange",
+              requestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+              scope: "https://www.googleapis.com/auth/cloud-platform",
+              subjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+              subjectToken: $token}' \
+            | curl -fsS -X POST -H "Content-Type: application/json" --data @- https://sts.googleapis.com/v1/token \
+            | jq -r '.access_token')"
+          echo "::add-mask::${federated}"
+          access="$(curl -fsS -X POST -H "Authorization: Bearer ${federated}" -H "Content-Type: application/json" \
+            --data '{"scope": ["https://www.googleapis.com/auth/cloud-platform"], "lifetime": "1200s"}' \
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${DEPLOYER_SA}:generateAccessToken" \
+            | jq -r '.accessToken')"
+          echo "::add-mask::${access}"
+          [[ -n "$access" && "$access" != null ]] || { echo "::error::no access token"; exit 1; }
+          token_file="${RUNNER_TEMP}/gcloud-access-token"
+          ( umask 077; printf '%s' "${access}" > "${token_file}" )
+          echo "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE=${token_file}" >> "${GITHUB_ENV}"
+
+      - name: Deploy
+        env:
+          CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+          CLOUDSDK_CONFIG: ${{ runner.temp }}/gcloud-config
+        run: |
+          set -euo pipefail
+          result="$(python3 -B src/control_watchdog_deploy.py --project="${PROJECT}" --region="${REGION}" \
+            --update-image="${DIGEST}" --revision="${GITHUB_SHA}")"
+          echo "${result}"
+          {
+            echo "### Control watchdog deploy"
+            echo
+            echo "${result}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Remove the access token
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/gcloud-access-token"

@@ -714,3 +714,256 @@ class OrphanedVolumeTests(unittest.TestCase):
                                         text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), ",".join(deploy.orphaned_secret_volumes(service)))
+
+
+# --------------------------------------------------------------------------------------------
+# Automatic deploys (SPOT_WATCHDOG_AUTO_DEPLOY=1 and --update-image)
+# --------------------------------------------------------------------------------------------
+
+AUTO_ENV = dict(ENV, SPOT_WATCHDOG_AUTO_DEPLOY="1")
+RUNTIME = f"spot-control-watchdog@{PROJECT}.iam.gserviceaccount.com"
+DEPLOYER = f"spot-watchdog-deployer@{PROJECT}.iam.gserviceaccount.com"
+IMAGE_REPO = IMAGE.split("@", 1)[0]
+OLD_SHA, NEW_SHA = "1" * 40, "2" * 40
+OLD_IMAGE, NEW_IMAGE = f"{IMAGE_REPO}@sha256:{'c' * 64}", f"{IMAGE_REPO}@sha256:{'d' * 64}"
+
+
+def live_service(image=OLD_IMAGE, *, labels=None, account=RUNTIME, ready=True):
+    """`gcloud run services describe --format=json`, shaped like the live service."""
+    revision = "spot-control-watchdog-00007-7dz"
+    return {"metadata": {"labels": {"cloud.googleapis.com/location": "us-central1", "spot-role": "control-watchdog"}
+                         if labels is None else labels},
+            "spec": {"template": {"spec": {"serviceAccountName": account, "containers": [{"image": image}]}}},
+            "status": {"latestReadyRevisionName": revision if ready else "old",
+                       "latestCreatedRevisionName": revision,
+                       "traffic": [{"latestRevision": True, "percent": 100, "revisionName": revision}],
+                       "conditions": [{"type": "Ready", "status": "True" if ready else "False"}]}}
+
+
+def tag_listing(pairs):
+    """`gcloud artifacts docker tags list --format=json`, shaped like the live repository's answer."""
+    base = f"projects/{PROJECT}/locations/us-central1/repositories/spot-control/packages/control-watchdog"
+    return [{"image": IMAGE_REPO, "tag": f"{base}/tags/{tag}", "version": f"{base}/versions/{image.split('@')[1]}"}
+            for tag, image in pairs]
+
+
+class AutoDeployIamTests(unittest.TestCase):
+    def test_off_by_default(self):
+        code, script, err = dry_run(f"--image={IMAGE}")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("spot-watchdog-deployer", script)
+        self.assertNotIn("WATCHDOG_DEPLOYER_SA", script)
+        self.assertNotIn("roles/run.developer", script)
+
+    def test_the_deployer_gets_exactly_the_service_its_account_and_read_access(self):
+        code, script, err = dry_run(f"--image={IMAGE}", env=AUTO_ENV)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
+        cmds = commands(script)
+        self.assertTrue([c for c in cmds if c[1:4] == ["iam", "service-accounts", "create"]
+                         and "spot-watchdog-deployer" in c])
+        deployer = [c for c in cmds if "add-iam-policy-binding" in c and f"--member=serviceAccount:{DEPLOYER}" in c]
+        self.assertEqual(sorted((c[1], c[4] if c[1] != "run" else c[4], flag(c, "role")) for c in deployer), sorted([
+            ("artifacts", "spot-control", "roles/artifactregistry.reader"),
+            ("iam", RUNTIME, "roles/iam.serviceAccountUser"),
+            ("run", "spot-control-watchdog", "roles/run.developer")]))
+        wif = [c for c in cmds if "add-iam-policy-binding" in c and c[4:5] == [DEPLOYER]]
+        self.assertEqual([flag(c, "role") for c in wif], ["roles/iam.workloadIdentityUser"])
+        self.assertIn("attribute.repository/swack-tools/spot-github-runners", flag(wif[0], "member"))
+        self.assertIn(f"gh variable set WATCHDOG_DEPLOYER_SA --repo swack-tools/spot-github-runners --body {DEPLOYER}",
+                      script)
+        self.assertIn("never rolls the watchdog back", script)
+        # The documented list carries the same four bindings.
+        config = deploy.config_from_args(deploy.args_parser().parse_args([f"--project={PROJECT}"]), AUTO_ENV)
+        roles = {(b[1], b[2]) for b in deploy.iam_bindings(config)}
+        for role in ("roles/run.developer", "roles/iam.serviceAccountUser", "roles/artifactregistry.reader"):
+            self.assertIn((f"serviceAccount:{DEPLOYER}", role), roles)
+        # Never a setting of the service itself.
+        self.assertNotIn("SPOT_WATCHDOG_AUTO_DEPLOY", config.service_env())
+
+    def test_a_bad_value_is_refused(self):
+        code, _, err = dry_run(env=dict(ENV, SPOT_WATCHDOG_AUTO_DEPLOY="yes"))
+        self.assertEqual(code, 1)
+        self.assertIn("SPOT_WATCHDOG_AUTO_DEPLOY must be empty, 0, or 1", err)
+
+
+class AutoDeployGuardTests(unittest.TestCase):
+    def deploy(self, service, env=AUTO_ENV, image=IMAGE):
+        calls = []
+
+        def run(argv):
+            calls.append(list(argv))
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
+            if list(argv[1:4]) == ["run", "services", "describe"]:
+                if service is None and not any(c[1:3] == ["run", "deploy"] for c in calls):
+                    return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: Service [x] could not be found.")
+                return SimpleNamespace(returncode=0, stdout=json.dumps(service or SERVICE), stderr="")
+            if "describe" in argv and "versions" in argv:
+                return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = deploy.main([f"--project={PROJECT}", f"--image={image}"], runner=run, env=env)
+        return code, err.getvalue(), calls
+
+    def test_an_older_image_is_refused_before_anything_changes(self):
+        code, err, calls = self.deploy(live_service(NEW_IMAGE), image=OLD_IMAGE)
+        self.assertEqual(code, 1)
+        self.assertIn(f"pass --image={NEW_IMAGE}", err)
+        self.assertEqual(len(calls), 1)
+
+    def test_the_deployed_image_or_a_new_service_passes_and_off_never_checks(self):
+        self.assertEqual(self.deploy(live_service(IMAGE))[0], 0)
+        self.assertEqual(self.deploy(None)[0], 0)
+        code, _, calls = self.deploy(live_service(NEW_IMAGE), env=ENV)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0][:3], ["gcloud", "projects", "describe"])  # no guard describe first
+
+    def test_an_unreadable_service_is_refused(self):
+        def run(argv):
+            return SimpleNamespace(returncode=1, stdout="", stderr="PERMISSION_DENIED")
+        config = deploy.config_from_args(deploy.args_parser().parse_args([f"--project={PROJECT}", f"--image={IMAGE}"]),
+                                         AUTO_ENV)
+        with self.assertRaises(deploy.DeployError):
+            deploy.auto_deploy_guard(config, run)
+
+
+class UpdateImageTests(unittest.TestCase):
+    def runner(self, service=None, tags=None, ancestry=0, update_rc=0, after=None, git_stderr=""):
+        calls = []
+        service = live_service() if service is None else service
+        state = {"updated": False}
+
+        def run(argv):
+            argv = list(argv)
+            calls.append(argv)
+            if argv[1:4] == ["run", "services", "describe"]:
+                current = (after if after is not None else live_service(NEW_IMAGE)) if state["updated"] else service
+                return SimpleNamespace(returncode=0, stdout=json.dumps(current), stderr="")
+            if argv[1:5] == ["artifacts", "docker", "tags", "list"]:
+                listing = tags if tags is not None else tag_listing([(OLD_SHA, OLD_IMAGE), (NEW_SHA, NEW_IMAGE),
+                                                                     ("latest", NEW_IMAGE)])
+                return SimpleNamespace(returncode=0, stdout=json.dumps(listing), stderr="Listing items under ...")
+            if argv[0] == "git":
+                return SimpleNamespace(returncode=ancestry, stdout="", stderr=git_stderr)
+            if argv[1:4] == ["run", "services", "update"]:
+                state["updated"] = update_rc == 0
+                return SimpleNamespace(returncode=update_rc, stdout="", stderr="" if update_rc == 0 else "revision failed")
+            raise AssertionError(argv)
+        return run, calls
+
+    def update(self, run, *extra, image=NEW_IMAGE, revision=NEW_SHA):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = deploy.main([f"--project={PROJECT}", f"--update-image={image}", f"--revision={revision}",
+                                "--repo-dir=/checkout", *extra], runner=run, env={})
+        return code, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def updates(calls):
+        return [c for c in calls if c[1:4] == ["run", "services", "update"]]
+
+    def test_a_newer_commit_swaps_only_the_image_and_is_verified(self):
+        run, calls = self.runner()
+        code, out, err = self.update(run)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"moved from commit {OLD_SHA} to {NEW_SHA}", out)
+        self.assertIn(["git", "-C", "/checkout", "merge-base", "--is-ancestor", OLD_SHA, NEW_SHA], calls)
+        (update,) = self.updates(calls)
+        self.assertEqual(update, ["gcloud", "run", "services", "update", "spot-control-watchdog",
+                                  f"--project={PROJECT}", "--region=us-central1", f"--image={NEW_IMAGE}", "--quiet"])
+        self.assertEqual(calls[-1][1:4], ["run", "services", "describe"])  # verified after the update
+
+    def test_refusals_change_nothing(self):
+        cases = {
+            "not a descendant": self.runner(ancestry=1),
+            "full-history checkout": self.runner(ancestry=128, git_stderr="fatal: Not a valid commit name"),
+            "has no commit tags": self.runner(tags=tag_listing([(NEW_SHA, NEW_IMAGE)])),
+            "has 2 commit tags": self.runner(tags=tag_listing([(OLD_SHA, OLD_IMAGE), ("3" * 40, OLD_IMAGE),
+                                                               (NEW_SHA, NEW_IMAGE)])),
+            "does not carry the commit tag": self.runner(tags=tag_listing([(OLD_SHA, OLD_IMAGE)])),
+            "no spot-role=control-watchdog label": self.runner(service=live_service(labels={})),
+            "runs as": self.runner(service=live_service(account="other@x.iam.gserviceaccount.com")),
+            "is not us-central1-docker.pkg.dev": self.runner(service=live_service("gcr.io/x/y:latest")),
+        }
+        for words, (run, calls) in cases.items():
+            with self.subTest(words):
+                code, _, err = self.update(run)
+                self.assertEqual(code, 1)
+                self.assertIn(words, err)
+                self.assertEqual(self.updates(calls), [])
+
+    def test_compare_and_swap(self):
+        run, calls = self.runner()
+        code, _, err = self.update(run, f"--expect-current={NEW_IMAGE}")
+        self.assertEqual(code, 1)
+        self.assertIn("not the expected", err)
+        self.assertEqual(self.updates(calls), [])
+        run, calls = self.runner()
+        self.assertEqual(self.update(run, f"--expect-current={OLD_IMAGE}")[0], 0)
+
+    def test_already_deployed_or_same_commit_is_done(self):
+        run, calls = self.runner(service=live_service(NEW_IMAGE))
+        code, out, _ = self.update(run)
+        self.assertEqual(code, 0)
+        self.assertIn("already runs", out)
+        self.assertEqual(len(calls), 1)
+        rebuilt = f"{IMAGE_REPO}@sha256:{'e' * 64}"  # a re-run built the deployed commit again
+        run, calls = self.runner(tags=tag_listing([(OLD_SHA, OLD_IMAGE), (OLD_SHA, rebuilt)]))
+        code, out, _ = self.update(run, image=rebuilt, revision=OLD_SHA)
+        self.assertEqual(code, 0)
+        self.assertIn("already runs commit", out)
+        self.assertEqual(self.updates(calls), [])
+
+    def test_a_failed_or_unsettled_update_fails(self):
+        run, _ = self.runner(update_rc=1)
+        code, _, err = self.update(run)
+        self.assertEqual(code, 1)
+        self.assertIn("traffic stays on the ready revision", err)
+        run, _ = self.runner(after=live_service(NEW_IMAGE, ready=False))
+        code, _, err = self.update(run)
+        self.assertEqual(code, 1)
+        self.assertIn("is not ready", err)
+        split = live_service(NEW_IMAGE)
+        split["status"]["traffic"] = [{"revisionName": "spot-control-watchdog-00007-7dz", "percent": 50}]
+        run, _ = self.runner(after=split)
+        self.assertIn("50% of traffic", self.update(run)[2])
+
+    def test_the_dry_run_runs_nothing_and_bad_arguments_are_refused(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = deploy.main(["--dry-run", f"--project={PROJECT}", f"--update-image={NEW_IMAGE}",
+                                f"--revision={NEW_SHA}"], runner=never, env={})
+        self.assertEqual(code, 0, err.getvalue())
+        script = out.getvalue()
+        self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
+        self.assertIn("nothing below has run", script)
+        self.assertIn(f"--image={NEW_IMAGE} --quiet", script)
+        for extra, words in (([f"--update-image={IMAGE_REPO}:latest", f"--revision={NEW_SHA}"], "pinned by digest"),
+                             ([f"--update-image={NEW_IMAGE}", "--revision=main"], "40-hex"),
+                             ([f"--update-image={NEW_IMAGE}", f"--revision={NEW_SHA}", "--expect-current=x"],
+                              "--expect-current must be")):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as caught:
+                self.assertEqual(deploy.main([f"--project={PROJECT}", *extra], runner=never, env={}), 1)
+            self.assertIn(words, caught.getvalue())
+
+    def test_commit_tags_ignore_other_tags_and_malformed_rows(self):
+        listing = tag_listing([(OLD_SHA, OLD_IMAGE), ("latest", OLD_IMAGE)]) + [None, {"tag": "x"}, "junk"]
+        self.assertEqual(deploy.commit_tags(listing), {OLD_IMAGE.split("@")[1]: {OLD_SHA}})
+        self.assertEqual(deploy.commit_tags({"not": "a list"}), {})
+
+
+class AutoDeployWorkflowTests(unittest.TestCase):
+    def test_the_deploy_job_is_gated_and_runs_the_image_only_update(self):
+        text = (ROOT / deploy.IMAGE_WORKFLOW).read_text()
+        job = text[text.index("\n  deploy:\n"):]
+        self.assertIn("needs: build", job)
+        self.assertIn("if: ${{ vars.WATCHDOG_DEPLOYER_SA != '' && github.ref == 'refs/heads/main' }}", job)
+        self.assertIn("fetch-depth: 0", job)
+        self.assertIn("persist-credentials: false", job)
+        self.assertIn('--update-image="${DIGEST}" --revision="${GITHUB_SHA}"', job)
+        self.assertIn("--dry-run", job)
+        self.assertIn("serviceAccounts/${DEPLOYER_SA}:generateAccessToken", job)
+        self.assertNotIn("${{ vars.", job.split("steps:", 1)[1])  # settings reach scripts through env only
+        self.assertIn("digest: ${{ steps.push.outputs.digest }}", text)

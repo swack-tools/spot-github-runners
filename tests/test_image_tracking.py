@@ -7,9 +7,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
+import tempfile
 import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import test_control_vm as tcv
 from lib import control_vm as cv
@@ -242,6 +247,11 @@ class FakeGitHub:
     def compare(self, base, head):
         self.calls.append(("compare", base, head))
         return self.order.get((base, head), "behind")
+
+    def set_status(self, sha, state, description, *, target_url=""):
+        self.calls.append(("status", sha, state, description))
+        if getattr(self, "status_error", None):
+            raise it.TrackingError(self.status_error)
 
 
 class WatchdogGcloud(tcv.FakeGcloud):
@@ -674,6 +684,221 @@ class RestartPolicyTests(unittest.TestCase):
         self.assertIn(("set-scheduling", "spot-control-b"), h.events)
         h.tick()
         self.assertIn(("origin", "a"), h.events)
+
+
+
+# --------------------------------------------------------------------------------------------
+# Aborted rollouts: recorded reason, warning, retry, and GitHub commit statuses
+# --------------------------------------------------------------------------------------------
+
+def abort_rollout(h):
+    """Start the rollout to :main (D_B) and let it time out unhealthy."""
+    h.tick()
+    h.http.unhealthy("b")
+    h.gcloud.status("b", "RUNNING")
+    h.clock[0] += cv.HEALTH_TIMEOUT_SECONDS
+    h.tick()
+
+
+class AbortVisibilityTests(unittest.TestCase):
+    def test_the_abort_reason_is_kept_named_in_the_plan_and_logged_every_check(self):
+        h = TrackingHarness()
+        h.active()
+        abort_rollout(h)
+        failure = h.image["failures"][D_B]
+        self.assertEqual(failure["revision"], SHA_B)
+        self.assertIn(f"not healthy after {cv.HEALTH_TIMEOUT_SECONDS}s", failure["reason"])
+        self.assertEqual(failure["at"], h.clock[0])
+        h.clock[0] += cv.ROTATION_COOLDOWN_SECONDS
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "WARNING") as logs:
+            plan = h.tick()
+        self.assertEqual(plan.action, "noop")
+        self.assertIn("not healthy after", plan.reason)
+        self.assertIn("retry-image --apply", plan.reason)
+        self.assertTrue(any("image rollout held" in line for line in logs.output))
+        # A preview reports the same, and changes nothing.
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "WARNING"):
+            self.assertIn("not healthy after", h.tick(apply=False).reason)
+        # The status output carries it too.
+        manager = h.manager()
+        self.assertIn(D_B, manager.status(manager.observe())["image"]["failures"])
+
+    def test_failures_stay_bounded_to_the_backed_off_digests(self):
+        cache = {}
+        for i in range(it.FAILED_DIGESTS_KEPT + 3):
+            it.record_failed(cache, f"sha256:{i:064d}", reason=f"r{i}", at=i)
+        self.assertEqual(set(cache["failures"]), set(cache["failed"]))
+        self.assertEqual(it.failure_of(cache, cache["failed"][-1])["reason"], f"r{it.FAILED_DIGESTS_KEPT + 2}")
+        self.assertEqual(it.failure_of(cache, "sha256:" + "f" * 64), {})
+        it.record_failed({"failed": [D_A], "failures": "junk"}, D_B)  # a malformed section never raises
+
+    def test_retry_lifts_the_back_off_and_skips_the_abort_cooldown_once(self):
+        h = TrackingHarness()
+        h.active()
+        abort_rollout(h)
+        self.assertIn("cooldown", h.tick().reason)
+        digest, failure = cv.retry_image_target(h.state[cv.STATE_KEY], None)
+        self.assertEqual(digest, D_B)
+        self.assertIn("not healthy after", failure["reason"])
+        it.retry_failed(h.image, D_B, at=h.clock[0])
+        self.assertEqual(h.image["failed"], [])
+        self.assertNotIn(D_B, h.image["failures"])
+        plan = h.tick()  # no cooldown wait for the abort before the retry
+        self.assertEqual(plan.action, "rotate")
+        self.assertEqual(h.transition["dashboard_image"], IMG_B)
+        self.assertNotIn("retry", h.image)  # used up once its rollout begins
+        # Aborting again backs it off again, and that abort's cooldown applies.
+        h.http.unhealthy("b")
+        h.gcloud.status("b", "RUNNING")
+        h.clock[0] += cv.HEALTH_TIMEOUT_SECONDS
+        h.tick()
+        self.assertEqual(h.image["failed"], [D_B])
+        self.assertIn("cooldown", h.tick().reason)
+
+    def test_a_retry_never_skips_a_completed_transitions_cooldown(self):
+        h = TrackingHarness()
+        h.active()
+        h.state.setdefault(cv.STATE_KEY, {})["last_transition_end_at"] = h.clock[0] - 60
+        h.state[cv.STATE_KEY]["image"] = {"failed": [D_B], "retry": {"digest": D_C, "at": h.clock[0]}}
+        self.assertIn("cooldown", h.tick().reason)
+
+    def test_retry_target_selection(self):
+        failures = {"image": {"failed": [D_A, D_B], "main": {"digest": D_B}}}
+        self.assertEqual(cv.retry_image_target(failures, None)[0], D_B)  # the :main one
+        self.assertEqual(cv.retry_image_target(failures, D_A)[0], D_A)
+        self.assertEqual(cv.retry_image_target({"image": {"failed": [D_C]}}, None)[0], D_C)  # the only one
+        for cstate, digest, words in (({}, None, "no image rollout is backed off"),
+                                      ({"image": {"failed": [D_A, D_B]}}, None, "name one with --digest"),
+                                      (failures, D_C, "is not backed off"),
+                                      (failures, "sha256:nope", "must be sha256")):
+            with self.assertRaises(ValueError) as caught:
+                cv.retry_image_target(cstate, digest)
+            self.assertIn(words, str(caught.exception))
+        with self.assertRaises(ValueError):
+            it.retry_failed({"failed": []}, D_A, at=1)
+
+
+class RetryImageCliTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.dir = Path(directory.name)
+        self.path = cv.project_control_paths("homelab-424523", self.dir)[0]
+        self.cstate = {"image": {"failed": [D_B], "main": {"digest": D_B},
+                                 "failures": {D_B: {"reason": "slot b not healthy after 1200s", "revision": SHA_B}}},
+                       "last_abort_at": 5.0}
+        self.path.write_text(json.dumps({cv.STATE_KEY: self.cstate}))
+
+    def cli(self, *argv):
+        out = io.StringIO()
+        with redirect_stdout(out), patch("lib.environment.load_env"), \
+                patch.dict("os.environ", {cv.ENV_CONTROL_STATE_URI: ""}):
+            code = cv.main(["retry-image", *argv, "--control-state-dir", str(self.dir),
+                            "--state-file", str(self.dir / "autoscaler.json")])
+        return code, out.getvalue()
+
+    def test_preview_changes_nothing_and_apply_lifts_the_back_off(self):
+        before = self.path.read_text()
+        code, out = self.cli()
+        self.assertEqual(code, 0)
+        self.assertIn(f"Would lift the back-off of {D_B}", out)
+        self.assertIn("slot b not healthy after 1200s", out)
+        self.assertEqual(self.path.read_text(), before)
+        code, out = self.cli("--apply")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"Lifted the back-off of {D_B}", out)
+        image = json.loads(self.path.read_text())[cv.STATE_KEY]["image"]
+        self.assertEqual(image["failed"], [])
+        self.assertEqual(image["retry"]["digest"], D_B)
+        self.assertEqual(image["retry"]["previous"]["reason"], "slot b not healthy after 1200s")
+        code, out = self.cli("--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing to retry: no image rollout is backed off", out)
+
+    def test_an_unknown_digest_is_refused_without_a_write(self):
+        before = self.path.read_text()
+        code, out = self.cli("--apply", "--digest", D_C)
+        self.assertEqual(code, 1)
+        self.assertIn("is not backed off", out)
+        self.assertEqual(self.path.read_text(), before)
+
+
+class RolloutStatusTests(unittest.TestCase):
+    def statuses(self, h):
+        return [c[1:] for c in h.github.calls if c[0] == "status"]
+
+    def test_a_rollout_reports_pending_then_success_on_its_commit(self):
+        h = TrackingHarness(rollout_status="1")
+        h.active()
+        h.tick()
+        self.assertEqual([s[:2] for s in self.statuses(h)], [(SHA_B, "pending")])
+        h.finish()
+        self.assertEqual([s[:2] for s in self.statuses(h)], [(SHA_B, "pending"), (SHA_B, "success")])
+        self.assertIn("spot-control-b", self.statuses(h)[-1][2])
+
+    def test_an_aborted_rollout_reports_failure_with_the_reason(self):
+        h = TrackingHarness(rollout_status="1")
+        h.active()
+        abort_rollout(h)
+        sha, state, description = self.statuses(h)[-1]
+        self.assertEqual((sha, state), (SHA_B, "failure"))
+        self.assertIn("not healthy after", description)
+
+    def test_off_by_default_and_a_reporting_failure_changes_nothing(self):
+        h = TrackingHarness()
+        h.active()
+        abort_rollout(h)
+        self.assertEqual(self.statuses(h), [])
+        h = TrackingHarness(rollout_status="1")
+        h.active()
+        h.github.status_error = "HTTP 403"
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "WARNING") as logs:
+            h.tick()
+        self.assertEqual(h.transition["step"], "wait_health")
+        self.assertTrue(any("could not report the image rollout" in line for line in logs.output))
+        h.github.status_error = None
+        h.finish()
+        self.assertIsNone(h.transition)
+
+    def test_a_recovery_reports_nothing(self):
+        h = TrackingHarness(rollout_status="1")
+        h.manager()._report_rollout({"image_rollout": None}, "pending", "x")
+        self.assertEqual(self.statuses(h), [])
+
+    def test_settings(self):
+        config = tcv.config(image_track="main", image_track_token="pat", rollout_status="yes")
+        self.assertTrue(any(it.ENV_ROLLOUT_STATUS in p for p in config.tracking_problems()))
+        self.assertFalse(tcv.config(image_track="", rollout_status="1").reports_rollouts)
+        self.assertTrue(tcv.config(image_track="main", rollout_status="1").reports_rollouts)
+        env = {it.ENV_IMAGE_TRACK: "main", it.ENV_ROLLOUT_STATUS: " 1 "}
+        self.assertTrue(cv.ControlConfig.from_env("homelab-424523", env).reports_rollouts)
+
+
+class SetStatusTests(unittest.TestCase):
+    def test_posts_a_commit_status_and_needs_201(self):
+        calls = []
+
+        def http(method, url, headers, body, timeout):
+            calls.append((method, url, headers, json.loads(body)))
+            return HttpResponse(201, {}, b"{}")
+        client = it.GitHubClient("swack-tools/spot-github-runners", "pat", transport=http)
+        client.set_status(SHA_B, "failure", "x" * 200, target_url="https://spot.swacktech.com")
+        method, url, headers, body = calls[0]
+        self.assertEqual((method, url), ("POST", f"https://api.github.com/repos/swack-tools/spot-github-runners/"
+                                                 f"statuses/{SHA_B}"))
+        self.assertEqual(headers["Authorization"], "Bearer pat")
+        self.assertEqual((body["state"], body["context"], body["target_url"]),
+                         ("failure", it.ROLLOUT_STATUS_CONTEXT, "https://spot.swacktech.com"))
+        self.assertEqual(len(body["description"]), it.STATUS_DESCRIPTION_MAX)
+        client.set_status(SHA_B, "success", "ok", target_url="http://insecure")
+        self.assertNotIn("target_url", calls[1][3])
+
+        def forbidden(method, url, headers, body, timeout):
+            return HttpResponse(403, {}, b"{}")
+        client = it.GitHubClient("swack-tools/spot-github-runners", "pat", transport=forbidden)
+        for args in ((SHA_B, "success", "ok"), ("main", "success", "ok"), (SHA_B, "done", "ok")):
+            with self.assertRaises(it.TrackingError):
+                client.set_status(*args)
 
 
 if __name__ == "__main__":
