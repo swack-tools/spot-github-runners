@@ -2133,7 +2133,11 @@ class ControlVmManager:
             health = probe_health(self.requester, self.config, slot)
             if not health.hydrated:
                 return False, f"slot {slot} is not reachable to retry the release: {health.detail}"
-            if not health.frozen:
+            if not health.frozen or t.get("capture_pending"):
+                # capture_pending: an earlier refreeze may have frozen it without its snapshot reaching us, so frozen
+                # no longer shows the release never landed. A freeze is idempotent and returns the current state.
+                t["capture_pending"] = True
+                self.save()
                 status, body = self._control(slot, "freeze", "POST")
                 if not (status == 200 and self._record_freeze(t, body)):
                     return False, f"freeze before retrying the release of slot {slot} returned {status}"
@@ -2268,11 +2272,15 @@ class ControlVmManager:
                 return False
             t["snapshot_in_kv"] = snapshot["state_version"]
             t["frozen_version"] = max(version, t.get("frozen_version") or 0)
+            t.pop("capture_pending", None)
             self.save()
             return True
         if not kept or snapshot["state_version"] >= kept["state_version"]:
             t["frozen_snapshot"] = snapshot  # never replace a newer snapshot with an older one (a stale container)
+            if snapshot["state_version"] >= (t.get("snapshot_in_kv") or 0):
+                t.pop("snapshot_in_kv", None)  # the newest snapshot is this local one again
         t["frozen_version"] = max(version, t.get("frozen_version") or 0)
+        t.pop("capture_pending", None)
         self.save()
         return True
 
@@ -2284,7 +2292,7 @@ class ControlVmManager:
         previous = t.get("from_image") or ""
         waited = self.clock() - t["step_started_at"]
         if (vm is not None and vm.running and t.get("release_attempted") and not t.get("refrozen")
-                and t.get("image_written") and not t.get("restored")
+                and t.get("image_written") and not t.get("restored") and not t.get("capture_pending")
                 and (obs.health.get(slot) or HealthResult.unknown()).frozen):
             # Still frozen: no release landed, so it is drained and its (possibly stale) state must not replace the
             # kept snapshot.
@@ -2297,6 +2305,7 @@ class ControlVmManager:
             # released first, so the rollback always releases the restored container before it ends.
             t["released"] = False
             t["freeze_requested"] = True
+            t["capture_pending"] = True  # until its snapshot is recorded, frozen proves nothing (see above)
             self.save()
             status, body = self._control(slot, "freeze", "POST")
             if status == 200 and self._record_freeze(t, body):

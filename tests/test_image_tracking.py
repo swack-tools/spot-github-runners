@@ -716,6 +716,39 @@ class RolloutTests(unittest.TestCase):
         posted = [json.loads(c[3]) for c in h.http.calls if c[1].endswith("/api/control/import")]
         self.assertEqual(posted[-1], original)
 
+    def test_a_lost_refreeze_answer_is_never_taken_as_no_release(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_response_lost = True  # the release lands
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        h.http.import_response_lost = False
+        h.http.freeze_status = None  # the retry's refreeze lands (frozen again), but its snapshot is lost
+        h.clock[0] += 180
+        h.tick()
+        self.assertTrue(h.transition["capture_pending"])
+        h.http.health["a"] = (503, dict(h.http.health["a"][1], status="frozen", frozen=True))
+        h.clock[0] += 180
+        h.tick()  # frozen now, but that proves nothing: no import of the original snapshot over its state
+        self.assertEqual(h.events.count(("import", "a")), 1)
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: frozen, but a refreeze is unconfirmed, so no shortcut and no swap back yet
+        self.assertNotIn(("set-image", "spot-control-a", IMG_A), h.events)
+        h.http.freeze_status = 200
+        h.tick()
+        self.assertIn(("set-image", "spot-control-a", IMG_A), h.events)
+
+    def test_a_newer_local_snapshot_replaces_the_kv_selector(self):
+        from lib.edge_state import build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        t = {"snapshot_in_kv": 9, "frozen_version": 9, "frozen_snapshot": build_snapshot({}, 7, "a", now=5)}
+        self.assertTrue(manager._record_freeze(t, {"state_version": 10, "snapshot": build_snapshot({}, 10, "a", now=6)}))
+        self.assertNotIn("snapshot_in_kv", t)
+        self.assertEqual(t["frozen_snapshot"]["state_version"], 10)
+
     def test_preservation_never_overwrites_a_snapshot_kept_in_kv(self):
         from lib.edge_state import KV_STATE_KEY, build_snapshot
         h = TrackingHarness()
