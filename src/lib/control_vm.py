@@ -158,6 +158,11 @@ HEALTH_TIMEOUT_SECONDS = 1200      # New VM must report healthy within this (fir
 PROPAGATION_SECONDS = 90           # KV propagation wait between cutover and deleting the old VM.
 REPLACEMENT_READY_GRACE_SECONDS = 300  # Replacement unready this long after cutover -> fall back to old.
 ROTATION_COOLDOWN_SECONDS = 6 * 3600
+# In-place image update (MODE_IMAGE): the VM's image watcher swaps the dashboard container within seconds of the
+# dashboard-image metadata change. A VM that reports no swap this long has no watcher (it booted before the watcher
+# existed), so it is reset once and its startup script pulls the new image.
+IMAGE_SWAP_GRACE_SECONDS = 300
+IMAGE_UPDATE_TIMEOUT_SECONDS = 1200  # the new image must serve healthy within this, or the update rolls back
 PRICE_CHECK_INTERVAL_SECONDS = 3600
 MIN_SAVINGS_FRACTION = Decimal("0.30")
 MIN_SAVINGS_DAILY_USD = Decimal("0.05")
@@ -174,13 +179,17 @@ BOOTING_STATES = frozenset({"PROVISIONING", "STAGING", "RUNNING"})
 MODE_BOOTSTRAP = "bootstrap"
 MODE_RECOVER = "recover"
 MODE_PRICE = "price"
-MODE_ACTION = {MODE_BOOTSTRAP: "bootstrap", MODE_RECOVER: "recreate_other_slot", MODE_PRICE: "rotate"}
+MODE_IMAGE = "image"
+MODE_ACTION = {MODE_BOOTSTRAP: "bootstrap", MODE_RECOVER: "recreate_other_slot", MODE_PRICE: "rotate",
+               MODE_IMAGE: "update_image"}
 STEPS = {
     MODE_BOOTSTRAP: ("create", "wait_health", "cutover"),
     MODE_RECOVER: ("create", "wait_health", "freeze", "import", "cutover", "propagate", "delete_old"),
     MODE_PRICE: ("create", "wait_health", "freeze", "import", "cutover", "propagate", "delete_old"),
+    # Same VM, same slot, same state file: no second VM, freeze, import, or cutover. See _begin_image.
+    MODE_IMAGE: ("set_image", "wait_image"),
 }
-ACTIONS = ("bootstrap", "start", "recreate_other_slot", "rotate", "wait", "noop")
+ACTIONS = ("bootstrap", "start", "recreate_other_slot", "rotate", "update_image", "wait", "noop")
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$")
@@ -632,6 +641,7 @@ class HealthResult:
     hydrated: bool = False
     detail: str = ""
     slot: str | None = None
+    image: str | None = None  # the image the dashboard container runs (DASHBOARD_IMAGE), when it reports one
 
     @classmethod
     def unknown(cls, detail: str = "not probed") -> HealthResult:
@@ -1009,6 +1019,20 @@ def dashboard_image_of(stdout: str | None) -> tuple[str, str]:
     return str(row.get("id") or ""), image
 
 
+def set_metadata_command(vm: ControlVm, project: str, items: Mapping[str, str],
+                         startup_script_path: str | None = None) -> list[str]:
+    """Update instance metadata in place (``add-metadata`` replaces the listed keys and keeps the others)."""
+    command = ["gcloud", "compute", "instances", "add-metadata", vm.name, f"--zone={vm.zone}", f"--project={project}",
+               "--metadata=" + ",".join(f"{key}={value}" for key, value in items.items())]
+    if startup_script_path:
+        command.append(f"--metadata-from-file=startup-script={startup_script_path}")
+    return command + ["--quiet"]
+
+
+def reset_command(vm: ControlVm, project: str) -> list[str]:
+    return ["gcloud", "compute", "instances", "reset", vm.name, f"--zone={vm.zone}", f"--project={project}", "--quiet"]
+
+
 def stop_command(vm: ControlVm, project: str) -> list[str]:
     return ["gcloud", "compute", "instances", "stop", vm.name, f"--zone={vm.zone}",
             f"--project={project}", "--quiet"]
@@ -1124,11 +1148,12 @@ def probe_health(requester: edge_state.Requester, config: ControlConfig, slot: s
     version = version if isinstance(version, int) and not isinstance(version, bool) else None
     hydrated, frozen = data.get("hydrated") is True, data.get("frozen") is True
     reported_slot = data.get("slot") if data.get("slot") in edge_state.CONTROL_SLOTS else None
+    image = data.get("image") if isinstance(data.get("image"), str) and data.get("image") else None
     ok = status == 200 and data.get("status") == "ok" and hydrated and not frozen
     return HealthResult(ok, status, version, frozen, hydrated,
                         detail="healthy" if ok else f"HTTP {status} status={data.get('status')!r} "
                                                      f"hydrated={hydrated} frozen={frozen}",
-                        slot=reported_slot)
+                        slot=reported_slot, image=image)
 
 
 def _access_headers(config: ControlConfig) -> dict[str, str]:
@@ -1271,6 +1296,12 @@ class ControlVmManager:
                          provisioning=self.config.provisioning)
         if self.config.tracking and not force_rotate and control_state is None:
             plan = self._image_rollout(obs, plan) or plan
+        if plan.action == "update_image" and not plan.resume and self._rollout is not None:
+            # The image must be one a fresh VM of this mode accepts: a reboot runs the same startup checks.
+            problems = dataclasses.replace(self.config, dashboard_image=self._rollout.image).create_problems()
+            if problems:
+                self._rollout = None
+                return _wait("image rollout refused: " + "; ".join(problems), slot=plan.target_slot)
         if self.config.standard and plan.offer is not None and not plan.resume:
             # Refuse before a transition begins (for example the switch from Spot) rather than after it fails
             # to create: a free-tier VM without a pinned published image would have to build on 1 GB.
@@ -1461,19 +1492,9 @@ class ControlVmManager:
         if not decision.roll:
             return Plan(plan.action, f"{plan.reason}; image tracking: {decision.reason}", slot=plan.slot,
                         target_slot=plan.target_slot, offer=plan.offer)
-        offers = obs.offers
-        if offers is None:
-            try:
-                offers = list(self.offer_source())
-            except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-                return Plan(plan.action, f"{plan.reason}; image rollout waits: offer scan failed: {exc}",
-                            slot=plan.slot)
-        best = choose_offer(offers, self.config.max_daily_usd)
-        if best is None:
-            return Plan(plan.action, f"{plan.reason}; image rollout waits: no offer under the cap", slot=plan.slot)
+        # In place: the active VM swaps its dashboard container; no second VM is created (see _begin_image).
         self._rollout = decision
-        return Plan("rotate", f"image rollout: {decision.reason}", slot=active.slot,
-                    target_slot=other_slot(active.slot), offer=best)
+        return Plan("update_image", f"image rollout: {decision.reason}", target_slot=active.slot)
 
     def _same_provisioning(self, vm: ControlVm) -> bool:
         """The VM runs the configured mode: standard needs a VM the inventory reports standard; Spot accepts a Spot
@@ -1491,6 +1512,11 @@ class ControlVmManager:
             return
         if plan.action == "start":
             self._start(obs.vm(plan.slot))
+            return
+        if plan.action == "update_image":
+            if not plan.resume:
+                self._begin_image(plan, obs)
+            self.advance(obs)
             return
         if not plan.resume:
             mode = {"bootstrap": MODE_BOOTSTRAP, "recreate_other_slot": MODE_RECOVER, "rotate": MODE_PRICE}[plan.action]
@@ -1574,6 +1600,45 @@ class ControlVmManager:
         self.cstate["transition"] = transition
         self.save()
         self._note("began %s transition %s -> slot %s: %s", mode, plan.slot or "-", new_slot, plan.reason)
+
+    def _begin_image(self, plan: Plan, obs: Observation) -> None:
+        """Start an in-place image update of the active VM: same instance, slot, boot disk, and state file.
+
+        Only the dashboard container changes, so there is never a second writer to fence and no snapshot to move.
+        The transition records the image to restore (``from_image``) if the new one never serves healthy.
+        """
+        rollout = self._rollout
+        slot = plan.target_slot
+        vm = obs.vm(slot)
+        now = self.clock()
+        before = obs.health.get(slot) or HealthResult.unknown()
+        self.cstate["transition"] = {
+            "id": uuid.uuid4().hex,
+            "mode": MODE_IMAGE,
+            "old_slot": None,
+            "new_slot": slot,
+            "old_vm": None,
+            # instance_id pins the VM: one recreated under the slot name meanwhile is held (_identity_problem).
+            "new_vm": {"name": vm.name, "zone": vm.zone, "machine_type": vm.machine_type,
+                       "instance_id": vm.instance_id or None, "dashboard_image": rollout.image},
+            "from_image": self._active_image(vm),
+            "state_version_before": before.state_version,
+            "provisioning": self.config.provisioning,
+            "dashboard_image": rollout.image,
+            "image_rollout": {"image": rollout.image, "digest": rollout.digest, "revision": rollout.revision,
+                              "from_revision": rollout.from_revision},
+            "step": "set_image",
+            "started_at": now,
+            "step_started_at": now,
+            "updated_at": now,
+            "attempts": 0,
+            "reset_at": None,
+            "abort_reason": None,
+            "error": None,
+            "reason": plan.reason,
+        }
+        self.save()
+        self._note("began in-place image update of %s to %s: %s", vm.name, rollout.image, plan.reason)
 
     def _retained_zones(self, slot: str) -> list[str]:
         """Zones holding a retained boot disk for ``slot``; creating the VM there would collide on its name."""
@@ -1984,6 +2049,98 @@ class ControlVmManager:
             return self._abort(t, f"slot {t['new_slot']} not healthy after {HEALTH_TIMEOUT_SECONDS}s")
         self.save()
         return "wait"
+
+    # -- in-place image update (MODE_IMAGE) ----------------------------------------------------
+    def _set_image_metadata(self, t: dict, vm: ControlVm, image: str) -> str | None:
+        """Write ``dashboard-image`` (with the rest of the current metadata and startup script, as a fresh VM of
+        this slot would get them) to ``vm``. None on success, else the error."""
+        try:
+            items = metadata_items(dataclasses.replace(self.config, dashboard_image=image), t["new_slot"])
+        except ValueError as exc:
+            return f"invalid control VM settings: {exc}"
+        if items.get("dashboard-image") != image:
+            return f"metadata would not pin {image}"
+        with tempfile.TemporaryDirectory(prefix="spot-control-") as tmp:
+            script_path = Path(tmp) / "control-vm-startup.sh"
+            script_path.write_text(render_control_startup(), encoding="utf-8")
+            result = self.gcloud(set_metadata_command(vm, self.config.project, items, str(script_path)))
+        if result.returncode != 0:
+            return f"add-metadata on {vm.name} failed: {(result.stderr or '').strip()[:200]}"
+        return None
+
+    def _step_set_image(self, t: dict, obs: Observation) -> str:
+        vm = obs.vm(t["new_slot"])
+        if vm is None or not vm.running:
+            return self._abort(t, f"{control_vm_name(t['new_slot'])} is {vm.status if vm else 'missing'}; "
+                                  f"the image update needs the running VM")
+        # Recorded before the call: a failed or ambiguous write may still have landed, so the rollback restores.
+        t["image_written"] = True
+        self.save()
+        error = self._set_image_metadata(t, vm, t["dashboard_image"])
+        if error:
+            if self._fail_attempt(t, error):
+                return self._abort(t, error)
+            return "wait"
+        self._note("set dashboard-image of %s to %s; its image watcher swaps the container", vm.name,
+                   t["dashboard_image"])
+        return self._advance_step(t)
+
+    def _step_wait_image(self, t: dict, obs: Observation) -> str:
+        slot, image = t["new_slot"], t["dashboard_image"]
+        vm = obs.vm(slot)
+        result = obs.health.get(slot) or HealthResult.unknown()
+        floor = t.get("state_version_before")
+        if vm is not None and vm.running and result.ok and result.image == image:
+            if isinstance(floor, int) and (result.state_version is None or result.state_version < floor):
+                # Same state file, so the version can only grow; a lower one means the state did not carry over.
+                t["error"] = f"slot {slot} serves {image} at state_version {result.state_version} < {floor}"
+            else:
+                self._note("slot %s serves %s (state_version=%s)", slot, image, result.state_version)
+                return self._advance_step(t)
+        else:
+            t["error"] = (f"slot {slot} reports image {result.image or 'unknown'}: {result.detail}"
+                          if vm is not None and vm.running else f"{control_vm_name(slot)} is "
+                                                                f"{vm.status if vm else 'missing'}")
+        elapsed = self.clock() - t["step_started_at"]
+        if elapsed >= IMAGE_UPDATE_TIMEOUT_SECONDS:
+            return self._abort(t, f"slot {slot} did not serve {image} healthy within {IMAGE_UPDATE_TIMEOUT_SECONDS}s"
+                                  f" ({t['error']})")
+        if (vm is not None and vm.running and not t.get("reset_at") and result.image != image
+                and elapsed >= IMAGE_SWAP_GRACE_SECONDS):
+            # Still the old container: the VM booted before the image watcher existed. A reset reruns the (just
+            # refreshed) startup script, which pulls the new image and installs the watcher for the next update.
+            reset = self.gcloud(reset_command(vm, self.config.project))
+            if reset.returncode == 0:
+                t["reset_at"] = self.clock()
+                self._note("%s did not swap its container within %ss; reset it to boot %s", vm.name,
+                           IMAGE_SWAP_GRACE_SECONDS, image, level=logging.WARNING)
+            else:
+                self._note("reset of %s failed: %s", vm.name, (reset.stderr or "").strip()[:200],
+                           level=logging.WARNING)
+        t["updated_at"] = self.clock()
+        self.save()
+        return "wait"
+
+    def _step_image_abort(self, t: dict, obs: Observation) -> str:
+        """Roll an in-place update back: pin the previous image again (the watcher, or the next boot, swaps back)
+        and back off the new digest. The normal health handling takes over once the transition ends."""
+        vm = obs.vm(t["new_slot"])
+        previous = t.get("from_image") or ""
+        if vm is not None and previous and t.get("image_written") and not t.get("restored"):
+            error = self._set_image_metadata(t, vm, previous)
+            if error:
+                # Keep trying: ending here would leave the VM pinned to the image that failed.
+                t["error"] = f"could not restore dashboard-image {previous}: {error}"
+                t["updated_at"] = self.clock()
+                self.save()
+                self._note(t["error"], level=logging.ERROR)
+                return "wait"
+            t["restored"] = True
+            self._note("restored dashboard-image of %s to %s", vm.name, previous)
+        elif t.get("image_written") and not previous:
+            self._note("no previous image recorded for slot %s; leaving its metadata as it is", t["new_slot"],
+                       level=logging.WARNING)
+        return self._end_abort(t)
 
     def _control(self, slot: str, op: str, method: str, body: Mapping[str, Any] | None = None,
                  timeout: float = 60.0) -> tuple[int | None, Any]:
@@ -2459,6 +2616,9 @@ class ControlVmManager:
         return False
 
     def _step_abort(self, t: dict, obs: Observation) -> str:
+        if t["mode"] == MODE_IMAGE:
+            # Never the make-before-break rollback below: it would delete new_slot, which is the serving VM here.
+            return self._step_image_abort(t, obs)
         old = obs.vm(t.get("old_slot"))
         # Never two writable slots: fence the replacement before the old slot is reactivated.
         if not self._fence_replacement(t, obs):
@@ -2509,6 +2669,9 @@ class ControlVmManager:
                                    reason=t.get("carry_back_unconfirmed")
                                    or "rollback could not confirm its state reached the old VM"):
                 return "wait"
+        return self._end_abort(t)
+
+    def _end_abort(self, t: dict) -> str:
         rollout = t.get("image_rollout") or {}
         if rollout.get("digest"):
             # Never retry this digest automatically; the next :main digest gets a fresh chance (after the cooldown).

@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import test_control_vm as tcv
@@ -245,14 +246,31 @@ class FakeGitHub:
 
 
 class WatchdogGcloud(tcv.FakeGcloud):
-    """FakeGcloud plus instance metadata (dashboard-image) and set-scheduling."""
+    """FakeGcloud plus instance metadata (dashboard-image, add-metadata), reset, and set-scheduling."""
 
     def __init__(self, events):
         super().__init__(events)
         self.images: dict[str, str] = {}
+        self.metadata_rc = 0
+        self.reset_rc = 0
+        self.metadata_scripts: list[str] = []
 
     def __call__(self, argv):
         verb = argv[2:4]
+        if verb == ["instances", "add-metadata"]:
+            self.calls.append(list(argv))
+            items = dict(item.split("=", 1) for item in
+                         next(a for a in argv if a.startswith("--metadata="))[len("--metadata="):].split(","))
+            script = next(a.split("=", 2)[2] for a in argv if a.startswith("--metadata-from-file=startup-script="))
+            self.metadata_scripts.append(Path(script).read_text(encoding="utf-8"))
+            self.events.append(("set-image", argv[4], items["dashboard-image"]))
+            if self.metadata_rc == 0:
+                self.images[argv[4]] = items["dashboard-image"]
+            return SimpleNamespace(returncode=self.metadata_rc, stdout="", stderr="boom" if self.metadata_rc else "")
+        if verb == ["instances", "reset"]:
+            self.calls.append(list(argv))
+            self.events.append(("reset", argv[4]))
+            return SimpleNamespace(returncode=self.reset_rc, stdout="", stderr="")
         if verb == ["instances", "set-scheduling"]:
             self.calls.append(list(argv))
             self.events.append(("set-scheduling", argv[4]))
@@ -305,33 +323,46 @@ class TrackingHarness(tcv.Harness):
     def image(self):
         return self.state.get(cv.STATE_KEY, {}).get("image", {})
 
+    def swapped(self, image=IMG_B, slot="a", version=7):
+        """The VM's image watcher replaced the dashboard container, which now reports ``image``."""
+        self.http.healthy(slot, version=version, image=image)
+
     def finish(self):
         """Drive a started rollout to completion."""
-        self.gcloud.status("b", "RUNNING")
-        self.http.healthy("b")
-        self.tick()
-        self.clock[0] += cv.PROPAGATION_SECONDS + 1
+        self.swapped()
+        self.clock[0] += 180
         self.tick()
 
 
 class RolloutTests(unittest.TestCase):
-    def test_newer_main_digest_rolls_out_through_make_before_break(self):
+    def test_newer_main_digest_updates_the_image_in_place(self):
         h = TrackingHarness()
         h.active()
         plan = h.tick()
-        self.assertEqual((plan.action, plan.slot, plan.target_slot), ("rotate", "a", "b"))
+        self.assertEqual((plan.action, plan.target_slot), ("update_image", "a"))
         self.assertIn("image rollout", plan.reason)
         t = h.transition
-        self.assertEqual((t["mode"], t["dashboard_image"]), (cv.MODE_PRICE, IMG_B))
+        self.assertEqual((t["mode"], t["step"], t["dashboard_image"], t["from_image"]),
+                         (cv.MODE_IMAGE, "wait_image", IMG_B, IMG_A))
         self.assertEqual(t["image_rollout"], {"image": IMG_B, "digest": D_B, "revision": SHA_B,
                                               "from_revision": SHA_A})
-        self.assertEqual(h.gcloud.create_image(), IMG_B)
+        self.assertEqual(t["new_vm"]["instance_id"], "id-a")
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_B)
+        # The refreshed startup script installs the image watcher on the next boot of a VM that lacks it.
+        self.assertEqual(h.gcloud.metadata_scripts, [cv.render_control_startup()])
+        self.assertIn("install_image_watcher", h.gcloud.metadata_scripts[0])
         self.assertEqual(h.image["active"]["image"], IMG_A)  # recorded from a's metadata
+        self.assertEqual(h.tick().action, "update_image")  # resumes; the old container still serves
+        self.assertIsNotNone(h.transition)
         h.finish()
         self.assertIsNone(h.transition)
-        self.assertEqual(h.mutations(), [("create", "spot-control-b", "us-central1-a"), ("freeze", "a"),
-                                         ("import", "b"), ("origin", "b"), ("delete", "spot-control-a")])
-        self.assertEqual((h.image["active"]["image"], h.image["active"]["slot"]), (IMG_B, "b"))
+        # No second VM, freeze, import, cutover, or reset: one metadata write.
+        self.assertEqual(h.mutations(), [("set-image", "spot-control-a", IMG_B)])
+        self.assertEqual(sorted(h.gcloud.vms), ["spot-control-a"])
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertEqual((h.image["active"]["image"], h.image["active"]["slot"], h.image["active"]["instance_id"]),
+                         (IMG_B, "a", "id-a"))
+        self.assertEqual(h.state[cv.STATE_KEY]["history"][-1]["mode"], cv.MODE_IMAGE)
         # Up to date afterwards, and the cooldown keeps the registry quiet meanwhile.
         h.registry.calls.clear()
         self.assertIn("cooldown", h.tick().reason)
@@ -379,28 +410,105 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         h.github.verdicts[SHA_B] = "success"  # a re-run succeeded
         h.clock[0] += it.VERDICT_RECHECK_SECONDS
-        self.assertEqual(h.tick().action, "rotate")
+        self.assertEqual(h.tick().action, "update_image")
 
-    def test_aborted_rollout_backs_off_that_digest_until_a_new_one(self):
+    def test_unhealthy_new_image_rolls_back_and_backs_off_that_digest(self):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.http.unhealthy("b")
-        h.gcloud.status("b", "RUNNING")
-        h.clock[0] += cv.HEALTH_TIMEOUT_SECONDS
-        h.tick()  # never healthy: abort, a keeps serving
+        h.http.health["a"] = (503, {"status": "starting", "hydrated": False, "frozen": False, "state_version": 7,
+                                    "slot": "a", "image": IMG_B})  # swapped, but the new image never gets ready
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        self.assertNotIn(("reset", "spot-control-a"), h.events, "the container did swap; a reset would not help")
+        self.assertIn(f"reports image {IMG_B}", h.transition["error"])
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # timed out: pin the previous image again; the watcher swaps back
         self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations(), [("set-image", "spot-control-a", IMG_B),
+                                         ("set-image", "spot-control-a", IMG_A)])
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
         self.assertEqual(h.image["failed"], [D_B])
-        self.assertNotIn("spot-control-b", h.gcloud.vms)
+        self.assertEqual(h.image["active"]["image"], IMG_A)
+        self.assertEqual(sorted(h.gcloud.vms), ["spot-control-a"])  # never deleted
         self.assertEqual(h.kv.origin_slot(), "a")
+        h.http.healthy("a", version=7, image=IMG_A)
         h.clock[0] += cv.ROTATION_COOLDOWN_SECONDS
         plan = h.tick()
         self.assertEqual(plan.action, "noop")
         self.assertIn("aborted earlier", plan.reason)
         h.registry.tags["main"] = D_C
         plan = h.tick()
-        self.assertEqual(plan.action, "rotate")
+        self.assertEqual(plan.action, "update_image")
         self.assertEqual(h.transition["dashboard_image"], IMG_C)
+
+    def test_a_vm_without_the_image_watcher_is_reset_once(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS - 1
+        h.tick()
+        self.assertNotIn(("reset", "spot-control-a"), h.events)
+        h.clock[0] += 1
+        h.tick()  # the old container (no image in its health) still serves: no watcher on this VM
+        self.assertEqual(h.events.count(("reset", "spot-control-a")), 1)
+        h.http.unhealthy("a")  # rebooting
+        h.clock[0] += 180
+        h.tick()
+        self.assertEqual(h.events.count(("reset", "spot-control-a")), 1, "never a second reset")
+        h.finish()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.image["active"]["image"], IMG_B)
+
+    def test_a_lower_state_version_after_the_swap_is_not_success(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.swapped(version=3)
+        h.http.versions["a"] = 3  # the new container came up without the state file's changes
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNotNone(h.transition)
+        self.assertIn("state_version 3 < 7", h.transition["error"])
+
+    def test_metadata_write_failures_abort_without_a_swap(self):
+        h = TrackingHarness()
+        h.active()
+        h.gcloud.metadata_rc = 1
+        for _ in range(cv.STEP_RETRY_LIMIT - 1):
+            h.tick()
+            self.assertEqual(h.transition["step"], "set_image")
+        h.tick()  # the limit: abort; restoring the previous image also fails, so the rollback keeps trying
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertIn("could not restore", h.transition["error"])
+        h.gcloud.metadata_rc = 0
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
+        self.assertEqual(h.image["failed"], [D_B])
+
+    def test_a_vm_recreated_during_the_update_is_held(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.recreate("a", "id-new")
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        self.assertIn("held", h.transition["error"])
+        self.assertNotIn(("reset", "spot-control-a"), h.events)
+
+    def test_a_stopped_vm_is_not_updated(self):
+        h = TrackingHarness()
+        h.active()
+        manager = h.manager()
+        obs = manager.observe()
+        plan = manager.plan(obs)
+        self.assertEqual(plan.action, "update_image")
+        h.gcloud.status("a", "TERMINATED")
+        manager.execute(plan, manager.observe())
+        self.assertIsNone(h.transition)
+        self.assertNotIn("set-image", [e[0] for e in h.events])
+        self.assertEqual(h.image["failed"], [D_B])
 
     def test_no_rollout_while_a_transition_runs_or_the_other_slot_exists(self):
         h = TrackingHarness()
@@ -590,10 +698,28 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         h.active()
         plan = h.tick(apply=False)
-        self.assertEqual(plan.action, "rotate")
+        self.assertEqual(plan.action, "update_image")
         self.assertEqual(h.mutations(), [])
         self.assertEqual(h.state, {})
         self.assertEqual(h.saves, 0)
+
+
+class ImageHealthTests(unittest.TestCase):
+    def test_probe_reads_the_reported_image(self):
+        h = tcv.Harness()
+        h.http.healthy("a", version=4, image=IMG_B)
+        self.assertEqual(cv.probe_health(h.http, h.config, "a").image, IMG_B)
+        h.http.healthy("a", version=4)
+        self.assertIsNone(cv.probe_health(h.http, h.config, "a").image)
+        h.http.health["a"] = (200, {"status": "ok", "hydrated": True, "frozen": False, "image": 5})
+        self.assertIsNone(cv.probe_health(h.http, h.config, "a").image)
+
+    def test_an_image_transition_resumes_as_update_image(self):
+        plan = cv.plan_next(vms=[], origin=None, origin_known=True, health={}, offers=None,
+                            control_state={"transition": {"mode": cv.MODE_IMAGE, "step": "wait_image",
+                                                          "old_slot": None, "new_slot": "a"}},
+                            now=0, max_daily_usd=cv.DEFAULT_MAX_DAILY_USD)
+        self.assertEqual((plan.action, plan.target_slot, plan.resume), ("update_image", "a", True))
 
 
 class RestartPolicyTests(unittest.TestCase):

@@ -1260,7 +1260,7 @@ workstation. Pausing the scheduler also pauses the runner floor; `src/runner_flo
 
 ### Image tracking
 
-`SPOT_DASHBOARD_IMAGE_TRACK=main` rolls the control VM to the image that
+`SPOT_DASHBOARD_IMAGE_TRACK=main` updates the control VM to the image that
 `ghcr.io/swack-tools/spot-dashboard:main` names. On each check the manager resolves that tag's digest with
 `SPOT_DASHBOARD_IMAGE_TRACK_TOKEN`, a classic GitHub token with `read:packages`. The token also needs `repo`
 while the repository is private. The manager starts a rollout only when all of these hold:
@@ -1273,13 +1273,28 @@ while the repository is private. The manager starts a rollout only when all of t
 - GitHub's compare API reports that commit `ahead` of the active image's commit. The manager never rolls
   to an older, equal, or diverged commit, or when either commit is unknown.
 
-The rollout is the make-before-break rotation that a price rotation uses: create the other slot with the
-new digest, wait for health, freeze, import, check the version floor, write `origin:active`, wait for
-propagation, and delete the old VM. A rollout that aborts backs off that digest. The manager tries again
-only after `:main` names another digest and the cooldown has passed.
+The rollout updates the active VM in place. It creates no second VM, so a rollout costs nothing extra on the
+free-tier e2-micro. The VM keeps its slot, boot disk, state file, and `origin:active`:
+
+1. The manager writes the new digest to the VM's `dashboard-image` metadata. The same call refreshes the
+   VM's other metadata and its startup script, as a new VM of that slot would get them.
+1. On the VM, the `spot-dashboard-image-watch` service waits on the metadata server for that value to change.
+   It then reruns the startup script, which pulls the new image while the old container still serves, stops
+   the old container, and starts the new one. The dashboard is unavailable for a few seconds.
+1. The dashboard reports its image in `/api/health`. The manager completes the rollout once the VM reports the
+   new image, healthy, at a `state_version` no lower than before the update.
+
+A VM created before the watcher existed doesn't swap its container. When the VM still reports another image
+after 5 minutes, the manager resets it once. The reset boots the refreshed startup script, which pulls the new
+image and installs the watcher for the next rollout. A reset takes the dashboard offline for a few minutes.
+
+When the new image doesn't serve healthy within 20 minutes, the manager writes the previous image back to
+`dashboard-image`, and the watcher swaps back. That rollout's digest is backed off: the manager tries again only
+after `:main` names another digest and the cooldown has passed.
 
 The state's `image` section records the active VM's image, read once from its `dashboard-image` metadata
-or written when a transition completes. It also records the digests that failed and cached workflow answers.
+or written when a transition or an in-place update completes. It also records the digests that failed and
+cached workflow answers.
 `status` shows it. While tracking is on, a recovery recreates the recorded image, not `SPOT_DASHBOARD_IMAGE`,
 so a recovery never moves to an older image. Every transition records the image it creates, and a controller
 that resumes the transition creates that image whatever its own settings.

@@ -4705,6 +4705,7 @@ class DashboardStore:
                     "kv_writer": bool(self.kv_writer),
                     "reason": f"{self.controlled_targets_error}; {self.recovery_detail}",
                     "state_backup": str(self.state_backup_path) if self.state_backup_path else None,
+                    "image": os.environ.get("DASHBOARD_IMAGE") or None,
                 }
             status = "frozen" if frozen else ("ok" if hydrated and reconciled else "starting")
             if self.hydrate_problem and not hydrated:
@@ -4725,6 +4726,8 @@ class DashboardStore:
                 "state_version": self.state_version(),
                 "slot": self.control_slot,
                 "kv_writer": bool(self.kv_writer),
+                # The image the control VM started this container from; the controller confirms image updates by it.
+                "image": os.environ.get("DASHBOARD_IMAGE") or None,
             }
 
     def _prune_idempotency(self, records: dict[str, Any], now: float) -> dict[str, Any]:

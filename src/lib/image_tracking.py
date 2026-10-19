@@ -1,9 +1,10 @@
 """Opt-in dashboard image rollout: follow the published ``:main`` image of the dashboard.
 
 ``SPOT_DASHBOARD_IMAGE_TRACK=main`` makes the control VM manager resolve the digest that
-``ghcr.io/swack-tools/spot-dashboard:main`` points at on each check. It starts the normal make-before-break
-rotation (create, health, freeze, import, version floor, fence, cutover, delete) to that digest only when all of
-these hold:
+``ghcr.io/swack-tools/spot-dashboard:main`` points at on each check. It starts an in-place image update of the
+active VM (``control_vm.MODE_IMAGE``: pin the digest in its ``dashboard-image`` metadata, wait for the VM's image
+watcher to swap the dashboard container and report the image healthy, roll back on failure) only when all of these
+hold:
 
 * no transition is in progress, the active control VM is running and healthy, and the other slot is empty;
 * the rotation cooldown (``ROTATION_COOLDOWN_SECONDS`` after the last completed or aborted transition) has passed;
@@ -14,7 +15,7 @@ these hold:
   ``identical``, ``behind`` and ``diverged`` never roll, so the manager never moves to an older image.
 
 Every network answer that is missing or malformed is a reason not to roll. Nothing here changes provider state;
-the manager turns a positive decision into a ``rotate`` plan.
+the manager turns a positive decision into an ``update_image`` plan.
 
 Standard library only.
 """

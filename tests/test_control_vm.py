@@ -212,9 +212,9 @@ class FakeHttp:
         self.unfreeze_status = 200
         self.snapshot_status = 200
 
-    def healthy(self, slot, version=0):
+    def healthy(self, slot, version=0, image=None):
         self.health[slot] = (200, {"status": "ok", "hydrated": True, "frozen": False, "state_version": version,
-                                   "slot": slot, "kv_writer": False})
+                                   "slot": slot, "kv_writer": False, **({"image": image} if image else {})})
 
     def unhealthy(self, slot):
         self.health[slot] = (503, {"error": "control_vm_unavailable", "status": "starting", "hydrated": False,
@@ -281,7 +281,7 @@ class Harness:
 
     def mutations(self):
         return [e for e in self.events if e[0] in ("create", "start", "stop", "delete", "origin", "freeze", "import",
-                                                    "unfreeze")]
+                                                    "unfreeze", "set-image", "reset")]
 
 
 def vm(slot, status="RUNNING", zone="us-central1-a", machine="e2-small"):
@@ -2310,7 +2310,8 @@ class StartupScriptTests(unittest.TestCase):
         self.assertIn("readonly DASHBOARD_CONTAINER=spot-dashboard", self.text)
         self.assertIn("readonly TUNNEL_CONTAINER=spot-cloudflared", self.text)
         self.assertEqual(self.text.count("--restart unless-stopped --network host"), 2)
-        self.assertIn('--env-file "$ENV_FILE" -v "$STATE_DIR:/state"', self.text)
+        self.assertIn('--env-file "$ENV_FILE" -e "DASHBOARD_IMAGE=$DASHBOARD_IMAGE_REF" -v "$STATE_DIR:/state"',
+                      self.text)
         self.assertIn('--host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" \\\n'
                       '    --project "$PROJECT"', self.text)
         self.assertIn('(umask 022 && git -C "$workdir" -c advice.detachedHead=false checkout -q FETCH_HEAD)',
@@ -3244,3 +3245,77 @@ swapoff() { :; }
         calls, stderr = self.run_zram()
         self.assertIn("could not read MemTotal", stderr)
         self.assertNotIn("mkswap:zram0", calls)
+
+
+class StartupScriptImageWatcherTests(unittest.TestCase):
+    """The in-place image update (MODE_IMAGE): the VM swaps the dashboard container when dashboard-image changes."""
+
+    def setUp(self):
+        self.text = SCRIPT.read_text(encoding="utf-8")
+        self.main = re.search(r"^main\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.watch = re.search(r"<<'WATCH'\n(.*?)^WATCH$", self.text, re.S | re.M).group(1)
+
+    def test_runs_never_overlap_and_the_watcher_starts_after_the_containers(self):
+        self.assertIn("readonly RUN_LOCK=/run/spot-control-startup.lock", self.text)
+        lock = self.main.index('exec 9>"$RUN_LOCK"\n  flock 9')
+        self.assertLess(lock, self.main.index("wait_for_metadata"))
+        self.assertLess(self.main.index("run_containers"), self.main.index("install_image_watcher"))
+        self.assertLess(self.main.index("install_image_watcher"), self.main.index("report_health"))
+
+    def test_the_watcher_unit_waits_for_the_boot_run_and_is_started_without_blocking(self):
+        self.assertIn("After=google-startup-scripts.service docker.service network-online.target", self.text)
+        self.assertIn("ExecStart=$WATCH_SCRIPT", self.text)
+        self.assertIn("Restart=always", self.text)
+        self.assertIn('systemctl start --no-block "$WATCH_UNIT"', self.text)
+        self.assertNotIn("systemctl restart", self.text)  # a rerun runs inside the watcher; never restart it
+        # Both files are replaced by rename, never rewritten in place under the running watcher.
+        self.assertIn('write_root_file "$WATCH_SCRIPT" 0755', self.text)
+        self.assertIn('write_root_file "/etc/systemd/system/$WATCH_UNIT" 0644', self.text)
+        self.assertIn('mv -f "$temp" "$target"', self.text)
+
+    def test_the_old_container_stops_gracefully_after_the_pull(self):
+        run = re.search(r"^run_containers\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.assertLess(run.index('docker stop --time 20 "$DASHBOARD_CONTAINER"'),
+                        run.index('docker rm -f "$DASHBOARD_CONTAINER"'))
+        self.assertLess(self.main.index("pull_published_image"), self.main.index("run_containers"))
+
+    def run_watcher(self, value, running):
+        # curl call 1 answers with the value and an ETag; call 2 fails, so the watcher sleeps, which ends the run.
+        stubs = {
+            "curl": r'''#!/usr/bin/env bash
+n=$(($(cat "$STUB/count" 2>/dev/null || echo 0) + 1))
+echo "$n" > "$STUB/count"
+printf '%s\n' "${@: -1}" >> "$STUB/urls"
+[[ $n == 1 ]] || exit 22
+while [[ $# -gt 0 ]]; do
+  if [[ $1 == -D ]]; then printf 'ETag: abc123\r\n' > "$2"; fi
+  shift
+done
+printf '%s' "$VALUE"
+''',
+            "sleep": "#!/usr/bin/env bash\nkill -TERM $PPID\n",
+            "docker": "#!/usr/bin/env bash\nprintf '%s\\n' \"$RUNNING\"\n",
+            "google_metadata_script_runner": '#!/usr/bin/env bash\necho "$*" >> "$STUB/reruns"\n',
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp)
+            (stub / "watch.sh").write_text(self.watch, encoding="utf-8")
+            for name, body in stubs.items():
+                (stub / name).write_text(body, encoding="utf-8")
+                (stub / name).chmod(0o755)
+            env = {"PATH": f"{stub}:/usr/bin:/bin", "STUB": str(stub), "VALUE": value, "RUNNING": running}
+            subprocess.run(["bash", str(stub / "watch.sh")], env=env, capture_output=True, text=True, timeout=30)
+            reruns = (stub / "reruns").read_text() if (stub / "reruns").exists() else ""
+            return reruns, (stub / "urls").read_text().splitlines()
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_watcher_reruns_the_startup_script_only_for_another_image(self):
+        new = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "b" * 64
+        old = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "a" * 64
+        reruns, urls = self.run_watcher(new, old)
+        self.assertEqual(reruns, "startup\n")
+        self.assertIn("wait_for_change=true", urls[0])
+        self.assertIn("last_etag=NONE", urls[0])
+        self.assertIn("last_etag=abc123", urls[1])  # the next wait starts from the answer's ETag
+        reruns, _ = self.run_watcher(new, new)
+        self.assertEqual(reruns, "")

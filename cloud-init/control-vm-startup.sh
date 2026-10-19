@@ -31,6 +31,12 @@ readonly ZRAM_PRIORITY=100
 readonly MEMINFO=/proc/meminfo
 # Container logs are capped on every shape so they can't fill the small boot disk.
 readonly LOG_ARGS=(--log-driver json-file --log-opt max-size=10m --log-opt max-file=3)
+# One run at a time: the boot run and a rerun by the image watcher never overlap.
+readonly RUN_LOCK=/run/spot-control-startup.lock
+# The image watcher reruns this script when the dashboard-image metadata changes, so an image update swaps only the
+# containers: same VM, same boot disk, same state file (see install_image_watcher).
+readonly WATCH_SCRIPT=/usr/local/sbin/spot-dashboard-image-watch
+readonly WATCH_UNIT=spot-dashboard-image-watch.service
 
 log() {
   printf 'spot-control-startup: %s\n' "$*" >&2
@@ -399,12 +405,15 @@ run_containers() {
   chown "$CONTAINER_UID:$CONTAINER_UID" "$STATE_DIR"
   chmod 0750 "$STATE_DIR"
 
-  # Recreate on every boot so changed metadata, secrets, or images always take effect.
+  # Recreate on every run so changed metadata, secrets, or images always take effect. The image is pulled
+  # before this point, so the old container serves until here. A graceful stop first lets it finish requests.
+  docker stop --time 20 "$DASHBOARD_CONTAINER" >/dev/null 2>&1 || true
   docker rm -f "$DASHBOARD_CONTAINER" >/dev/null 2>&1 || true
+  # DASHBOARD_IMAGE is reported by /api/health, so the controller can confirm which image serves.
   docker run -d --name "$DASHBOARD_CONTAINER" --restart unless-stopped --network host \
     "${DASHBOARD_RUN_ARGS[@]}" \
     --user "$CONTAINER_UID:$CONTAINER_UID" --cap-drop ALL --security-opt no-new-privileges \
-    --env-file "$ENV_FILE" -v "$STATE_DIR:/state" "$DASHBOARD_IMAGE_REF" \
+    --env-file "$ENV_FILE" -e "DASHBOARD_IMAGE=$DASHBOARD_IMAGE_REF" -v "$STATE_DIR:/state" "$DASHBOARD_IMAGE_REF" \
     --host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" \
     --project "$PROJECT" >/dev/null
 
@@ -415,6 +424,70 @@ run_containers() {
     "${TUNNEL_RUN_ARGS[@]}" \
     --cap-drop ALL --security-opt no-new-privileges \
     --env-file "$TUNNEL_ENV_FILE" "$CLOUDFLARED_IMAGE" tunnel --no-autoupdate run >/dev/null
+}
+
+# Atomically replace a root-owned file with stdin, with the given mode. A rename never changes the file a running
+# process (the watcher itself, during a rerun) is reading.
+write_root_file() {
+  local target="$1" mode="$2" temp
+  temp="$(mktemp "$target.XXXXXX")"
+  cat >"$temp"
+  chmod "$mode" "$temp"
+  chown root:root "$temp"
+  mv -f "$temp" "$target"
+}
+
+# Install and start (once per boot) the service that reruns this script when the dashboard-image metadata changes.
+# It long-polls the metadata server, so it costs no CPU while it waits. A rerun pulls the new image while the old
+# container still serves, then recreates the containers. The service starts after the boot run of this script
+# (After=google-startup-scripts.service), and both take RUN_LOCK, so runs never overlap. A rerun never restarts the
+# watcher; a changed watcher takes effect at the next boot.
+install_image_watcher() {
+  write_root_file "$WATCH_SCRIPT" 0755 <<'WATCH'
+#!/usr/bin/env bash
+# Installed by the control VM startup script (cloud-init/control-vm-startup.sh); reruns it when the dashboard-image
+# instance metadata names an image the dashboard container does not run.
+set -uo pipefail
+readonly URL=http://metadata.google.internal/computeMetadata/v1/instance/attributes/dashboard-image
+readonly CONTAINER=spot-dashboard
+log() { printf 'spot-dashboard-image-watch: %s\n' "$*" >&2; }
+etag=NONE
+while true; do
+  headers="$(mktemp)"
+  if ! value="$(curl -fsS --max-time 3700 -D "$headers" -H 'Metadata-Flavor: Google' \
+      "$URL?wait_for_change=true&timeout_sec=3600&last_etag=$etag")"; then
+    rm -f "$headers"
+    sleep 15
+    continue
+  fi
+  etag="$(tr -d '\r' <"$headers" | sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//p' | tail -n 1)"
+  rm -f "$headers"
+  [[ "$etag" =~ ^[A-Za-z0-9]+$ ]] || etag=NONE
+  running="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
+  [[ -n "$value" && "$value" != "$running" ]] || continue
+  log "dashboard-image is $value but $CONTAINER runs ${running:-nothing}; rerunning the startup script"
+  google_metadata_script_runner startup || log "the startup script failed; retrying at the next change or in an hour"
+done
+WATCH
+  write_root_file "/etc/systemd/system/$WATCH_UNIT" 0644 <<UNIT
+[Unit]
+Description=Swap the Spot dashboard container when its dashboard-image metadata changes
+After=google-startup-scripts.service docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$WATCH_SCRIPT
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable "$WATCH_UNIT" >/dev/null 2>&1 || fail "could not enable $WATCH_UNIT"
+  # --no-block: during the boot run the start waits for this script to finish (After=), so it must not block.
+  systemctl start --no-block "$WATCH_UNIT" || fail "could not start $WATCH_UNIT"
 }
 
 report_health() {
@@ -432,6 +505,8 @@ report_health() {
 
 main() {
   [[ "$(id -u)" -eq 0 ]] || fail "must run as root"
+  exec 9>"$RUN_LOCK"
+  flock 9
   wait_for_metadata
   PROJECT="$(curl -fsS -H 'Metadata-Flavor: Google' "$METADATA/project/project-id")"
   # projects/<number>/machineTypes/<type>; the shape decides the swap file and the container memory limits.
@@ -499,6 +574,7 @@ main() {
   unset TOKEN
   run_containers
   unset GITHUB_TOKEN
+  install_image_watcher
   report_health
 }
 
