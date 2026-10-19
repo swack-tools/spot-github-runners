@@ -1073,20 +1073,23 @@ Both compute bindings use the custom role `spotControlWatchdogCompute`, not the 
 `roles/compute.instanceAdmin.v1`. The predefined role includes `compute.projects.setCommonInstanceMetadata`. An
 IAM condition narrows only instances and disks, and the project always passes it. With that permission, the
 watchdog's account could write project-wide `ssh-keys` or a `startup-script`, which every VM in the project trusts,
-so it would have root on all of them. The custom role holds the predefined role's permissions without
-`compute.projects.setCommonInstanceMetadata`, `compute.instances.osAdminLogin`, `compute.instances.osLogin`, and
-every `*.setIamPolicy`, and without the permissions that a project custom role can't hold. The deploy reads the
-predefined role each time it runs, as the autoscaler deploy does for `spotRunnerHostAdmin`. The watchdog needs
-none of the dropped permissions: it never runs `gcloud compute ssh`, and it writes only instance metadata on the
-VMs that the conditions name.
+so it would have root on all of them. Its image, snapshot, instance template, and instance group writes would
+also reach every one of those in the project. The custom role keeps the predefined role's instance and disk
+permissions, which the conditions narrow, and only its read and use permissions on other resources. It drops
+`compute.projects.setCommonInstanceMetadata`, `compute.instances.osAdminLogin`, `compute.instances.osLogin`, every
+`*.setIamPolicy`, and the permissions that a project custom role can't hold. The deploy reads the predefined role
+each time it runs and filters it the same way as the autoscaler deploy does for `spotRunnerHostAdmin`. The
+watchdog needs none of the dropped permissions: it never runs `gcloud compute ssh`, it creates VMs from a public
+image, and it writes only instance metadata on the VMs that the conditions name.
 
 Deploys before the custom role bound the predefined role with the same conditions. IAM changes take several
 minutes to propagate, so the deploy doesn't revoke the predefined role in the run that first grants the custom
 role: it prints that the custom role is newly bound. Run the deploy again 10 minutes or more later. The deploy
 removes each predefined role binding only when the project policy already held its custom role replacement, under
-the same condition, when the deploy started. The control VM binding also takes the unconditional predefined binding
-that `--no-compute-condition` made, and an unconditional custom role binding from such a deploy, with it. With no
-floor targets, the deploy removes both floor bindings without waiting. It skips any binding that is absent.
+the same condition, when the deploy started. The unconditional predefined binding that `--no-compute-condition`
+made, and an unconditional custom role binding from such a deploy, go with the control VM binding, or with the floor
+binding when there are floor targets, since they cover floor hosts too. With no floor targets, the deploy removes
+both floor bindings without waiting. It skips any binding that is absent.
 
 The service references these secrets:
 

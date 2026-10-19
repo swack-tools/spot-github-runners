@@ -118,11 +118,14 @@ FLOOR_CONDITION_EXPRESSION = (
 )
 
 # Both compute bindings use a custom role: roles/compute.instanceAdmin.v1 without the permissions that reach past the
-# VMs the conditions name. A condition can only narrow instances and disks; the project itself always passes it, so
-# the base role's compute.projects.setCommonInstanceMetadata would let this account write project-wide ssh-keys or a
-# startup-script, which every VM in the project trusts: root on all of them. The role's permissions are read from
-# the base role at deploy time (read_role_permissions); the autoscaler deploy builds its role the same way.
+# VMs the conditions name. A condition can only narrow instances and disks; every other resource passes it, so the
+# base role's compute.projects.setCommonInstanceMetadata would let this account write project-wide ssh-keys or a
+# startup-script, which every VM in the project trusts (root on all of them), and its image, snapshot, template and
+# instance group writes would reach every one of those in the project. The role's permissions are read from the base
+# role at deploy time (read_role_permissions, role_permissions); the autoscaler deploy builds its role the same way.
 BASE_COMPUTE_ROLE = "roles/compute.instanceAdmin.v1"
+# Resource types the role may change; the IAM conditions limit them to the VMs and disks they name.
+HOST_RESOURCES = ("instances", "disks")
 EXCLUDED_PERMISSIONS = ("compute.projects.setCommonInstanceMetadata", "compute.instances.osAdminLogin",
                         "compute.instances.osLogin")
 ROLE_ID = "spotControlWatchdogCompute"
@@ -427,11 +430,25 @@ def orphaned_secret_volumes(service: Mapping) -> list[str]:
 
 
 def role_permissions(base: Sequence[str], support: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    """The base role's permissions minus project metadata, OS Login and IAM policy writes, and minus those custom
-    roles can't hold (``support``: permission -> customRolesSupportLevel, from list-testable-permissions)."""
+    """The base role's permissions that a conditioned compute binding needs, and that a project custom role can hold
+    (``support``: permission -> customRolesSupportLevel, from list-testable-permissions):
+
+    * every permission on instances and disks (the binding's condition narrows those), except OS Login and IAM
+      policy writes;
+    * on every other Compute Engine resource type only reads and uses (``get*``, ``list*``, ``use*``: a subnetwork,
+      an external IP, a public image), so images, snapshots, templates and instance groups stay untouched; no
+      project metadata write;
+    * on other services only reads (``get*``, ``list*``).
+    """
     keep = []
     for permission in base:
         if permission in EXCLUDED_PERMISSIONS or permission.endswith(".setIamPolicy"):
+            continue
+        service, _, rest = permission.partition(".")
+        resource, _, verb = rest.rpartition(".")
+        if service == "compute" and resource in HOST_RESOURCES:
+            pass
+        elif not verb.startswith(("get", "list") if service != "compute" else ("get", "list", "use")):
             continue
         # A permission a project-level custom role can't hold (not testable on the project, or NOT_SUPPORTED, such
         # as resourcemanager.projects.list) would make the whole role definition fail.
@@ -445,20 +462,19 @@ def custom_role_file(title: str, permissions: Sequence[str]) -> str:
     """A custom compute role definition (``gcloud iam roles create --file``), as JSON (a YAML subset); without
     ``permissions`` (a dry run) it shows what the deploy computes in their place."""
     included = list(permissions) or [
-        f"<computed at deploy time: {BASE_COMPUTE_ROLE} minus {', '.join(EXCLUDED_PERMISSIONS)} and *.setIamPolicy>"]
+        f"<computed at deploy time from {BASE_COMPUTE_ROLE}: instance and disk permissions except "
+        f"{', '.join(EXCLUDED_PERMISSIONS[1:])} and *.setIamPolicy; get*, list* and use* on other compute "
+        "resources; get* and list* on other services>"]
     return json.dumps({"title": title,
-                       "description": f"{BASE_COMPUTE_ROLE} without project metadata, OS Login, or IAM policy writes",
+                       "description": f"{BASE_COMPUTE_ROLE}: instances and disks; reads and uses only on the rest",
                        "stage": "GA", "includedPermissions": included}, indent=2)
 
 
-def read_role_permissions(project: str, runner: Runner, apis: Sequence[str] = (),
-                          select: Callable[[Sequence[str], Mapping[str, str]], tuple[str, ...]] | None = None
-                          ) -> tuple[str, ...]:
+def read_role_permissions(project: str, runner: Runner, apis: Sequence[str] = ()) -> tuple[str, ...]:
     """Read the base role and the project's custom-role support levels; raises DeployError on failure.
 
     ``apis`` are enabled first: on a fresh project the IAM API is off, and a permission whose service API is off may
-    be missing from the testable permissions. ``select`` picks the role's permissions from the base role's and the
-    support levels (default :func:`role_permissions`; the autoscaler deploy passes a narrower one)."""
+    be missing from the testable permissions."""
     if apis:
         enabled = runner(["gcloud", "services", "enable", *apis, f"--project={project}"])
         if enabled.returncode != 0:
@@ -474,7 +490,7 @@ def read_role_permissions(project: str, runner: Runner, apis: Sequence[str] = ()
         support = {row["name"]: row.get("customRolesSupportLevel", "SUPPORTED") for row in json.loads(testable.stdout)}
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
         raise DeployError(f"could not read {BASE_COMPUTE_ROLE}'s permissions: {exc}") from exc
-    permissions = (select or role_permissions)(base, support)
+    permissions = role_permissions(base, support)
     if not any(p == "compute.instances.create" for p in permissions):
         raise DeployError(f"{BASE_COMPUTE_ROLE} returned no usable permissions")
     return permissions
@@ -598,7 +614,7 @@ def build_steps(config: DeployConfig) -> list[Step]:
                       for secret in sorted(by_secret))))
 
     steps.append(Step(
-        f"Custom role {config.compute_role} ({BASE_COMPUTE_ROLE} minus project metadata, OS Login, IAM policy)",
+        f"Custom role {config.compute_role} ({BASE_COMPUTE_ROLE}: instances and disks; reads and uses on the rest)",
         files={"watchdog-compute-role.json": custom_role_file("Spot control watchdog compute",
                                                               config.role_permissions)},
         check=_c("gcloud", "iam", "roles", "describe", ROLE_ID, p, "--format=value(name)"),
@@ -629,10 +645,15 @@ def build_steps(config: DeployConfig) -> list[Step]:
                     "floor-condition.json": json.dumps(floor_condition(), indent=2)}
     newly_bound = (f"{config.compute_role} is newly bound: run this deploy again once IAM has propagated it "
                    f"(10 minutes or more) to remove the {BASE_COMPUTE_ROLE} bindings it replaces")
-    replaced = [unbind(BASE_COMPUTE_ROLE, control_file), unbind(BASE_COMPUTE_ROLE, "--condition=None")]
+    # The unconditional bindings also cover floor hosts, so with the floor on they wait for the floor's custom
+    # binding; the IAM step binds it after the control one, so it existing means both do.
+    unconditional = [unbind(BASE_COMPUTE_ROLE, "--condition=None")]
     if config.compute_condition:
-        replaced.append(unbind(config.compute_role, "--condition=None"))
-    elif config.floor_enabled:
+        unconditional.append(unbind(config.compute_role, "--condition=None"))
+    replaced = [unbind(BASE_COMPUTE_ROLE, control_file)]
+    if not (config.floor_enabled and config.compute_condition):
+        replaced += unconditional
+    if config.floor_enabled and not config.compute_condition:
         replaced.append(unbind(BASE_COMPUTE_ROLE, floor_file))  # the unconditional custom binding covers floor hosts
     steps.append(Step(
         f"Remove the {BASE_COMPUTE_ROLE} control VM bindings earlier deploys made, once the custom role replaces them "
@@ -641,9 +662,9 @@ def build_steps(config: DeployConfig) -> list[Step]:
         remove_when=(bound("spot-control-vms-only" if config.compute_condition else None), newly_bound)))
     if config.floor_enabled and config.compute_condition:
         steps.append(Step(
-            f"Remove the {BASE_COMPUTE_ROLE} runner floor binding earlier deploys made, once the custom role replaces "
-            "it (an absent one is skipped)",
-            files=legacy_files, remove=(unbind(BASE_COMPUTE_ROLE, floor_file),),
+            f"Remove the {BASE_COMPUTE_ROLE} runner floor and unconditional bindings earlier deploys made, once the "
+            "custom role replaces them (absent ones are skipped)",
+            files=legacy_files, remove=(unbind(BASE_COMPUTE_ROLE, floor_file), *unconditional),
             remove_when=(bound(FLOOR_CONDITION_TITLE), newly_bound)))
     compute_args = (["--condition-from-file=@FILE:compute-condition.json"] if config.compute_condition
                     else ["--condition=None"])

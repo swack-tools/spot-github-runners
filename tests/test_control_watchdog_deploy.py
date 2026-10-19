@@ -44,7 +44,9 @@ PREDEFINED_ROLE = "roles/compute.instanceAdmin.v1"
 BASE_ROLE = ["compute.instances.create", "compute.instances.setMetadata", "compute.instances.delete",
              "compute.projects.get", "compute.projects.setCommonInstanceMetadata", "compute.instances.osAdminLogin",
              "compute.instances.osLogin", "compute.instances.setIamPolicy", "compute.disks.delete",
-             "resourcemanager.projects.list"]
+             "resourcemanager.projects.list", "compute.snapshots.delete", "compute.images.create",
+             "compute.images.useReadOnly", "compute.subnetworks.use", "compute.machineTypes.list",
+             "compute.instanceGroupManagers.update"]
 TESTABLE = [{"name": p, "customRolesSupportLevel": "NOT_SUPPORTED" if p.startswith("resourcemanager") else "SUPPORTED"}
             for p in BASE_ROLE]
 
@@ -1067,7 +1069,8 @@ class AutoDeployWorkflowTests(unittest.TestCase):
 
 
 class CustomComputeRoleTests(unittest.TestCase):
-    """Both compute bindings use a custom role without project metadata, OS Login, or IAM policy writes."""
+    """Both compute bindings use a custom role with writes on instances and disks only, and none on project
+    metadata, OS Login, or IAM policy."""
 
     def runner(self, role_ok=True, bound=False):
         """``bound``: the custom role bindings already in the project policy when the deploy started (True: all;
@@ -1112,21 +1115,24 @@ class CustomComputeRoleTests(unittest.TestCase):
         return [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]
                 and (role is None or flag(c, "role") == role)]
 
-    def test_the_role_is_the_base_role_without_project_metadata_os_login_or_iam_policy_writes(self):
+    def test_the_role_writes_only_instances_and_disks_and_never_project_metadata_os_login_or_iam_policy(self):
         run, calls, seen = self.runner()
         code, err = self.deploy(run)
         self.assertEqual(code, 0, err)
+        # Snapshot, image and instance group writes are dropped: the conditions only narrow instances and disks.
         self.assertEqual(seen["role"]["includedPermissions"],
-                         ["compute.disks.delete", "compute.instances.create", "compute.instances.delete",
-                          "compute.instances.setMetadata", "compute.projects.get"])
+                         ["compute.disks.delete", "compute.images.useReadOnly", "compute.instances.create",
+                          "compute.instances.delete", "compute.instances.setMetadata", "compute.machineTypes.list",
+                          "compute.projects.get", "compute.subnetworks.use"])
         self.assertTrue(any(c[:5] == ["gcloud", "iam", "roles", "create", "spotControlWatchdogCompute"]
                             for c in calls))
         # The predefined role, which can write project metadata, is never granted.
         self.assertFalse([c for c in calls if "add-iam-policy-binding" in c and flag(c, "role") == PREDEFINED_ROLE])
 
-    def test_the_autoscaler_reads_its_role_through_the_same_code_with_its_own_filter(self):
+    def test_the_autoscaler_reads_and_filters_its_role_through_the_same_code(self):
         from lib import autoscaler_deploy
         self.assertIs(autoscaler_deploy.EXCLUDED_PERMISSIONS, deploy.EXCLUDED_PERMISSIONS)
+        self.assertIs(autoscaler_deploy.role_permissions, deploy.role_permissions)
         run, calls, _ = self.runner()
         config = autoscaler_deploy.AutoscalerDeployConfig(project=PROJECT)
         self.assertEqual(autoscaler_deploy.read_role_permissions(config, run),
@@ -1185,9 +1191,14 @@ class CustomComputeRoleTests(unittest.TestCase):
         self.assertIn(deploy.control_condition(), seen["removed"])
         self.assertNotIn(deploy.floor_condition(), seen["removed"])
         self.assertIn("is newly bound", self.out)
+        # The unconditional bindings (a --no-compute-condition deploy's) cover floor hosts too, so they wait for the
+        # floor's replacement as well.
+        self.assertFalse([c for c in self.removals(calls) if flag(c, "condition") == "None"])
         run, calls, seen = self.runner(bound={"spot-control-vms-only", deploy.FLOOR_CONDITION_TITLE})
         self.assertEqual(self.deploy(run)[0], 0)
         self.assertIn(deploy.floor_condition(), seen["removed"])
+        self.assertEqual(sorted(flag(c, "role") for c in self.removals(calls) if flag(c, "condition") == "None"),
+                         sorted([PREDEFINED_ROLE, CUSTOM_ROLE]))
         self.assertNotIn("is newly bound", self.out)
 
     def test_an_unreadable_base_role_stops_before_anything_changes(self):
@@ -1202,7 +1213,7 @@ class CustomComputeRoleTests(unittest.TestCase):
         code, script, err = dry_run(f"--image={IMAGE}", env=FLOOR_ENV)
         self.assertEqual(code, 0, err)
         self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
-        self.assertIn("<computed at deploy time: roles/compute.instanceAdmin.v1 minus", script)
+        self.assertIn("<computed at deploy time from roles/compute.instanceAdmin.v1: instance and disk", script)
         self.assertIn('if [ -n "$(gcloud projects get-iam-policy', script)
         self.assertEqual(sorted(flag(c, "role") for c in self.removals(commands(script))
                                 if flag(c, "role") == PREDEFINED_ROLE or flag(c, "condition") == "None"),

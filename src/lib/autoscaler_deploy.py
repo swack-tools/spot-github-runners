@@ -74,12 +74,12 @@ SECRET_LABEL = "spot-runner-autoscaler"
 # condition can only narrow instances and disks; the project itself always passes it, and the base role's
 # compute.projects.setCommonInstanceMetadata would let gcloud compute ssh put the autoscaler's key (or anyone with
 # this account a startup script) into project metadata, which every VM in the project trusts. Without it gcloud
-# falls back to the runner host's own metadata. The base role is read through the watchdog deploy's
-# read_role_permissions, with this module's narrower role_permissions.
+# falls back to the runner host's own metadata. The base role is read and filtered by the watchdog deploy's
+# read_role_permissions and role_permissions, which its own custom role uses too.
 BASE_COMPUTE_ROLE = wd.BASE_COMPUTE_ROLE
 ROLE_ID = "spotRunnerHostAdmin"
 # Resource types the role may change; the IAM condition limits them to oxidex-runners-* and runner-data*.
-HOST_RESOURCES = ("instances", "disks")
+HOST_RESOURCES = wd.HOST_RESOURCES
 EXCLUDED_PERMISSIONS = wd.EXCLUDED_PERMISSIONS
 
 _MEMORY_RE = re.compile(r"^[1-9][0-9]*(Mi|Gi)$")
@@ -258,33 +258,8 @@ def validate_args(config: AutoscalerDeployConfig) -> list[str]:
     return problems
 
 
-def role_permissions(base: Sequence[str], support: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    """The base role's permissions that the autoscaler needs, and that a project custom role can hold
-    (``support``: permission -> customRolesSupportLevel, from list-testable-permissions):
-
-    * every permission on instances and disks (the binding's condition narrows those to runner hosts), except OS
-      Login and IAM policy writes;
-    * on every other Compute Engine resource type only reads and uses (``get*``, ``list*``, ``use*``: a subnetwork,
-      an external IP, a public image), so images, snapshots, templates and instance groups stay untouched; no
-      project metadata write;
-    * on other services only reads (``get*``, ``list*``).
-    """
-    keep = []
-    for permission in base:
-        if permission in EXCLUDED_PERMISSIONS or permission.endswith(".setIamPolicy"):
-            continue
-        service, _, rest = permission.partition(".")
-        resource, _, verb = rest.rpartition(".")
-        if service == "compute" and resource in HOST_RESOURCES:
-            pass
-        elif not verb.startswith(("get", "list") if service != "compute" else ("get", "list", "use")):
-            continue
-        # A permission a project-level custom role can't hold (not testable on the project, or NOT_SUPPORTED, such
-        # as resourcemanager.projects.list) would make the whole role definition fail.
-        if support is not None and support.get(permission, "NOT_SUPPORTED") == "NOT_SUPPORTED":
-            continue
-        keep.append(permission)
-    return tuple(sorted(set(keep)))
+# The watchdog deploy's filter: every instance and disk permission, reads and uses only on the rest.
+role_permissions = wd.role_permissions
 
 
 def role_file(config: AutoscalerDeployConfig) -> str:
@@ -300,7 +275,7 @@ def role_file(config: AutoscalerDeployConfig) -> str:
 
 def read_role_permissions(config: AutoscalerDeployConfig, runner: wd.Runner) -> tuple[str, ...]:
     """Read the base role and the project's custom-role support levels; raises DeployError on failure."""
-    return wd.read_role_permissions(config.project, runner, APIS, select=role_permissions)
+    return wd.read_role_permissions(config.project, runner, APIS)
 
 
 def hosts_condition() -> dict[str, str]:
