@@ -2129,6 +2129,13 @@ class ControlVmManager:
         self.save()
         snapshot = t.get("frozen_snapshot")
         floor = t.get("frozen_version") or 0
+        if t.get("snapshot_in_kv"):
+            try:
+                snapshot = parse_snapshot(self.kv.get(KV_STATE_KEY)) if self.kv is not None else None
+            except KvError as exc:
+                return False, f"could not read the frozen snapshot from KV: {exc}"
+            if snapshot is None or snapshot["state_version"] < t["snapshot_in_kv"]:
+                return False, "KV no longer holds the frozen snapshot"
         if snapshot:
             status, body = self._control(slot, "import", "POST", snapshot)
             version = body.get("state_version") if isinstance(body, dict) else None
@@ -2240,10 +2247,17 @@ class ControlVmManager:
                 t["snapshot_too_large"] = size  # the first freeze: refuse the update (set_image aborts)
                 self.save()
                 return False
-            # A refreeze: the drain is confirmed, and what the container wrote is on the shared disk; keep the
-            # snapshot already held.
-            self._note("refreeze snapshot is %d bytes; keeping the earlier snapshot", size, level=logging.WARNING)
-            snapshot = kept
+            # A refreeze too large for the controller state: keep it in KV instead (a release then imports it from
+            # there). Not confirmed until KV holds it, since the container may hold changes only in memory.
+            problem = self._publish_snapshot(snapshot)
+            if problem:
+                self._note("refreeze snapshot is %d bytes and could not be kept: %s", size, problem,
+                           level=logging.WARNING)
+                return False
+            t["snapshot_in_kv"] = snapshot["state_version"]
+            t["frozen_version"] = max(version, t.get("frozen_version") or 0)
+            self.save()
+            return True
         if not kept or snapshot["state_version"] >= kept["state_version"]:
             t["frozen_snapshot"] = snapshot  # never replace a newer snapshot with an older one (a stale container)
         t["frozen_version"] = max(version, t.get("frozen_version") or 0)
@@ -2373,22 +2387,32 @@ class ControlVmManager:
         return self._end_abort(t)
 
     def _preserve_frozen_snapshot(self, t: dict) -> str | None:
-        """Before a rollback ends without releasing a container: publish the frozen snapshot to KV when KV holds
-        older state, so a recovery that hydrates from KV keeps it. None when KV holds at least that state."""
+        """Before a rollback ends without releasing a container: make sure KV holds the frozen snapshot, so a
+        recovery that hydrates from KV keeps it. None when it does."""
         snapshot = t.get("frozen_snapshot")
-        if not snapshot or self.kv is None:
-            return None if not snapshot else "Cloudflare KV is not configured"
+        return self._publish_snapshot(snapshot) if snapshot else None
+
+    def _publish_snapshot(self, snapshot: Mapping[str, Any]) -> str | None:
+        """Write ``snapshot`` to the KV state key unless KV already holds newer state, or the same state at the same
+        version (an equal version can still differ: a change whose disk write failed is in the snapshot without a
+        version bump). None once KV holds it."""
+        if self.kv is None:
+            return "Cloudflare KV is not configured"
+
+        def holds(current: Mapping[str, Any] | None) -> bool:
+            return current is not None and (current["state_version"] > snapshot["state_version"]
+                                            or (current["state_version"] == snapshot["state_version"]
+                                                and current.get("state") == snapshot.get("state")))
         try:
-            current = parse_snapshot(self.kv.get(KV_STATE_KEY))
-            if current is not None and current["state_version"] >= snapshot["state_version"]:
+            if holds(parse_snapshot(self.kv.get(KV_STATE_KEY))):
                 return None
             self.kv.put(KV_STATE_KEY, json.dumps(snapshot, separators=(",", ":")))
             stored = parse_snapshot(self.kv.get(KV_STATE_KEY))
         except KvError as exc:
             return f"could not publish the frozen snapshot to KV: {exc}"
-        if stored is None or stored["state_version"] < snapshot["state_version"]:
+        if not holds(stored):
             return "KV does not show the frozen snapshot yet"
-        self._note("published the frozen snapshot (state_version %d) to KV for recovery", snapshot["state_version"],
+        self._note("published the frozen snapshot (state_version %d) to KV", snapshot["state_version"],
                    level=logging.WARNING)
         return None
 

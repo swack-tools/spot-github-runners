@@ -653,6 +653,34 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         self.assertEqual(h.mutations()[-1], ("unfreeze", "a"))
 
+    def test_kv_at_an_equal_version_with_other_state_is_overwritten(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot, parse_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        frozen = build_snapshot({"records": ["done"]}, 7, "a", now=5)
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 7, "a", now=4))
+        self.assertIsNone(manager._publish_snapshot(frozen))
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state"], {"records": ["done"]})
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 8, "a", now=6))  # newer: left alone
+        self.assertIsNone(manager._publish_snapshot(frozen))
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 8)
+
+    def test_an_oversized_refreeze_is_kept_in_kv_and_imported_from_there(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        t = {}
+        self.assertTrue(manager._record_freeze(t, {"state_version": 7, "snapshot": build_snapshot({}, 7, "a", now=5)}))
+        big = build_snapshot({"blob": "x" * 64}, 9, "a", now=6)
+        with unittest.mock.patch.object(cv, "IMAGE_SNAPSHOT_MAX_BYTES", 100):
+            self.assertTrue(manager._record_freeze(t, {"state_version": 9, "snapshot": big}))
+        self.assertEqual((t["snapshot_in_kv"], t["frozen_version"], t["frozen_snapshot"]["state_version"]), (9, 9, 7))
+        self.assertEqual(json.loads(h.kv.store[KV_STATE_KEY])["state_version"], 9)
+        h.http.versions["a"] = 0
+        ok, detail = manager._release(t, "a")
+        self.assertTrue(ok, detail)
+        self.assertEqual(h.http.versions["a"], 9)  # imported the KV copy, not the older one in the state
+
     def test_a_stale_running_report_does_not_block_forever(self):
         h = TrackingHarness()
         h.active()
