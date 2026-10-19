@@ -36,12 +36,16 @@ class FakeGcs:
     """Objects with generations; ``put`` honors ifGenerationMatch like the JSON API."""
 
     def __init__(self):
+        self.slept: list[float] = []
         self.objects: dict[str, tuple[bytes, int]] = {}
         self.next_generation = 100
         self.puts: list[tuple[str, int]] = []
         self.ambiguous: list[bool] = []  # per put: True = raise GcsAmbiguous after (or instead of) writing
         self.ambiguous_lands: list[bool] = []
         self.fail_put: Exception | None = None
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
 
     def write(self, name, data):
         self.next_generation += 1
@@ -137,6 +141,8 @@ class StoreTests(unittest.TestCase):
         store.save(b'{"ok": true}')
         self.assertEqual(fake.objects[OBJECT][0], b'{"ok": true}')
         self.assertEqual(len(fake.puts), 2)
+        # The retry waited first: Cloud Storage answers 429 to a second write of one object within a second.
+        self.assertEqual(fake.slept, [store_module.WRITE_BACKOFF_SECONDS])
 
     def test_writes_that_stay_unconfirmed_fail_closed(self):
         store, fake = make_store()
