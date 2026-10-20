@@ -1056,8 +1056,8 @@ pinned by digest. The OIDC provider admits only that workflow on `main` of `swac
 
 | Member | Role | Resource | Why |
 | --- | --- | --- | --- |
-| `spot-control-watchdog` | `roles/compute.instanceAdmin.v1` | Project, with the IAM condition `spot-control-vms-only` | List, describe, create, start, stop, set scheduling on, and delete the control VMs and their boot disks; list machine types; use the subnetwork and an external IP. The condition limits instances and disks to names that start with `spot-control-`. |
-| `spot-control-watchdog` | `roles/compute.instanceAdmin.v1` | Project, with the IAM condition `spot-runner-floor-hosts`; only with floor targets | Create, describe, start, set metadata and labels on, and delete runner floor hosts and their disks. The condition limits instances to names that start with `oxidex-runners-`, and disks to those names and names that start with `runner-data`. The control VM binding stays as it is, so removing this binding turns the floor's compute access off. |
+| `spot-control-watchdog` | `spotControlWatchdogCompute` (custom) | Project, with the IAM condition `spot-control-vms-only` | List, describe, create, start, stop, set scheduling on, and delete the control VMs and their boot disks; list machine types; use the subnetwork and an external IP. The condition limits instances and disks to names that start with `spot-control-`. |
+| `spot-control-watchdog` | `spotControlWatchdogCompute` (custom) | Project, with the IAM condition `spot-runner-floor-hosts`; only with floor targets | Create, describe, start, set metadata and labels on, and delete runner floor hosts and their disks. The condition limits instances to names that start with `oxidex-runners-`, and disks to those names and names that start with `runner-data`. The control VM binding stays as it is, so removing this binding turns the floor's compute access off. |
 | `spot-control-watchdog` | `roles/iam.serviceAccountUser` | The control VM service account only | Create control VMs that run as that account. Floor hosts run with no service account, so the floor needs no `actAs` on any account. |
 | `spot-control-watchdog` | `roles/storage.objectAdmin` | The state bucket only | Read and conditionally write the state and lease objects. |
 | `spot-control-watchdog` | `roles/secretmanager.secretAccessor` | Each referenced secret only | Read the service's secrets when an instance starts. |
@@ -1068,6 +1068,31 @@ pinned by digest. The OIDC provider admits only that workflow on `main` of `swac
 | `spot-watchdog-deployer` | `roles/run.developer` | The Cloud Run service only; only with `SPOT_WATCHDOG_AUTO_DEPLOY=1` | Read the service and roll it to a new image. No other service. |
 | `spot-watchdog-deployer` | `roles/iam.serviceAccountUser` | The `spot-control-watchdog` account only; only with `SPOT_WATCHDOG_AUTO_DEPLOY=1` | A new revision keeps running as the runtime account. |
 | `spot-watchdog-deployer` | `roles/artifactregistry.reader` | The `spot-control` repository only; only with `SPOT_WATCHDOG_AUTO_DEPLOY=1` | Read the commit tags of the deployed and the new image. |
+
+Both compute bindings use the custom role `spotControlWatchdogCompute`, not the predefined
+`roles/compute.instanceAdmin.v1`. The predefined role includes `compute.projects.setCommonInstanceMetadata`. An
+IAM condition narrows only instances and disks, and the project always passes it. With that permission, the
+watchdog's account could write project-wide `ssh-keys` or a `startup-script`, which every VM in the project trusts,
+so it would have root on all of them. Its image, snapshot, instance template, and instance group writes would
+also reach every one of those in the project. The custom role keeps the predefined role's instance and disk
+permissions, which the conditions narrow, and only its read and use permissions on other resources. It drops
+`compute.projects.setCommonInstanceMetadata`, `compute.instances.osAdminLogin`, `compute.instances.osLogin`, every
+`*.setIamPolicy`, and the permissions that a project custom role can't hold. The deploy reads the predefined role
+each time it runs and filters it the same way as the autoscaler deploy does for `spotRunnerHostAdmin`. The
+watchdog needs none of the dropped permissions: it never runs `gcloud compute ssh`, it creates VMs from a public
+image, and it writes only instance metadata on the VMs that the conditions name.
+
+Deploys before the custom role bound the predefined role with the same conditions. IAM changes take several
+minutes to propagate, so the deploy doesn't revoke the predefined role in the run that first grants the custom
+role: it prints that the custom role is newly bound. Run the deploy again 10 minutes or more later. The deploy
+removes each predefined role binding only when the project policy already held its custom role replacement, under
+the same condition, when the deploy started. When obsolete grants remain, before each gated removal the deploy waits 10 minutes after
+observing the replacement binding, because policy visibility does not prove that authorization has propagated.
+With both control and floor grants, this adds 20 minutes to a migration deploy. An interrupted wait stops the
+deploy without revoking that grant. The unconditional predefined binding that `--no-compute-condition`
+made, and an unconditional custom role binding from such a deploy, go with the control VM binding, or with the floor
+binding when there are floor targets, since they cover floor hosts too. With no floor targets, the deploy removes
+both floor bindings without waiting. It skips any binding that is absent.
 
 The service references these secrets:
 

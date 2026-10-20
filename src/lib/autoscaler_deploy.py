@@ -74,13 +74,13 @@ SECRET_LABEL = "spot-runner-autoscaler"
 # condition can only narrow instances and disks; the project itself always passes it, and the base role's
 # compute.projects.setCommonInstanceMetadata would let gcloud compute ssh put the autoscaler's key (or anyone with
 # this account a startup script) into project metadata, which every VM in the project trusts. Without it gcloud
-# falls back to the runner host's own metadata.
-BASE_COMPUTE_ROLE = "roles/compute.instanceAdmin.v1"
+# falls back to the runner host's own metadata. The base role is read and filtered by the watchdog deploy's
+# read_role_permissions and role_permissions, which its own custom role uses too.
+BASE_COMPUTE_ROLE = wd.BASE_COMPUTE_ROLE
 ROLE_ID = "spotRunnerHostAdmin"
 # Resource types the role may change; the IAM condition limits them to oxidex-runners-* and runner-data*.
-HOST_RESOURCES = ("instances", "disks")
-EXCLUDED_PERMISSIONS = ("compute.projects.setCommonInstanceMetadata", "compute.instances.osAdminLogin",
-                        "compute.instances.osLogin")
+HOST_RESOURCES = wd.HOST_RESOURCES
+EXCLUDED_PERMISSIONS = wd.EXCLUDED_PERMISSIONS
 
 _MEMORY_RE = re.compile(r"^[1-9][0-9]*(Mi|Gi)$")
 _CPU_RE = re.compile(r"^[1-8]$")
@@ -286,33 +286,8 @@ def validate_args(config: AutoscalerDeployConfig) -> list[str]:
     return problems
 
 
-def role_permissions(base: Sequence[str], support: Mapping[str, str] | None = None) -> tuple[str, ...]:
-    """The base role's permissions that the autoscaler needs, and that a project custom role can hold
-    (``support``: permission -> customRolesSupportLevel, from list-testable-permissions):
-
-    * every permission on instances and disks (the binding's condition narrows those to runner hosts), except OS
-      Login and IAM policy writes;
-    * on every other Compute Engine resource type only reads and uses (``get*``, ``list*``, ``use*``: a subnetwork,
-      an external IP, a public image), so images, snapshots, templates and instance groups stay untouched; no
-      project metadata write;
-    * on other services only reads (``get*``, ``list*``).
-    """
-    keep = []
-    for permission in base:
-        if permission in EXCLUDED_PERMISSIONS or permission.endswith(".setIamPolicy"):
-            continue
-        service, _, rest = permission.partition(".")
-        resource, _, verb = rest.rpartition(".")
-        if service == "compute" and resource in HOST_RESOURCES:
-            pass
-        elif not verb.startswith(("get", "list") if service != "compute" else ("get", "list", "use")):
-            continue
-        # A permission a project-level custom role can't hold (not testable on the project, or NOT_SUPPORTED, such
-        # as resourcemanager.projects.list) would make the whole role definition fail.
-        if support is not None and support.get(permission, "NOT_SUPPORTED") == "NOT_SUPPORTED":
-            continue
-        keep.append(permission)
-    return tuple(sorted(set(keep)))
+# The watchdog deploy's filter: every instance and disk permission, reads and uses only on the rest.
+role_permissions = wd.role_permissions
 
 
 def role_file(config: AutoscalerDeployConfig) -> str:
@@ -328,21 +303,7 @@ def role_file(config: AutoscalerDeployConfig) -> str:
 
 def read_role_permissions(config: AutoscalerDeployConfig, runner: wd.Runner) -> tuple[str, ...]:
     """Read the base role and the project's custom-role support levels; raises DeployError on failure."""
-    described = runner(["gcloud", "iam", "roles", "describe", BASE_COMPUTE_ROLE, "--format=json"])
-    testable = runner(["gcloud", "iam", "list-testable-permissions",
-                       f"//cloudresourcemanager.googleapis.com/projects/{config.project}",
-                       "--format=json(name,customRolesSupportLevel)"])
-    try:
-        if described.returncode != 0 or testable.returncode != 0:
-            raise ValueError((described.stderr or testable.stderr or "").strip()[:300])
-        base = json.loads(described.stdout).get("includedPermissions") or []
-        support = {row["name"]: row.get("customRolesSupportLevel", "SUPPORTED") for row in json.loads(testable.stdout)}
-    except (ValueError, TypeError, KeyError, AttributeError) as exc:
-        raise wd.DeployError(f"could not read {BASE_COMPUTE_ROLE}'s permissions: {exc}") from exc
-    permissions = role_permissions(base, support)
-    if not any(p == "compute.instances.create" for p in permissions):
-        raise wd.DeployError(f"{BASE_COMPUTE_ROLE} returned no usable permissions")
-    return permissions
+    return wd.read_role_permissions(config.project, runner, APIS)
 
 
 def hosts_condition() -> dict[str, str]:

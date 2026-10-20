@@ -38,12 +38,33 @@ ENV = {
 # The live service as `gcloud run services describe --format=json` prints it: nothing orphaned.
 SERVICE = {"spec": {"template": {"spec": {"containers": [{"volumeMounts": []}], "volumes": []}}}}
 
+CUSTOM_ROLE = f"projects/{PROJECT}/roles/spotControlWatchdogCompute"
+PREDEFINED_ROLE = "roles/compute.instanceAdmin.v1"
+# A cut-down roles/compute.instanceAdmin.v1 and the project's custom-role support levels for it.
+BASE_ROLE = ["compute.instances.create", "compute.instances.setMetadata", "compute.instances.delete",
+             "compute.projects.get", "compute.projects.setCommonInstanceMetadata", "compute.instances.osAdminLogin",
+             "compute.instances.osLogin", "compute.instances.setIamPolicy", "compute.disks.delete",
+             "resourcemanager.projects.list", "compute.snapshots.delete", "compute.images.create",
+             "compute.images.useReadOnly", "compute.subnetworks.use", "compute.machineTypes.list",
+             "compute.instanceGroupManagers.update"]
+TESTABLE = [{"name": p, "customRolesSupportLevel": "NOT_SUPPORTED" if p.startswith("resourcemanager") else "SUPPORTED"}
+            for p in BASE_ROLE]
+
+
+def role_read(argv):
+    """The fake answers to the deploy's reads of the predefined role, or None for any other command."""
+    if list(argv[:5]) == ["gcloud", "iam", "roles", "describe", PREDEFINED_ROLE]:
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"includedPermissions": BASE_ROLE}), stderr="")
+    if list(argv[:3]) == ["gcloud", "iam", "list-testable-permissions"]:
+        return SimpleNamespace(returncode=0, stdout=json.dumps(TESTABLE), stderr="")
+    return None
+
 
 def described(argv, service=SERVICE):
-    """The fake answer to the post-deploy describe of the service, or None for any other command."""
+    """The fake answer to the post-deploy describe of the service or a role read, or None for any other command."""
     if list(argv[1:4]) == ["run", "services", "describe"]:
         return SimpleNamespace(returncode=0, stdout=json.dumps(service), stderr="")
-    return None
+    return role_read(argv)
 
 
 def never(argv):
@@ -89,12 +110,12 @@ class DryRunTests(unittest.TestCase):
         runtime = f"--member=serviceAccount:spot-control-watchdog@{PROJECT}.iam.gserviceaccount.com"
         roles = sorted({flag(c, "role") for c in self.commands if "add-iam-policy-binding" in c})
         self.assertEqual(roles, sorted([
-            "roles/compute.instanceAdmin.v1", "roles/iam.serviceAccountUser", "roles/storage.objectAdmin",
+            CUSTOM_ROLE, "roles/iam.serviceAccountUser", "roles/storage.objectAdmin",
             "roles/secretmanager.secretAccessor", "roles/run.invoker", "roles/artifactregistry.writer",
             "roles/iam.workloadIdentityUser"]))
         compute = self.binding("projects", runtime)
         self.assertEqual(len(compute), 1)
-        self.assertEqual(flag(compute[0], "role"), "roles/compute.instanceAdmin.v1")
+        self.assertEqual(flag(compute[0], "role"), CUSTOM_ROLE)
         self.assertEqual(flag(compute[0], "condition-from-file"), "@FILE:compute-condition.json")
         act_as = self.binding("service-accounts", runtime)
         self.assertEqual([c[4] for c in act_as], [CONTROL_SA])  # actAs on the control VM account only
@@ -408,7 +429,7 @@ class FloorDeployTests(unittest.TestCase):
 
     def test_a_second_narrow_compute_binding_and_the_control_binding_unchanged(self):
         project_level = [c for c in self.commands if c[1:3] == ["projects", "add-iam-policy-binding"]]
-        self.assertEqual([flag(c, "role") for c in project_level], ["roles/compute.instanceAdmin.v1"] * 2)
+        self.assertEqual([flag(c, "role") for c in project_level], [CUSTOM_ROLE] * 2)
         self.assertEqual([flag(c, "condition-from-file") for c in project_level],
                          ["@FILE:compute-condition.json", "@FILE:floor-condition.json"])
         self.assertIn(deploy.FLOOR_CONDITION_TITLE, self.script)
@@ -498,7 +519,7 @@ class FloorDeployTests(unittest.TestCase):
             argv = list(argv)
             calls.append(argv)
             for arg in argv:
-                if arg.startswith("--condition-from-file="):
+                if arg.startswith("--condition-from-file=") and "add-iam-policy-binding" in argv:
                     files.append(json.loads(Path(arg.split("=", 1)[1]).read_text()))
             if argv[:3] == ["gcloud", "projects", "describe"]:
                 return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
@@ -551,10 +572,10 @@ class FloorRemovalTests(unittest.TestCase):
             return SimpleNamespace(returncode=1 if "describe" in argv else 0, stdout="", stderr="")
         return run, calls
 
-    def deploy(self, run, env):
+    def deploy(self, run, env, *extra):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}"], runner=run, env=env)
+            code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}", *extra], runner=run, env=env)
         return code, err.getvalue()
 
     def removed(self, calls):
@@ -567,12 +588,19 @@ class FloorRemovalTests(unittest.TestCase):
         code, err = self.deploy(run, ENV)
         self.assertEqual(code, 0, err)
         compute = [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]]
-        self.assertEqual(len(compute), 1)
-        self.assertEqual(flag(compute[0], "role"), "roles/compute.instanceAdmin.v1")
+        # The custom role's floor binding and the predefined one an earlier deploy made: the floor needs neither.
+        self.assertEqual(sorted(flag(c, "role") for c in compute), [CUSTOM_ROLE, PREDEFINED_ROLE])
+        self.assertTrue(all(flag(c, "condition-from-file").endswith("/floor-condition.json") for c in compute))
         removed = sorted(c[3] for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"])
         self.assertEqual(removed, ["spot-floor-github-old", "spot-floor-github-swackhamer"])
         self.assertTrue(all(flag(c, "role") == "roles/secretmanager.secretAccessor"
                             for c in self.removed(calls) if c[1:3] == ["secrets", "remove-iam-policy-binding"]))
+        # An unconditional deploy removes both conditioned floor bindings an earlier deploy made too.
+        run, calls = self.runner()
+        code, err = self.deploy(run, ENV, "--no-compute-condition")
+        self.assertEqual(code, 0, err)
+        compute = [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]]
+        self.assertEqual(sorted(flag(c, "role") for c in compute), [CUSTOM_ROLE, PREDEFINED_ROLE])
 
     def test_floor_on_keeps_current_secrets_and_removes_a_dropped_one(self):
         run, calls = self.runner()
@@ -608,7 +636,10 @@ class FloorRemovalTests(unittest.TestCase):
                 self.assertIn("labels.spot-runner-floor=token", script)
                 self.assertIn('"$name"', script)
                 self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
-                self.assertEqual("projects remove-iam-policy-binding" in script, env is ENV)
+                floor_removal = [c for c in commands(script) if c[1:3] == ["projects", "remove-iam-policy-binding"]
+                                 and flag(c, "condition-from-file") == "@FILE:floor-condition.json"
+                                 and flag(c, "role") == CUSTOM_ROLE]
+                self.assertEqual(bool(floor_removal), env is ENV)
 
 
 def secret_volume(name, secret):
@@ -639,6 +670,8 @@ class OrphanedVolumeTests(unittest.TestCase):
                 if describe_fails:
                     return SimpleNamespace(returncode=1, stdout="", stderr="PERMISSION_DENIED")
                 return described(argv, service)
+            if role_read(argv):
+                return role_read(argv)
             if "describe" in argv and "versions" in argv:
                 return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
             return SimpleNamespace(returncode=1 if "describe" in argv else 0, stdout="", stderr="")
@@ -810,7 +843,7 @@ class AutoDeployGuardTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout=json.dumps(current), stderr="")
             if "describe" in argv and "versions" in argv:
                 return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return role_read(argv) or SimpleNamespace(returncode=0, stdout="", stderr="")
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             code = deploy.main([f"--project={PROJECT}", f"--image={image}"], runner=run, env=env)
@@ -828,7 +861,7 @@ class AutoDeployGuardTests(unittest.TestCase):
         self.assertEqual(self.deploy(None)[0], 0)
         code, _, calls = self.deploy(live_service(NEW_IMAGE), env=ENV)
         self.assertEqual(code, 0)
-        self.assertEqual(calls[0][:3], ["gcloud", "projects", "describe"])  # no guard describe first
+        self.assertNotEqual(calls[0][1:4], ["run", "services", "describe"])  # no guard describe first
 
     def test_the_workflow_deploying_meanwhile_is_never_overwritten_silently(self):
         # Between the early guard and the deploy step: the step's own guard refuses before gcloud run deploy.
@@ -1039,3 +1072,218 @@ class AutoDeployWorkflowTests(unittest.TestCase):
             with self.subTest(lookup=lookup):
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertEqual("CALLED push" in result.stdout, pushed)
+
+
+class CustomComputeRoleTests(unittest.TestCase):
+    """Both compute bindings use a custom role with writes on instances and disks only, and none on project
+    metadata, OS Login, or IAM policy."""
+
+    def runner(self, role_ok=True, bound=False, obsolete=True):
+        """``bound``: the custom role bindings already in the project policy when the deploy started (True: all;
+        or a set of condition titles, None for the unconditional one)."""
+        calls, seen = [], {}
+
+        def run(argv):
+            argv = list(argv)
+            calls.append(argv)
+            if argv[:4] in (["gcloud", "iam", "roles", "create"], ["gcloud", "iam", "roles", "update"]):
+                seen["role"] = json.loads(Path(flag(argv, "file")).read_text())
+            if argv[:3] == ["gcloud", "projects", "get-iam-policy"]:
+                if flag(argv, "filter").startswith("bindings.members="):
+                    return SimpleNamespace(returncode=0, stdout="old-role" if obsolete else "", stderr="")
+                title = re.search(r'bindings\.condition\.title="([^"]+)"', flag(argv, "filter"))
+                found = bound is True or (bound and (title.group(1) if title else None) in bound)
+                return SimpleNamespace(returncode=0, stdout=f"{CUSTOM_ROLE}\n" if found else "", stderr="")
+            if "remove-iam-policy-binding" in argv and argv[1] == "projects":
+                for arg in argv:
+                    if arg.startswith("--condition-from-file="):
+                        seen.setdefault("removed", []).append(json.loads(Path(arg.split("=", 1)[1]).read_text()))
+                return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: Policy binding with the specified "
+                                       "principal, role, and condition not found!")
+            if argv[:3] == ["gcloud", "projects", "describe"]:
+                return SimpleNamespace(returncode=0, stdout="123456789\n", stderr="")
+            if not role_ok and argv[:3] == ["gcloud", "iam", "list-testable-permissions"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="PERMISSION_DENIED")
+            if described(argv):
+                return described(argv)
+            if "describe" in argv and "versions" in argv:
+                return SimpleNamespace(returncode=0, stdout="ENABLED\n", stderr="")
+            return SimpleNamespace(returncode=1 if "describe" in argv else 0, stdout="", stderr="")
+        return run, calls, seen
+
+    def deploy(self, run, env=FLOOR_ENV, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = deploy.main([f"--project={PROJECT}", f"--image={IMAGE}", *extra], runner=run, env=env)
+        self.out = out.getvalue()
+        return code, err.getvalue()
+
+    @staticmethod
+    def removals(calls, role=None):
+        return [c for c in calls if c[1:3] == ["projects", "remove-iam-policy-binding"]
+                and (role is None or flag(c, "role") == role)]
+
+    def test_the_role_writes_only_instances_and_disks_and_never_project_metadata_os_login_or_iam_policy(self):
+        run, calls, seen = self.runner()
+        code, err = self.deploy(run)
+        self.assertEqual(code, 0, err)
+        # Snapshot, image and instance group writes are dropped: the conditions only narrow instances and disks.
+        self.assertEqual(seen["role"]["includedPermissions"],
+                         ["compute.disks.delete", "compute.images.useReadOnly", "compute.instances.create",
+                          "compute.instances.delete", "compute.instances.setMetadata", "compute.machineTypes.list",
+                          "compute.projects.get", "compute.subnetworks.use"])
+        self.assertTrue(any(c[:5] == ["gcloud", "iam", "roles", "create", "spotControlWatchdogCompute"]
+                            for c in calls))
+        # The predefined role, which can write project metadata, is never granted.
+        self.assertFalse([c for c in calls if "add-iam-policy-binding" in c and flag(c, "role") == PREDEFINED_ROLE])
+
+    def test_the_autoscaler_reads_and_filters_its_role_through_the_same_code(self):
+        from lib import autoscaler_deploy
+        self.assertIs(autoscaler_deploy.EXCLUDED_PERMISSIONS, deploy.EXCLUDED_PERMISSIONS)
+        self.assertIs(autoscaler_deploy.role_permissions, deploy.role_permissions)
+        run, calls, _ = self.runner()
+        config = autoscaler_deploy.AutoscalerDeployConfig(project=PROJECT)
+        self.assertEqual(autoscaler_deploy.read_role_permissions(config, run),
+                         autoscaler_deploy.role_permissions(BASE_ROLE, {r["name"]: r["customRolesSupportLevel"]
+                                                                        for r in TESTABLE}))
+        self.assertEqual(calls[0][1:3], ["services", "enable"])
+
+    def test_the_apis_are_enabled_before_the_base_role_is_read(self):
+        run, calls, _ = self.runner()
+        code, err = self.deploy(run)
+        self.assertEqual(code, 0, err)
+        enable = next(i for i, c in enumerate(calls) if c[1:3] == ["services", "enable"])
+        read = next(i for i, c in enumerate(calls) if c[1:4] == ["iam", "roles", "describe"])
+        self.assertLess(enable, read)
+        self.assertIn("iam.googleapis.com", calls[enable])
+        self.assertIn("cloudbilling.googleapis.com", calls[enable])  # the floor's APIs too
+
+    def test_a_new_custom_binding_keeps_the_predefined_role_until_a_later_deploy(self):
+        # IAM propagates in minutes: revoking the old grant in the run that adds the new one could leave a gap.
+        run, calls, _ = self.runner(bound=False)
+        code, err = self.deploy(run)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.removals(calls, PREDEFINED_ROLE))
+        self.assertIn("is newly bound: run this deploy again", self.out)
+        gate = next(i for i, c in enumerate(calls) if c[1:3] == ["projects", "get-iam-policy"]
+                    and flag(c, "filter").startswith("bindings.role="))
+        adds = [i for i, c in enumerate(calls) if c[1:3] == ["projects", "add-iam-policy-binding"]]
+        self.assertEqual(len(adds), 2)
+        self.assertLess(gate, min(adds))  # the policy is read before this deploy adds anything
+        gate_filter = flag(calls[gate], "filter")
+        self.assertIn(f'bindings.role="{CUSTOM_ROLE}"', gate_filter)
+        self.assertIn('bindings.condition.title="spot-control-vms-only"', gate_filter)
+
+    def test_every_binding_an_earlier_deploy_made_is_removed_once_the_custom_role_is_bound(self):
+        for env, extra in ((ENV, ()), (FLOOR_ENV, ()), (ENV, ("--no-compute-condition",))):
+            with self.subTest(floor=env is FLOOR_ENV, extra=extra):
+                run, calls, seen = self.runner(bound=True)
+                code, err = self.deploy(run, env, *extra)
+                self.assertEqual(code, 0, err)
+                legacy = self.removals(calls, PREDEFINED_ROLE)
+                self.assertEqual([flag(c, "member") for c in legacy],
+                                 [f"serviceAccount:spot-control-watchdog@{PROJECT}.iam.gserviceaccount.com"] * 3)
+                self.assertEqual(sum(flag(c, "condition") == "None" for c in legacy), 1)
+                # The removal files carry the exact conditions the predefined role was granted with.
+                self.assertIn(deploy.control_condition(), seen["removed"])
+                self.assertIn(deploy.floor_condition(), seen["removed"])
+                # An unconditional custom role binding from a --no-compute-condition deploy goes too, unless this
+                # deploy is itself unconditional.
+                unconditional = [c for c in self.removals(calls, CUSTOM_ROLE) if flag(c, "condition") == "None"]
+                self.assertEqual(len(unconditional), 0 if extra else 1)
+
+    def test_each_old_binding_waits_for_its_own_replacement(self):
+        # A deploy that stopped after the control binding: the floor's custom binding is not there yet.
+        run, calls, seen = self.runner(bound={"spot-control-vms-only"})
+        code, err = self.deploy(run)
+        self.assertEqual(code, 0, err)
+        self.assertIn(deploy.control_condition(), seen["removed"])
+        self.assertNotIn(deploy.floor_condition(), seen["removed"])
+        self.assertIn("is newly bound", self.out)
+        # The unconditional bindings (a --no-compute-condition deploy's) cover floor hosts too, so they wait for the
+        # floor's replacement as well.
+        self.assertFalse([c for c in self.removals(calls) if flag(c, "condition") == "None"])
+        run, calls, seen = self.runner(bound={"spot-control-vms-only", deploy.FLOOR_CONDITION_TITLE})
+        self.assertEqual(self.deploy(run)[0], 0)
+        self.assertIn(deploy.floor_condition(), seen["removed"])
+        self.assertEqual(sorted(flag(c, "role") for c in self.removals(calls) if flag(c, "condition") == "None"),
+                         sorted([PREDEFINED_ROLE, CUSTOM_ROLE]))
+        self.assertNotIn("is newly bound", self.out)
+
+    def test_wait_command_timeout_exceeds_the_full_propagation_interval(self):
+        from unittest.mock import patch
+        with patch.object(deploy.subprocess, "run") as run:
+            deploy.default_runner(["sleep", "600"])
+        self.assertGreater(run.call_args.kwargs["timeout"], 600)
+
+    def test_completed_migration_skips_waits_and_revocations(self):
+        run, calls, _ = self.runner(bound=True, obsolete=False)
+        self.assertEqual(self.deploy(run)[0], 0)
+        self.assertNotIn(["sleep", "600"], calls)
+        self.assertFalse(self.removals(calls))
+
+    def test_each_replacement_has_its_own_propagation_wait(self):
+        run, calls, _ = self.runner(bound=True)
+        ready = False
+        def checked(argv):
+            nonlocal ready
+            command = list(argv)
+            if command[1:3] == ["projects", "get-iam-policy"]:
+                ready = False
+            if command == ["sleep", "600"]:
+                ready = True
+            if command[1:3] == ["projects", "remove-iam-policy-binding"]:
+                self.assertTrue(ready, "this replacement was not allowed to propagate")
+            return run(argv)
+        self.assertEqual(self.deploy(checked)[0], 0)
+        self.assertEqual(calls.count(["sleep", "600"]), 2)
+
+    def test_observed_bindings_wait_before_revoking_and_a_failed_wait_stops(self):
+        run, calls, _ = self.runner(bound=True)
+        self.assertEqual(self.deploy(run)[0], 0)
+        waits = [i for i, c in enumerate(calls) if c == ["sleep", "600"]]
+        self.assertEqual(len(waits), 2)
+        for i, command in enumerate(calls):
+            if command[1:3] == ["projects", "remove-iam-policy-binding"]:
+                self.assertTrue(any(w < i for w in waits))
+        run, calls, _ = self.runner(bound=True)
+
+        def failed_wait(argv):
+            if list(argv) == ["sleep", "600"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="interrupted")
+            return run(argv)
+
+        self.assertEqual(self.deploy(failed_wait)[0], 1)
+        self.assertFalse(self.removals(calls))
+        run, calls, _ = self.runner(bound=False)
+        self.assertEqual(self.deploy(run)[0], 0)
+        self.assertNotIn(["sleep", "600"], calls)
+
+    def test_an_unreadable_base_role_stops_before_anything_changes(self):
+        run, calls, _ = self.runner(role_ok=False)
+        code, err = self.deploy(run)
+        self.assertEqual(code, 1)
+        self.assertIn("could not read roles/compute.instanceAdmin.v1", err)
+        self.assertFalse([c for c in calls if not ("describe" in c or "list-testable-permissions" in c
+                                                   or c[1:3] == ["services", "enable"])])
+
+    def test_the_dry_run_shows_the_role_and_the_gated_removals(self):
+        code, script, err = dry_run(f"--image={IMAGE}", env=FLOOR_ENV)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(subprocess.run(["bash", "-n"], input=script, text=True).returncode, 0)
+        self.assertIn("<computed at deploy time from roles/compute.instanceAdmin.v1: instance and disk", script)
+        self.assertIn('if [ -n "$(gcloud projects get-iam-policy', script)
+        self.assertEqual(sorted(flag(c, "role") for c in self.removals(commands(script))
+                                if flag(c, "role") == PREDEFINED_ROLE or flag(c, "condition") == "None"),
+                         sorted([PREDEFINED_ROLE] * 3 + [CUSTOM_ROLE]))
+        self.assertEqual(script.count("  sleep 600"), 2)
+        self.assertEqual(script.count('if [ -n "$(gcloud projects get-iam-policy'), 4)  # control and floor
+
+    def test_the_watchdog_code_never_uses_ssh_or_project_metadata(self):
+        # The custom role drops what these would need; control VMs and floor hosts get instance metadata only.
+        for module in ("control_vm.py", "runner_floor.py"):
+            source = (ROOT / "src" / "lib" / module).read_text()
+            with self.subTest(module=module):
+                for needle in ('"compute", "ssh"', '"compute", "scp"', '"project-info", "add-metadata"',
+                               '"project-info", "remove-metadata"', "os-login", "setCommonInstanceMetadata"):
+                    self.assertNotIn(needle, source)
