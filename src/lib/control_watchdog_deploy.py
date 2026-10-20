@@ -839,6 +839,7 @@ def render(config: DeployConfig, steps: Sequence[Step], *, title: str = "Control
         if step.remove_when:
             gate, skipped = step.remove_when
             lines.append(f"if [ -n \"$({_shell(gate)})\" ]; then")
+            lines.append("  sleep 600")  # IAM visibility is not proof of effective authorization.
             lines += [f"  {_shell(c)} 2>/dev/null || echo 'already absent'" for c in step.remove]
             lines += ["else", f"  echo {shlex.quote(skipped)}", "fi"]
         else:
@@ -959,6 +960,9 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
                 if not (result.stdout or "").strip():
                     out(f"  {skipped}")
                     removals = ()
+                elif removals:
+                    out("  Waiting 600 seconds for the replacement IAM grant to propagate before revocation")
+                    run(("sleep", "600"), {}, step.title)
             for command in removals:
                 remove(command, step.files, step.title)
             for listing, keep, commands in step.prune:

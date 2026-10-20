@@ -1207,6 +1207,27 @@ class CustomComputeRoleTests(unittest.TestCase):
                          sorted([PREDEFINED_ROLE, CUSTOM_ROLE]))
         self.assertNotIn("is newly bound", self.out)
 
+    def test_observed_bindings_wait_before_revoking_and_a_failed_wait_stops(self):
+        run, calls, _ = self.runner(bound=True)
+        self.assertEqual(self.deploy(run)[0], 0)
+        waits = [i for i, c in enumerate(calls) if c == ["sleep", "600"]]
+        self.assertEqual(len(waits), 2)
+        for i, command in enumerate(calls):
+            if command[1:3] == ["projects", "remove-iam-policy-binding"]:
+                self.assertTrue(any(w < i for w in waits))
+        run, calls, _ = self.runner(bound=True)
+
+        def failed_wait(argv):
+            if list(argv) == ["sleep", "600"]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="interrupted")
+            return run(argv)
+
+        self.assertEqual(self.deploy(failed_wait)[0], 1)
+        self.assertFalse(self.removals(calls))
+        run, calls, _ = self.runner(bound=False)
+        self.assertEqual(self.deploy(run)[0], 0)
+        self.assertNotIn(["sleep", "600"], calls)
+
     def test_an_unreadable_base_role_stops_before_anything_changes(self):
         run, calls, _ = self.runner(role_ok=False)
         code, err = self.deploy(run)
@@ -1224,6 +1245,7 @@ class CustomComputeRoleTests(unittest.TestCase):
         self.assertEqual(sorted(flag(c, "role") for c in self.removals(commands(script))
                                 if flag(c, "role") == PREDEFINED_ROLE or flag(c, "condition") == "None"),
                          sorted([PREDEFINED_ROLE] * 3 + [CUSTOM_ROLE]))
+        self.assertEqual(script.count("  sleep 600"), 2)
         self.assertEqual(script.count('if [ -n "$(gcloud projects get-iam-policy'), 2)  # control and floor
 
     def test_the_watchdog_code_never_uses_ssh_or_project_metadata(self):
