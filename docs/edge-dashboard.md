@@ -1088,7 +1088,8 @@ role: it prints that the custom role is newly bound. Run the deploy again 10 min
 removes each predefined role binding only when the project policy already held its custom role replacement, under
 the same condition, when the deploy started. Before each gated removal, the deploy waits 10 minutes after
 observing the replacement binding, because policy visibility does not prove that authorization has propagated.
-With both control and floor grants, this adds 20 minutes to a migration deploy. An interrupted wait stops the
+With both control and floor grants, this adds 20 minutes to a migration deploy. Once obsolete grants are gone,
+subsequent deploys skip these waits. An interrupted wait stops the
 deploy without revoking that grant. The unconditional predefined binding that `--no-compute-condition`
 made, and an unconditional custom role binding from such a deploy, go with the control VM binding, or with the floor
 binding when there are floor targets, since they cover floor hosts too. With no floor targets, the deploy removes
