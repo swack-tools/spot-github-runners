@@ -12,7 +12,6 @@ import re
 import shlex
 import subprocess
 import unittest
-from unittest.mock import patch
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -1090,8 +1089,8 @@ class CustomComputeRoleTests(unittest.TestCase):
             if argv[:4] in (["gcloud", "iam", "roles", "create"], ["gcloud", "iam", "roles", "update"]):
                 seen["role"] = json.loads(Path(flag(argv, "file")).read_text())
             if argv[:3] == ["gcloud", "projects", "get-iam-policy"]:
-                if PREDEFINED_ROLE in flag(argv, "filter"):
-                    return SimpleNamespace(returncode=0, stdout=PREDEFINED_ROLE if obsolete else "", stderr="")
+                if flag(argv, "filter").startswith("bindings.members="):
+                    return SimpleNamespace(returncode=0, stdout="old-role" if obsolete else "", stderr="")
                 title = re.search(r'bindings\.condition\.title="([^"]+)"', flag(argv, "filter"))
                 found = bound is True or (bound and (title.group(1) if title else None) in bound)
                 return SimpleNamespace(returncode=0, stdout=f"{CUSTOM_ROLE}\n" if found else "", stderr="")
@@ -1166,7 +1165,8 @@ class CustomComputeRoleTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertFalse(self.removals(calls, PREDEFINED_ROLE))
         self.assertIn("is newly bound: run this deploy again", self.out)
-        gate = next(i for i, c in enumerate(calls) if c[1:3] == ["projects", "get-iam-policy"])
+        gate = next(i for i, c in enumerate(calls) if c[1:3] == ["projects", "get-iam-policy"]
+                    and flag(c, "filter").startswith("bindings.role="))
         adds = [i for i, c in enumerate(calls) if c[1:3] == ["projects", "add-iam-policy-binding"]]
         self.assertEqual(len(adds), 2)
         self.assertLess(gate, min(adds))  # the policy is read before this deploy adds anything
@@ -1210,18 +1210,33 @@ class CustomComputeRoleTests(unittest.TestCase):
                          sorted([PREDEFINED_ROLE, CUSTOM_ROLE]))
         self.assertNotIn("is newly bound", self.out)
 
-    def test_completed_migration_skips_propagation_waits(self):
+    def test_wait_command_timeout_exceeds_the_full_propagation_interval(self):
+        from unittest.mock import patch
+        with patch.object(deploy.subprocess, "run") as run:
+            deploy.default_runner(["sleep", "600"])
+        self.assertGreater(run.call_args.kwargs["timeout"], 600)
+
+    def test_completed_migration_skips_waits_and_revocations(self):
         run, calls, _ = self.runner(bound=True, obsolete=False)
         self.assertEqual(self.deploy(run)[0], 0)
         self.assertNotIn(["sleep", "600"], calls)
         self.assertFalse(self.removals(calls))
 
-    def test_real_runner_gives_the_propagation_wait_timeout_headroom(self):
-        with patch.object(deploy.subprocess, "run") as run:
-            deploy.default_runner(["sleep", "600"])
-            self.assertGreater(run.call_args.kwargs["timeout"], 600)
-            deploy.default_runner(["gcloud", "projects", "describe", PROJECT])
-            self.assertEqual(run.call_args.kwargs["timeout"], 600)
+    def test_each_replacement_has_its_own_propagation_wait(self):
+        run, calls, _ = self.runner(bound=True)
+        ready = False
+        def checked(argv):
+            nonlocal ready
+            command = list(argv)
+            if command[1:3] == ["projects", "get-iam-policy"]:
+                ready = False
+            if command == ["sleep", "600"]:
+                ready = True
+            if command[1:3] == ["projects", "remove-iam-policy-binding"]:
+                self.assertTrue(ready, "this replacement was not allowed to propagate")
+            return run(argv)
+        self.assertEqual(self.deploy(checked)[0], 0)
+        self.assertEqual(calls.count(["sleep", "600"]), 2)
 
     def test_observed_bindings_wait_before_revoking_and_a_failed_wait_stops(self):
         run, calls, _ = self.runner(bound=True)
@@ -1262,7 +1277,7 @@ class CustomComputeRoleTests(unittest.TestCase):
                                 if flag(c, "role") == PREDEFINED_ROLE or flag(c, "condition") == "None"),
                          sorted([PREDEFINED_ROLE] * 3 + [CUSTOM_ROLE]))
         self.assertEqual(script.count("  sleep 600"), 2)
-        self.assertEqual(script.count('if [ -n "$(gcloud projects get-iam-policy'), 4)  # replacements and obsolete grants
+        self.assertEqual(script.count('if [ -n "$(gcloud projects get-iam-policy'), 4)  # control and floor
 
     def test_the_watchdog_code_never_uses_ssh_or_project_metadata(self):
         # The custom role drops what these would need; control VMs and floor hosts get instance metadata only.
