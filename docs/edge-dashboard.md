@@ -1343,7 +1343,7 @@ workstation. Pausing the scheduler also pauses the runner floor; `src/runner_flo
 
 ### Image tracking
 
-`SPOT_DASHBOARD_IMAGE_TRACK=main` rolls the control VM to the image that
+`SPOT_DASHBOARD_IMAGE_TRACK=main` updates the control VM to the image that
 `ghcr.io/swack-tools/spot-dashboard:main` names. On each check the manager resolves that tag's digest with
 `SPOT_DASHBOARD_IMAGE_TRACK_TOKEN`, a classic GitHub token with `read:packages`. The token also needs `repo`
 while the repository is private. The manager starts a rollout only when all of these hold:
@@ -1356,10 +1356,55 @@ while the repository is private. The manager starts a rollout only when all of t
 - GitHub's compare API reports that commit `ahead` of the active image's commit. The manager never rolls
   to an older, equal, or diverged commit, or when either commit is unknown.
 
-The rollout is the make-before-break rotation that a price rotation uses: create the other slot with the
-new digest, wait for health, freeze, import, check the version floor, write `origin:active`, wait for
-propagation, and delete the old VM. A rollout that aborts backs off that digest. The manager tries again
-only after `:main` names another digest and the cooldown has passed, or after you retry it.
+The rollout updates the active VM in place. It creates no second VM, so a rollout costs nothing extra on the
+free-tier e2-micro. The VM keeps its slot, boot disk, state file, and `origin:active`:
+
+1. The manager freezes the dashboard, as a rotation freezes the old VM, so changes in flight finish and new
+   ones wait. It keeps the snapshot that the freeze returns.
+1. The manager writes the new digest to the VM's `dashboard-image` metadata. The same call refreshes the
+   VM's other metadata and its startup script, as a new VM of that slot would get them. Settings that are no
+   longer set are written empty.
+1. On the VM, the `spot-dashboard-image-watch` service waits on the metadata server for that value to change.
+   It then reruns the startup script, which pulls the new image while the old container still serves, stops
+   the old container, and starts the new one. The dashboard is unavailable for a few seconds. When the value
+   changes again during the pull, the script follows the newer value. A container whose image, arguments, and
+   settings are unchanged keeps running. The script then removes every image except the new one and the one it
+   replaced, so updates don't fill the boot disk.
+1. The dashboard reports its image in `/api/health`. The new container starts frozen, because the freeze marker
+   is on the boot disk. Once it reports the new image, the manager imports the frozen snapshot into it, as a
+   rotation imports into its replacement. The import stores the frozen state, including changes that never
+   reached the state file, and clears the freeze. The rollout completes when the container serves healthy with at
+   least the frozen `state_version`.
+
+Each metadata write carries an update ID in `dashboard-update-id`. Each startup script run reports its progress in
+the guest attribute `spot-dashboard/run`, which the `enable-guest-attributes=TRUE` metadata allows: `running`, then
+`done` or `failed` with the update ID it applied. Once reporting is on, a run that can't report its start stops
+before it touches a container, and a run retries its end report. When the container already runs the pinned image,
+the watcher reports `done` for that ID itself, and it checks once right after each run it starts, so a lost end
+report doesn't stall the rollout. A run in progress may still replace the container, so the manager releases a
+container, in a rollout or a rollback, only after the run for its own update ID ends.
+
+The manager trusts a health answer only when it comes from the slot it asked about. When a slot's tunnel reaches
+the other slot's VM, the rollout doesn't start, and an update in progress neither releases nor resets the VM.
+
+A container that starts writable, for example an image whose freeze handling regressed, may have accepted
+changes. The manager freezes it and imports its current state instead of the older frozen snapshot. When that state
+is behind the frozen one, the update holds for an operator.
+
+A VM created before the watcher existed doesn't swap its container. When the VM still serves another image
+after 5 minutes, the manager resets it once. The reset boots the refreshed startup script, which pulls the new
+image and installs the watcher for the next rollout. A reset takes the dashboard offline for a few minutes.
+
+When the VM stops or disappears during the update, the manager ends the update at once: it pins the previous
+image, starts a stopped VM, and releases it once it's back. When the new image doesn't serve healthy within
+20 minutes, the manager freezes it again if it may have been released, writes the previous image back to
+`dashboard-image`, and the watcher swaps back. The manager then imports the frozen snapshot into the restored
+container. It never releases the failed image: while the VM is reachable, the rollback holds until it can release
+the restored container, and after 20 minutes it reports an error that needs an operator. A VM that stays
+unreachable for 20 minutes is left to the normal recovery, after the manager has made sure that KV holds the
+frozen snapshot, which recovery hydrates from. That rollout's digest is
+backed off: the manager tries again only after `:main` names another digest and the cooldown has passed, or
+after you retry it.
 
 #### Aborted rollouts
 
@@ -1371,11 +1416,11 @@ An aborted rollout is never silent:
   the rollout aborted. During the cooldown that follows, the check names the last `:main` digest it saw. The plan reason names it too, so the watchdog's tick output and `src/control_vm.py plan` show it.
 - With `SPOT_DASHBOARD_ROLLOUT_STATUS=1`, the manager reports every rollout as a GitHub commit status with the
   context `spot-dashboard/rollout` on the image's commit. The status is `pending` when the rollout begins,
-  `success` once the new VM serves, and `failure` with the reason when it aborts. The commit on `main`
+  `success` once the new image serves, and `failure` with the reason when it aborts. The commit on `main`
   then shows the failure next to its other checks. The token then also needs the `repo:status` scope. A failure
   to report is logged and never changes the rollout.
 
-For example, a rollout aborts with `slot b not healthy after 1200s` when the new VM can't start its tunnel.
+For example, a rollout aborts with `slot a did not serve ... healthy within 1200s` when the new image can't start.
 Once you have fixed the cause, lift the back-off instead of editing the state. Without `--apply`, the command
 names the digest and why its rollout aborted, and changes nothing:
 
@@ -1392,7 +1437,8 @@ and any other digest still waits for the cooldown. A
 rollout that aborts again backs the digest off again.
 
 The state's `image` section records the active VM's image, read once from its `dashboard-image` metadata
-or written when a transition completes. It also records the digests that failed and cached workflow answers.
+or written when a transition or an in-place update completes. It also records the digests that failed and
+cached workflow answers.
 `status` shows it. While tracking is on, a recovery recreates the recorded image, not `SPOT_DASHBOARD_IMAGE`,
 so a recovery never moves to an older image. Every transition records the image it creates, and a controller
 that resumes the transition creates that image whatever its own settings.

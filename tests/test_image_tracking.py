@@ -11,6 +11,7 @@ import io
 import json
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -255,14 +256,39 @@ class FakeGitHub:
 
 
 class WatchdogGcloud(tcv.FakeGcloud):
-    """FakeGcloud plus instance metadata (dashboard-image) and set-scheduling."""
+    """FakeGcloud plus instance metadata (dashboard-image, add-metadata), reset, and set-scheduling."""
 
     def __init__(self, events):
         super().__init__(events)
         self.images: dict[str, str] = {}
+        self.metadata_rc = 0
+        self.reset_rc = 0
+        self.metadata_scripts: list[str] = []
+        self.runs: dict[str, str] = {}  # guest attribute spot-dashboard/run by VM name
 
     def __call__(self, argv):
         verb = argv[2:4]
+        if verb == ["instances", "get-guest-attributes"]:
+            self.calls.append(list(argv))
+            assert "--query-path=spot-dashboard/" in argv
+            if argv[4] not in self.runs:
+                return SimpleNamespace(returncode=1, stdout="", stderr="ERROR: The resource was not found")
+            rows = [{"namespace": "spot-dashboard", "key": "run", "value": self.runs[argv[4]]}]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+        if verb == ["instances", "add-metadata"]:
+            self.calls.append(list(argv))
+            items = dict(item.split("=", 1) for item in
+                         next(a for a in argv if a.startswith("--metadata="))[len("--metadata="):].split(","))
+            script = next(a.split("=", 2)[2] for a in argv if a.startswith("--metadata-from-file=startup-script="))
+            self.metadata_scripts.append(Path(script).read_text(encoding="utf-8"))
+            self.events.append(("set-image", argv[4], items["dashboard-image"]))
+            if self.metadata_rc == 0:
+                self.images[argv[4]] = items["dashboard-image"]
+            return SimpleNamespace(returncode=self.metadata_rc, stdout="", stderr="boom" if self.metadata_rc else "")
+        if verb == ["instances", "reset"]:
+            self.calls.append(list(argv))
+            self.events.append(("reset", argv[4]))
+            return SimpleNamespace(returncode=self.reset_rc, stdout="", stderr="")
         if verb == ["instances", "set-scheduling"]:
             self.calls.append(list(argv))
             self.events.append(("set-scheduling", argv[4]))
@@ -315,33 +341,55 @@ class TrackingHarness(tcv.Harness):
     def image(self):
         return self.state.get(cv.STATE_KEY, {}).get("image", {})
 
+    def swapped(self, image=IMG_B, slot="a", version=7):
+        """The VM's image watcher replaced the dashboard container, which now reports ``image``. It starts frozen:
+        the freeze marker the update set lives on the boot disk."""
+        self.http.health[slot] = (503, {"status": "frozen", "hydrated": True, "frozen": True, "state_version": version,
+                                        "slot": slot, "kv_writer": False, "image": image})
+
+    def reported(self, outcome="done", slot="a"):
+        """The startup run (or the watcher) reports the update the controller last requested."""
+        expect = self.transition["expect_run"]
+        detail = expect["image"] if outcome == "done" else str(int(self.clock[0]))
+        self.gcloud.runs[f"spot-control-{slot}"] = f"{outcome} {expect['id']} {detail}"
+
     def finish(self):
         """Drive a started rollout to completion."""
-        self.gcloud.status("b", "RUNNING")
-        self.http.healthy("b")
-        self.tick()
-        self.clock[0] += cv.PROPAGATION_SECONDS + 1
+        self.swapped()
+        self.clock[0] += 180
         self.tick()
 
 
 class RolloutTests(unittest.TestCase):
-    def test_newer_main_digest_rolls_out_through_make_before_break(self):
+    def test_newer_main_digest_updates_the_image_in_place(self):
         h = TrackingHarness()
         h.active()
         plan = h.tick()
-        self.assertEqual((plan.action, plan.slot, plan.target_slot), ("rotate", "a", "b"))
+        self.assertEqual((plan.action, plan.target_slot), ("update_image", "a"))
         self.assertIn("image rollout", plan.reason)
         t = h.transition
-        self.assertEqual((t["mode"], t["dashboard_image"]), (cv.MODE_PRICE, IMG_B))
+        self.assertEqual((t["mode"], t["step"], t["dashboard_image"], t["from_image"]),
+                         (cv.MODE_IMAGE, "wait_image", IMG_B, IMG_A))
         self.assertEqual(t["image_rollout"], {"image": IMG_B, "digest": D_B, "revision": SHA_B,
                                               "from_revision": SHA_A})
-        self.assertEqual(h.gcloud.create_image(), IMG_B)
+        self.assertEqual(t["new_vm"]["instance_id"], "id-a")
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_B)
+        # The refreshed startup script installs the image watcher on the next boot of a VM that lacks it.
+        self.assertEqual(h.gcloud.metadata_scripts, [cv.render_control_startup()])
+        self.assertIn("install_image_watcher", h.gcloud.metadata_scripts[0])
         self.assertEqual(h.image["active"]["image"], IMG_A)  # recorded from a's metadata
+        self.assertEqual(h.tick().action, "update_image")  # resumes; the old container still serves
+        self.assertIsNotNone(h.transition)
         h.finish()
         self.assertIsNone(h.transition)
-        self.assertEqual(h.mutations(), [("create", "spot-control-b", "us-central1-a"), ("freeze", "a"),
-                                         ("import", "b"), ("origin", "b"), ("delete", "spot-control-a")])
-        self.assertEqual((h.image["active"]["image"], h.image["active"]["slot"]), (IMG_B, "b"))
+        # No second VM, cutover, or reset: drain (freeze), one metadata write, and release by importing the frozen
+        # snapshot into the new container.
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B), ("import", "a")])
+        self.assertEqual(sorted(h.gcloud.vms), ["spot-control-a"])
+        self.assertEqual(h.kv.origin_slot(), "a")
+        self.assertEqual((h.image["active"]["image"], h.image["active"]["slot"], h.image["active"]["instance_id"]),
+                         (IMG_B, "a", "id-a"))
+        self.assertEqual(h.state[cv.STATE_KEY]["history"][-1]["mode"], cv.MODE_IMAGE)
         # Up to date afterwards, and the cooldown keeps the registry quiet meanwhile.
         h.registry.calls.clear()
         self.assertIn("cooldown", h.tick().reason)
@@ -389,28 +437,656 @@ class RolloutTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         h.github.verdicts[SHA_B] = "success"  # a re-run succeeded
         h.clock[0] += it.VERDICT_RECHECK_SECONDS
-        self.assertEqual(h.tick().action, "rotate")
+        self.assertEqual(h.tick().action, "update_image")
 
-    def test_aborted_rollout_backs_off_that_digest_until_a_new_one(self):
+    def test_unhealthy_new_image_rolls_back_and_backs_off_that_digest(self):
         h = TrackingHarness()
         h.active()
         h.tick()
-        h.http.unhealthy("b")
-        h.gcloud.status("b", "RUNNING")
-        h.clock[0] += cv.HEALTH_TIMEOUT_SECONDS
-        h.tick()  # never healthy: abort, a keeps serving
+        h.http.health["a"] = (503, {"status": "starting", "hydrated": False, "frozen": True, "state_version": 7,
+                                    "slot": "a", "image": IMG_B})  # swapped, but the new image never gets ready
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        self.assertNotIn(("reset", "spot-control-a"), h.events, "the container did swap; a reset would not help")
+        self.assertIn(f"reports image {IMG_B}", h.transition["error"])
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # timed out: pin the previous image again; the watcher swaps back
+        self.assertIn("to release it", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events, "the failed image is never released")
+        h.swapped(image=IMG_A)
+        h.clock[0] += 180
+        h.tick()
         self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B),
+                                         ("set-image", "spot-control-a", IMG_A), ("import", "a")])
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
         self.assertEqual(h.image["failed"], [D_B])
-        self.assertNotIn("spot-control-b", h.gcloud.vms)
+        self.assertEqual(h.image["active"]["image"], IMG_A)
+        self.assertEqual(sorted(h.gcloud.vms), ["spot-control-a"])  # never deleted
         self.assertEqual(h.kv.origin_slot(), "a")
+        h.http.healthy("a", version=7, image=IMG_A)
         h.clock[0] += cv.ROTATION_COOLDOWN_SECONDS
         plan = h.tick()
         self.assertEqual(plan.action, "noop")
         self.assertIn("aborted earlier", plan.reason)
         h.registry.tags["main"] = D_C
         plan = h.tick()
-        self.assertEqual(plan.action, "rotate")
+        self.assertEqual(plan.action, "update_image")
         self.assertEqual(h.transition["dashboard_image"], IMG_C)
+    def test_a_vm_without_the_image_watcher_is_reset_once(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS - 1
+        h.tick()
+        self.assertNotIn(("reset", "spot-control-a"), h.events)
+        h.clock[0] += 1
+        h.tick()  # the old container (no image in its health) still serves: no watcher on this VM
+        self.assertEqual(h.events.count(("reset", "spot-control-a")), 1)
+        h.http.unhealthy("a")  # rebooting
+        h.clock[0] += 180
+        h.tick()
+        self.assertEqual(h.events.count(("reset", "spot-control-a")), 1, "never a second reset")
+        h.finish()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.image["active"]["image"], IMG_B)
+
+    def test_a_restored_container_behind_the_frozen_state_is_raised_by_the_import(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.reset_rc = 0
+        h.swapped(image=IMG_A, version=3)  # the old image came back behind the frozen version
+        h.http.versions["a"] = 3
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.http.versions["a"], 7)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+    def test_a_rollback_never_releases_the_failed_image_and_holds_for_an_operator(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_status = 500
+        h.swapped()  # the new image runs, but its release keeps failing
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: pin the previous image (still frozen, so no refreeze is needed)
+        self.assertEqual(h.mutations()[-1], ("set-image", "spot-control-a", IMG_A))
+        self.assertEqual(h.events.count(("freeze", "a")), 1)
+        for _ in range(2):
+            h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+            with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+                h.tick()  # the watcher never swapped back: reachable, so never ended into a recovery
+        self.assertIn("operator action needed", h.transition["error"])
+        self.assertIn("still runs", h.transition["error"])
+        h.swapped(image=IMG_A)
+        h.http.import_status = 200
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+    def test_an_unanswered_release_means_no_reset_and_a_refreeze_before_rollback(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_response_lost = True  # the release lands; its answer is lost
+        h.swapped()
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        self.assertNotIn(("reset", "spot-control-a"), h.events)
+        h.http.import_response_lost = False
+        h.http.health["a"] = (503, dict(h.http.health["a"][1], status="starting", frozen=False))  # released, not ready
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()
+        mutations = h.mutations()
+        self.assertLess(mutations.index(("freeze", "a"), 1), mutations.index(("set-image", "spot-control-a", IMG_A)))
+    def test_a_refreeze_never_replaces_a_newer_snapshot(self):
+        from lib.edge_state import build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        t = {}
+        self.assertTrue(manager._record_freeze(t, {"state_version": 7, "snapshot": build_snapshot({}, 7, "a", now=5)}))
+        self.assertTrue(manager._record_freeze(t, {"state_version": 3, "snapshot": build_snapshot({}, 3, "a", now=6)}))
+        self.assertEqual((t["frozen_version"], t["frozen_snapshot"]["state_version"]), (7, 7))
+        self.assertFalse(manager._record_freeze({}, {"state_version": 7}))  # no snapshot: not a usable freeze
+
+    def test_a_rollback_never_swaps_a_released_container_without_a_confirmed_refreeze(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_response_lost = True  # the release lands; its answer is lost
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        h.http.freeze_status = 503
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        for _ in range(cv.STEP_RETRY_LIMIT + 2):
+            h.tick()
+            h.clock[0] += 180
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertNotIn(("set-image", "spot-control-a", IMG_A), h.events)
+        h.http.freeze_status = 200
+        h.tick()
+        self.assertIn(("set-image", "spot-control-a", IMG_A), h.events)
+
+    def test_an_unreachable_vm_ends_the_rollback_only_after_kv_holds_the_frozen_state(self):
+        from lib.edge_state import KV_STATE_KEY, parse_snapshot
+        h = TrackingHarness()
+        h.active()
+        h.tick()  # frozen at state_version 7
+        h.kv.store.pop(KV_STATE_KEY, None)
+        del h.http.health["a"]  # unreachable from here on
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: pin the previous image, wait for the VM
+        self.assertEqual(h.transition["step"], "abort")
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
+    def test_a_vanished_vm_ends_the_rollback_only_after_kv_holds_the_frozen_state(self):
+        from lib.edge_state import KV_STATE_KEY, parse_snapshot
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.kv.store.pop(KV_STATE_KEY, None)
+        h.gcloud.vms.pop("spot-control-a")
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
+    def test_a_container_is_released_only_once_its_startup_run_settled(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        self.assertIn("a startup run is in progress", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events)
+        h.gcloud.runs["spot-control-a"] = f"done some-earlier-update {IMG_B}"  # an older request's report
+        h.clock[0] += 180
+        h.tick()
+        self.assertIn("to report update", h.transition["error"])
+        h.reported()
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertIn(("import", "a"), h.events)
+
+    def test_a_rollback_waits_for_a_pending_startup_run(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"  # still pulling the new image
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"
+        h.tick()  # rollback: the old container still serves, but the run may yet replace it
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertIn("a startup run is in progress", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events)
+        h.reported()  # it followed the restored image
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+
+    def test_a_rollback_never_releases_a_failed_image_that_a_late_run_started(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        forward = h.transition["expect_run"]["id"]
+        h.gcloud.runs["spot-control-a"] = f"done {forward} {IMG_B}"  # a late run started the failed image after all
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback; the old image's health was observed, but the restore has not been applied
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertIn("-restore", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events)
+        h.reported()  # the restore was applied
+        h.swapped(image=IMG_B)  # but a fresh probe still shows B
+        h.clock[0] += 180
+        h.tick()
+        self.assertNotIn(("import", "a"), h.events)
+        h.swapped(image=IMG_A)
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+
+    def test_an_oversized_snapshot_refuses_the_update_and_releases_the_dashboard(self):
+        h = TrackingHarness()
+        h.active()
+        with unittest.mock.patch.object(cv, "IMAGE_SNAPSHOT_MAX_BYTES", 10):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertNotIn("set-image", [e[0] for e in h.events])
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("unfreeze", "a")])
+        self.assertEqual(h.image["failed"], [D_B])
+
+    def test_an_oversized_refusal_retries_a_lost_unfreeze_without_capturing(self):
+        h = TrackingHarness()
+        h.active()
+        h.http.unfreeze_status = None  # the rollback's unfreeze lands; its answer is lost
+        with unittest.mock.patch.object(cv, "IMAGE_SNAPSHOT_MAX_BYTES", 10):
+            h.tick()
+            self.assertEqual(h.transition["step"], "abort")
+            h.http.unfreeze_status = 200
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.events.count(("freeze", "a")), 1)
+        self.assertEqual(h.events.count(("unfreeze", "a")), 2)
+
+    def test_a_rollback_before_any_metadata_write_needs_no_run_report(self):
+        h = TrackingHarness()
+        h.active()
+        h.http.freeze_status = None  # the freeze may have landed; its answers are lost
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"  # would block a release after a write
+        for _ in range(cv.STEP_RETRY_LIMIT):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("unfreeze", "a"))
+
+    def test_kv_at_an_equal_version_with_other_state_is_overwritten(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot, parse_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        frozen = build_snapshot({"records": ["done"]}, 7, "a", now=5)
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 7, "a", now=4))
+        self.assertIsNone(manager._publish_snapshot(frozen))
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state"], {"records": ["done"]})
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 8, "a", now=6))  # newer: left alone
+        self.assertIsNone(manager._publish_snapshot(frozen))
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 8)
+
+    def test_an_oversized_refreeze_is_kept_in_kv_and_imported_from_there(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        t = {}
+        self.assertTrue(manager._record_freeze(t, {"state_version": 7, "snapshot": build_snapshot({}, 7, "a", now=5)}))
+        big = build_snapshot({"blob": "x" * 64}, 9, "a", now=6)
+        with unittest.mock.patch.object(cv, "IMAGE_SNAPSHOT_MAX_BYTES", 100):
+            self.assertTrue(manager._record_freeze(t, {"state_version": 9, "snapshot": big}))
+        self.assertEqual((t["snapshot_in_kv"], t["frozen_version"], t["frozen_snapshot"]["state_version"]), (9, 9, 7))
+        self.assertEqual(json.loads(h.kv.store[KV_STATE_KEY])["state_version"], 9)
+        h.http.versions["a"] = 0
+        h.swapped(version=0)  # the restored container, frozen
+        ok, detail = manager._release(t, "a")
+        self.assertTrue(ok, detail)
+        self.assertEqual(h.http.versions["a"], 9)  # imported the KV copy, not the older one in the state
+
+    def test_a_retried_release_refreezes_first(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_response_lost = True  # the import lands; its answer is lost
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        h.http.import_response_lost = False
+        h.clock[0] += 180
+        h.tick()
+        imports = [i for i, e in enumerate(h.events) if e == ("import", "a")]
+        freezes = [i for i, e in enumerate(h.events) if e == ("freeze", "a")]
+        self.assertEqual(len(imports), 2)
+        self.assertTrue(any(imports[0] < f < imports[1] for f in freezes), h.events)
+        self.assertIsNone(h.transition)
+
+    def test_a_failed_import_into_a_stale_container_keeps_the_original_snapshot(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        original = h.transition["frozen_snapshot"]
+        h.http.import_status = 500  # a definite failure: still frozen
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        h.http.import_status = 200
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual([e for e in h.events if e == ("freeze", "a")], [("freeze", "a")])  # no refreeze
+        posted = [json.loads(c[3]) for c in h.http.calls if c[1].endswith("/api/control/import")]
+        self.assertEqual(posted[-1], original)
+
+    def test_a_lost_refreeze_answer_is_never_taken_as_no_release(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_response_lost = True  # the release lands
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        h.http.import_response_lost = False
+        h.http.freeze_status = None  # the retry's refreeze lands (frozen again), but its snapshot is lost
+        h.clock[0] += 180
+        h.tick()
+        self.assertTrue(h.transition["capture_pending"])
+        h.http.health["a"] = (503, dict(h.http.health["a"][1], status="frozen", frozen=True))
+        h.clock[0] += 180
+        h.tick()  # frozen now, but that proves nothing: no import of the original snapshot over its state
+        self.assertEqual(h.events.count(("import", "a")), 1)
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: frozen, but a refreeze is unconfirmed, so no shortcut and no swap back yet
+        self.assertNotIn(("set-image", "spot-control-a", IMG_A), h.events)
+        h.http.freeze_status = 200
+        h.tick()
+        self.assertIn(("set-image", "spot-control-a", IMG_A), h.events)
+
+    def test_a_newer_local_snapshot_replaces_the_kv_selector(self):
+        from lib.edge_state import build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        t = {"snapshot_in_kv": 9, "frozen_version": 9, "frozen_snapshot": build_snapshot({}, 7, "a", now=5)}
+        self.assertTrue(manager._record_freeze(t, {"state_version": 10, "snapshot": build_snapshot({}, 10, "a", now=6)}))
+        self.assertNotIn("snapshot_in_kv", t)
+        self.assertEqual(t["frozen_snapshot"]["state_version"], 10)
+
+    def test_preservation_never_overwrites_a_snapshot_kept_in_kv(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({"new": 1}, 9, "a", now=6))
+        t = {"snapshot_in_kv": 9, "snapshot_in_kv_digest": cv.snapshot_digest(build_snapshot({"new": 1}, 9, "a", now=1)),
+             "frozen_snapshot": build_snapshot({"old": 1}, 9, "a", now=5)}
+        self.assertIsNone(manager._preserve_frozen_snapshot(t))
+        self.assertEqual(json.loads(h.kv.store[KV_STATE_KEY])["state"], {"new": 1})
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 8, "a", now=7))
+        self.assertIn("does not (yet) hold", manager._preserve_frozen_snapshot(t))
+
+    def test_a_vanished_vm_without_a_captured_snapshot_holds_unless_kv_has_the_known_state(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        for kv_version, holds in ((3, True), (7, False)):
+            h = TrackingHarness()
+            h.active()
+            h.http.freeze_status = None  # the freeze may have landed; its snapshot never arrives
+            h.tick()
+            h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, kv_version, "a", now=1))
+            h.gcloud.vms.pop("spot-control-a")
+            with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+                h.tick()
+            if holds:
+                self.assertIn("operator action needed", h.transition["error"])
+            else:
+                self.assertIsNone(h.transition)
+
+    def test_a_target_that_starts_writable_is_frozen_and_captured_before_the_import(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.healthy("a", version=8, image=IMG_B)  # writable: its freeze handling regressed; took a change
+        h.http.versions["a"] = 8
+        h.clock[0] += 180
+        h.tick()
+        freezes = [i for i, e in enumerate(h.events) if e == ("freeze", "a")]
+        imports = [i for i, e in enumerate(h.events) if e == ("import", "a")]
+        self.assertEqual(len(freezes), 2)
+        self.assertLess(freezes[1], imports[0])
+        posted = [json.loads(c[3]) for c in h.http.calls if c[1].endswith("/api/control/import")]
+        self.assertEqual(posted[-1]["state_version"], 8)  # its own current state, not the older frozen one
+
+    def test_a_rollback_drains_a_pending_capture_before_the_swap_back(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.healthy("a", version=8, image=IMG_B)  # started writable
+        h.http.versions["a"] = 8
+        h.http.freeze_status = 409  # busy: the capture can't drain it yet
+        h.clock[0] += 180
+        h.tick()
+        self.assertTrue(h.transition["capture_pending"])
+        self.assertFalse(h.transition.get("release_attempted"))
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: no swap back before a confirmed drain
+        self.assertNotIn(("set-image", "spot-control-a", IMG_A), h.events)
+        h.http.freeze_status = 200
+        h.tick()
+        self.assertIn(("set-image", "spot-control-a", IMG_A), h.events)
+        self.assertEqual(h.transition["frozen_snapshot"]["state_version"], 8)  # what it accepted is kept
+
+    def test_a_target_that_starts_writable_behind_the_frozen_state_holds(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.healthy("a", version=3, image=IMG_B)
+        h.http.versions["a"] = 3
+        h.clock[0] += 180
+        h.tick()
+        self.assertIn("operator action needed", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.events)
+
+    def test_a_rollback_holds_a_container_that_diverged_below_the_frozen_state(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.healthy("a", version=3, image=IMG_B)  # started writable, behind the frozen 7
+        h.http.versions["a"] = 3
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        for _ in range(2):
+            with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+                h.tick()
+        self.assertIn("operator action needed", h.transition["error"])
+        self.assertNotIn(("set-image", "spot-control-a", IMG_A), h.events)
+        self.assertEqual(h.transition["frozen_snapshot"]["state_version"], 7)
+
+    def test_a_release_imports_only_the_exact_snapshot_kept_in_kv(self):
+        from lib.edge_state import KV_STATE_KEY, build_snapshot
+        h = TrackingHarness()
+        manager = h.manager()
+        kept = build_snapshot({"records": ["done"]}, 9, "a", now=6)
+        t = {"snapshot_in_kv": 9, "snapshot_in_kv_digest": cv.snapshot_digest(kept), "frozen_version": 9,
+             "frozen_snapshot": build_snapshot({}, 7, "a", now=5)}
+        h.kv.store[KV_STATE_KEY] = json.dumps(build_snapshot({}, 9, "a", now=7))  # same version, other state
+        h.swapped(version=0)
+        ok, detail = manager._release(t, "a")
+        self.assertFalse(ok)
+        self.assertIn("does not (yet) hold", detail)
+        h.kv.store[KV_STATE_KEY] = json.dumps(kept)
+        self.assertTrue(manager._release(t, "a")[0])
+
+    def test_a_stale_running_report_does_not_block_forever(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0]) - cv.STARTUP_RUN_STALE_SECONDS - 1}"
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+
+    def test_a_vanished_vm_preserves_the_snapshot_even_after_a_release(self):
+        from lib.edge_state import KV_STATE_KEY, parse_snapshot
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.kv.store.pop(KV_STATE_KEY, None)
+        h.swapped()
+        h.http.health["a"] = (503, {"status": "starting", "hydrated": True, "frozen": False, "state_version": 7,
+                                    "slot": "a", "image": IMG_B})  # the import lands, but it never gets healthy
+        h.clock[0] += 180
+        h.tick()
+        self.assertTrue(h.transition["released"])
+        h.gcloud.vms.pop("spot-control-a")
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
+    def test_an_unreachable_vm_that_cannot_be_refrozen_is_fenced_by_stop(self):
+        from lib.edge_state import KV_STATE_KEY, parse_snapshot
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.kv.store.pop(KV_STATE_KEY, None)
+        h.http.import_response_lost = True  # the release lands; its answer is lost
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        del h.http.health["a"]  # then the dashboard became unreachable
+        h.http.freeze_status = None
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback: the refreeze can't reach it, so it waits
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertNotIn(("stop", "spot-control-a"), h.events)
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()
+        self.assertIn(("stop", "spot-control-a"), h.events)
+        h.gcloud.status("a", "TERMINATED")
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
+        self.assertEqual(parse_snapshot(h.kv.store[KV_STATE_KEY])["state_version"], 7)
+
+    def test_no_reset_while_a_startup_run_is_pulling(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.runs["spot-control-a"] = f"running {int(h.clock[0])}"  # a slow pull on a VM with the watcher
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        self.assertNotIn(("reset", "spot-control-a"), h.events)
+
+    def test_a_failed_fencing_stop_is_retried(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_response_lost = True
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        del h.http.health["a"]
+        h.http.freeze_status = None
+        h.gcloud.stop_rc = 1
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # rollback begins; the refreeze can't reach it
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()  # the first stop fails
+        h.tick()  # inside the retry interval: no second stop yet
+        self.assertEqual(h.events.count(("stop", "spot-control-a")), 1)
+        h.gcloud.stop_rc = 0
+        h.clock[0] += cv.STOP_RETRY_SECONDS
+        with self.assertLogs("spot_runner_autoscaler.control_vm", "ERROR"):
+            h.tick()
+        self.assertEqual(h.events.count(("stop", "spot-control-a")), 2)
+
+    def test_a_reset_that_reports_failure_is_never_repeated(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.reset_rc = 1  # it may still have landed
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        h.clock[0] += 180
+        h.tick()
+        self.assertEqual(h.events.count(("reset", "spot-control-a")), 1)
+        self.assertIsNotNone(h.transition["reset_at"])
+
+    def test_a_new_container_behind_the_frozen_state_is_raised_by_the_import(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.swapped(version=3)
+        h.http.versions["a"] = 3  # came up without changes the freeze drained
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.http.versions["a"], 7)  # the frozen snapshot, imported
+        self.assertEqual(h.image["active"]["image"], IMG_B)
+
+    def test_a_failed_import_is_never_success(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.import_status = 500
+        h.swapped()
+        h.clock[0] += 180
+        h.tick()
+        self.assertIn("import into slot a returned 500", h.transition["error"])
+        self.assertEqual(h.transition["step"], "wait_image")
+    def test_metadata_write_failures_abort_without_a_swap(self):
+        h = TrackingHarness()
+        h.active()
+        h.gcloud.metadata_rc = 1
+        for _ in range(cv.STEP_RETRY_LIMIT - 1):
+            h.tick()
+            self.assertEqual(h.transition["step"], "set_image")
+        h.tick()  # the limit: abort; restoring the previous image also fails, so the rollback keeps trying
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertIn("could not restore", h.transition["error"])
+        h.gcloud.metadata_rc = 0
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
+        self.assertEqual(h.image["failed"], [D_B])
+
+    def test_a_vm_preempted_during_the_update_ends_it_at_once(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.status("a", "TERMINATED")
+        h.clock[0] += 180
+        h.tick()  # no 20-minute wait: roll back now, start the VM, and unfreeze it once it is back
+        self.assertEqual(h.transition["step"], "abort")
+        self.assertEqual(h.gcloud.images["spot-control-a"], IMG_A)
+        self.assertIn(("start", "spot-control-a"), h.events)
+        h.gcloud.status("a", "RUNNING")
+        h.swapped(image=IMG_A)  # booted the restored image, still frozen
+        h.clock[0] += 180
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+        self.assertEqual(h.image["failed"], [D_B])
+        self.assertEqual(h.tick().action, "noop")
+
+    def test_a_dashboard_that_does_not_freeze_is_never_updated(self):
+        h = TrackingHarness()
+        h.active()
+        h.http.freeze_status = 503
+        for _ in range(cv.STEP_RETRY_LIMIT):
+            h.tick()
+        self.assertIsNone(h.transition)
+        self.assertNotIn("set-image", [e[0] for e in h.events])
+        self.assertEqual(h.mutations()[-1], ("unfreeze", "a"))  # in case a freeze landed without its answer
+        self.assertEqual(h.image["failed"], [D_B])
+
+    def test_every_managed_key_is_written_so_cleared_settings_clear(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        call = next(c for c in h.gcloud.calls if c[2:4] == ["instances", "add-metadata"])
+        items = dict(item.split("=", 1) for item in
+                     next(a for a in call if a.startswith("--metadata="))[len("--metadata="):].split(","))
+        self.assertEqual(list(items), list(cv.METADATA_KEYS))
+        self.assertEqual(items["dashboard-image"], IMG_B)
+        for key in ("dashboard-config-repo", "dashboard-controlled-targets", "dashboard-global-admins",
+                    "dashboard-session-not-before", "dashboard-source-ref"):
+            self.assertEqual(items[key], "", key)  # unset here: cleared on the VM rather than left as it was
+
+    def test_a_vm_recreated_during_the_update_is_held(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.gcloud.recreate("a", "id-new")
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS
+        h.tick()
+        self.assertIn("held", h.transition["error"])
+        self.assertNotIn(("reset", "spot-control-a"), h.events)
+
+    def test_a_stopped_vm_is_not_updated(self):
+        h = TrackingHarness()
+        h.active()
+        manager = h.manager()
+        obs = manager.observe()
+        plan = manager.plan(obs)
+        self.assertEqual(plan.action, "update_image")
+        h.gcloud.status("a", "TERMINATED")
+        manager.execute(plan, manager.observe())
+        self.assertIsNone(h.transition)
+        self.assertNotIn("set-image", [e[0] for e in h.events])
+        self.assertEqual(h.image["failed"], [D_B])
 
     def test_no_rollout_while_a_transition_runs_or_the_other_slot_exists(self):
         h = TrackingHarness()
@@ -600,10 +1276,97 @@ class RolloutTests(unittest.TestCase):
         h = TrackingHarness()
         h.active()
         plan = h.tick(apply=False)
-        self.assertEqual(plan.action, "rotate")
+        self.assertEqual(plan.action, "update_image")
         self.assertEqual(h.mutations(), [])
         self.assertEqual(h.state, {})
         self.assertEqual(h.saves, 0)
+
+
+class MisroutedSlotTests(unittest.TestCase):
+    """A tunnel that reaches the other slot's VM never counts as this slot's health."""
+
+    def test_health_for_slot_rejects_an_answer_from_the_other_slot(self):
+        h = tcv.Harness()
+        h.http.healthy("a", version=4, image=IMG_B)
+        h.http.health["a"][1]["slot"] = "b"
+        result = cv.health_for_slot(cv.probe_health(h.http, h.config, "a"), "a")
+        self.assertEqual((result.ok, result.hydrated, result.frozen, result.image), (False, False, False, None))
+        self.assertIn("answered as slot 'b'", result.detail)
+        h.http.healthy("a", version=4, image=IMG_B)
+        self.assertTrue(cv.health_for_slot(cv.probe_health(h.http, h.config, "a"), "a").ok)
+        self.assertTrue(result.misrouted)
+        unreachable = cv.HealthResult.unknown("unreachable")
+        self.assertIs(cv.health_for_slot(unreachable, "a"), unreachable)
+        edge_error = cv.HealthResult(False, status_code=502, detail="HTTP 502 without health JSON")
+        self.assertIs(cv.health_for_slot(edge_error, "a"), edge_error)  # no dashboard answered: not misrouted
+        unnamed = cv.health_for_slot(cv.HealthResult(True, 200, 4, hydrated=True, detail="healthy"), "a")
+        self.assertEqual((unnamed.ok, unnamed.hydrated, unnamed.misrouted), (False, False, False))
+
+    def test_a_rollback_holds_rather_than_ending_on_a_misrouted_answer(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        h.http.health["a"] = (503, {"status": "starting", "hydrated": False, "frozen": True, "state_version": 7,
+                                    "slot": "a", "image": h.transition["dashboard_image"]})
+        h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+        h.tick()  # timed out: the previous image is pinned again
+        self.assertEqual(h.transition["step"], "abort")
+        h.swapped(image=IMG_A)
+        h.http.health["a"][1]["slot"] = "b"  # the restored container, but answered through a misrouted tunnel
+        for _ in range(3):
+            h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+            h.tick()
+            self.assertIsNotNone(h.transition)  # never ended as unreachable: the release is still owed
+        self.assertIn("answered as slot 'b'", h.transition["error"])
+        self.assertNotIn(("import", "a"), h.mutations())
+        self.assertFalse([m for m in h.mutations() if m[0] == "stop"])
+        h.swapped(image=IMG_A)  # routed correctly again
+        h.reported()
+        h.tick()
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+
+    def test_a_rollout_never_starts_through_a_misrouted_tunnel(self):
+        h = TrackingHarness()
+        h.active()
+        h.http.health["a"][1]["slot"] = "b"
+        self.assertNotEqual(h.tick().action, "update_image")
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations(), [])
+
+    def test_a_misrouted_answer_never_releases_or_resets(self):
+        h = TrackingHarness()
+        h.active()
+        h.tick()
+        self.assertEqual(h.transition["step"], "wait_image")
+        h.swapped()
+        h.http.health["a"][1]["slot"] = "b"  # the new image's health, but from slot b's VM
+        h.clock[0] += cv.IMAGE_SWAP_GRACE_SECONDS + 60
+        h.tick()
+        self.assertIsNotNone(h.transition)
+        self.assertIn("answered as slot 'b'", h.transition["error"])
+        self.assertEqual(h.mutations(), [("freeze", "a"), ("set-image", "spot-control-a", IMG_B)])
+        h.finish()  # routed correctly again: the release goes ahead
+        self.assertIsNone(h.transition)
+        self.assertEqual(h.mutations()[-1], ("import", "a"))
+
+
+class ImageHealthTests(unittest.TestCase):
+    def test_probe_reads_the_reported_image(self):
+        h = tcv.Harness()
+        h.http.healthy("a", version=4, image=IMG_B)
+        self.assertEqual(cv.probe_health(h.http, h.config, "a").image, IMG_B)
+        h.http.healthy("a", version=4)
+        self.assertIsNone(cv.probe_health(h.http, h.config, "a").image)
+        h.http.health["a"] = (200, {"status": "ok", "hydrated": True, "frozen": False, "image": 5})
+        self.assertIsNone(cv.probe_health(h.http, h.config, "a").image)
+
+    def test_an_image_transition_resumes_as_update_image(self):
+        plan = cv.plan_next(vms=[], origin=None, origin_known=True, health={}, offers=None,
+                            control_state={"transition": {"mode": cv.MODE_IMAGE, "step": "wait_image",
+                                                          "old_slot": None, "new_slot": "a"}},
+                            now=0, max_daily_usd=cv.DEFAULT_MAX_DAILY_USD)
+        self.assertEqual((plan.action, plan.target_slot, plan.resume), ("update_image", "a", True))
 
 
 class RestartPolicyTests(unittest.TestCase):
@@ -692,12 +1455,20 @@ class RestartPolicyTests(unittest.TestCase):
 # --------------------------------------------------------------------------------------------
 
 def abort_rollout(h):
-    """Start the rollout to :main (D_B) and let it time out unhealthy."""
+    """Start the in-place rollout to :main (D_B) and let it time out unhealthy, then complete the rollback."""
     h.tick()
-    h.http.unhealthy("b")
-    h.gcloud.status("b", "RUNNING")
-    h.clock[0] += cv.HEALTH_TIMEOUT_SECONDS
-    h.tick()
+    fail_update(h)
+
+
+def fail_update(h, slot="a"):
+    """The update in progress never gets healthy: it times out, the watcher swaps back, and the rollback ends."""
+    h.http.health[slot] = (503, {"status": "starting", "hydrated": False, "frozen": True, "state_version": 7,
+                                 "slot": slot, "image": h.transition["dashboard_image"]})
+    h.clock[0] += cv.IMAGE_UPDATE_TIMEOUT_SECONDS
+    h.tick()  # timed out: the previous image is pinned again
+    h.swapped(image=h.transition["from_image"], slot=slot)
+    h.tick()  # the restored container is released; the rollback ends
+    h.http.healthy(slot, version=7, image=h.image["active"]["image"])
 
 
 class AbortVisibilityTests(unittest.TestCase):
@@ -707,18 +1478,18 @@ class AbortVisibilityTests(unittest.TestCase):
         abort_rollout(h)
         failure = h.image["failures"][D_B]
         self.assertEqual(failure["revision"], SHA_B)
-        self.assertIn(f"not healthy after {cv.HEALTH_TIMEOUT_SECONDS}s", failure["reason"])
+        self.assertIn(f"healthy within {cv.IMAGE_UPDATE_TIMEOUT_SECONDS}s", failure["reason"])
         self.assertEqual(failure["at"], h.clock[0])
         h.clock[0] += cv.ROTATION_COOLDOWN_SECONDS
         with self.assertLogs("spot_runner_autoscaler.control_vm", "WARNING") as logs:
             plan = h.tick()
         self.assertEqual(plan.action, "noop")
-        self.assertIn("not healthy after", plan.reason)
+        self.assertIn("healthy within", plan.reason)
         self.assertIn("retry-image --apply", plan.reason)
         self.assertTrue(any("image rollout held" in line for line in logs.output))
         # A preview reports the same, and changes nothing.
         with self.assertLogs("spot_runner_autoscaler.control_vm", "WARNING"):
-            self.assertIn("not healthy after", h.tick(apply=False).reason)
+            self.assertIn("healthy within", h.tick(apply=False).reason)
         # The status output carries it too.
         manager = h.manager()
         self.assertIn(D_B, manager.status(manager.observe())["image"]["failures"])
@@ -731,7 +1502,7 @@ class AbortVisibilityTests(unittest.TestCase):
         with self.assertLogs("spot_runner_autoscaler.control_vm", "WARNING") as logs:
             plan = h.tick()
         self.assertIn("cooldown", plan.reason)
-        self.assertIn("not healthy after", plan.reason)
+        self.assertIn("healthy within", plan.reason)
         self.assertTrue(any("image rollout held" in line for line in logs.output))
         self.assertEqual(h.registry.calls, [])  # still no registry call while the cooldown holds
 
@@ -747,7 +1518,7 @@ class AbortVisibilityTests(unittest.TestCase):
         self.assertIsNone(h.transition)
         h.clock[0] += cv.ROTATION_COOLDOWN_SECONDS
         plan = h.tick()  # after the cooldown the new digest rolls as usual, and uses the retry up
-        self.assertEqual(plan.action, "rotate")
+        self.assertEqual(plan.action, "update_image")
         self.assertEqual(h.transition["dashboard_image"], IMG_C)
         self.assertNotIn("retry", h.image)
 
@@ -767,19 +1538,16 @@ class AbortVisibilityTests(unittest.TestCase):
         self.assertIn("cooldown", h.tick().reason)
         digest, failure = cv.retry_image_target(h.state[cv.STATE_KEY], None)
         self.assertEqual(digest, D_B)
-        self.assertIn("not healthy after", failure["reason"])
+        self.assertIn("healthy within", failure["reason"])
         it.retry_failed(h.image, D_B, at=h.clock[0])
         self.assertEqual(h.image["failed"], [])
         self.assertNotIn(D_B, h.image["failures"])
         plan = h.tick()  # no cooldown wait for the abort before the retry
-        self.assertEqual(plan.action, "rotate")
+        self.assertEqual(plan.action, "update_image")
         self.assertEqual(h.transition["dashboard_image"], IMG_B)
         self.assertNotIn("retry", h.image)  # used up once its rollout begins
         # Aborting again backs it off again, and that abort's cooldown applies.
-        h.http.unhealthy("b")
-        h.gcloud.status("b", "RUNNING")
-        h.clock[0] += cv.HEALTH_TIMEOUT_SECONDS
-        h.tick()
+        fail_update(h)
         self.assertEqual(h.image["failed"], [D_B])
         self.assertIn("cooldown", h.tick().reason)
 
@@ -862,7 +1630,7 @@ class RolloutStatusTests(unittest.TestCase):
         self.assertEqual([s[:2] for s in self.statuses(h)], [(SHA_B, "pending")])
         h.finish()
         self.assertEqual([s[:2] for s in self.statuses(h)], [(SHA_B, "pending"), (SHA_B, "success")])
-        self.assertIn("spot-control-b", self.statuses(h)[-1][2])
+        self.assertIn("spot-control-a", self.statuses(h)[-1][2])
 
     def test_an_aborted_rollout_reports_failure_with_the_reason(self):
         h = TrackingHarness(rollout_status="1")
@@ -870,7 +1638,7 @@ class RolloutStatusTests(unittest.TestCase):
         abort_rollout(h)
         sha, state, description = self.statuses(h)[-1]
         self.assertEqual((sha, state), (SHA_B, "failure"))
-        self.assertIn("not healthy after", description)
+        self.assertIn("healthy within", description)
 
     def test_off_by_default_and_a_reporting_failure_changes_nothing(self):
         h = TrackingHarness()
@@ -882,7 +1650,7 @@ class RolloutStatusTests(unittest.TestCase):
         h.github.status_error = "HTTP 403"
         with self.assertLogs("spot_runner_autoscaler.control_vm", "WARNING") as logs:
             h.tick()
-        self.assertEqual(h.transition["step"], "wait_health")
+        self.assertEqual(h.transition["step"], "wait_image")
         self.assertTrue(any("could not report the image rollout" in line for line in logs.output))
         h.github.status_error = None
         h.finish()

@@ -31,6 +31,12 @@ readonly ZRAM_PRIORITY=100
 readonly MEMINFO=/proc/meminfo
 # Container logs are capped on every shape so they can't fill the small boot disk.
 readonly LOG_ARGS=(--log-driver json-file --log-opt max-size=10m --log-opt max-file=3)
+# One run at a time: the boot run and a rerun by the image watcher never overlap.
+readonly RUN_LOCK=/run/spot-control-startup.lock
+# The image watcher reruns this script when the dashboard-image metadata changes, so an image update swaps only the
+# containers: same VM, same boot disk, same state file (see install_image_watcher).
+readonly WATCH_SCRIPT=/usr/local/sbin/spot-dashboard-image-watch
+readonly WATCH_UNIT=spot-dashboard-image-watch.service
 
 log() {
   printf 'spot-control-startup: %s\n' "$*" >&2
@@ -118,6 +124,18 @@ dashboard_image_ok() {
   local ref="$1"
   [[ "$ref" =~ ^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]] && return 0
   [[ "$ref" =~ ^[a-z0-9][a-z0-9._/-]*:[0-9a-f]{40}$ ]]
+}
+
+# The dashboard-image checks for this shape: on the e2-micro (1 GB of RAM, never builds) a digest or a published
+# commit tag; elsewhere a digest.
+check_dashboard_image() {
+  local ref="$1"
+  if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then
+    dashboard_image_ok "$ref" \
+      || fail "the e2-micro control VM needs dashboard-image pinned by digest or a 40-hex commit tag; it never builds the image"
+  else
+    [[ "$ref" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"
+  fi
 }
 
 # Origin (https://host[:port]) of the public dashboard URL. The URL must be https:// plus a DNS host name, an
@@ -307,12 +325,73 @@ pull_published_image() {
   fi
   log "pulling $DASHBOARD_IMAGE"
   printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username x-access-token --password-stdin >/dev/null
-  docker pull "$DASHBOARD_IMAGE" >/dev/null || fail "could not pull $DASHBOARD_IMAGE"
+  # Bounded, so every run ends and reports (the controller treats an old "running" report as a dead run).
+  timeout 900 docker pull "$DASHBOARD_IMAGE" >/dev/null || fail "could not pull $DASHBOARD_IMAGE"
   docker logout ghcr.io >/dev/null 2>&1 || true
 }
 
+# A pull can take minutes on the e2-micro, and the controller may pin another image meanwhile (a rollback). Read
+# dashboard-image again after the pull and pull that image instead, so this run never starts a superseded image.
+follow_image_changes() {
+  local latest attempt
+  for attempt in 1 2 3 4 5; do
+    latest="$(metadata_attr dashboard-image)"
+    if [[ -z "$latest" || "$latest" == "$DASHBOARD_IMAGE" ]]; then
+      return 0
+    fi
+    check_dashboard_image "$latest"
+    log "dashboard-image changed to $latest during the pull; following it"
+    DASHBOARD_IMAGE="$latest"
+    read_update_id
+    pull_published_image
+  done
+  fail "dashboard-image kept changing during the pull"
+}
+
 BUILD_DIR=""
+PREVIOUS_IMAGE_ID=""
+# Report this run as the guest attribute spot-dashboard/run (the instance metadata enable-guest-attributes=TRUE
+# allows it): "running <unix time>", then "done <update id> <image>" or "failed <update id> <unix time>", where the
+# update id is the dashboard-update-id metadata the run applied. The controller releases a container only on the end
+# report of the update it requested, since a pending run may still replace it.
+report_run() {
+  curl -fsS -X PUT --max-time 5 -H 'Metadata-Flavor: Google' --data "$1" \
+    "$METADATA/instance/guest-attributes/spot-dashboard/run" >/dev/null 2>&1
+}
+
+# The end report ("done" or "failed"), retried: a lost one leaves "running", and the controller then waits for the
+# watcher's own confirmation (it reconciles right after the run it started) instead of releasing the container.
+report_run_end() {
+  local attempt
+  for attempt in 1 2 3 4 5 6; do
+    report_run "$1" && return 0
+    ((attempt == 6)) || sleep 5
+  done
+  log "could not report the end of this run (guest attribute spot-dashboard/run)"
+  return 1
+}
+
+# The "running" report is required once guest attributes are enabled: a run that can't announce itself stops
+# before it touches a container, so the controller never mistakes it for no run at all.
+report_run_start() {
+  local enabled
+  enabled="$(metadata_attr enable-guest-attributes)"
+  if ! report_run "running $(date +%s)" && [[ "$enabled" == TRUE || "$enabled" == true ]]; then
+    fail "could not report this run (guest attribute spot-dashboard/run)"
+  fi
+}
+
+# The dashboard-update-id metadata: empty, or the controller's <transition id>-<phase>.
+read_update_id() {
+  UPDATE_ID="$(metadata_attr dashboard-update-id)"
+  [[ -z "$UPDATE_ID" || "$UPDATE_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "dashboard-update-id is malformed"
+}
+
 cleanup() {
+  local status=$?
+  if ((status != 0)); then
+    report_run_end "failed ${UPDATE_ID:--} $(date +%s)" || true
+  fi
   if [[ -n "$BUILD_DIR" ]]; then
     rm -rf "$BUILD_DIR"
   fi
@@ -394,27 +473,146 @@ write_dashboard_env() {
   printf 'TUNNEL_TOKEN=%s\n' "$tunnel_token" | write_private_file "$TUNNEL_ENV_FILE"
 }
 
+# Run container NAME from the docker run arguments that follow, unless it already runs exactly them: same image,
+# arguments, and env file (metadata and secrets), recorded as a hash in a label. A run that changes nothing (a boot,
+# or a rerun superseded by a rollback) keeps the running container, so it is never stopped undrained. Otherwise a
+# graceful stop lets it finish requests before it is replaced.
+ensure_container() {
+  local name="$1" env_file="$2" hash current
+  shift 2
+  hash="$({ printf '%s\0' "$@"; cat "$env_file"; } | sha256sum | cut -d' ' -f1)"
+  current="$(docker inspect --format '{{index .Config.Labels "spot-run-hash"}} {{.State.Running}}' "$name" 2>/dev/null \
+    || true)"
+  if [[ -n "$hash" && "$current" == "$hash true" ]]; then
+    log "keeping $name: its image, arguments, and settings are unchanged"
+    return 0
+  fi
+  docker stop --time 20 "$name" >/dev/null 2>&1 || true
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" --label "spot-run-hash=$hash" "$@" >/dev/null
+}
+
 run_containers() {
   install -d -m 0750 -o "$CONTAINER_UID" -g "$CONTAINER_UID" "$STATE_DIR"
   chown "$CONTAINER_UID:$CONTAINER_UID" "$STATE_DIR"
   chmod 0750 "$STATE_DIR"
 
-  # Recreate on every boot so changed metadata, secrets, or images always take effect.
-  docker rm -f "$DASHBOARD_CONTAINER" >/dev/null 2>&1 || true
-  docker run -d --name "$DASHBOARD_CONTAINER" --restart unless-stopped --network host \
-    "${DASHBOARD_RUN_ARGS[@]}" \
-    --user "$CONTAINER_UID:$CONTAINER_UID" --cap-drop ALL --security-opt no-new-privileges \
-    --env-file "$ENV_FILE" -v "$STATE_DIR:/state" "$DASHBOARD_IMAGE_REF" \
-    --host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" \
-    --project "$PROJECT" >/dev/null
+  # Changed metadata, secrets, or images always take effect (see ensure_container). The image is pulled before
+  # this point, so the old container serves until here.
+  PREVIOUS_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$DASHBOARD_CONTAINER" 2>/dev/null || true)"
+  # DASHBOARD_IMAGE is reported by /api/health, so the controller can confirm which image serves.
+  local -a dashboard_args=(--restart unless-stopped --network host
+    "${DASHBOARD_RUN_ARGS[@]}"
+    --user "$CONTAINER_UID:$CONTAINER_UID" --cap-drop ALL --security-opt no-new-privileges
+    --env-file "$ENV_FILE" -e "DASHBOARD_IMAGE=$DASHBOARD_IMAGE_REF" -v "$STATE_DIR:/state" "$DASHBOARD_IMAGE_REF"
+    --host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" --project "$PROJECT")
+  ensure_container "$DASHBOARD_CONTAINER" "$ENV_FILE" "${dashboard_args[@]}"
 
   image_present "$CLOUDFLARED_IMAGE" || docker pull "$CLOUDFLARED_IMAGE" >/dev/null
-  docker rm -f "$TUNNEL_CONTAINER" >/dev/null 2>&1 || true
   # cloudflared reads the slot's tunnel token from TUNNEL_TOKEN, keeping it out of argv.
-  docker run -d --name "$TUNNEL_CONTAINER" --restart unless-stopped --network host \
-    "${TUNNEL_RUN_ARGS[@]}" \
-    --cap-drop ALL --security-opt no-new-privileges \
-    --env-file "$TUNNEL_ENV_FILE" "$CLOUDFLARED_IMAGE" tunnel --no-autoupdate run >/dev/null
+  local -a tunnel_args=(--restart unless-stopped --network host
+    "${TUNNEL_RUN_ARGS[@]}"
+    --cap-drop ALL --security-opt no-new-privileges
+    --env-file "$TUNNEL_ENV_FILE" "$CLOUDFLARED_IMAGE" tunnel --no-autoupdate run)
+  ensure_container "$TUNNEL_CONTAINER" "$TUNNEL_ENV_FILE" "${tunnel_args[@]}"
+}
+
+# In-place image updates pull each new image onto the same small boot disk. Remove every image except the one the
+# dashboard now runs and the one it ran before this run (a rollback then needs no pull). Images that a container
+# uses, such as cloudflared's, can't be removed without --force, so docker keeps them.
+remove_old_images() {
+  local current id
+  current="$(docker inspect --format '{{.Image}}' "$DASHBOARD_CONTAINER" 2>/dev/null || true)"
+  [[ -n "$current" ]] || return 0
+  while read -r id; do
+    [[ -z "$id" || "$id" == "$current" || "$id" == "$PREVIOUS_IMAGE_ID" ]] && continue
+    docker image rm "$id" >/dev/null 2>&1 || true
+  done < <(docker image ls --no-trunc --quiet | sort -u)
+}
+
+# Atomically replace a root-owned file with stdin, with the given mode. A rename never changes the file a running
+# process (the watcher itself, during a rerun) is reading.
+write_root_file() {
+  local target="$1" mode="$2" temp
+  temp="$(mktemp "$target.XXXXXX")"
+  cat >"$temp"
+  chmod "$mode" "$temp"
+  chown root:root "$temp"
+  mv -f "$temp" "$target"
+}
+
+# Install and start (once per boot) the service that reruns this script when the dashboard-image metadata changes.
+# It long-polls the metadata server, so it costs no CPU while it waits. A rerun pulls the new image while the old
+# container still serves, then recreates the containers. The service starts after the boot run of this script
+# (After=google-startup-scripts.service), and both take RUN_LOCK, so runs never overlap. A rerun never restarts the
+# watcher; a changed watcher takes effect at the next boot.
+install_image_watcher() {
+  write_root_file "$WATCH_SCRIPT" 0755 <<'WATCH'
+#!/usr/bin/env bash
+# Installed by the control VM startup script (cloud-init/control-vm-startup.sh); reruns it when the dashboard-image
+# instance metadata names an image the dashboard container does not run.
+set -uo pipefail
+readonly ATTRS=http://metadata.google.internal/computeMetadata/v1/instance/attributes
+readonly RUN_REPORT=http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/spot-dashboard/run
+readonly CONTAINER=spot-dashboard
+log() { printf 'spot-dashboard-image-watch: %s\n' "$*" >&2; }
+attr() { curl -fsS --max-time 10 -H 'Metadata-Flavor: Google' "$ATTRS/$1" 2>/dev/null || true; }
+etag=NONE
+# After a rerun, check once without waiting, so a run whose own end report was lost is still confirmed promptly.
+recheck=0
+while true; do
+  if ((recheck == 0)); then
+    # Wakes on any metadata change: a request can change only dashboard-update-id (a restore of the running image).
+    headers="$(mktemp)"
+    if ! curl -fsS --max-time 3700 -D "$headers" -H 'Metadata-Flavor: Google' \
+        "$ATTRS/?recursive=true&wait_for_change=true&timeout_sec=3600&last_etag=$etag" >/dev/null; then
+      rm -f "$headers"
+      sleep 15
+      continue
+    fi
+    etag="$(tr -d '\r' <"$headers" | sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//p' | tail -n 1)"
+    rm -f "$headers"
+    [[ "$etag" =~ ^[A-Za-z0-9]+$ ]] || etag=NONE
+  fi
+  rechecking=$recheck
+  recheck=0
+  value="$(attr dashboard-image)"
+  [[ -n "$value" ]] || continue
+  running="$(docker inspect --format '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
+  if [[ "$value" == "$running" ]]; then
+    # Nothing to swap: confirm the request (its update id) so the controller knows no run is pending for it.
+    id="$(attr dashboard-update-id)"
+    [[ "$id" =~ ^[a-z0-9-]{1,64}$ ]] || id=-
+    curl -fsS -X PUT --max-time 5 -H 'Metadata-Flavor: Google' --data "done $id $value" "$RUN_REPORT" \
+      >/dev/null 2>&1 || true
+    continue
+  fi
+  # Right after a rerun, a mismatch means it failed: wait for the next change (or the hourly timeout) to retry.
+  ((rechecking == 0)) || continue
+  log "dashboard-image is $value but $CONTAINER runs ${running:-nothing}; rerunning the startup script"
+  google_metadata_script_runner startup || log "the startup script failed; retrying at the next change or in an hour"
+  recheck=1
+done
+WATCH
+  write_root_file "/etc/systemd/system/$WATCH_UNIT" 0644 <<UNIT
+[Unit]
+Description=Swap the Spot dashboard container when its dashboard-image metadata changes
+After=google-startup-scripts.service docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$WATCH_SCRIPT
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable "$WATCH_UNIT" >/dev/null 2>&1 || fail "could not enable $WATCH_UNIT"
+  # --no-block: during the boot run the start waits for this script to finish (After=), so it must not block.
+  systemctl start --no-block "$WATCH_UNIT" || fail "could not start $WATCH_UNIT"
 }
 
 report_health() {
@@ -432,7 +630,15 @@ report_health() {
 
 main() {
   [[ "$(id -u)" -eq 0 ]] || fail "must run as root"
+  exec 9>"$RUN_LOCK"
+  flock 9
   wait_for_metadata
+  report_run_start
+  read_update_id
+  # Before anything that can fail (metadata checks, secrets, packages, the pull, container replacement), so a later
+  # metadata change always has a watcher to apply it and to confirm it, including a rollback after this run fails.
+  # A failed run is also retried by the watcher when it starts and finds the pinned image not running.
+  install_image_watcher
   PROJECT="$(curl -fsS -H 'Metadata-Flavor: Google' "$METADATA/project/project-id")"
   # projects/<number>/machineTypes/<type>; the shape decides the swap file and the container memory limits.
   MACHINE_TYPE="$(curl -fsS --retry 5 --retry-connrefused --max-time 10 -H 'Metadata-Flavor: Google' \
@@ -467,12 +673,8 @@ main() {
   GLOBAL_ADMINS="$(global_admins_csv "$GLOBAL_ADMINS_METADATA")" \
     || fail "dashboard-global-admins must be none or ;-separated login:numeric_id entries"
   PUBLIC_ORIGIN="$(public_origin_of "$PUBLIC_URL")" || fail "dashboard-public-url must be https://host[:port] without a path, query, or user info"
-  if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then
-    # 1 GB of RAM: never build on the box, always pull the published image.
-    dashboard_image_ok "$DASHBOARD_IMAGE" \
-      || fail "the e2-micro control VM needs dashboard-image pinned by digest or a 40-hex commit tag; it never builds the image"
-  elif [[ -n "$DASHBOARD_IMAGE" ]]; then
-    [[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"
+  if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" || -n "$DASHBOARD_IMAGE" ]]; then
+    check_dashboard_image "$DASHBOARD_IMAGE"
   else
     [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] || fail "dashboard-source-ref must be a 40-hex commit"
   fi
@@ -492,6 +694,7 @@ main() {
   install_packages
   if [[ -n "$DASHBOARD_IMAGE" ]]; then
     pull_published_image
+    follow_image_changes
     DASHBOARD_IMAGE_REF="$DASHBOARD_IMAGE"
   else
     build_from_source
@@ -499,6 +702,8 @@ main() {
   unset TOKEN
   run_containers
   unset GITHUB_TOKEN
+  remove_old_images
+  report_run_end "done ${UPDATE_ID:--} $DASHBOARD_IMAGE_REF" || true
   report_health
 }
 

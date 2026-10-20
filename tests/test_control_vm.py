@@ -209,12 +209,13 @@ class FakeHttp:
         self.versions = {"a": 7, "b": 0}
         self.freeze_status = 200
         self.import_status = 200
+        self.import_response_lost = False  # the import applies, but the caller sees no answer
         self.unfreeze_status = 200
         self.snapshot_status = 200
 
-    def healthy(self, slot, version=0):
+    def healthy(self, slot, version=0, image=None):
         self.health[slot] = (200, {"status": "ok", "hydrated": True, "frozen": False, "state_version": version,
-                                   "slot": slot, "kv_writer": False})
+                                   "slot": slot, "kv_writer": False, **({"image": image} if image else {})})
 
     def unhealthy(self, slot):
         self.health[slot] = (503, {"error": "control_vm_unavailable", "status": "starting", "hydrated": False,
@@ -246,8 +247,15 @@ class FakeHttp:
             envelope = json.loads(body)
             if self.import_status == 200:
                 self.versions[slot] = max(self.versions[slot], envelope["state_version"])
+                if slot in self.health and self.health[slot][1].get("frozen"):  # an import clears the freeze
+                    self.health[slot] = (200, dict(self.health[slot][1], status="ok", frozen=False))
+            if self.import_response_lost:
+                return None, b""
             return self.import_status, json.dumps({"state_version": self.versions[slot], "imported": True}).encode()
         if op == "unfreeze":
+            if self.unfreeze_status == 200 and slot in self.health and self.health[slot][1].get("frozen"):
+                status, data = self.health[slot]
+                self.health[slot] = (200, dict(data, status="ok", frozen=False))
             return self.unfreeze_status, b'{"frozen": false}'
         raise AssertionError(path)
 
@@ -281,7 +289,7 @@ class Harness:
 
     def mutations(self):
         return [e for e in self.events if e[0] in ("create", "start", "stop", "delete", "origin", "freeze", "import",
-                                                    "unfreeze")]
+                                                    "unfreeze", "set-image", "reset")]
 
 
 def vm(slot, status="RUNNING", zone="us-central1-a", machine="e2-small"):
@@ -2305,14 +2313,15 @@ class StartupScriptTests(unittest.TestCase):
         self.assertNotIn("metadata-from", self.text)
 
     def test_containers_match_contract(self):
-        self.assertIn('docker rm -f "$DASHBOARD_CONTAINER"', self.text)
-        self.assertIn('docker rm -f "$TUNNEL_CONTAINER"', self.text)
+        self.assertIn('ensure_container "$DASHBOARD_CONTAINER" "$ENV_FILE" "${dashboard_args[@]}"', self.text)
+        self.assertIn('ensure_container "$TUNNEL_CONTAINER" "$TUNNEL_ENV_FILE" "${tunnel_args[@]}"', self.text)
         self.assertIn("readonly DASHBOARD_CONTAINER=spot-dashboard", self.text)
         self.assertIn("readonly TUNNEL_CONTAINER=spot-cloudflared", self.text)
         self.assertEqual(self.text.count("--restart unless-stopped --network host"), 2)
-        self.assertIn('--env-file "$ENV_FILE" -v "$STATE_DIR:/state"', self.text)
-        self.assertIn('--host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" \\\n'
-                      '    --project "$PROJECT"', self.text)
+        self.assertIn('--env-file "$ENV_FILE" -e "DASHBOARD_IMAGE=$DASHBOARD_IMAGE_REF" -v "$STATE_DIR:/state"',
+                      self.text)
+        self.assertIn('--host 127.0.0.1 --port 8787 --state-file /state/state.json --control-slot "$SLOT" '
+                      '--project "$PROJECT"', self.text)
         self.assertIn('(umask 022 && git -C "$workdir" -c advice.detachedHead=false checkout -q FETCH_HEAD)',
                       self.text)
         self.assertIn("tunnel --no-autoupdate run", self.text)
@@ -3058,8 +3067,8 @@ swapon() {
                                                "T": logs + " --memory=160m --memory-swap=320m"})
         self.assertEqual(outputs["e2-small"], {"D": logs, "T": logs})
         run = self._function("run_containers")
-        self.assertIn('--network host \\\n    "${DASHBOARD_RUN_ARGS[@]}" \\\n    --user', run)
-        self.assertIn('--network host \\\n    "${TUNNEL_RUN_ARGS[@]}" \\\n    --cap-drop', run)
+        self.assertIn('--network host\n    "${DASHBOARD_RUN_ARGS[@]}"\n    --user', run)
+        self.assertIn('--network host\n    "${TUNNEL_RUN_ARGS[@]}"\n    --cap-drop', run)
         self.assertLess(self.main.index("set_container_limits"), self.main.index("run_containers"))
 
 
@@ -3140,12 +3149,46 @@ class StandardDashboardImageTests(unittest.TestCase):
             expected = not self.std(dashboard_image=value).create_problems() if value else False
             self.assertEqual(result.returncode == 0, expected, value)
         main = re.search(r"^main\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
-        micro_check = main.index('dashboard_image_ok "$DASHBOARD_IMAGE"')
-        self.assertLess(main.index('if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" ]]; then\n    # 1 GB'), micro_check)
+        micro_check = main.index('check_dashboard_image "$DASHBOARD_IMAGE"')
+        self.assertLess(main.index('if [[ "$MACHINE_TYPE" == "$MICRO_MACHINE_TYPE" || -n "$DASHBOARD_IMAGE" ]]; then'),
+                        micro_check)
         self.assertLess(micro_check, main.index("build_from_source\n"))
-        # Other shapes keep the digest-only check and the source build.
-        self.assertIn('[[ "$DASHBOARD_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || fail "dashboard-image must be pinned by digest"',
-                      main)
+        # The e2-micro takes a digest or a published commit tag; other shapes keep the digest-only check.
+        check = re.search(r"^check_dashboard_image\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        stubs = 'fail() { echo "FAIL: $*" >&2; exit 1; }\n' + function + check
+        tag = f"ghcr.io/swack-tools/spot-dashboard:{self.SHA}"
+        for machine, value, ok in (("e2-micro", tag, True), ("e2-micro", self.DIGEST, True), ("e2-micro", "", False),
+                                   ("e2-small", self.DIGEST, True), ("e2-small", tag, False)):
+            script = (f'MACHINE_TYPE={machine}\nMICRO_MACHINE_TYPE=e2-micro\n' + stubs
+                      + 'check_dashboard_image "$1"')
+            result = subprocess.run(["bash", "-c", script, "check", value], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode == 0, ok, (machine, value))
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_a_run_follows_an_image_pinned_during_its_pull(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        main = re.search(r"^main\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        self.assertLess(main.index("pull_published_image\n    follow_image_changes"), main.index("run_containers"))
+        function = re.search(r"^follow_image_changes\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        stubs = ('log() { :; }\nfail() { echo "FAIL: $*"; exit 1; }\ncheck_dashboard_image() { [[ $1 != bad ]] || '
+                 'fail bad; }\npull_published_image() { echo "pull $DASHBOARD_IMAGE"; }\nread_update_id() { :; }\n'
+                 'metadata_attr() { n=$(($(cat "$DIR/n" 2>/dev/null || echo 0) + 1)); echo $n > "$DIR/n"; '
+                 'sed -n "${n}p" "$DIR/answers"; }\n')
+        kept_changing = "FAIL: dashboard-image kept changing during the pull"
+        for answers, expected_out, ok in ((["A"], [], True), (["B", "B"], ["pull B"], True), ([""], [], True),
+                                          (["bad"], ["FAIL: bad"], False),
+                                          (["B", "C", "D", "E", "F", "G"],
+                                           ["pull B", "pull C", "pull D", "pull E", "pull F", kept_changing], False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "answers").write_text("\n".join(answers) + "\n", encoding="utf-8")
+                script = "DASHBOARD_IMAGE=A\n" + stubs + function + 'follow_image_changes\necho "final $DASHBOARD_IMAGE"\n'
+                result = subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin", "DIR": tmp},
+                                        capture_output=True, text=True, timeout=30)
+            lines = result.stdout.splitlines()
+            self.assertEqual(result.returncode == 0, ok, answers)
+            self.assertEqual(lines[:len(expected_out)], expected_out, answers)
+            if ok:
+                self.assertEqual(lines[-1], f"final {answers[-1] or 'A'}", answers)
 
 
 class StartupScriptZramTests(unittest.TestCase):
@@ -3244,3 +3287,192 @@ swapoff() { :; }
         calls, stderr = self.run_zram()
         self.assertIn("could not read MemTotal", stderr)
         self.assertNotIn("mkswap:zram0", calls)
+
+
+class StartupScriptImageWatcherTests(unittest.TestCase):
+    """The in-place image update (MODE_IMAGE): the VM swaps the dashboard container when dashboard-image changes."""
+
+    def setUp(self):
+        self.text = SCRIPT.read_text(encoding="utf-8")
+        self.main = re.search(r"^main\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.watch = re.search(r"<<'WATCH'\n(.*?)^WATCH$", self.text, re.S | re.M).group(1)
+
+    def test_each_run_reports_its_progress(self):
+        done = 'report_run_end "done ${UPDATE_ID:--} $DASHBOARD_IMAGE_REF"'
+        self.assertLess(self.main.index("wait_for_metadata"), self.main.index("report_run_start\n  read_update_id"))
+        self.assertLess(self.main.index("report_run_start"), self.main.index("run_containers"))
+        self.assertLess(self.main.index("remove_old_images"), self.main.index(done))
+        self.assertLess(self.main.index(done), self.main.index("report_health"))
+        cleanup = re.search(r"^cleanup\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.assertTrue(cleanup.startswith('cleanup() {\n  local status=$?\n'))
+        self.assertIn('report_run_end "failed ${UPDATE_ID:--} $(date +%s)"', cleanup)
+        follow = re.search(r"^follow_image_changes\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.assertIn('DASHBOARD_IMAGE="$latest"\n    read_update_id', follow)  # the id of the image it applies
+        self.assertIn('"$METADATA/instance/guest-attributes/spot-dashboard/run"', self.text)
+        self.assertEqual(cv.metadata_items(config(), "a")["enable-guest-attributes"], "TRUE")
+
+    def test_runs_never_overlap_and_the_watcher_starts_after_the_containers(self):
+        self.assertIn("readonly RUN_LOCK=/run/spot-control-startup.lock", self.text)
+        lock = self.main.index('exec 9>"$RUN_LOCK"\n  flock 9')
+        self.assertLess(lock, self.main.index("wait_for_metadata"))
+        watcher = self.main.index("install_image_watcher")
+        self.assertLess(self.main.index("read_update_id"), watcher)
+        for later in ("check_dashboard_image", "write_dashboard_env", "install_packages", "pull_published_image",
+                      "build_from_source", "run_containers"):
+            self.assertLess(watcher, self.main.index(later), later)  # installed even when these fail
+
+    def test_the_watcher_unit_waits_for_the_boot_run_and_is_started_without_blocking(self):
+        self.assertIn("After=google-startup-scripts.service docker.service network-online.target", self.text)
+        self.assertIn("ExecStart=$WATCH_SCRIPT", self.text)
+        self.assertIn("Restart=always", self.text)
+        self.assertIn('systemctl start --no-block "$WATCH_UNIT"', self.text)
+        self.assertNotIn("systemctl restart", self.text)  # a rerun runs inside the watcher; never restart it
+        # Both files are replaced by rename, never rewritten in place under the running watcher.
+        self.assertIn('write_root_file "$WATCH_SCRIPT" 0755', self.text)
+        self.assertIn('write_root_file "/etc/systemd/system/$WATCH_UNIT" 0644', self.text)
+        self.assertIn('mv -f "$temp" "$target"', self.text)
+
+    def test_the_old_container_stops_gracefully_after_the_pull(self):
+        ensure = re.search(r"^ensure_container\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.assertLess(ensure.index('docker stop --time 20 "$name"'), ensure.index('docker rm -f "$name"'))
+        self.assertLess(self.main.index("pull_published_image"), self.main.index("run_containers"))
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_an_unchanged_container_is_kept_and_a_changed_one_replaced(self):
+        ensure = re.search(r"^ensure_container\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp)
+            (stub / "env").write_text("A=1\n", encoding="utf-8")
+            # docker inspect answers with the label recorded by the last docker run; every call is logged.
+            (stub / "docker").write_text(
+                '#!/usr/bin/env bash\necho "$1" >> "$STUB/calls"\n'
+                'if [[ $1 == inspect ]]; then [[ -f "$STUB/label" ]] || exit 1; echo "$(cat "$STUB/label") true"; fi\n'
+                'if [[ $1 == run ]]; then for a in "$@"; do [[ $a == spot-run-hash=* ]] && '
+                'echo "${a#spot-run-hash=}" > "$STUB/label"; done; fi\nexit 0\n', encoding="utf-8")
+            (stub / "docker").chmod(0o755)
+            script = 'log() { :; }\n' + ensure + 'ensure_container spot-dashboard "$STUB/env" --network host img:1\n'
+
+            def run():
+                Path(tmp, "calls").unlink(missing_ok=True)
+                subprocess.run(["bash", "-c", script], env={"PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin", "STUB": tmp},
+                               check=True, capture_output=True, text=True, timeout=30)
+                return Path(tmp, "calls").read_text().split()
+            self.assertEqual(run(), ["inspect", "stop", "rm", "run"])  # nothing ran it yet
+            self.assertEqual(run(), ["inspect"])  # the same run again keeps it
+            (stub / "env").write_text("A=2\n", encoding="utf-8")  # a changed setting or secret replaces it
+            self.assertEqual(run(), ["inspect", "stop", "rm", "run"])
+
+    def run_watcher(self, value, running, swaps=False):
+        # curl call 1 answers with the value and an ETag; call 2 fails, so the watcher sleeps, which ends the run.
+        # swaps: a rerun replaces the container, so docker then reports the requested image.
+        stubs = {
+            "curl": r'''#!/usr/bin/env bash
+if [[ " $* " == *" PUT "* ]]; then
+  while [[ $# -gt 0 ]]; do [[ $1 == --data ]] && echo "$2 -> ${@: -1}" >> "$STUB/puts"; shift; done
+  exit 0
+fi
+if [[ "${@: -1}" == */attributes/dashboard-update-id ]]; then printf 'upd-1'; exit 0; fi
+if [[ "${@: -1}" == */attributes/dashboard-image ]]; then printf '%s' "$VALUE"; exit 0; fi
+n=$(($(cat "$STUB/count" 2>/dev/null || echo 0) + 1))
+echo "$n" > "$STUB/count"
+printf '%s\n' "${@: -1}" >> "$STUB/urls"
+[[ $n == 1 ]] || exit 22
+while [[ $# -gt 0 ]]; do
+  if [[ $1 == -D ]]; then printf 'ETag: abc123\r\n' > "$2"; fi
+  shift
+done
+printf '{}'
+''',
+            "sleep": "#!/usr/bin/env bash\nkill -TERM $PPID\n",
+            "docker": ("#!/usr/bin/env bash\nif [[ -n $SWAPS && -e $STUB/reruns ]]; then printf '%s\\n' \"$VALUE\"; "
+                       "else printf '%s\\n' \"$RUNNING\"; fi\n"),
+            "google_metadata_script_runner": '#!/usr/bin/env bash\necho "$*" >> "$STUB/reruns"\n',
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp)
+            (stub / "watch.sh").write_text(self.watch, encoding="utf-8")
+            for name, body in stubs.items():
+                (stub / name).write_text(body, encoding="utf-8")
+                (stub / name).chmod(0o755)
+            env = {"PATH": f"{stub}:/usr/bin:/bin", "STUB": str(stub), "VALUE": value, "RUNNING": running,
+                   "SWAPS": "1" if swaps else ""}
+            subprocess.run(["bash", str(stub / "watch.sh")], env=env, capture_output=True, text=True, timeout=30)
+            reruns = (stub / "reruns").read_text() if (stub / "reruns").exists() else ""
+            self.puts = (stub / "puts").read_text().splitlines() if (stub / "puts").exists() else []
+            return reruns, (stub / "urls").read_text().splitlines()
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_old_images_are_removed_but_the_current_and_previous_are_kept(self):
+        function = re.search(r"^remove_old_images\(\) \{\n.*?^\}\n", self.text, re.S | re.M).group(0)
+        self.assertLess(self.main.index("run_containers"), self.main.index("remove_old_images"))
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp)
+            (stub / "docker").write_text(
+                '#!/usr/bin/env bash\n'
+                'case "$1 $2" in\n'
+                '  "inspect --format") echo sha256:cur ;;\n'
+                '  "image ls") printf "sha256:old1\\nsha256:cur\\nsha256:prev\\nsha256:cloudflared\\nsha256:old1\\n" ;;\n'
+                '  "image rm") echo "$3" >> "$STUB/removed"; [[ $3 != sha256:cloudflared ]] ;;\n'
+                'esac\n', encoding="utf-8")
+            (stub / "docker").chmod(0o755)
+            script = ('DASHBOARD_CONTAINER=spot-dashboard\nPREVIOUS_IMAGE_ID=sha256:prev\n' + function
+                      + "remove_old_images\n")
+            result = subprocess.run(["bash", "-c", script], env={"PATH": f"{stub}:/usr/bin:/bin", "STUB": tmp},
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            removed = (stub / "removed").read_text().split()
+        self.assertEqual(sorted(removed), ["sha256:cloudflared", "sha256:old1"])  # in use: docker refuses, kept
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_watcher_reruns_the_startup_script_only_for_another_image(self):
+        new = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "b" * 64
+        old = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "a" * 64
+        reruns, urls = self.run_watcher(new, old)
+        self.assertEqual(reruns, "startup\n")
+        self.assertIn("/instance/attributes/?recursive=true&wait_for_change=true", urls[0])  # any metadata change
+        self.assertIn("last_etag=NONE", urls[0])
+        self.assertIn("last_etag=abc123", urls[1])  # the next wait starts from the answer's ETag
+        self.assertEqual(self.puts, [])
+        reruns, _ = self.run_watcher(new, new)
+        self.assertEqual(reruns, "")
+        # Nothing to swap: it confirms the request, so the controller knows no run is pending for it.
+        self.assertEqual(self.puts, [f"done upd-1 {new} -> http://metadata.google.internal/computeMetadata/v1/instance/"
+                                     "guest-attributes/spot-dashboard/run"])
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_watcher_confirms_its_rerun_without_waiting_for_another_change(self):
+        new = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "b" * 64
+        old = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "a" * 64
+        # The rerun swapped the container (its own end report may have been lost): confirmed before the next wait.
+        reruns, urls = self.run_watcher(new, old, swaps=True)
+        self.assertEqual(reruns, "startup\n")
+        self.assertEqual(len([u for u in urls if "wait_for_change" in u]), 2)
+        self.assertEqual(self.puts, [f"done upd-1 {new} -> http://metadata.google.internal/computeMetadata/v1/instance/"
+                                     "guest-attributes/spot-dashboard/run"])
+        # A failed rerun (still the old image) is not retried in a loop: it waits for the next change.
+        reruns, _ = self.run_watcher(new, old)
+        self.assertEqual(reruns, "startup\n")
+        self.assertEqual(self.puts, [])
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_the_end_report_is_retried(self):
+        functions = "".join(re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", self.text, re.S | re.M).group(0)
+                            for name in ("report_run", "report_run_end"))
+        script = ('exec 3>&1\nMETADATA=http://x\nlog() { :; }\nsleep() { :; }\n'
+                  'curl() { n=$((n + 1)); echo "try $n" >&3; ((n >= 3)); }\n' + functions
+                  + 'report_run_end "done x y" && echo reported\n')
+        result = subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
+                                timeout=30)
+        self.assertEqual(result.stdout.split("\n")[-2:], ["reported", ""])
+        self.assertIn("try 3", result.stdout)
+
+    @unittest.skipUnless(shutil.which("bash"), "bash is not installed")
+    def test_a_run_that_cannot_report_its_start_stops_once_reporting_is_enabled(self):
+        functions = "".join(re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", self.text, re.S | re.M).group(0)
+                            for name in ("report_run", "report_run_start"))
+        for enabled, ok in (("TRUE", False), ("", True)):
+            script = ('METADATA=http://x\nmetadata_attr() { echo "$ENABLED"; }\nfail() { echo "FAIL: $*"; exit 1; }\n'
+                      'curl() { return 22; }\n' + functions + 'report_run_start\necho reached\n')
+            result = subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin", "ENABLED": enabled},
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual("reached" in result.stdout, ok, (enabled, result.stdout))

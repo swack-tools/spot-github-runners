@@ -167,7 +167,7 @@ While the dashboard is hydrating, frozen for a control VM handover, not reconcil
 
 ### Health
 
-`GET /api/health` needs no sign-in. It returns the fields `status`, `hydrated`, `frozen`, `reconciled`, `active`, `ownership`, `state_version`, `slot`, and `kv_writer`, plus `reason` when something blocks the dashboard. The HTTP status is 200 when the dashboard is hydrated, not frozen, and reconciled. Otherwise it is 503 with the wait body merged with these fields.
+`GET /api/health` needs no sign-in. It returns the fields `status`, `hydrated`, `frozen`, `reconciled`, `active`, `ownership`, `state_version`, `slot`, `kv_writer`, and `image`, plus `reason` when something blocks the dashboard. `image` is the dashboard image the control VM started the container from, or `null` outside a control VM. The HTTP status is 200 when the dashboard is hydrated, not frozen, and reconciled. Otherwise it is 503 with the wait body merged with these fields.
 
 | `status` | Meaning |
 | --- | --- |

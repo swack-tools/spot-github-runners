@@ -1937,6 +1937,18 @@ class StoreTargetPolicyTests(unittest.TestCase):
         self.kv_fake.values[KV_STATE_KEY] = json.dumps(
             build_snapshot({"controlled_targets": list(targets)}, version, "a", now=1))
 
+    def test_health_reports_the_container_image(self):
+        # The control VM controller confirms an in-place image update by this field (DASHBOARD_IMAGE, set by
+        # cloud-init/control-vm-startup.sh); it is absent (None) outside a control VM.
+        image = "ghcr.io/swack-tools/spot-dashboard@sha256:" + "b" * 64
+        with mock.patch.dict(os.environ, {"DASHBOARD_IMAGE": image}):
+            self.assertEqual(DashboardStore(state_path=self.path, sleep=lambda _s: None).health()["image"], image)
+            self.path.write_text("{broken", encoding="utf-8")
+            self.assertEqual(self.assert_fails_closed(self.open_store())["image"], image)
+        with mock.patch.dict(os.environ, {"DASHBOARD_IMAGE": ""}):
+            other = self.path.parent / "other.json"
+            self.assertIsNone(DashboardStore(state_path=other, sleep=lambda _s: None).health()["image"])
+
     def test_inaccessible_state_file_is_kept_aside_and_fails_closed(self):
         for exc in (PermissionError(13, "Permission denied"), IsADirectoryError(21, "Is a directory"),
                     OSError(5, "Input/output error")):
