@@ -391,6 +391,8 @@ class Step:
     # (read command, message): the remove commands run only when the read prints something; otherwise the deploy
     # prints the message and removes nothing.
     remove_when: tuple[tuple[str, ...], str] | None = None
+    # Optional inventory of obsolete grants: skip the entire removal phase when already clean.
+    remove_pending: tuple[str, ...] | None = None
     # SPOT_WATCHDOG_AUTO_DEPLOY=1: right before the run commands, the service must be absent or run the deploy's
     # image; right after them, it must run that image and no other change may have landed (see auto_deploy_guard).
     image_guard: bool = False
@@ -639,6 +641,21 @@ def build_steps(config: DeployConfig) -> list[Step]:
                   f'--filter=bindings.role="{config.compute_role}" AND bindings.members="{runtime}" AND {where}',
                   "--format=value(bindings.role)")
 
+    def pending(commands: Sequence[tuple[str, ...]]) -> tuple[str, ...]:
+        alternatives = []
+        for command in commands:
+            role = next(arg.split("=", 1)[1] for arg in command if arg.startswith("--role="))
+            condition = next(arg for arg in command if arg.startswith("--condition"))
+            if condition == "--condition=None":
+                where = "NOT bindings.condition:*"
+            else:
+                title = "spot-control-vms-only" if "compute-condition.json" in condition else FLOOR_CONDITION_TITLE
+                where = f'bindings.condition.title="{title}"'
+            alternatives.append(f'(bindings.role="{role}" AND {where})')
+        return _c("gcloud", "projects", "get-iam-policy", config.project, "--flatten=bindings[].members",
+                  f'--filter=bindings.members="{runtime}" AND (' + " OR ".join(alternatives) + ")",
+                  "--format=value(bindings.role)")
+
     control_file, floor_file = "--condition-from-file=@FILE:compute-condition.json", \
         "--condition-from-file=@FILE:floor-condition.json"
     legacy_files = {"compute-condition.json": json.dumps(control_condition(), indent=2),
@@ -658,13 +675,14 @@ def build_steps(config: DeployConfig) -> list[Step]:
     steps.append(Step(
         f"Remove the {BASE_COMPUTE_ROLE} control VM bindings earlier deploys made, once the custom role replaces them "
         "(absent ones are skipped)",
-        files=legacy_files, remove=tuple(replaced),
+        files=legacy_files, remove=tuple(replaced), remove_pending=pending(replaced),
         remove_when=(bound("spot-control-vms-only" if config.compute_condition else None), newly_bound)))
     if config.floor_enabled and config.compute_condition:
         steps.append(Step(
             f"Remove the {BASE_COMPUTE_ROLE} runner floor and unconditional bindings earlier deploys made, once the "
             "custom role replaces them (absent ones are skipped)",
             files=legacy_files, remove=(unbind(BASE_COMPUTE_ROLE, floor_file), *unconditional),
+            remove_pending=pending((unbind(BASE_COMPUTE_ROLE, floor_file), *unconditional)),
             remove_when=(bound(FLOOR_CONDITION_TITLE), newly_bound)))
     compute_args = (["--condition-from-file=@FILE:compute-condition.json"] if config.compute_condition
                     else ["--condition=None"])
@@ -836,6 +854,8 @@ def render(config: DeployConfig, steps: Sequence[Step], *, title: str = "Control
             describe, update = step.volume_prune
             lines.append(f"volumes=\"$({_shell(describe)} | python3 -c {shlex.quote(ORPHANED_VOLUMES_PY)})\"")
             lines.append(f"if [ -n \"$volumes\" ]; then {_shell(update)} \"--remove-volume=$volumes\"; fi")
+        if step.remove_pending:
+            lines.append(f'if [ -n "$({_shell(step.remove_pending)})" ]; then')
         if step.remove_when:
             gate, skipped = step.remove_when
             lines.append(f"if [ -n \"$({_shell(gate)})\" ]; then")
@@ -844,6 +864,8 @@ def render(config: DeployConfig, steps: Sequence[Step], *, title: str = "Control
             lines += ["else", f"  echo {shlex.quote(skipped)}", "fi"]
         else:
             lines += [f"{_shell(c)} 2>/dev/null || echo 'already absent'" for c in step.remove]
+        if step.remove_pending:
+            lines.append("fi")
         for listing, keep, commands in step.prune:
             lines.append(f"for name in $({_shell(listing)}); do")
             lines.append(f"  case ' {' '.join(keep)} ' in *\" $name \"*) continue ;; esac")
@@ -879,7 +901,9 @@ Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
 
 
 def default_runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(list(argv), check=False, text=True, capture_output=True, timeout=600)
+    # Give the propagation wait time to finish: a deadline equal to its duration races normal process startup.
+    timeout = 660 if list(argv) == ["sleep", "600"] else 600
+    return subprocess.run(list(argv), check=False, text=True, capture_output=True, timeout=timeout)
 
 
 def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = default_runner,
@@ -952,7 +976,13 @@ def execute(config: DeployConfig, steps: Sequence[Step], runner: Runner = defaul
                 if orphans:
                     run((*update, "--remove-volume=" + ",".join(orphans)), step.files, step.title)
             removals = step.remove
-            if step.remove_when:
+            if step.remove_pending:
+                result = runner(materialize(step.remove_pending, step.files))
+                if result.returncode != 0:
+                    raise DeployError(f"{step.title} failed: could not inventory obsolete IAM grants")
+                if not (result.stdout or "").strip():
+                    removals = ()
+            if step.remove_when and removals:
                 gate, skipped = step.remove_when
                 result = runner(materialize(gate, step.files))
                 if result.returncode != 0:
