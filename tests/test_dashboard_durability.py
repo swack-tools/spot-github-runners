@@ -829,7 +829,8 @@ class HealthAndGateTests(ServerHarness):
         status, msg, body = self.request("GET", "/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(set(body), {"status", "hydrated", "frozen", "reconciled", "active", "ownership",
-                                     "state_version", "slot", "kv_writer"})
+                                     "state_version", "slot", "kv_writer", "image"})
+        self.assertIsNone(body["image"])  # DASHBOARD_IMAGE is set only by the control VM startup script
         self.assertTrue(body["active"])
         self.assertTrue(body["reconciled"])
         self.assertEqual((body["status"], body["hydrated"], body["frozen"], body["slot"], body["kv_writer"]),

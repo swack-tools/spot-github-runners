@@ -36,12 +36,16 @@ class FakeGcs:
     """Objects with generations; ``put`` honors ifGenerationMatch like the JSON API."""
 
     def __init__(self):
+        self.slept: list[float] = []
         self.objects: dict[str, tuple[bytes, int]] = {}
         self.next_generation = 100
         self.puts: list[tuple[str, int]] = []
         self.ambiguous: list[bool] = []  # per put: True = raise GcsAmbiguous after (or instead of) writing
         self.ambiguous_lands: list[bool] = []
         self.fail_put: Exception | None = None
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
 
     def write(self, name, data):
         self.next_generation += 1
@@ -137,6 +141,8 @@ class StoreTests(unittest.TestCase):
         store.save(b'{"ok": true}')
         self.assertEqual(fake.objects[OBJECT][0], b'{"ok": true}')
         self.assertEqual(len(fake.puts), 2)
+        # The retry waited first: Cloud Storage answers 429 to a second write of one object within a second.
+        self.assertEqual(fake.slept, [store_module.WRITE_BACKOFF_SECONDS])
 
     def test_writes_that_stay_unconfirmed_fail_closed(self):
         store, fake = make_store()
@@ -303,6 +309,15 @@ class AutoscalerIntegrationTests(unittest.TestCase):
         with patch.object(store_module, "_STORE", store):
             self.assertFalse(controller.import_deployment_receipt(state, self.path))
         self.assertEqual(store.restored, [receipt])
+
+    def test_a_receipt_recorded_on_another_machine_is_restored_next_to_this_state_file(self):
+        restored = []
+        store = SimpleNamespace(restore_receipt=lambda path: restored.append(path) or False)
+        foreign = "/Users/someone/Library/Application Support/Spot Runner Autoscaler/" + RECEIPT
+        state = {"host_operation": {"kind": "launch", "deployment_receipt": foreign, "vm": {}}}
+        with patch.object(store_module, "_STORE", store):
+            self.assertFalse(controller.import_deployment_receipt(state, self.path))
+        self.assertEqual(restored, [self.path.parent / RECEIPT])
 
     def test_the_floor_lease_guard_also_proves_the_state_is_durable(self):
         self.fake.write(OBJECT, b"{}")

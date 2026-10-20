@@ -171,10 +171,35 @@ class AutoscalerDeployConfig:
         return f"https://run.googleapis.com/v2/projects/{self.project}/locations/{self.region}/jobs/{self.job}:run"
 
     def job_args(self) -> list[str]:
-        """The container args: the operator's autoscaler flags plus the dedicated host account."""
-        args = list(self.autoscaler_args)
+        """The container args: the operator's autoscaler flags plus the dedicated host account, each flag that takes
+        a value joined to it (``--job-repository=owner/repo``): ``gcloud run jobs deploy --args`` refuses a list
+        that holds one item twice, and repeated flags such as --job-repository would otherwise repeat."""
+        from .spot_runner_autoscaler import args_parser
+
+        actions = args_parser()._option_string_actions
+
+        def action_for(flag: str):
+            # The flag itself, or the one long option it abbreviates, as argparse resolves it.
+            if flag in actions:
+                return flag, actions[flag]
+            matches = [name for name in actions if name.startswith("--") and name.startswith(flag)]
+            return (matches[0], actions[matches[0]]) if flag.startswith("--") and len(matches) == 1 else (flag, None)
+
+        source = list(self.autoscaler_args)
+        args: list[str] = []
+        index = 0
+        while index < len(source):
+            arg = source[index]
+            name, action = action_for(arg)
+            if (action is not None and action.nargs is None and index + 1 < len(source)
+                    and not source[index + 1].startswith("--")):
+                args.append(f"{name}={source[index + 1]}")
+                index += 2
+                continue
+            args.append(arg)
+            index += 1
         if not any(a == "--host-service-account" or a.startswith("--host-service-account=") for a in args):
-            args += ["--host-service-account", self.host_email]
+            args.append(f"--host-service-account={self.host_email}")
         return args
 
     def job_env(self) -> dict[str, str]:
@@ -241,6 +266,9 @@ def validate_args(config: AutoscalerDeployConfig) -> list[str]:
     for arg in args:
         if any(c in arg for c in "|\n\r") or not arg:
             problems.append(f"autoscaler argument {arg!r} is empty or holds '|' or a newline")
+    repeated = sorted({arg for arg in args if args.count(arg) > 1})
+    if repeated:
+        problems.append(f"autoscaler argument(s) {', '.join(repeated)} appear twice; gcloud refuses repeated --args")
     try:
         autoscaler_argv(args, {})
     except JobConfigError as exc:
@@ -383,13 +411,17 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
     steps.append(wd.Step(
         "Remove grants that are no longer configured (absent ones are skipped)", files=files,
         remove=(c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
-                  f"--role={config.compute_role}", *other, "--format=none"),),
+                  f"--role={config.compute_role}", *other, "--format=none"),)))
+    # Revoking a retired secret waits until the job mounts the new ones: an infrastructure-only deploy (no --image)
+    # keeps every grant, so the deployed job can still read what it mounts.
+    secret_prune = wd.Step(
+        "Revoke the job's access to secrets it no longer mounts (absent ones are skipped)",
         prune=((c("gcloud", "secrets", "list", p, f"--filter=labels.{SECRET_LABEL}=mounted",
                   "--format=value(name.basename())"), keep,
                 (c("gcloud", "secrets", "remove-iam-policy-binding", wd.NAME_ARG, p, f"--member={runtime}",
                    f"--role={wd.ROLE_SECRET}", "--format=none"),
                  c("gcloud", "secrets", "update", wd.NAME_ARG, p, f"--remove-labels={SECRET_LABEL}",
-                   "--format=none"))),)))
+                   "--format=none"))),))
     if not config.image:
         return steps
     env_arg = "--set-env-vars=^|^" + "|".join(f"{k}={v}" for k, v in sorted(config.job_env().items()))
@@ -404,6 +436,7 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
         c("gcloud", "run", "jobs", "add-iam-policy-binding", config.job, p, region,
           f"--member=serviceAccount:{config.invoker_email}", f"--role={wd.ROLE_INVOKER}", "--format=none"),
     )))
+    steps.append(secret_prune)
     if config.skip_scheduler:
         return steps
     scheduler = (p, location, f"--schedule={config.schedule}", "--time-zone=Etc/UTC", f"--uri={config.run_uri}",
