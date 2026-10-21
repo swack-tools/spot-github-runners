@@ -936,6 +936,54 @@ class GhApiFallbackTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError, msg=payload):
                     list_config_repo_targets(env={"GH_TOKEN": "t"})
 
+    def test_hardware_runner_sizing_and_16vcpu_32gib_baseline(self):
+        from lib import runner_manager
+        from lib.patch_console import validate_manifest
+
+        manifest = validate_patch_dict({
+            "schema": "spot-runner-patch-v1",
+            "hardware": {
+                "min_vcpu": 16,
+                "min_ram_gib": 32,
+                "runners_count": 2,
+                "runner_vcpu": 7,
+                "runner_ram_gib": 14,
+                "host_overhead_gib": 4,
+                "queued_jobs_threshold": 20,
+            },
+        })
+        canonical = manifest.to_canonical_dict()["hardware"]
+        self.assertEqual(canonical["min_vcpu"], 16)
+        self.assertEqual(canonical["min_ram_gib"], 32)
+        self.assertEqual(canonical["runners_count"], 2)
+        self.assertEqual(canonical["runner_vcpu"], 7)
+        self.assertEqual(canonical["runner_ram_gib"], 14)
+        self.assertEqual(canonical["host_overhead_gib"], 4)
+        self.assertEqual(canonical["queued_jobs_threshold"], 20)
+
+        # Console manifest validator accepts all new hardware sizing fields.
+        console_patch, errors, _ = validate_manifest(
+            json.dumps({"schema": "spot-runner-patch-v1", "hardware": canonical}),
+            path="defaults.yaml",
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(console_patch.to_canonical_dict()["hardware"], canonical)
+
+        # 16 vCPU / 32 GiB hosts default to 2 runners @ 7 vCPU / 14 GiB each (4 GiB host overhead).
+        for instance_type in ("c4d-highcpu-16", "n4d-highcpu-16", "n4-highcpu-16", "c2d-highcpu-16"):
+            args = runner_manager.args_parser().parse_args([
+                "--max-cost", "0.25",
+                "--instance-type", instance_type,
+                "--cpu", "16",
+                "--ram", "32",
+            ])
+            runner_manager.select_sizing(args)
+            self.assertEqual(
+                (args.runner_count, args.runner_cpu, args.runner_memory_gb),
+                (2, 7, 14),
+                instance_type,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

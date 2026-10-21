@@ -124,7 +124,8 @@ target holds the operation instead of selecting an arbitrary fallback.
 
 **Growth and shrinkage.** The planner reads absolute demand, not fleet averages:
 
-- One host over 75 percent CPU or memory, or a compatible queue delay or
+- One host over 75 percent CPU or memory, or a compatible queue delay (when at
+  least `--queued-jobs-threshold` jobs are queued; default `20`) or
   job-duration regression, grows the fleet when the signal holds in two
   distinct windows. Only a host OOM grows it after a single observation, and
   only when the job inventory and the host events from every host are
@@ -221,6 +222,7 @@ swack-tools:secret=spot-floor-github-<account>,account=<account>,group=<runner g
 | `group` | Organizations only. The runner group that the floor host's runner joins. The keeper requires a group with selected-repository access, and it refuses the Default group. Without `group`, the runner joins the Default group. Personal accounts support only repository runners, so a repository target has no group. |
 | `labels` | Extra scheduling labels joined with `+`, such as `ubuntu-latest`. Every floor runner also gets `spot`, its machine type, and its region. The keeper records the extra labels in the host metadata, so a later live patch keeps them. Labels compare without case, as on GitHub: the parser refuses a label listed twice in another case, and one that repeats a label every runner gets. At most 16 extra labels, the most the host metadata records. |
 | `ram` | The least RAM in GiB, from 4 to 32. The default is 16. |
+| `vcpu` | The floor host vCPU count (`4` or `16`). The default is `4` (1 runner). When `vcpu=16,ram=32` is set, the floor host provisions 2 runners with 7 vCPU and 14 GiB of RAM each, reserving 2 vCPU and 4 GiB of RAM for the host operating system and Docker engine. |
 
 The configuration is an environment variable of the watchdog service, not an
 object in the state bucket. Each change is a new service revision that the deploy

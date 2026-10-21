@@ -280,7 +280,7 @@ def default_scaling_config() -> dict[str, Any]:
             "scale_up_step_runners": 2,
             # Scale-up triggers
             "enable_queued_jobs_trigger": True,
-            "queued_jobs_threshold": 2,
+            "queued_jobs_threshold": 20,
             "enable_provisioned_jobs_trigger": True,
             "provisioned_jobs_threshold": 6,
             "enable_hourly_runs_scale_up": True,
@@ -551,13 +551,13 @@ def evaluate_scaling_decision(
             desired_runners = max(desired_runners, journal_oom_target_runners)
 
     # 3. Queued jobs waiting for a runner
-    if cfg.get("enable_queued_jobs_trigger", True) and queued_jobs >= _finite_int_val(cfg.get("queued_jobs_threshold", 2), "queued_jobs_threshold"):
+    if cfg.get("enable_queued_jobs_trigger", True) and queued_jobs >= _finite_int_val(cfg.get("queued_jobs_threshold", 20), "queued_jobs_threshold"):
         scale_up_reasons.append(
             {
                 "trigger": "queued_jobs",
                 "summary": (
                     f"{queued_jobs} queued jobs waiting for a runner "
-                    f"(threshold >= {cfg.get('queued_jobs_threshold', 2)})"
+                    f"(threshold >= {cfg.get('queued_jobs_threshold', 20)})"
                 ),
             }
         )

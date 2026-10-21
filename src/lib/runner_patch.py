@@ -144,6 +144,11 @@ class HardwarePatch:
     extra_labels: tuple[str, ...] = ()
     min_vcpu: int | None = None
     min_ram_gib: int | None = None
+    runners_count: int | None = None
+    runner_vcpu: int | None = None
+    runner_ram_gib: int | None = None
+    host_overhead_gib: int | None = None
+    queued_jobs_threshold: int | None = None
     qualify_command: str = ""
 
 
@@ -208,6 +213,11 @@ class RunnerPatch:
         payload = asdict(self)
         payload.pop("source_commit", None)
         payload.pop("source_branch", None)
+        hw = payload.get("hardware")
+        if isinstance(hw, dict):
+            for opt_key in ("runners_count", "runner_vcpu", "runner_ram_gib", "host_overhead_gib", "queued_jobs_threshold"):
+                if hw.get(opt_key) is None:
+                    hw.pop(opt_key, None)
         return payload
 
     @property
@@ -616,6 +626,27 @@ def validate_patch_dict(
     min_ram_gib = hw_raw.get("min_ram_gib")
     if min_ram_gib is not None and (not isinstance(min_ram_gib, int) or isinstance(min_ram_gib, bool) or min_ram_gib < 1):
         raise ValueError("hardware.min_ram_gib must be a positive integer")
+    runners_count = hw_raw.get("runners_count")
+    if runners_count is not None and (not isinstance(runners_count, int) or isinstance(runners_count, bool) or runners_count < 1):
+        raise ValueError("hardware.runners_count must be a positive integer")
+    runner_vcpu = hw_raw.get("runner_vcpu")
+    if runner_vcpu is not None and (not isinstance(runner_vcpu, int) or isinstance(runner_vcpu, bool) or runner_vcpu < 1):
+        raise ValueError("hardware.runner_vcpu must be a positive integer")
+    runner_ram_gib = hw_raw.get("runner_ram_gib")
+    if runner_ram_gib is not None and (not isinstance(runner_ram_gib, int) or isinstance(runner_ram_gib, bool) or runner_ram_gib < 2):
+        raise ValueError("hardware.runner_ram_gib must be an integer >= 2")
+    host_overhead_gib = hw_raw.get("host_overhead_gib")
+    if host_overhead_gib is not None and (not isinstance(host_overhead_gib, int) or isinstance(host_overhead_gib, bool) or host_overhead_gib < 0):
+        raise ValueError("hardware.host_overhead_gib must be a non-negative integer")
+    queued_jobs_threshold = hw_raw.get("queued_jobs_threshold")
+    if queued_jobs_threshold is not None and (not isinstance(queued_jobs_threshold, int) or isinstance(queued_jobs_threshold, bool) or queued_jobs_threshold < 1):
+        raise ValueError("hardware.queued_jobs_threshold must be a positive integer")
+    if runners_count is not None and runner_vcpu is not None and min_vcpu is not None:
+        if runners_count * runner_vcpu > min_vcpu:
+            raise ValueError("hardware.runners_count * hardware.runner_vcpu exceeds hardware.min_vcpu")
+    if runners_count is not None and runner_ram_gib is not None and min_ram_gib is not None:
+        if runners_count * runner_ram_gib + (host_overhead_gib or 0) > min_ram_gib:
+            raise ValueError("hardware.runners_count * hardware.runner_ram_gib + hardware.host_overhead_gib exceeds hardware.min_ram_gib")
     qualify_command = str(hw_raw.get("qualify_command") or "")
 
     host_raw = data.get("host") or {}
@@ -648,6 +679,11 @@ def validate_patch_dict(
             extra_labels=tuple(extra_labels),
             min_vcpu=min_vcpu,
             min_ram_gib=min_ram_gib,
+            runners_count=runners_count,
+            runner_vcpu=runner_vcpu,
+            runner_ram_gib=runner_ram_gib,
+            host_overhead_gib=host_overhead_gib,
+            queued_jobs_threshold=queued_jobs_threshold,
             qualify_command=qualify_command,
         ),
         host=HostPatch(
@@ -689,6 +725,10 @@ def merge_patch_dicts(defaults: dict[str, Any], override: dict[str, Any]) -> dic
         "min_ram_gib": hw_ovr.get("min_ram_gib", hw_def.get("min_ram_gib")),
         "qualify_command": hw_ovr.get("qualify_command") or hw_def.get("qualify_command") or "",
     }
+    for opt_key in ("runners_count", "runner_vcpu", "runner_ram_gib", "host_overhead_gib", "queued_jobs_threshold"):
+        opt_val = hw_ovr.get(opt_key, hw_def.get(opt_key))
+        if opt_val is not None:
+            merged["hardware"][opt_key] = opt_val
     host_def = defaults.get("host") or {}
     host_ovr = override.get("host") or {}
     host_files = {f["path"]: f for f in (host_def.get("files") or []) if isinstance(f, dict) and "path" in f}

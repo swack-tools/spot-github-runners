@@ -52,6 +52,11 @@ All keys are optional except where noted. A missing `schema` defaults to `spot-r
 | `extra_labels` | List of extra GitHub runner labels. Each matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`. |
 | `min_vcpu` | Positive integer. Booleans are refused. |
 | `min_ram_gib` | Positive integer, in GiB. |
+| `runners_count` | Positive integer. Sets the number of runner containers per host (for example, `2` on a 16 vCPU and 32 GiB host). |
+| `runner_vcpu` | Positive integer. Sets the vCPU limit allocated to each runner container (for example, `7` vCPU per runner). |
+| `runner_ram_gib` | Positive integer, in GiB. Sets the memory limit allocated to each runner container (for example, `14` GiB per runner). |
+| `host_overhead_gib` | Positive integer, in GiB. Reserves host RAM for the Linux kernel and Docker engine (for example, `4` GiB on a 32 GiB host). |
+| `queued_jobs_threshold` | Positive integer. Sets the minimum number of queued jobs before queue backlog triggers scale-up (for example, `20`). |
 | `qualify_command` | Shell script text. It runs as the last step of the host script. The image build and the container steps come after it. A failure stops the patch from completing. |
 
 The supported ISA names, the `/proc/cpuinfo` flags that the host script requires, and the Compute Engine machine families and CPU platforms that provide them are:
@@ -98,7 +103,7 @@ For a repository, the loader merges `defaults.yaml` with the repository file. Th
 | Setting | Merge rule |
 | --- | --- |
 | `schema`, `repository` | The repository file's value, else the default's. |
-| `hardware.arch`, `min_vcpu`, `min_ram_gib` | The repository file's value when the key is present, else the default's. |
+| `hardware.arch`, `min_vcpu`, `min_ram_gib`, `runners_count`, `runner_vcpu`, `runner_ram_gib`, `host_overhead_gib`, `queued_jobs_threshold` | The repository file's value when the key is present, else the default's. |
 | `hardware.qualify_command` | The repository file's value when it isn't empty, else the default's. |
 | `isa`, `extra_labels`, `apt_packages`, `boot_mkdirs` | The union, with default entries first, and duplicates removed. |
 | `sysctl` | Mapping merge. The repository file wins for a key that both define. |
@@ -303,6 +308,66 @@ A host counts as patched when its applied or pending digest is recorded and isn'
 
 !!! note "The LaunchAgent copies the option"
     Installing the macOS LaunchAgent with `--install-launch-agent` copies `--patch-repo` and `--config-repo` into the agent's arguments. Installing also writes and bootstraps the live daemon, so treat it as a live change.
+
+## Example: 16 vCPU and 32 GiB baseline with 2 runners
+
+To enforce a minimum host size of 16 vCPU and 32 GiB of RAM across every monitored repository, with 2 runners per host (7 vCPU and 14 GiB of RAM per runner, reserving 2 vCPU and 4 GiB of RAM for the host operating system and Docker engine) and a 20-job queue threshold before scale-up, set those values in `defaults.yaml` in the configuration repository:
+
+```yaml
+schema: spot-runner-patch-v1
+
+hardware:
+  arch: x86_64
+  isa:
+    - avx2
+  min_vcpu: 16
+  min_ram_gib: 32
+  runners_count: 2
+  runner_vcpu: 7
+  runner_ram_gib: 14
+  host_overhead_gib: 4
+  queued_jobs_threshold: 20
+
+host:
+  apt_packages:
+    - jq
+    - zstd
+  sysctl:
+    vm.max_map_count: 262144
+    fs.inotify.max_user_watches: 524288
+```
+
+A repository manifest under `repos/<owner>/<repo>.yaml` inherits those defaults and can add repository-specific ISA flags (such as `avx512` or `avx512-vbmi2`), extra scheduling labels (`ubuntu-latest`), host directories, container mounts, and Dockerfile commands:
+
+```yaml
+schema: spot-runner-patch-v1
+repository: swack-tools/oxidex
+
+hardware:
+  arch: x86_64
+  isa:
+    - avx512
+    - avx512-vbmi2
+  extra_labels:
+    - oxidex-fast
+  min_vcpu: 16
+  min_ram_gib: 32
+  runners_count: 2
+  runner_vcpu: 7
+  runner_ram_gib: 14
+  host_overhead_gib: 4
+  queued_jobs_threshold: 20
+
+host:
+  boot_mkdirs:
+    - /mnt/runner-data/cargo-shared
+
+container:
+  mounts:
+    - source: /mnt/runner-data/cargo-shared
+      target: /cache/cargo
+      read_only: false
+```
 
 ## Source files
 

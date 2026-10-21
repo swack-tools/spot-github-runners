@@ -58,8 +58,10 @@ def evidence_for(vms,runners,args,state):
               and len(health)==len(fleet))
     signals=workload_signals(list(data.get('capacity_jobs',{}).values()),
                              [set(row.labels) for row in runners if controller.runner_is_managed(row)],
-                             timestamp,group_ids={10})
+                             timestamp,group_ids={10},
+                             min_queued_jobs=getattr(args,'queued_jobs_threshold',20))
     signals['complete']=complete
+    signals['queued_jobs_threshold']=getattr(args,'queued_jobs_threshold',20)
     signals['minimum_job_memory_gib']=getattr(args,'tier_job_memory_gib',15)
     kinds=set().union(*(pending_kinds(state,key) for key in health))
     signals['host_oom']='host' in kinds
