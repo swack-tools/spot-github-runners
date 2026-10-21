@@ -83,6 +83,7 @@ DISK_PREFIX = "runner-data-"     # and their data disks
 RUNNER_PREFIX = "gha"
 BASE_LABEL = "spot"
 FLOOR_VCPU = 4                   # runner_manager sizing: host_vCPU // 4 runners, so 4 vCPU is one runner
+ALLOWED_FLOOR_VCPUS = (4, 16)
 DEFAULT_MIN_RAM_GIB = 16
 MAX_RAM_GIB = 32
 DATA_DISK_GB = 100
@@ -124,7 +125,7 @@ _LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _REGION_RE = re.compile(r"^[a-z]+-[a-z]+[0-9]+$")
 # Classic, OAuth, user-to-server, server-to-server, refresh, and fine-grained GitHub token prefixes.
 _TOKENISH_RE = re.compile(r"^(gh[pousr]_|github_pat_)")
-_OPTION_KEYS = ("secret", "account", "group", "labels", "ram")
+_OPTION_KEYS = ("secret", "account", "group", "labels", "ram", "vcpu")
 
 
 class FloorError(RuntimeError):
@@ -153,6 +154,11 @@ class FloorTarget:
     group_id: int | None = None  # organization runner group; None registers into the Default group
     labels: tuple[str, ...] = ()  # extra scheduling labels beyond spot, the machine type, and the region
     min_ram_gib: int = DEFAULT_MIN_RAM_GIB
+    vcpu: int = FLOOR_VCPU
+
+    @property
+    def runner_count(self) -> int:
+        return 2 if (self.vcpu == 16 and self.min_ram_gib == 32) else 1
 
     @property
     def target(self) -> TargetConfig:
@@ -254,7 +260,12 @@ def parse_targets(text: str | None) -> tuple[FloorTarget, ...]:
             if not options["ram"].isdigit() or not 4 <= int(options["ram"]) <= MAX_RAM_GIB:
                 raise ValueError(f"floor target {name}: ram= must be a whole number of GiB from 4 to {MAX_RAM_GIB}")
             ram = int(options["ram"])
-        targets.append(FloorTarget(name, secret, account, group_id, tuple(labels), ram))
+        vcpu = FLOOR_VCPU
+        if "vcpu" in options:
+            if not options["vcpu"].isdigit() or int(options["vcpu"]) not in ALLOWED_FLOOR_VCPUS:
+                raise ValueError(f"floor target {name}: vcpu= must be 4 or 16")
+            vcpu = int(options["vcpu"])
+        targets.append(FloorTarget(name, secret, account, group_id, tuple(labels), ram, vcpu))
     if len(targets) > MAX_TARGETS:
         raise ValueError(f"at most {MAX_TARGETS} floor targets")
     return tuple(targets)
@@ -950,20 +961,21 @@ class FloorOffer:
                 "total_daily_usd": str(self.total_daily_usd.quantize(Decimal("0.0001")))}
 
 
-def machine_type_filter(regions: Sequence[str]) -> str:
-    """The ``--filter`` for 4-vCPU machine types in ``regions``.
+def machine_type_filter(regions: Sequence[str], vcpu: int = FLOOR_VCPU) -> str:
+    """The ``--filter`` for ``vcpu``-vCPU machine types in ``regions``.
 
     One ``zone~^<region>-`` term per region joined with OR: gcloud 589 crashes (TypeError) on a regex alternation
     such as ``zone~^(a|b)-``. Each region matches _REGION_RE (letters, digits, and hyphens only).
     """
     zones = " OR ".join(f"zone~^{region}-" for region in regions)
-    return f"--filter=guestCpus={FLOOR_VCPU} AND ({zones})"
+    return f"--filter=guestCpus={vcpu} AND ({zones})"
 
 
 def price_offers(shapes: Sequence[Mapping[str, Any]], regions: Sequence[str], min_ram_gib: int, *,
                  rates: Callable[[str, str], tuple[Decimal, Decimal]],
-                 storage: Callable[[str], Mapping[str, Decimal]]) -> list[FloorOffer]:
-    """Price every 4-vCPU shape of a supported x86 family in ``regions`` with at least ``min_ram_gib``.
+                 storage: Callable[[str], Mapping[str, Decimal]],
+                 target_vcpu: int = FLOOR_VCPU) -> list[FloorOffer]:
+    """Price every ``target_vcpu``-vCPU shape of a supported x86 family in ``regions`` with at least ``min_ram_gib``.
 
     ``shapes`` are machine-type rows (name, zone, guestCpus, memoryMb); ``rates(region, family)`` returns the exact
     Spot (core, GiB) hourly prices and ``storage(region)`` the disk rates, both from the billing catalog, the same
@@ -983,7 +995,7 @@ def price_offers(shapes: Sequence[Mapping[str, Any]], regions: Sequence[str], mi
         except (TypeError, ValueError):
             continue
         ram_gib = memory_mb // 1024
-        if (region not in regions or vcpu != FLOOR_VCPU or machine_profile(name) is None
+        if (region not in regions or vcpu != target_vcpu or machine_profile(name) is None
                 or not min_ram_gib <= ram_gib <= MAX_RAM_GIB or memory_mb % 1024):
             continue
         family = name.split("-", 1)[0]
@@ -1041,20 +1053,22 @@ def manager_argv(project: str, target: FloorTarget, offer_or_op: Mapping[str, An
                  disk_name: str, max_daily_usd: Decimal) -> list[str]:
     """runner_manager arguments for a floor host (recorded in the operation so later ticks rebuild the same)."""
     data = offer_or_op.to_dict() if isinstance(offer_or_op, FloorOffer) else dict(offer_or_op)
+    ram_gib = int(data["ram_gib"])
+    runner_count = 2 if (target.vcpu == 16 and ram_gib == 32) else target.runner_count
     argv = ["--project", project, "--target", target.name,
             "--max-cost", str((Decimal(max_daily_usd) / 24).quantize(Decimal("0.000001"))),
             "--max-total-daily-usd", str(max_daily_usd), "--cheapest-storage",
             "--instance-type", str(data["machine_type"]), "--region", str(data["region"]), "--zone", str(data["zone"]),
-            "--cpu", str(FLOOR_VCPU), "--ram", str(int(data["ram_gib"])), "--instance-name", name,
+            "--cpu", str(target.vcpu), "--ram", str(ram_gib), "--instance-name", name,
             "--disk-device-name", disk_name, "--disk-size-gb", str(DATA_DISK_GB),
-            "--runner-prefix", RUNNER_PREFIX, "--runner-label", BASE_LABEL, "--runner-count", "1"]
+            "--runner-prefix", RUNNER_PREFIX, "--runner-label", BASE_LABEL, "--runner-count", str(runner_count)]
     if target.group_id:
         argv += ["--runner-group-id", str(target.group_id)]
     return argv
 
 
 def manager_args(argv: Sequence[str], target: FloorTarget) -> argparse.Namespace:
-    """Parse and size runner_manager arguments for a floor host: one runner, no service account."""
+    """Parse and size runner_manager arguments for a floor host: one runner (or two on 16 vCPU / 32 GiB), no service account."""
     from . import runner_manager
 
     args = runner_manager.args_parser().parse_args(list(argv))
@@ -1065,8 +1079,13 @@ def manager_args(argv: Sequence[str], target: FloorTarget) -> argparse.Namespace
     # needs no iam.serviceAccountUser on any runner account.
     args.no_service_account = True
     runner_manager.select_sizing(args)
-    if args.runner_count != 1:
-        raise FloorError(f"a {FLOOR_VCPU}-vCPU floor host must size to exactly one runner, not {args.runner_count}")
+    expected_count = 2 if (target.vcpu == 16 and getattr(args, "ram", 0) == 32) else target.runner_count
+    if args.runner_count != expected_count:
+        if expected_count == 1:
+            raise FloorError(f"a {target.vcpu}-vCPU floor host must size to exactly one runner, not {args.runner_count}")
+        raise FloorError(
+            f"a {target.vcpu}-vCPU floor host must size to exactly {expected_count} runners, not {args.runner_count}"
+        )
     return args
 
 
@@ -1122,7 +1141,7 @@ class GcloudProvider:
         from .runner_manager import spot_rates
         from .storage_selection import storage_rates
 
-        out = self._checked(["compute", "machine-types", "list", machine_type_filter(config.regions),
+        out = self._checked(["compute", "machine-types", "list", machine_type_filter(config.regions, target.vcpu),
                              "--format=json(name,zone,guestCpus,memoryMb)"], "machine-type inventory", timeout=120)
         rows = json.loads(out or "[]")
         from .billing_catalog import catalog_skus
@@ -1132,7 +1151,7 @@ class GcloudProvider:
             except (OSError, ValueError) as exc:
                 raise FloorError(f"the billing catalog is unavailable, so no floor offer can be priced: {exc}") from exc
             return price_offers(rows if isinstance(rows, list) else [], config.regions, target.min_ram_gib,
-                                rates=spot_rates, storage=storage_rates)
+                                rates=spot_rates, storage=storage_rates, target_vcpu=target.vcpu)
 
     def preflight(self, args: argparse.Namespace, zone: str) -> None:
         """runner_manager's live price, storage, and quota checks; raises when the offer is over the cap."""
@@ -1248,7 +1267,8 @@ class FloorKeeper:
                              occupied_regions=sorted({h.region for h in others}))
         if offer is None:
             self._record_failure(None)
-            return self._saved("launch_held", f"no 4-vCPU Spot offer with at least {self.target.min_ram_gib} GiB costs "
+            return self._saved("launch_held", f"no {self.target.vcpu}-vCPU Spot offer with at least "
+                                            f"{self.target.min_ram_gib} GiB costs "
                                             f"less than ${self.config.max_daily_usd}/day in "
                                             f"{', '.join(self.config.regions)} outside failed zones")
         suffix = launch_name_suffix(offer.region, offer.zone, self.target.name)
@@ -1330,7 +1350,8 @@ class FloorKeeper:
             self.record["late_creates"] = [e for e in self.record["late_creates"] if e is not entry]
             return self._saved("late_create_left", f"{vm.name} is now instance {vm.instance_id}, not the "
                                                  f"{entry['instance_id']} first seen; it isn't this keeper's to delete")
-        names = list((entry.get("operation") or {}).get("expected_runners") or expected_runner_names(vm.name))
+        names = list((entry.get("operation") or {}).get("expected_runners")
+                     or expected_runner_names(vm.name, self.target.runner_count))
         runners = {r.name: r for r in self.github.list_runners(self.target.target)}
         active = [n for n in names if n in runners and (runners[n].online or runners[n].busy)]
         if active:
@@ -1609,7 +1630,7 @@ def status_report(config: FloorConfig, services: Services) -> list[dict[str, Any
             runners = services.github_for(target, None).list_runners(target.target)
             plan = plan_target(target, hosts, runners, record, services.clock())
             own = managed_hosts(target, hosts)
-            names = {n for h in own for n in expected_runner_names(h.name)}
+            names = {n for h in own for n in expected_runner_names(h.name, target.runner_count)}
             prefix = f"{RUNNER_PREFIX}-{HOST_PREFIX}"
             row.update(plan=plan.describe(), hosts=[asdict(h) for h in own],
                        runners=[{"name": r.name, "status": r.status, "busy": r.busy, "labels": list(r.labels)}

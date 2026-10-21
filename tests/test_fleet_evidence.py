@@ -71,3 +71,25 @@ class EvidenceTests(unittest.TestCase):
                              labels=['self-hosted','linux','x64'] if index%2 else ['SELF-HOSTED','Linux','X64'],
                              conclusion='success',started_at=iso(start),completed_at=iso(start+duration)))
         self.assertTrue(workload_signals(jobs,[{'self-hosted','Linux','X64'}],12000)['duration_regression'])
+
+    def test_twenty_queued_jobs_threshold_suppresses_early_scale_up(self):
+        from lib.dashboard_scaling import default_scaling_config
+        self.assertEqual(default_scaling_config()['cicd_runner']['queued_jobs_threshold'], 20)
+        labels = [{'self-hosted', 'Linux', 'X64', 'spot'}]
+        nineteen = [
+            dict(id=i, status='queued', labels=['self-hosted', 'Linux', 'X64', 'spot'],
+                 created_at='1970-01-01T00:00:00Z', runner_group_id=10)
+            for i in range(19)
+        ]
+        under = workload_signals(nineteen, labels, 1000, group_ids={10}, min_queued_jobs=20)
+        self.assertEqual(under['queued_jobs'], 19)
+        self.assertFalse(under['pending'])
+        self.assertFalse(under['queue_delayed'])
+        twenty = nineteen + [
+            dict(id=20, status='queued', labels=['self-hosted', 'Linux', 'X64', 'spot'],
+                 created_at='1970-01-01T00:00:00Z', runner_group_id=10)
+        ]
+        at_threshold = workload_signals(twenty, labels, 1000, group_ids={10}, min_queued_jobs=20)
+        self.assertEqual(at_threshold['queued_jobs'], 20)
+        self.assertTrue(at_threshold['pending'])
+        self.assertTrue(at_threshold['queue_delayed'])

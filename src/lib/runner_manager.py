@@ -240,14 +240,45 @@ def select_sizing(args: argparse.Namespace) -> None:
         if len(f'{args.runner_prefix}-{args.instance_name}-{args.runner_count}') > 64:
             raise RuntimeError('GitHub runner name exceeds64 characters')
         return
-    host_overhead = int(getattr(args, 'host_overhead_gib', 2)) if args.ram <= 8 else (4 if args.ram <= 16 else 8)
+    if patch is not None and patch.hardware.host_overhead_gib is not None:
+        host_overhead = int(patch.hardware.host_overhead_gib)
+    elif args.cpu == 16 and args.ram == 32:
+        host_overhead = 4
+    else:
+        host_overhead = int(getattr(args, 'host_overhead_gib', 2)) if args.ram <= 8 else (4 if args.ram <= 16 else 8)
 
     if not args.fixed_runner_sizing:
         if args.cpu < 2:
             raise RuntimeError("At least 2 host vCPUs are required for one runner")
         if args.ram < 4:
             raise RuntimeError("At least 4 GiB host RAM is required for one runner")
-        if getattr(args, "runner_count", None) == 1 or args.cpu < 4 or args.ram <= 8:
+        if patch is not None and (
+            patch.hardware.runners_count is not None
+            or patch.hardware.runner_vcpu is not None
+            or patch.hardware.runner_ram_gib is not None
+        ):
+            args.runner_count = (
+                patch.hardware.runners_count
+                if patch.hardware.runners_count is not None
+                else (2 if (args.cpu == 16 and args.ram == 32) else max(1, args.cpu // 4))
+            )
+            args.runner_cpu = (
+                patch.hardware.runner_vcpu
+                if patch.hardware.runner_vcpu is not None
+                else (7 if (args.cpu == 16 and args.ram == 32 and args.runner_count == 2) else min(4, args.cpu // args.runner_count))
+            )
+            args.runner_memory_gb = (
+                patch.hardware.runner_ram_gib
+                if patch.hardware.runner_ram_gib is not None
+                else max(2, (args.ram - host_overhead) // args.runner_count)
+            )
+            args.fixed_runner_sizing = True
+        elif args.cpu == 16 and args.ram == 32 and getattr(args, "runner_count", None) != 1:
+            args.runner_count = 2
+            args.runner_cpu = 7
+            args.runner_memory_gb = 14
+            args.fixed_runner_sizing = True
+        elif getattr(args, "runner_count", None) == 1 or args.cpu < 4 or args.ram <= 8:
             args.runner_count = 1
             args.runner_cpu = min(4, args.cpu)
             args.runner_memory_gb = max(2, args.ram - host_overhead)

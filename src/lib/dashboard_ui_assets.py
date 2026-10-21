@@ -1023,7 +1023,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
             <div class="field">
               <label>Scale-Up Queued Jobs Waiting (&gt;=)</label>
-              <input type="number" id="sc-queued-thresh" min="1" max="100" value="2" />
+              <input type="number" id="sc-queued-thresh" min="1" max="100" value="20" />
             </div>
             <div class="field">
               <label>Scale-Up Provisioned Jobs (&gt;=)</label>
@@ -2701,7 +2701,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       const policy = {
         min_runners: parseInt(document.getElementById("sc-min-runners").value || "4", 10),
         max_runners: parseInt(document.getElementById("sc-max-runners").value || "24", 10),
-        queued_jobs_threshold: parseInt(document.getElementById("sc-queued-thresh").value || "2", 10),
+        queued_jobs_threshold: parseInt(document.getElementById("sc-queued-thresh").value || "20", 10),
         provisioned_jobs_threshold: parseInt(document.getElementById("sc-prov-thresh").value || "6", 10),
         hourly_runs_scale_up_threshold: parseInt(document.getElementById("sc-hourly-up-thresh").value || "20", 10),
         cpu_threshold_percent: parseFloat(document.getElementById("sc-cpu-thresh").value || "50"),

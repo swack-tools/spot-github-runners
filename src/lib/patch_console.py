@@ -55,7 +55,19 @@ _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _FIELD_RE = re.compile(r"\b((?:hardware|host|container)\.[a-z_]+)\b")
 SECTION_KEYS = {
-    "hardware": {"arch", "isa", "extra_labels", "min_vcpu", "min_ram_gib", "qualify_command"},
+    "hardware": {
+        "arch",
+        "isa",
+        "extra_labels",
+        "min_vcpu",
+        "min_ram_gib",
+        "runners_count",
+        "runner_vcpu",
+        "runner_ram_gib",
+        "host_overhead_gib",
+        "queued_jobs_threshold",
+        "qualify_command",
+    },
     "host": {"apt_packages", "sysctl", "files", "boot_mkdirs", "boot_script"},
     "container": {"apt_packages", "sysctl", "mounts", "files", "dockerfile_run"},
 }

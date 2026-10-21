@@ -3077,6 +3077,8 @@ def args_parser() -> argparse.ArgumentParser:
         return value
     parser.add_argument('--tier-job-memory-gib',type=job_memory,default=15,
                         help='Per-job cap/reservation; default 15 GiB is a verified compatible workload cap, not a measured peak')
+    parser.add_argument('--queued-jobs-threshold', type=int, default=20,
+                        help='Minimum queued jobs required before queue backlog triggers scale-up (default: 20)')
     parser.add_argument('--dry-run',action='store_true',help='Read-only tier decision; never mutate providers or controller state')
     parser.add_argument('--manage-control-vm', action='store_true', default=False,
                         help='Also manage the Spot control VM that hosts the dashboard (bootstrap, preemption '

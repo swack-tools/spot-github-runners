@@ -163,9 +163,10 @@ def record_resources(state, vms, samples, timestamp):
     return observations
 
 
-def workload_signals(jobs, runner_labels, timestamp, *, group_ids=None):
-    result = dict(pending=False,queue_delayed=False,duration_regression=False)
+def workload_signals(jobs, runner_labels, timestamp, *, group_ids=None, min_queued_jobs=1):
+    result = dict(pending=False,queue_delayed=False,duration_regression=False,queued_jobs=0)
     completions = {}
+    delayed_queued_jobs = 0
     # GitHub matches runner labels case-insensitively, including default OS/CPU
     # labels. Use the same identity for queue fit and duration-history grouping.
     available_labels = [{label.casefold() for label in available} for available in runner_labels]
@@ -177,10 +178,10 @@ def workload_signals(jobs, runner_labels, timestamp, *, group_ids=None):
             continue
         try:
             if job.get('status') in ('queued','waiting','pending','requested'):
-                result['pending'] = True
+                result['queued_jobs'] += 1
                 created = job.get('created_at') or job.get('run_created_at')
                 if created and timestamp - epoch(created) > 120:
-                    result['queue_delayed'] = True
+                    delayed_queued_jobs += 1
             elif job.get('conclusion') == 'success' and job.get('completed_at') and job.get('started_at'):
                 if timestamp - epoch(job['completed_at']) > 86400:
                     continue
@@ -190,6 +191,11 @@ def workload_signals(jobs, runner_labels, timestamp, *, group_ids=None):
                     completions.setdefault(key,[]).append((epoch(job['completed_at']),duration))
         except (ValueError, TypeError, OverflowError):
             continue
+    threshold = max(1, int(min_queued_jobs))
+    if result['queued_jobs'] >= threshold:
+        result['pending'] = True
+        if delayed_queued_jobs > 0:
+            result['queue_delayed'] = True
     for values in completions.values():
         values.sort()
         if len(values) >= 10:

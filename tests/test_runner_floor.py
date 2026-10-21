@@ -1658,5 +1658,23 @@ class MachineTypeFilterTests(unittest.TestCase):
         self.assertEqual(flt, "--filter=guestCpus=4 AND (zone~^us-central1- OR zone~^us-east1-)")
         self.assertNotIn("|", flt)
 
+    def test_sixteen_vcpu_32_gib_floor_target_sizes_two_runners(self):
+        targets = rf.parse_targets(
+            "swack-tools:secret=spot-floor-github-swackhamer,account=swackhamer,group=10,vcpu=16,ram=32"
+        )
+        self.assertEqual(len(targets), 1)
+        t = targets[0]
+        self.assertEqual((t.vcpu, t.min_ram_gib, t.runner_count), (16, 32, 2))
+        self.assertEqual(
+            rf.machine_type_filter(("us-central1",), t.vcpu),
+            "--filter=guestCpus=16 AND (zone~^us-central1-)",
+        )
+        offer = rf.FloorOffer("c4d-highcpu-16", "us-central1", "us-central1-a", 32, Decimal("0.10"), Decimal("5"))
+        argv = rf.manager_argv(PROJECT, t, offer, "oxidex-runners-test", "runner-data-test", Decimal("5.00"))
+        args = rf.manager_args(argv, t)
+        self.assertEqual((args.cpu, args.ram, args.runner_count, args.runner_cpu, args.runner_memory_gb), (16, 32, 2, 7, 14))
+        with self.assertRaises(ValueError):
+            rf.parse_targets("swack-tools:secret=s,vcpu=8")
+
 if __name__ == "__main__":
     unittest.main()
