@@ -2131,12 +2131,21 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       } else {
         instancesHtml = running.map(inst => {
           const p = inst.pricing;
-          const hr = withDiskTax ? p.total_hourly_usd : p.compute_hourly_usd;
-          const day = withDiskTax ? p.total_daily_usd : p.compute_daily_usd;
-          const mo = withDiskTax ? p.total_monthly_usd : p.compute_monthly_usd;
-          const modeNote = withDiskTax
-            ? `Includes ${inst.boot_disk_gb}GB ${inst.boot_disk_type} + ${inst.data_disk_gb}GB ${inst.data_disk_type} ($${p.disk_daily_usd.toFixed(2)}/day) & ${p.tax_rate_percent}% tax`
-            : `Compute Spot price only (excludes disk & taxes)`;
+          const hasPricing = !!(p && p.total_hourly_usd != null);
+          const hr = hasPricing
+            ? (withDiskTax ? p.total_hourly_usd : p.compute_hourly_usd)
+            : (inst.active_hourly_usd || 0);
+          const day = hasPricing
+            ? (withDiskTax ? p.total_daily_usd : p.compute_daily_usd)
+            : (hr * 24);
+          const mo = hasPricing
+            ? (withDiskTax ? p.total_monthly_usd : p.compute_monthly_usd)
+            : (day * 30);
+          const modeNote = hasPricing && p.disk_daily_usd != null
+            ? (withDiskTax
+              ? `Includes ${inst.boot_disk_gb || 0}GB ${inst.boot_disk_type || ''} + ${inst.data_disk_gb || 0}GB ${inst.data_disk_type || ''} ($${p.disk_daily_usd.toFixed(2)}/day) & ${p.tax_rate_percent || 0}% tax`
+              : `Compute Spot price only (excludes disk & taxes)`)
+            : `Pricing record unconfigured for ${esc(inst.machine_type)}`;
 
           return `
             <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:12px;">
@@ -2155,19 +2164,19 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-bottom:8px;">
                 <div style="background:#0b1120; border:1px solid var(--border); border-radius:7px; padding:8px;">
                   <div style="font-size:10.5px; color:var(--text-muted);">SPOT PRICE / HOUR</div>
-                  <div class="mono" style="font-size:16px; font-weight:700; color:#38bdf8;">$${hr.toFixed(4)}/hr</div>
+                  <div class="mono" style="font-size:16px; font-weight:700; color:#38bdf8;">${hasPricing ? `$${hr.toFixed(4)}/hr` : (hr > 0 ? `$${hr.toFixed(4)}/hr` : "Unknown")}</div>
                 </div>
                 <div style="background:#0b1120; border:1px solid var(--border); border-radius:7px; padding:8px;">
                   <div style="font-size:10.5px; color:var(--text-muted);">SPOT PRICE / DAY</div>
-                  <div class="mono" style="font-size:16px; font-weight:700; color:#34d399;">$${day.toFixed(2)}/day</div>
+                  <div class="mono" style="font-size:16px; font-weight:700; color:#34d399;">${hasPricing ? `$${day.toFixed(2)}/day` : (day > 0 ? `$${day.toFixed(2)}/day` : "Unknown")}</div>
                 </div>
                 <div style="background:#0b1120; border:1px solid var(--border); border-radius:7px; padding:8px;">
                   <div style="font-size:10.5px; color:var(--text-muted);">SPOT PRICE / MONTH</div>
-                  <div class="mono" style="font-size:16px; font-weight:700; color:#c4b5fd;">$${mo.toFixed(2)}/mo</div>
+                  <div class="mono" style="font-size:16px; font-weight:700; color:#c4b5fd;">${hasPricing ? `$${mo.toFixed(2)}/mo` : (mo > 0 ? `$${mo.toFixed(2)}/mo` : "Unknown")}</div>
                 </div>
               </div>
               <div style="font-size:11.5px; color:var(--text-muted); margin-bottom:10px;">
-                💡 ${esc(modeNote)} · CPU: <strong>${esc(inst.cpu_platform)}</strong> (Benchmark: <strong>${inst.benchmark_score}</strong>)
+                💡 ${esc(modeNote)} · CPU: <strong>${esc(inst.cpu_platform || 'Unknown')}</strong> (Benchmark: <strong>${inst.benchmark_score != null ? inst.benchmark_score : '—'}</strong>)
               </div>
 
               <div style="font-size:11.5px; font-weight:600; color:var(--text-muted);">SSH Into GCloud Instance (Terminal Command):</div>
@@ -2656,7 +2665,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           <td class="mono"><strong>${r.units_per_instance}</strong> (${r.unit_vcpu}c/${r.unit_ram_gib}G each)</td>
           <td class="mono">${r.instances_needed_for_floor} VM(s) (${r.total_units_at_floor} total)</td>
           <td class="mono">${r.data_disk_gb}GB ${esc(r.data_disk_type)}</td>
-          <td class="mono">$${r.pricing.compute_hourly_usd.toFixed(4)}/hr · $${r.pricing.compute_daily_usd.toFixed(2)}/d</td>
+          <td class="mono">${r.pricing ? `$${r.pricing.compute_hourly_usd.toFixed(4)}/hr · $${r.pricing.compute_daily_usd.toFixed(2)}/d` : "—"}</td>
           <td class="mono" style="font-weight:700;">$${r.evaluated_hourly_usd.toFixed(4)}/hr · $${r.evaluated_daily_usd.toFixed(2)}/d · $${r.evaluated_monthly_usd.toFixed(2)}/mo</td>
           <td>
             ${r.price_qualifies

@@ -54,12 +54,37 @@ DISK_DEVICE_NAME="builder-cache-disk"
 DEPLOYMENT_ID="${INSTANCE_NAME}"
 UPLOADER_MAPPING="/path/to/approved-uploader-mapping.json"
 UPLOADER_CONFIG=$(jq -c . "$UPLOADER_MAPPING")
-UPLOADER_SHA=$(sha256sum "$UPLOADER_MAPPING" | awk '{print $1}')
+UPLOADER_SHA=$(printf '%s' "$UPLOADER_CONFIG" | sha256sum | awk '{print $1}')
 BUILD_CONFIG='{"approved_image_id":null,"cpus":16,"image":"oxidex-remote-builder:1.99.0","memory_gib":28,"role":"builder"}'
 ADMISSION_CONFIG='{"builder_cpus":16,"builder_gib":28,"host_cpus":16,"role":"builder","runner_gib":0,"runner_names":[],"work_gib":28}'
-HOST_AGENT_B64=$(base64 -w0 /usr/local/bin/host-agent 2>/dev/null || base64 /usr/local/bin/host-agent | tr -d '\n')
-BUILDER_DOCKERFILE_B64=$(base64 -w0 builder/Dockerfile 2>/dev/null || base64 builder/Dockerfile | tr -d '\n')
-ASSET_WRITES="install -d -m 0755 /usr/local/bin /opt/oxidex-builder/image; printf '%s' '${HOST_AGENT_B64}' | base64 -d >/usr/local/bin/host-agent; chmod 0755 /usr/local/bin/host-agent; printf '%s' '${BUILDER_DOCKERFILE_B64}' | base64 -d >/opt/oxidex-builder/image/Dockerfile"
+
+# Prepare builder asset writes script to stage binary payloads without exceeding command argument length limits
+cat << 'EOF' > /tmp/builder_assets.sh
+install -d -m 0755 /usr/local/bin /opt/oxidex-builder/image
+cat << 'ASSET_EOF' | base64 -d > /usr/local/bin/host-agent
+EOF
+base64 /usr/local/bin/host-agent >> /tmp/builder_assets.sh
+cat << 'EOF' >> /tmp/builder_assets.sh
+ASSET_EOF
+chmod 0755 /usr/local/bin/host-agent
+
+cat << 'ASSET_EOF' > /opt/oxidex-builder/image/Dockerfile
+EOF
+cat builder/standalone/Dockerfile >> /tmp/builder_assets.sh
+cat << 'EOF' >> /tmp/builder_assets.sh
+ASSET_EOF
+
+cat << 'ASSET_EOF' > /opt/oxidex-builder/image/website-package.json
+EOF
+cat builder/standalone/website-package.json >> /tmp/builder_assets.sh
+cat << 'EOF' >> /tmp/builder_assets.sh
+ASSET_EOF
+
+cat << 'ASSET_EOF' > /opt/oxidex-builder/image/website-package-lock.json
+EOF
+cat builder/standalone/website-package-lock.json >> /tmp/builder_assets.sh
+cat << 'EOF' >> /tmp/builder_assets.sh
+ASSET_EOF
 
 sed -e "s/{{INSTANCE_NAME}}/${INSTANCE_NAME}/g" \
     -e "s/{{PROJECT}}/${PROJECT}/g" \
@@ -70,8 +95,9 @@ sed -e "s/{{INSTANCE_NAME}}/${INSTANCE_NAME}/g" \
     -e "s/{{UPLOADER_SHA}}/${UPLOADER_SHA}/g" \
     -e "s|{{BUILD_CONFIG}}|${BUILD_CONFIG}|g" \
     -e "s|{{ADMISSION_CONFIG}}|${ADMISSION_CONFIG}|g" \
-    -e "s|{{ASSET_WRITES}}|${ASSET_WRITES}|g" \
+    -e '/{{ASSET_WRITES}}/{' -e 'r /tmp/builder_assets.sh' -e 'd' -e '}' \
     cloud-init/builder-startup.sh > /private/builder-startup.sh
+rm -f /tmp/builder_assets.sh
 
 gcloud compute instances create "${INSTANCE_NAME}" \
   --project="${PROJECT}" \

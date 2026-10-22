@@ -1,13 +1,16 @@
 use spot_dashboard_edge::gcp::{GceInsertInstanceRequest, GceMetadata, GceOperation};
 use spot_dashboard_edge::github::RunnerBootstrapConfig;
 use spot_dashboard_edge::reconciler::{
-    run_inventory_refresh, run_reconciliation, set_reconciler_lease, GcpReconcilerClient,
-    GitHubReconcilerClient, ReconcilerError, SimpleGceInstance, SimpleGitHubRunner,
+    refresh_fleet_inventory, run_inventory_refresh, run_reconciliation, set_reconciler_lease,
+    GcpReconcilerClient, GitHubReconcilerClient, ReconcilerError, SimpleGceInstance,
+    SimpleGitHubRunner,
 };
 use spot_dashboard_edge::state::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 pub struct MockKvStore {
     pub data: Mutex<HashMap<String, String>>,
@@ -503,8 +506,9 @@ impl GitHubReconcilerClient for MockGitHubFloorClient {
 
 #[tokio::test]
 async fn test_floor_keeper_target_collision_org_vs_repo() {
-    invalidate_state_cache();
+    let _lock = TEST_MUTEX.lock().unwrap();
     set_reconciler_lease(None);
+    invalidate_state_cache();
     let kv = MockKvStore::new();
     let now = 1792000000;
 
@@ -540,10 +544,13 @@ async fn test_floor_keeper_target_collision_org_vs_repo() {
         report.launched_hosts.iter().any(|h| h.contains("swack-tools") && !h.contains("swack-tools-oxidex")),
         "Org target swack-tools must have launched a floor host despite the presence of swack-tools/oxidex VM"
     );
+    set_reconciler_lease(None);
 }
 
 #[tokio::test]
 async fn test_read_only_inventory_refresh_never_mutates_fleet() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    set_reconciler_lease(None);
     invalidate_state_cache();
     let kv = MockKvStore::new();
     let now = 1792000000;
@@ -596,6 +603,8 @@ async fn test_overview_filter_nan_and_inf_window_hours_handling() {
 
 #[tokio::test]
 async fn test_read_only_inventory_refresh_marks_unqueried_runners_unknown() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    set_reconciler_lease(None);
     invalidate_state_cache();
     let kv = MockKvStore::new();
     let now = 1792000000;
@@ -657,5 +666,401 @@ async fn test_read_only_inventory_refresh_marks_unqueried_runners_unknown() {
     // GitHub was not queried during inventory refresh, so runner count is unknown
     assert_eq!(runner_rec.runners_count, 0);
     assert!(!runner_rec.runners_count_known);
+    set_reconciler_lease(None);
 }
+
+#[tokio::test]
+async fn test_inventory_refresh_diff_gating_zero_kv_writes_on_unchanged_inventory() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    set_reconciler_lease(None);
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    bundle.state.instances = vec![];
+    bundle.state.instances_view = vec![];
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    let gcp = MockGcpFloorClient {
+        instances: vec![SimpleGceInstance {
+            id: Some("1".into()),
+            name: "builder-dedicated-asia".to_string(),
+            zone: "asia-east2-a".to_string(),
+            machine_type: "n4-highcpu-16".to_string(),
+            status: "RUNNING".to_string(),
+            metadata: spot_dashboard_edge::gcp::GceMetadata {
+                fingerprint: None,
+                items: vec![],
+            },
+            disks: vec![],
+        }],
+    };
+
+    // First refresh writes state
+    let report1 = run_inventory_refresh(&kv, &gcp, now).await.unwrap();
+    assert!(report1.snapshot_written);
+    let kv_puts_after_first = kv.put_count.load(Ordering::SeqCst);
+
+    // Second refresh with identical inventory must diff-gate: snapshot_written = false, 0 KV puts
+    let report2 = run_inventory_refresh(&kv, &gcp, now + 10).await.unwrap();
+    assert!(!report2.snapshot_written);
+    let kv_puts_after_second = kv.put_count.load(Ordering::SeqCst);
+    assert_eq!(kv_puts_after_first, kv_puts_after_second);
+}
+
+#[tokio::test]
+async fn test_refresh_fleet_inventory_fails_without_credentials() {
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    bundle.state.instances = vec![InstanceRecord {
+        id: "inst-seed".into(),
+        name: "oxidex-runners-c4d-seed".into(),
+        zone: "us-central1-a".into(),
+        region: "us-central1".into(),
+        machine_type: "c4d-highcpu-16".into(),
+        status: "RUNNING".into(),
+        role: "cicd_runner".into(),
+        vcpu: 16,
+        ram_gib: 32,
+        runners_count: 2,
+        runners_count_known: true,
+        runner_limits_known: true,
+        created_at: None,
+        created_epoch: None,
+    }];
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    // Absent credentials must return Err rather than silently wiping inventory with simulated provider
+    let res_none = refresh_fleet_inventory(&kv, None, now).await;
+    assert!(res_none.is_err());
+
+    let res_empty = refresh_fleet_inventory(&kv, Some("   "), now).await;
+    assert!(res_empty.is_err());
+
+    let res_corrupt = refresh_fleet_inventory(&kv, Some("invalid-json"), now).await;
+    assert!(res_corrupt.is_err());
+
+    // Verify existing state was preserved untouched
+    let (fresh_bundle, _) = load_state(&kv, now).await.unwrap();
+    assert_eq!(fresh_bundle.state.instances.len(), 1);
+    assert_eq!(fresh_bundle.state.instances[0].name, "oxidex-runners-c4d-seed");
+}
+
+#[tokio::test]
+async fn test_overview_filter_preserves_live_gce_provisioning_and_staging_states() {
+    let now = 1792000000;
+    let now_f64 = now as f64;
+
+    let mut ov = serde_json::json!({
+        "instances_view": {
+            "instances": [
+                {
+                    "name": "oxidex-runners-c4d-staging",
+                    "status": "STAGING",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 100.0,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.18 }
+                },
+                {
+                    "name": "oxidex-runners-c4d-provisioning",
+                    "status": "PROVISIONING",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 50.0,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.18 }
+                },
+                {
+                    "name": "oxidex-runners-c4d-terminated",
+                    "status": "TERMINATED",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 5000.0,
+                    "deleted_epoch": now_f64 - 1000.0,
+                    "pricing": { "total_hourly_usd": 0.18 }
+                }
+            ]
+        }
+    });
+
+    let query = OverviewQuery {
+        include_deleted: Some(false),
+        ..Default::default()
+    };
+    apply_dynamic_overview_filtering(&mut ov, &query, &[], now);
+
+    let instances = ov["instances_view"]["instances"].as_array().unwrap();
+    // Live non-running states (STAGING, PROVISIONING) must remain visible when include_deleted = false
+    assert_eq!(instances.len(), 2);
+    let names: Vec<&str> = instances.iter().map(|i| i["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"oxidex-runners-c4d-staging"));
+    assert!(names.contains(&"oxidex-runners-c4d-provisioning"));
+    assert!(!names.contains(&"oxidex-runners-c4d-terminated"));
+}
+
+#[tokio::test]
+async fn test_overview_filter_retires_snapshot_rows_absent_from_live_inventory() {
+    let now = 1792000000;
+    let now_f64 = now as f64;
+
+    let mut ov = serde_json::json!({
+        "instances_view": {
+            "instances": [
+                {
+                    "name": "oxidex-runners-still-alive",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 3600.0,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.18 }
+                },
+                {
+                    "name": "oxidex-runners-deleted-from-gce",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 7200.0,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.18 }
+                }
+            ]
+        }
+    });
+
+    // Live inventory only contains "oxidex-runners-still-alive"
+    let live_inventory = vec![InstanceRecord {
+        id: "1".into(),
+        name: "oxidex-runners-still-alive".into(),
+        zone: "us-central1-a".into(),
+        region: "us-central1".into(),
+        machine_type: "c4d-standard-16".into(),
+        status: "RUNNING".into(),
+        role: "cicd_runner".into(),
+        vcpu: 16,
+        ram_gib: 32,
+        runners_count: 2,
+        runners_count_known: true,
+        runner_limits_known: true,
+        created_at: None,
+        created_epoch: None,
+    }];
+
+    // 1. With include_deleted = false, the absent VM is retired to TERMINATED and excluded from output
+    let query_active_only = OverviewQuery {
+        include_deleted: Some(false),
+        ..Default::default()
+    };
+    let mut ov_clone = ov.clone();
+    apply_dynamic_overview_filtering(&mut ov_clone, &query_active_only, &live_inventory, now);
+    let active_instances = ov_clone["instances_view"]["instances"].as_array().unwrap();
+    assert_eq!(active_instances.len(), 1);
+    assert_eq!(active_instances[0]["name"], "oxidex-runners-still-alive");
+
+    // 2. With include_deleted = true, the absent VM is shown with TERMINATED status and deleted_epoch = now
+    let query_all = OverviewQuery {
+        include_deleted: Some(true),
+        ..Default::default()
+    };
+    apply_dynamic_overview_filtering(&mut ov, &query_all, &live_inventory, now);
+    let all_instances = ov["instances_view"]["instances"].as_array().unwrap();
+    assert_eq!(all_instances.len(), 2);
+    let retired_vm = all_instances
+        .iter()
+        .find(|i| i["name"] == "oxidex-runners-deleted-from-gce")
+        .unwrap();
+    assert_eq!(retired_vm["status"], "TERMINATED");
+    assert_eq!(retired_vm["deleted_epoch"], now_f64);
+}
+
+#[tokio::test]
+async fn test_overview_filter_excludes_unrelated_project_vms() {
+    let now = 1792000000;
+    let now_f64 = now as f64;
+
+    let mut ov = serde_json::json!({
+        "instances_view": {
+            "instances": [
+                {
+                    "name": "database-primary-prod",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 3600.0,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.50 }
+                },
+                {
+                    "name": "oxidex-runners-eu-1",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 3600.0,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.18 }
+                },
+                {
+                    "name": "builder-dedicated-asia",
+                    "status": "RUNNING",
+                    "role": "rust_builder",
+                    "started_epoch": now_f64 - 3600.0,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.25 }
+                }
+            ]
+        }
+    });
+
+    let live_inventory = vec![
+        InstanceRecord {
+            id: "db-1".into(),
+            name: "unrelated-bastion-host".into(),
+            zone: "us-central1-a".into(),
+            region: "us-central1".into(),
+            machine_type: "e2-micro".into(),
+            status: "RUNNING".into(),
+            role: "cicd_runner".into(),
+            vcpu: 2,
+            ram_gib: 2,
+            runners_count: 0,
+            runners_count_known: false,
+            runner_limits_known: false,
+            created_at: None,
+            created_epoch: None,
+        },
+        InstanceRecord {
+            id: "runner-1".into(),
+            name: "oxidex-runners-eu-1".into(),
+            zone: "europe-west1-b".into(),
+            region: "europe-west1".into(),
+            machine_type: "c4d-highcpu-16".into(),
+            status: "RUNNING".into(),
+            role: "cicd_runner".into(),
+            vcpu: 16,
+            ram_gib: 32,
+            runners_count: 2,
+            runners_count_known: true,
+            runner_limits_known: true,
+            created_at: None,
+            created_epoch: None,
+        },
+    ];
+
+    let query = OverviewQuery {
+        include_deleted: Some(true),
+        ..Default::default()
+    };
+    apply_dynamic_overview_filtering(&mut ov, &query, &live_inventory, now);
+
+    let instances = ov["instances_view"]["instances"].as_array().unwrap();
+    let names: Vec<&str> = instances.iter().map(|i| i["name"].as_str().unwrap()).collect();
+
+    // database-primary-prod and unrelated-bastion-host must NOT appear in instances
+    assert!(!names.contains(&"database-primary-prod"));
+    assert!(!names.contains(&"unrelated-bastion-host"));
+    assert!(names.contains(&"oxidex-runners-eu-1"));
+    assert!(names.contains(&"builder-dedicated-asia"));
+}
+
+#[tokio::test]
+async fn test_overview_filter_preserves_observed_hardware_or_unknown() {
+    let now = 1792000000;
+    let mut ov = serde_json::json!({
+        "instances_view": {
+            "instances": []
+        },
+        "regions": [
+            {
+                "region": "asia-east2",
+                "qualified_types": [
+                    {
+                        "machine_type": "n4-highcpu-16",
+                        "cpu_platform": "Intel Emerald Rapids",
+                        "benchmark_score": 4100,
+                        "data_disk_gb": 100,
+                        "data_disk_type": "hyperdisk-balanced",
+                        "disk_category": "Hyperdisk"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let live_inventory = vec![
+        InstanceRecord {
+            id: "1".into(),
+            name: "builder-dedicated-asia".into(),
+            zone: "asia-east2-a".into(),
+            region: "asia-east2".into(),
+            machine_type: "n4-highcpu-16".into(),
+            status: "RUNNING".into(),
+            role: "rust_builder".into(),
+            vcpu: 16,
+            ram_gib: 32,
+            runners_count: 0,
+            runners_count_known: true,
+            runner_limits_known: true,
+            created_at: None,
+            created_epoch: None,
+        },
+        InstanceRecord {
+            id: "2".into(),
+            name: "oxidex-runners-custom-hw".into(),
+            zone: "us-west1-a".into(),
+            region: "us-west1".into(),
+            machine_type: "custom-unconfigured-16".into(),
+            status: "RUNNING".into(),
+            role: "cicd_runner".into(),
+            vcpu: 16,
+            ram_gib: 32,
+            runners_count: 2,
+            runners_count_known: true,
+            runner_limits_known: true,
+            created_at: None,
+            created_epoch: None,
+        },
+    ];
+
+    let query = OverviewQuery {
+        include_deleted: Some(true),
+        ..Default::default()
+    };
+    apply_dynamic_overview_filtering(&mut ov, &query, &live_inventory, now);
+
+    let instances = ov["instances_view"]["instances"].as_array().unwrap();
+
+    let builder_inst = instances.iter().find(|i| i["name"] == "builder-dedicated-asia").unwrap();
+    // Observed hardware from catalog
+    assert_eq!(builder_inst["cpu_platform"], "Intel Emerald Rapids");
+    assert_eq!(builder_inst["benchmark_score"], 4100);
+    assert_eq!(builder_inst["data_disk_gb"], 100);
+
+    let unconfigured_inst = instances.iter().find(|i| i["name"] == "oxidex-runners-custom-hw").unwrap();
+    // Unobserved hardware must be explicitly Unknown/null, not fabricated Intel Cascade Lake
+    assert_eq!(unconfigured_inst["cpu_platform"], "Unknown");
+    assert!(unconfigured_inst["benchmark_score"].is_null());
+    assert!(unconfigured_inst["data_disk_gb"].is_null());
+}
+
+#[tokio::test]
+async fn test_inventory_refresh_skips_when_reconciler_lease_active() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    // Simulate an active reconciler lease
+    set_reconciler_lease(Some(now + 120));
+
+    let gcp = MockGcpFloorClient { instances: vec![] };
+    let report = run_inventory_refresh(&kv, &gcp, now).await.unwrap();
+
+    assert_eq!(report.status, "skipped_lease_active");
+    assert!(!report.snapshot_written);
+    assert_eq!(kv.put_count.load(Ordering::SeqCst), 0);
+
+    // Release lease
+    set_reconciler_lease(None);
+}
+
+
 

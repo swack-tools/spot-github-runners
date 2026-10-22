@@ -539,13 +539,35 @@ where
     G: GcpReconcilerClient,
 {
     let tick = TICK_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
-    let (mut bundle, _) = load_state(kv, now).await?;
-    let project = bundle.state.project.clone();
+
+    // Check writer serialization lease: if reconciler is currently running, skip
+    {
+        let lease_guard = RECONCILER_LEASE.lock().unwrap();
+        if let Some(expires_at) = *lease_guard {
+            if now < expires_at {
+                return Ok(ReconciliationReport {
+                    tick,
+                    status: "skipped_lease_active".to_string(),
+                    launched_hosts: vec![],
+                    cleaned_vms: vec![],
+                    cleaned_runners: vec![],
+                    snapshot_written: false,
+                    kv_puts: TOTAL_KV_PUTS.load(Ordering::SeqCst),
+                });
+            }
+        }
+    }
+
+    let (initial_bundle, _) = load_state(kv, now).await?;
+    let project = initial_bundle.state.project.clone();
 
     let instances = gcp
         .list_instances(&project, now)
         .await
         .map_err(|e| ReconcilerError::Gcp(e.to_string()))?;
+
+    // Reload freshest state from KV right before merge and save to prevent clobbering concurrent state changes
+    let (mut fresh_bundle, _) = load_state(kv, now).await?;
 
     let fi = serde_json::json!({
         "source": "gce",
@@ -555,8 +577,9 @@ where
         "stale_reason": serde_json::Value::Null,
         "last_error": serde_json::Value::Null
     });
-    bundle.state.fleet_inventory = fi.clone();
-    if let Some(ref mut ov) = bundle.state.overview {
+    let initial_refresh = fresh_bundle.state.fleet_inventory.is_null();
+    fresh_bundle.state.fleet_inventory = fi.clone();
+    if let Some(ref mut ov) = fresh_bundle.state.overview {
         if let Some(obj) = ov.as_object_mut() {
             obj.insert("fleet_inventory".to_string(), fi.clone());
             if let Some(iv) = obj.get_mut("instances_view").and_then(|v| v.as_object_mut()) {
@@ -565,16 +588,20 @@ where
         }
     }
 
-    let existing_by_name: std::collections::HashMap<String, InstanceRecord> = bundle
+    let existing_by_name: std::collections::HashMap<String, InstanceRecord> = fresh_bundle
         .state
         .instances
         .iter()
         .map(|inst| (inst.name.clone(), inst.clone()))
         .collect();
 
-    bundle.state.instances_view = instances
+    let new_instances_view: Vec<InstanceRecord> = instances
         .iter()
-        .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
+        .filter(|i| {
+            let is_runner = i.name.starts_with("oxidex-runners-");
+            let is_builder = i.name.starts_with("builder-");
+            (is_runner || is_builder) && !i.status.eq_ignore_ascii_case("TERMINATED")
+        })
         .map(|i| {
             let is_builder = i.name.starts_with("builder-");
             if let Some(existing) = existing_by_name.get(&i.name) {
@@ -618,10 +645,17 @@ where
         })
         .collect();
 
-    bundle.state.instances = bundle.state.instances_view.clone();
-    bundle.state.updated_at = now;
-    save_state(kv, &mut bundle, now).await?;
-    TOTAL_KV_PUTS.fetch_add(1, Ordering::SeqCst);
+    let instances_changed = fresh_bundle.state.instances_view != new_instances_view;
+    let snapshot_written = if instances_changed || initial_refresh {
+        fresh_bundle.state.instances_view = new_instances_view.clone();
+        fresh_bundle.state.instances = new_instances_view;
+        fresh_bundle.state.updated_at = now;
+        save_state(kv, &mut fresh_bundle, now).await?;
+        TOTAL_KV_PUTS.fetch_add(1, Ordering::SeqCst);
+        true
+    } else {
+        false
+    };
 
     Ok(ReconciliationReport {
         tick,
@@ -629,7 +663,7 @@ where
         launched_hosts: vec![],
         cleaned_vms: vec![],
         cleaned_runners: vec![],
-        snapshot_written: true,
+        snapshot_written,
         kv_puts: TOTAL_KV_PUTS.load(Ordering::SeqCst),
     })
 }
@@ -641,23 +675,29 @@ pub async fn refresh_fleet_inventory<K: KvStoreBackend>(
 ) -> Result<ReconciliationReport, ReconcilerError> {
     if let Some(sa_key) = env_gcp_sa_key {
         if !sa_key.trim().is_empty() {
-            if let Ok(creds) = serde_json::from_str::<crate::gcp::GcpCredentials>(sa_key) {
-                let project = creds
-                    .project_id
-                    .clone()
-                    .unwrap_or_else(|| "homelab-424523".to_string());
-                let gcp_client = crate::gcp::GceComputeClient::new(
-                    creds,
-                    project,
-                    crate::gcp::WorkerGcpTransport,
-                );
-                return run_inventory_refresh(kv, &gcp_client, now).await;
+            match serde_json::from_str::<crate::gcp::GcpCredentials>(sa_key) {
+                Ok(creds) => {
+                    let project = creds
+                        .project_id
+                        .clone()
+                        .unwrap_or_else(|| "homelab-424523".to_string());
+                    let gcp_client = crate::gcp::GceComputeClient::new(
+                        creds,
+                        project,
+                        crate::gcp::WorkerGcpTransport,
+                    );
+                    return run_inventory_refresh(kv, &gcp_client, now).await;
+                }
+                Err(e) => {
+                    return Err(ReconcilerError::Gcp(format!("Malformed GCP credentials: {e}")));
+                }
             }
         }
     }
 
-    let sim = SimulatedFleetProvider;
-    run_inventory_refresh(kv, &sim, now).await
+    Err(ReconcilerError::Gcp(
+        "GCP service account key is missing or empty; cannot refresh live inventory without credentials".to_string(),
+    ))
 }
 
 // ============================================================================
@@ -1261,7 +1301,11 @@ where
 
         bundle.state.instances_view = instances
             .iter()
-            .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
+            .filter(|i| {
+                let is_runner = i.name.starts_with("oxidex-runners-");
+                let is_builder = i.name.starts_with("builder-");
+                (is_runner || is_builder) && !i.status.eq_ignore_ascii_case("TERMINATED")
+            })
             .map(|i| {
                 if let Some(existing) = existing_by_name.get(&i.name) {
                     if existing.role == "rust_builder" || i.name.starts_with("builder-") {

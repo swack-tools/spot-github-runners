@@ -172,7 +172,12 @@ fi
 uploader_sha='{{UPLOADER_SHA}}'
 if [[ ! "$uploader_sha" =~ ^\{\{.*\}\}$ && -n "$uploader_sha" ]]; then
   actual_mapping_sha=$(printf '%s' "$uploader_raw" | sha256sum | awk '{print $1}')
-  if [[ "$actual_mapping_sha" != "$uploader_sha" ]]; then
+  canonical_mapping_sha=$(printf '%s' "$uploader_raw" | jq -c . 2>/dev/null | sha256sum | awk '{print $1}')
+  file_mapping_sha=""
+  if [[ -f /etc/oxidex-builder-uploader.json ]]; then
+    file_mapping_sha=$(sha256sum /etc/oxidex-builder-uploader.json 2>/dev/null | awk '{print $1}')
+  fi
+  if [[ "$actual_mapping_sha" != "$uploader_sha" && "$canonical_mapping_sha" != "$uploader_sha" && "$file_mapping_sha" != "$uploader_sha" ]]; then
     echo "Uploader mapping checksum mismatch against UPLOADER_SHA" >&2
     exit 78
   fi

@@ -623,6 +623,9 @@ pub fn apply_dynamic_overview_filtering(
         .unwrap_or_default();
 
     for rec in live_instances_view {
+        if !rec.name.starts_with("oxidex-runners-") && !rec.name.starts_with("builder-") {
+            continue;
+        }
         if let Some(existing) = base_instances
             .iter_mut()
             .find(|inst| inst.get("name").and_then(|v| v.as_str()) == Some(&rec.name))
@@ -671,6 +674,44 @@ pub fn apply_dynamic_overview_filtering(
                 .and_then(|v| v.as_f64())
                 .unwrap_or(compute_hourly);
 
+            let (observed_cpu, observed_benchmark, observed_disk_gb, observed_disk_type, observed_disk_category) = {
+                let mut cpu = "Unknown".to_string();
+                let mut bench = serde_json::Value::Null;
+                let mut disk_gb = serde_json::Value::Null;
+                let mut disk_type = serde_json::Value::Null;
+                let mut disk_cat = serde_json::Value::Null;
+
+                if let Some(existing) = base_instances.iter().find(|i| {
+                    i.get("machine_type").and_then(|m| m.as_str()) == Some(&rec.machine_type)
+                }) {
+                    if let Some(c) = existing.get("cpu_platform").and_then(|v| v.as_str()) {
+                        cpu = c.to_string();
+                    }
+                    bench = existing.get("benchmark_score").cloned().unwrap_or(serde_json::Value::Null);
+                    disk_gb = existing.get("data_disk_gb").cloned().unwrap_or(serde_json::Value::Null);
+                    disk_type = existing.get("data_disk_type").cloned().unwrap_or(serde_json::Value::Null);
+                    disk_cat = existing.get("disk_category").cloned().unwrap_or(serde_json::Value::Null);
+                } else if let Some(arr) = regions_val.as_ref().and_then(|r| r.as_array()) {
+                    for reg in arr {
+                        if let Some(types) = reg.get("qualified_types").and_then(|t| t.as_array()) {
+                            for qt in types {
+                                if qt.get("machine_type").and_then(|m| m.as_str()) == Some(&rec.machine_type) {
+                                    if let Some(c) = qt.get("cpu_platform").and_then(|v| v.as_str()) {
+                                        cpu = c.to_string();
+                                    }
+                                    bench = qt.get("benchmark_score").cloned().unwrap_or(serde_json::Value::Null);
+                                    disk_gb = qt.get("data_disk_gb").cloned().unwrap_or(serde_json::Value::Null);
+                                    disk_type = qt.get("data_disk_type").cloned().unwrap_or(serde_json::Value::Null);
+                                    disk_cat = qt.get("disk_category").cloned().unwrap_or(serde_json::Value::Null);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                (cpu, bench, disk_gb, disk_type, disk_cat)
+            };
+
             base_instances.push(serde_json::json!({
                 "id": rec.id,
                 "name": rec.name,
@@ -679,7 +720,7 @@ pub fn apply_dynamic_overview_filtering(
                 "region": rec.region,
                 "display_location": rec.region,
                 "machine_type": rec.machine_type,
-                "cpu_platform": "Intel Cascade Lake",
+                "cpu_platform": observed_cpu,
                 "status": rec.status,
                 "role": rec.role,
                 "vcpu": rec.vcpu,
@@ -689,10 +730,10 @@ pub fn apply_dynamic_overview_filtering(
                 "runner_limits_known": rec.runner_limits_known,
                 "runner_vcpu": if is_builder { 16 } else { 7 },
                 "runner_ram_gib": if is_builder { 28 } else { 14 },
-                "benchmark_score": if is_builder { 3850 } else { 3420 },
-                "data_disk_gb": if is_builder { 100 } else { 50 },
-                "data_disk_type": "pd-ssd",
-                "disk_category": "SSD",
+                "benchmark_score": observed_benchmark,
+                "data_disk_gb": observed_disk_gb,
+                "data_disk_type": observed_disk_type,
+                "disk_category": observed_disk_category,
                 "started_at": started_at,
                 "started_epoch": started_epoch,
                 "deleted_at": serde_json::Value::Null,
@@ -706,6 +747,30 @@ pub fn apply_dynamic_overview_filtering(
                 "total_cost_in_window_usd": 0.0,
                 "ssh_command": format!("gcloud compute ssh {}", rec.name)
             }));
+        }
+    }
+
+    if !live_instances_view.is_empty() {
+        let live_names: std::collections::HashSet<&str> = live_instances_view
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+
+        for inst in &mut base_instances {
+            if let Some(name) = inst.get("name").and_then(|v| v.as_str()) {
+                if !live_names.contains(name) {
+                    let current_status = inst.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    if !current_status.eq_ignore_ascii_case("TERMINATED") {
+                        if let Some(obj) = inst.as_object_mut() {
+                            obj.insert("status".to_string(), serde_json::json!("TERMINATED"));
+                            if obj.get("deleted_epoch").map_or(true, |v| v.is_null()) {
+                                obj.insert("deleted_epoch".to_string(), serde_json::json!(now as f64));
+                                obj.insert("deleted_at".to_string(), serde_json::json!(chrono_iso(now)));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -727,10 +792,17 @@ pub fn apply_dynamic_overview_filtering(
     let mut filtered: Vec<serde_json::Value> = Vec::new();
     for inst_ref in &base_instances {
         let mut inst = inst_ref.clone();
-        let status = inst.get("status").and_then(|v| v.as_str()).unwrap_or("RUNNING");
-        let is_running = status.eq_ignore_ascii_case("RUNNING");
+        let name = inst.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if !name.starts_with("oxidex-runners-") && !name.starts_with("builder-") {
+            continue;
+        }
 
-        if !include_deleted && !is_running {
+        let status = inst.get("status").and_then(|v| v.as_str()).unwrap_or("RUNNING");
+        let is_terminated = status.eq_ignore_ascii_case("TERMINATED")
+            || inst.get("deleted_epoch").and_then(|v| v.as_f64()).is_some();
+        let is_running = !is_terminated;
+
+        if !include_deleted && is_terminated {
             continue;
         }
 
@@ -738,7 +810,7 @@ pub fn apply_dynamic_overview_filtering(
         let deleted_epoch = inst.get("deleted_epoch").and_then(|v| v.as_f64()).filter(|v| v.is_finite());
         let end_ts = deleted_epoch.unwrap_or(now_f64);
 
-        if !is_running && end_ts < window_start {
+        if is_terminated && end_ts < window_start {
             continue;
         }
 
@@ -860,10 +932,8 @@ pub fn apply_dynamic_overview_filtering(
     let running_count = filtered
         .iter()
         .filter(|i| {
-            i.get("status")
-                .and_then(|v| v.as_str())
-                .map(|s| s.eq_ignore_ascii_case("RUNNING"))
-                .unwrap_or(false)
+            let status = i.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            !status.eq_ignore_ascii_case("TERMINATED") && i.get("deleted_epoch").map_or(true, |v| v.is_null())
         })
         .count();
     let deleted_count = filtered.len().saturating_sub(running_count);
@@ -885,9 +955,8 @@ pub fn apply_dynamic_overview_filtering(
     let all_running: Vec<&serde_json::Value> = base_instances
         .iter()
         .filter(|inst| {
-            inst.get("status")
-                .and_then(|v| v.as_str())
-                .map_or(false, |s| s.eq_ignore_ascii_case("RUNNING"))
+            let status = inst.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            !status.eq_ignore_ascii_case("TERMINATED") && inst.get("deleted_epoch").map_or(true, |v| v.is_null())
         })
         .collect();
 
