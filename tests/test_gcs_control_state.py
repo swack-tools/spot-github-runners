@@ -14,7 +14,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from gcs_fixtures import BUCKET, TOKEN, FakeGcsServer
-from lib import control_vm as cv
 from lib import gcs_control_state as gcs
 
 URI = f"gs://{BUCKET}/control"
@@ -25,12 +24,7 @@ GRACE = gcs.LEASE_STALE_GRACE_SECONDS
 
 
 def tearDownModule():
-    # test_control_vm (imported for its harness) owns a temporary state directory that its own tearDownModule
-    # removes; when only this module runs, remove it here (cleanup is idempotent).
-    import sys
-    module = sys.modules.get("test_control_vm")
-    if module is not None:
-        module._CONTROL_STATE_DIR.cleanup()
+    pass
 
 
 class World:
@@ -389,7 +383,7 @@ class SuspendAwareLeaseTests(unittest.TestCase):
             mac.ensure()
 
     def test_the_guard_margin_covers_the_longest_provider_call(self):
-        self.assertGreaterEqual(gcs.LEASE_MIN_REMAINING_SECONDS, cv.GCLOUD_TIMEOUT_SECONDS + 60)
+        self.assertGreaterEqual(gcs.LEASE_MIN_REMAINING_SECONDS, 600 + 60)
 
     def test_a_wall_clock_stepped_back_keeps_monotonic_time(self):
         mac = self.lease("mac")
@@ -406,7 +400,7 @@ class ProjectStateTests(unittest.TestCase):
         self.w = World()
 
     def test_uninitialized_state_refuses_and_releases_the_lease(self):
-        with self.assertRaisesRegex(cv.ControlStateConflict, "migrate-state --apply"):
+        with self.assertRaisesRegex(gcs.ControlStateConflict, "migrate-state --apply"):
             with self.w.lock("a"):
                 pass
         self.assertNotIn(self.w.lock_name, self.w.server.objects)
@@ -438,7 +432,7 @@ class ProjectStateTests(unittest.TestCase):
             project.state = {"control_vm": {}}
             project.save()
             self.w.server.put_raw(self.w.state_name, self.w.server.objects[self.w.state_name][0])  # someone else
-            with self.assertRaisesRegex(cv.ControlStateConflict, "changed since this controller read it"):
+            with self.assertRaisesRegex(gcs.ControlStateConflict, "changed since this controller read it"):
                 project.save()
 
     def test_held_lock_returns_none_and_names_the_holder(self):
@@ -459,7 +453,7 @@ class ProjectStateTests(unittest.TestCase):
             project.save()
             self.assertEqual(project.generation, self.w.server.objects[self.w.state_name][1])
             self.w.server.faults.append(("POST", "drop"))
-            with self.assertRaisesRegex(cv.ControlStateConflict, "could not confirm"):
+            with self.assertRaisesRegex(gcs.ControlStateConflict, "could not confirm"):
                 project.save()
 
     def test_save_needs_the_lease_and_stops_once_it_is_lost(self):
@@ -480,16 +474,16 @@ class ProjectStateTests(unittest.TestCase):
     def test_wrong_project_or_schema_fails_closed(self):
         self.w.server.put_raw(self.w.state_name, json.dumps(
             {"schema": gcs.STATE_SCHEMA, "project": "other", "state": {}}).encode())
-        with self.assertRaisesRegex(cv.ControlStateConflict, "belongs to project 'other'"):
+        with self.assertRaisesRegex(gcs.ControlStateConflict, "belongs to project 'other'"):
             gcs.load_state(PROJECT, URI, client=self.w.client)
         self.w.server.put_raw(self.w.state_name, b'{"control_vm": {}}')
-        with self.assertRaisesRegex(cv.ControlStateConflict, "not a spot-control-vm-state-v1"):
+        with self.assertRaisesRegex(gcs.ControlStateConflict, "not a spot-control-vm-state-v1"):
             gcs.load_state(PROJECT, URI, client=self.w.client)
         self.w.server.put_raw(self.w.state_name, b"not json")
-        with self.assertRaises(cv.ControlStateConflict):
+        with self.assertRaises(gcs.ControlStateConflict):
             gcs.load_state(PROJECT, URI, client=self.w.client)
         # The lock is released when loading fails.
-        with self.assertRaises(cv.ControlStateConflict):
+        with self.assertRaises(gcs.ControlStateConflict):
             with self.w.lock("a"):
                 pass
         self.assertNotIn(self.w.lock_name, self.w.server.objects)
@@ -509,7 +503,7 @@ class MigrationTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.dir = Path(directory.name)
-        self.local, self.local_lock = cv.project_control_paths(PROJECT, self.dir)
+        self.local, self.local_lock = gcs.project_control_paths(PROJECT, self.dir)
 
     def migrate(self, apply):
         with patch.object(gcs, "GcsLease", lambda client, name: self.w.lease("migrator")):
@@ -533,12 +527,12 @@ class MigrationTests(unittest.TestCase):
         uploads = [c for c in self.w.server.writes() if c[1] == self.w.state_name]
         self.assertEqual([c[2]["ifGenerationMatch"] for c in uploads], ["0"])  # create-only
         marker = json.loads(self.local.read_text())
-        self.assertEqual(marker[cv.CONTROL_STATE_MOVED_KEY], URI)
+        self.assertEqual(marker[gcs.CONTROL_STATE_MOVED_KEY], URI)
         self.assertEqual(json.loads((self.dir / marker["backup"]).read_text()), state)
-        with self.assertRaisesRegex(cv.ControlStateConflict, "moved to gs://"):
-            cv.ProjectControlState(self.local).load()
-        with self.assertRaisesRegex(cv.ControlStateConflict, "SPOT_CONTROL_STATE_URI"):
-            with cv.ProjectControlLock(PROJECT, self.dir):
+        with self.assertRaisesRegex(gcs.ControlStateConflict, "moved to gs://"):
+            gcs.ProjectControlState(self.local).load()
+        with self.assertRaisesRegex(gcs.ControlStateConflict, "SPOT_CONTROL_STATE_URI"):
+            with gcs.ProjectControlLock(PROJECT, self.dir):
                 pass
         code, message = self.migrate(apply=True)
         self.assertEqual(code, 0)
@@ -553,7 +547,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(code, 0, message)
         self.assertIn("already equals", message)
         self.assertEqual([c for c in self.w.server.writes()[before:] if c[1] == self.w.state_name], [])
-        self.assertIn(cv.CONTROL_STATE_MOVED_KEY, json.loads(self.local.read_text()))
+        self.assertIn(gcs.CONTROL_STATE_MOVED_KEY, json.loads(self.local.read_text()))
 
     def test_different_states_refuse_and_change_nothing(self):
         self.write_local({"control_vm": {"transition": {"id": "local"}}})
@@ -625,8 +619,8 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("stays fenced", message)
         self.assertNotIn(self.w.state_name, self.w.server.objects)
-        with self.assertRaises(cv.ControlStateConflict):  # no local controller can use it meanwhile
-            cv.ProjectControlState(self.local).load()
+        with self.assertRaises(gcs.ControlStateConflict):  # no local controller can use it meanwhile
+            gcs.ProjectControlState(self.local).load()
         code, message = self.migrate(apply=False)
         self.assertIn("uploading the fenced backup", message)
         code, message = self.migrate(apply=True)
@@ -647,10 +641,10 @@ class MigrationTests(unittest.TestCase):
 
     def test_a_missing_file_next_to_a_backup_is_never_empty_state(self):
         (self.dir / f"{self.local.name}.migrated-20261018T000000Z").write_text("{}")
-        with self.assertRaisesRegex(cv.ControlStateConflict, "was migrated"):
-            cv.ProjectControlState(self.local).load()
-        with self.assertRaisesRegex(cv.ControlStateConflict, "was migrated"):
-            with cv.ProjectControlLock(PROJECT, self.dir):
+        with self.assertRaisesRegex(gcs.ControlStateConflict, "was migrated"):
+            gcs.ProjectControlState(self.local).load()
+        with self.assertRaisesRegex(gcs.ControlStateConflict, "was migrated"):
+            with gcs.ProjectControlLock(PROJECT, self.dir):
                 pass
 
     def test_a_missing_local_file_next_to_remote_state_gets_fenced(self):
@@ -658,8 +652,8 @@ class MigrationTests(unittest.TestCase):
         code, message = self.migrate(apply=True)
         self.assertEqual(code, 0, message)
         self.assertIn("fencing the local path", message)
-        with self.assertRaisesRegex(cv.ControlStateConflict, "moved to gs://"):
-            cv.ProjectControlState(self.local).load()
+        with self.assertRaisesRegex(gcs.ControlStateConflict, "moved to gs://"):
+            gcs.ProjectControlState(self.local).load()
         self.assertEqual(self.w.server.json(self.w.state_name)["state"]["control_vm"]["transition"]["id"], "remote")
 
     def test_a_marker_for_another_location_refuses(self):
@@ -692,171 +686,10 @@ class MigrationTests(unittest.TestCase):
         self.assertFalse(self.local.exists())
 
     def test_marker_without_remote_state_refuses(self):
-        self.local.write_text(json.dumps({cv.CONTROL_STATE_MOVED_KEY: URI}))
+        self.local.write_text(json.dumps({gcs.CONTROL_STATE_MOVED_KEY: URI}))
         code, message = self.migrate(apply=True)
         self.assertEqual(code, 1)
         self.assertIn("does not exist", message)
-
-
-class BackendSelectionTests(unittest.TestCase):
-    def test_uri_selects_cloud_storage(self):
-        self.assertIsInstance(cv.open_project_control_lock(PROJECT, "/tmp", env={}), cv.ProjectControlLock)
-        with patch.object(gcs, "AccessToken", lambda *a, **k: (lambda: TOKEN)):
-            lock = cv.open_project_control_lock(PROJECT, None, env={cv.ENV_CONTROL_STATE_URI: URI})
-        self.assertIsInstance(lock, gcs.GcsProjectControlLock)
-        self.assertEqual(lock.lease.name, "control/control-vm-proj.lock")
-        with self.assertRaises(ValueError):
-            cv.open_project_control_lock(PROJECT, None, env={cv.ENV_CONTROL_STATE_URI: "gs://Bad"})
-
-    def test_guard_runs_before_every_provider_call(self):
-        calls = []
-
-        def guard():
-            calls.append("guard")
-            raise gcs.LeaseLost("lost")
-        with patch.object(cv, "default_gcloud", side_effect=lambda argv: calls.append("gcloud")), \
-                patch.object(cv.edge_state, "default_requester", side_effect=lambda *a: calls.append("http")):
-            manager = cv.build_manager(PROJECT, {}, lambda: None, guard=guard, env={
-                "CLOUDFLARE_ACCOUNT_ID": "a", "CLOUDFLARE_KV_NAMESPACE_ID": "n", "CLOUDFLARE_KV_API_TOKEN": "t"})
-            with self.assertRaises(gcs.LeaseLost):
-                manager.gcloud(["gcloud", "compute", "instances", "list"])
-            with self.assertRaises(gcs.LeaseLost):
-                manager.requester("GET", "https://x", {}, None, 1)
-            with self.assertRaises(gcs.LeaseLost):
-                manager.kv.get("origin:active")
-        self.assertEqual(calls, ["guard"] * 3)
-
-
-class CliOnCloudStorageTests(unittest.TestCase):
-    """src/control_vm.py with SPOT_CONTROL_STATE_URI: the job's command line, end to end on the fakes."""
-
-    def setUp(self):
-        self.w = World()
-        import test_control_vm as tcv
-        self.tcv = tcv
-        self.w.init_state()
-        patches = [patch.dict("os.environ", {cv.ENV_CONTROL_STATE_URI: URI}),
-                   patch.object(gcs, "https_request", self.w.server),
-                   patch.object(gcs, "AccessToken", lambda *a, **k: (lambda: TOKEN)),
-                   patch("lib.environment.load_env")]
-        for p in patches:
-            p.start()
-            self.addCleanup(p.stop)
-
-    def run_cli(self, argv, h):
-        seen = {}
-
-        def factory(project, state, save, guard=None, **overrides):
-            seen.setdefault("guards", []).append(guard)
-            return cv.ControlVmManager(h.config, state, save, gcloud=h.gcloud, kv=h.kv, requester=h.http,
-                                       offer_source=lambda: list(h.offers), clock=lambda: h.clock[0])
-        out = io.StringIO()
-        with redirect_stdout(out):
-            code = cv.main([*argv, "--project", PROJECT, "--state-file", "/nonexistent/state.json"],
-                           manager_factory=factory)
-        return code, out.getvalue(), seen
-
-    def healthy(self):
-        h = self.tcv.Harness()
-        h.gcloud.add("a")
-        h.kv.set_origin("a")
-        h.http.healthy("a")
-        return h
-
-    def test_ensure_apply_persists_to_cloud_storage_with_the_lease_guard(self):
-        h = self.tcv.Harness()
-        code, output, seen = self.run_cli(["ensure", "--apply"], h)
-        self.assertEqual(code, 0, output)
-        self.assertIn("Executed: bootstrap", output)
-        self.assertEqual(self.w.server.json(self.w.state_name)["state"]["control_vm"]["transition"]["step"],
-                         "wait_health")
-        self.assertIsNotNone(seen["guards"][0])
-        self.assertNotIn(self.w.lock_name, self.w.server.objects)
-
-    def test_skip_if_idle_takes_no_lock_and_writes_nothing(self):
-        h = self.healthy()
-        code, output, _ = self.run_cli(["ensure", "--apply", "--skip-if-idle"], h)  # first run settles the state
-        self.assertEqual(code, 0, output)
-        writes = len(self.w.server.writes())
-        self.assertGreater(writes, 0)
-        code, output, _ = self.run_cli(["ensure", "--apply", "--skip-if-idle"], self.healthy())
-        self.assertEqual(code, 0)
-        self.assertIn("Idle (no lock taken, nothing changed): noop", output)
-        self.assertEqual(len(self.w.server.writes()), writes)
-        # Anything to do (the active VM went down) takes the lock and saves.
-        down = self.tcv.Harness()
-        down.gcloud.add("a", status="TERMINATED")
-        down.kv.set_origin("a")
-        code, output, _ = self.run_cli(["ensure", "--apply", "--skip-if-idle"], down)
-        self.assertIn("Executed: start", output)
-        self.assertGreater(len(self.w.server.writes()), writes)
-
-    def test_skip_if_locked_exits_zero_and_changes_nothing(self):
-        self.assertTrue(self.w.lease("operator-mac").acquire())
-        before = self.w.server.objects[self.w.state_name]
-        h = self.tcv.Harness()
-        code, output, _ = self.run_cli(["ensure", "--apply", "--skip-if-locked"], h)
-        self.assertEqual(code, 0)
-        self.assertIn("Skipped: Another controller", output)
-        self.assertIn("operator-mac", output)
-        self.assertEqual(h.gcloud.mutating(), [])
-        self.assertEqual(self.w.server.objects[self.w.state_name], before)
-        with self.assertRaisesRegex(RuntimeError, "Another controller"):
-            self.run_cli(["ensure", "--apply"], h)
-
-    def test_uninitialized_state_refuses_to_act(self):
-        self.w.server.objects.pop(self.w.state_name)
-        h = self.tcv.Harness()
-        with self.assertRaisesRegex(cv.ControlStateConflict, "migrate-state --apply"):
-            self.run_cli(["ensure", "--apply", "--skip-if-locked"], h)
-        self.assertEqual(h.gcloud.mutating(), [])
-        self.assertNotIn(self.w.lock_name, self.w.server.objects)
-
-    def test_plan_and_status_read_without_the_lease(self):
-        for command in ("plan", "status"):
-            code, _, _ = self.run_cli([command], self.healthy())
-            self.assertEqual(code, 0)
-        self.assertEqual(self.w.server.writes(), [])
-
-    def test_migrate_state_command(self):
-        self.w.server.objects.pop(self.w.state_name)
-        with tempfile.TemporaryDirectory() as tmp:
-            local, _ = cv.project_control_paths(PROJECT, tmp)
-            local.write_text(json.dumps({"control_vm": {"history": [1]}}))
-            with patch.object(gcs, "GcsLease", lambda client, name: self.w.lease("migrator")):
-                code, output, _ = self.run_cli(["migrate-state", "--control-state-dir", tmp], self.tcv.Harness())
-                self.assertEqual(code, 0)
-                self.assertIn("dry run", output)
-                code, output, _ = self.run_cli(["migrate-state", "--apply", "--control-state-dir", tmp],
-                                               self.tcv.Harness())
-            self.assertEqual(code, 0, output)
-            self.assertEqual(self.w.server.json(self.w.state_name)["state"], {"control_vm": {"history": [1]}})
-
-    def test_autoscaler_uses_the_same_lease_and_previews_without_it(self):
-        from lib import spot_runner_autoscaler as autoscaler
-        seen = []
-
-        def tick(args, cstate, save, guard=None):
-            seen.append(guard)
-            cstate.setdefault("control_vm", {})["transition"] = {"id": "t", "step": "wait_health"}
-            save()
-            return "planned"
-        with patch("lib.control_vm.autoscaler_tick", side_effect=tick):
-            args = SimpleNamespace(dry_run=True, project=PROJECT, control_state_dir=None)
-            self.assertEqual(autoscaler.manage_control_vm(args, {}, Path("/nonexistent/s.json")), "planned")
-            self.assertEqual(self.w.server.writes(), [])  # preview: no lease, no write
-            args.dry_run = False
-            self.assertEqual(autoscaler.manage_control_vm(args, {}, Path("/nonexistent/s.json")), "planned")
-        self.assertIsNone(seen[0])
-        self.assertIsNotNone(seen[1])
-        self.assertEqual(self.w.server.json(self.w.state_name)["state"]["control_vm"]["transition"]["id"], "t")
-        # Held by the watchdog: the autoscaler skips its control VM step and keeps managing runners.
-        self.assertTrue(self.w.lease("watchdog").acquire())
-        with patch("lib.control_vm.autoscaler_tick") as never, \
-                self.assertLogs("spot_runner_autoscaler", "INFO") as logs:
-            self.assertIsNone(autoscaler.manage_control_vm(args, {}, Path("/nonexistent/s.json")))
-        never.assert_not_called()
-        self.assertIn("another controller holds", "\n".join(logs.output))
 
 
 if __name__ == "__main__":

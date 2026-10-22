@@ -1,0 +1,47 @@
+[package]
+name = "spot-dashboard-edge"
+version = "0.1.0"
+edition = "2021"
+authors = ["swackhamer <swackhamer@users.noreply.github.com>"]
+description = "100% Rust serverless Cloudflare Worker for Spot GitHub Runners dashboard, auth, state, patch console, and GCP reconciler"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Cloudflare Worker SDK
+worker = "0.8.7"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography & Hashing
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2.6"
+base64 = "0.22"
+hex = "0.4"
+rsa = { version = "0.9.10", features = ["sha2"] }
+
+# Entropy for wasm32-unknown-unknown
+getrandom = { version = "0.2", features = ["js"] }
+
+# Error and Async Traits
+thiserror = "1.0"
+async-trait = "0.1"
+
+# URL, Encoding & Time
+url = "2.5"
+percent-encoding = "2.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

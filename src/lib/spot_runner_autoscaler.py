@@ -3141,42 +3141,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def manage_control_vm(args: argparse.Namespace, state: dict, state_path: Path):
-    """Run one control VM lifecycle step; its failures never stop runner management.
-
-    Control VMs (``spot-control-*``) are separate from runner hosts: runner inventory, price
-    rotation, and scaling never list, rotate, or delete them.
-
-    Several --target controllers can manage the one control VM pair of a project, so each check takes the
-    project-wide control VM lock (skipping the check while another controller holds it) and works on the
-    project-scoped control VM state, never on this controller's own state file. Control VM state saved in
-    this controller's state file before project scoping is moved to the project state first.
-    """
-    from .control_vm import (ControlStateConflict, autoscaler_tick, control_state_uri, load_project_control_state,
-                             open_project_control_lock)
-    dry_run = getattr(args, 'dry_run', False)
-    try:
-        if dry_run and control_state_uri():
-            # SPOT_CONTROL_STATE_URI: taking the Cloud Storage lease is a write, so a preview only reads the state.
-            project = load_project_control_state(args.project)
-            project.adopt(copy.deepcopy(state), state_path, persist=False)
-            return autoscaler_tick(args, copy.deepcopy(project.state), lambda: None)
-        with open_project_control_lock(args.project, getattr(args, 'control_state_dir', None)) as project:
-            if project is None:
-                LOG.info('Control VM management skipped this check: another controller holds the %s control VM '
-                         'lock', args.project)
-                return None
-            if dry_run:
-                project.adopt(copy.deepcopy(state), state_path, persist=False)
-                return autoscaler_tick(args, copy.deepcopy(project.state), lambda: None)
-            if project.adopt(state, state_path, persist=True):
-                write_scale_state(state_path, state)
-            # The Cloud Storage lease guards every provider call of the tick; the local flock needs no guard.
-            guard = {"guard": project.guard} if project.guard else {}
-            return autoscaler_tick(args, project.state, project.save, **guard)
-    except (ControlStateConflict, OSError, ValueError, RuntimeError) as exc:
-        # Control VM failures never stop runner management.
-        LOG.error('Control VM management failed this check: %s', exc)
-        return None
+    """Retired: control VMs decommissioned and replaced by 100% Rust Cloudflare Worker."""
+    return None
 
 
 def run_controller(args: argparse.Namespace) -> int:
