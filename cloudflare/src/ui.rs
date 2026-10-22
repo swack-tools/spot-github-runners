@@ -1977,7 +1977,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     function renderAll() {
       if (!APP_STATE) return;
       const hdrProjOrg = document.getElementById("hdr-project-org");
-      if (hdrProjOrg && APP_STATE.project && APP_STATE.org) {
+      // The server renders GCP_PROJECT into the header; only fill it in when the deploy left it unset.
+      if (hdrProjOrg && APP_STATE.project && APP_STATE.org && hdrProjOrg.textContent.includes("not configured")) {
         hdrProjOrg.textContent = `GCP Project: ${APP_STATE.project} · GitHub Org: ${APP_STATE.org}`;
       }
       document.getElementById("browser-tz-pill").textContent = `🕒 Browser TZ: ${BROWSER_TZ}`;

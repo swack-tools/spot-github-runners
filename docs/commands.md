@@ -171,12 +171,15 @@ wrangler dev
 
 ### Edge deployment
 
-Deploys the Worker and Cron Triggers (`*/5 * * * *`) to Cloudflare edge:
+Deploys the Worker and Cron Triggers (`*/5 * * * *`) to Cloudflare edge. The recipe reads the GCP project
+from the active gcloud configuration and passes it as the `GCP_PROJECT` variable:
 
 ```bash
-cd cloudflare
-wrangler deploy
+just gcp-project    # Shows the project that the deploy uses
+just deploy-worker  # Runs wrangler deploy --var GCP_PROJECT:<project>
 ```
+
+A plain `wrangler deploy` clears `GCP_PROJECT`, and the dashboard header then shows `not configured`.
 
 ### Secret management
 
