@@ -300,24 +300,61 @@ pub fn make_valid_manifest_json(repo: &str) -> Value {
 // REST Handlers
 // ============================================================================
 
+/// Maps a path (`defaults.yaml` or `repos/<owner>/<repo>.yaml`) or target name to a controlled target.
+pub fn resolve_target_from_repo_or_path(repo_or_path: &str) -> String {
+    if repo_or_path == DEFAULTS_PATH || repo_or_path == "repos/swack-tools/oxidex.yaml" || repo_or_path == "swack-tools/oxidex" {
+        return "swack-tools".to_string();
+    }
+    if let Some(rest) = repo_or_path.strip_prefix("repos/").and_then(|s| s.strip_suffix(".yaml")) {
+        return rest.to_string();
+    }
+    repo_or_path.to_string()
+}
+
 /// GET /api/patch-console/bootstrap
 pub fn handle_bootstrap() -> (u16, Value) {
+    let repositories: Vec<Value> = CONTROLLED_TARGETS
+        .iter()
+        .filter(|&&t| t != "swack-tools")
+        .map(|&t| {
+            json!({
+                "repository": t,
+                "path": format!("repos/{}.yaml", t),
+                "present": true,
+            })
+        })
+        .collect();
+
     (
         200,
         json!({
             "repository": CONFIG_REPO,
+            "config_repo": CONFIG_REPO,
+            "default_branch": DEFAULT_BRANCH,
+            "head_sha": "a".repeat(40),
+            "defaults": {
+                "path": DEFAULTS_PATH,
+                "present": true,
+            },
+            "repositories": repositories,
             "controlled_targets": CONTROLLED_TARGETS,
+            "executor": {
+                "available": false,
+                "reason": "Serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick.",
+            },
         }),
     )
 }
 
-/// GET /api/patch-console/manifest?repo=...
+/// GET /api/patch-console/manifest?repo=... (or ?path=...)
 pub async fn handle_manifest(
     repo: &str,
     transport: &dyn GitHubTransport,
     token: &str,
 ) -> (u16, Value) {
-    if repo.is_empty() || !CONTROLLED_TARGETS.contains(&repo) {
+    let resolved_repo = resolve_target_from_repo_or_path(repo);
+    let repo_ref = resolved_repo.as_str();
+    if repo_ref.is_empty() || !CONTROLLED_TARGETS.contains(&repo_ref) {
         return (
             400,
             json!({
@@ -327,7 +364,7 @@ pub async fn handle_manifest(
         );
     }
 
-    let manifest_path = match manifest_path_for_target(repo) {
+    let manifest_path = match manifest_path_for_target(repo_ref) {
         Ok(p) => p,
         Err(_) => {
             return (
@@ -342,7 +379,7 @@ pub async fn handle_manifest(
 
     let mut base_sha = "a".repeat(40);
     let mut blob_sha = "b".repeat(40);
-    let mut manifest_val = make_valid_manifest_json(repo);
+    let mut manifest_val = make_valid_manifest_json(repo_ref);
 
     // Try fetching from GitHub if token is provided or transport is mock
     if !token.is_empty() {
@@ -378,11 +415,17 @@ pub async fn handle_manifest(
     }
 
     let digest = compute_canonical_patch_sha256(&manifest_val).unwrap_or_default();
+    let content_str = serde_json::to_string_pretty(&manifest_val).unwrap_or_default();
 
     (
         200,
         json!({
-            "repository": repo,
+            "repository": repo_ref,
+            "path": manifest_path,
+            "exists": true,
+            "content": content_str,
+            "errors": [],
+            "effective": manifest_val,
             "manifest": manifest_val,
             "base_sha": base_sha,
             "blob_sha": blob_sha,
@@ -393,7 +436,28 @@ pub async fn handle_manifest(
 
 /// POST /api/patch-console/validate
 pub fn handle_validate(manifest_val: &Value) -> (u16, Value) {
-    let errors = match validate_patch_manifest(manifest_val) {
+    let target_val: Value = if manifest_val.get("schema").is_none() {
+        if let Some(content_str) = manifest_val.get("content").and_then(|c| c.as_str()) {
+            match crate::patch::parse_manifest_to_value(content_str) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    return (
+                        400,
+                        json!({
+                            "valid": false,
+                            "errors": [{"field": "content", "message": e}],
+                        }),
+                    );
+                }
+            }
+        } else {
+            manifest_val.clone()
+        }
+    } else {
+        manifest_val.clone()
+    };
+
+    let errors = match validate_patch_manifest(&target_val) {
         Ok(_) => Vec::new(),
         Err(errs) => errs,
     };
@@ -408,11 +472,13 @@ pub fn handle_validate(manifest_val: &Value) -> (u16, Value) {
         );
     }
 
-    let digest = compute_canonical_patch_sha256(manifest_val).unwrap_or_default();
+    let digest = compute_canonical_patch_sha256(&target_val).unwrap_or_default();
     (
         200,
         json!({
             "valid": true,
+            "errors": [],
+            "effective": target_val,
             "patch_sha256": digest,
         }),
     )
@@ -424,9 +490,17 @@ pub async fn handle_save(
     transport: &dyn GitHubTransport,
     token: &str,
 ) -> (u16, Value) {
-    let manifest = match body.get("manifest") {
-        Some(m) if !m.is_null() => m,
-        _ => {
+    let parsed_from_content: Option<Value> = if body.get("manifest").is_none() {
+        body.get("content")
+            .and_then(|c| c.as_str())
+            .and_then(|s| crate::patch::parse_manifest_to_value(s).ok())
+    } else {
+        None
+    };
+
+    let manifest = match body.get("manifest").filter(|m| !m.is_null()).or(parsed_from_content.as_ref()) {
+        Some(m) => m,
+        None => {
             return (
                 400,
                 json!({
@@ -436,7 +510,13 @@ pub async fn handle_save(
         }
     };
 
-    let repo = manifest.get("repository").and_then(|r| r.as_str()).unwrap_or("");
+    let raw_repo = manifest
+        .get("repository")
+        .and_then(|r| r.as_str())
+        .or_else(|| body.get("path").and_then(|p| p.as_str()))
+        .unwrap_or("");
+    let resolved_repo = resolve_target_from_repo_or_path(raw_repo);
+    let repo = resolved_repo.as_str();
     if !CONTROLLED_TARGETS.contains(&repo) {
         return (
             400,
@@ -479,6 +559,7 @@ pub async fn handle_save(
     };
 
     let mut pr_url = format!("https://github.com/{}/pull/123", CONFIG_REPO);
+    let mut pr_number: u64 = 123;
 
     if !token.is_empty() {
         let auth_hdr = format!("Bearer {}", token);
@@ -534,6 +615,9 @@ pub async fn handle_save(
                         if let Some(url_str) = pr_resp.get("html_url").and_then(|u| u.as_str()) {
                             pr_url = url_str.to_string();
                         }
+                        if let Some(num) = pr_resp.get("number").and_then(|n| n.as_u64()) {
+                            pr_number = num;
+                        }
                     }
                 }
             }
@@ -560,6 +644,10 @@ pub async fn handle_save(
             "target_repo": repo,
             "patch_sha256": digest,
             "pr_url": pr_url,
+            "pull_request": {
+                "number": pr_number,
+                "url": pr_url,
+            },
         }),
     )
 }
@@ -567,7 +655,30 @@ pub async fn handle_save(
 /// POST /api/patches/preview or /api/patch-console/preview
 pub fn handle_preview(body: &Value) -> (u16, Value) {
     let current = body.get("current_manifest");
-    let target = body.get("manifest").unwrap_or(&Value::Null);
+    let parsed_target: Option<Value> = if body.get("manifest").is_none() {
+        body.get("content")
+            .and_then(|c| c.as_str())
+            .and_then(|s| crate::patch::parse_manifest_to_value(s).ok())
+            .or_else(|| {
+                body.get("repository")
+                    .and_then(|r| r.as_str())
+                    .map(|r| make_valid_manifest_json(&resolve_target_from_repo_or_path(r)))
+            })
+    } else {
+        None
+    };
+    let target = body.get("manifest").or(parsed_target.as_ref()).unwrap_or(&Value::Null);
     let classification: RolloutClassification = classify_rollout_values(current, target);
-    (200, json!(classification))
+    let mut val = json!(classification);
+    if let Some(obj) = val.as_object_mut() {
+        obj.entry("hosts".to_string()).or_insert_with(|| json!([]));
+        obj.entry("hot_patch_allowed".to_string()).or_insert_with(|| json!(false));
+        obj.entry("executor".to_string()).or_insert_with(|| {
+            json!({
+                "available": false,
+                "reason": "Serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick.",
+            })
+        });
+    }
+    (200, val)
 }

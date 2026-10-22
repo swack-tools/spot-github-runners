@@ -120,6 +120,21 @@ pub fn error_response(status: u16, error: &str, message: &str) -> Result<Respons
     Ok(Response::ok(body.to_string())?.with_status(status).with_headers(headers))
 }
 
+fn is_global_admins_enabled(env: &Env) -> bool {
+    match env.var("DASHBOARD_GLOBAL_ADMINS") {
+        Ok(v) => v.to_string().trim().to_lowercase() != "none",
+        Err(_) => true,
+    }
+}
+
+fn is_production_oauth_configured(env: &Env) -> bool {
+    let secret = env.secret("GITHUB_OAUTH_CLIENT_SECRET")
+        .or_else(|_| env.var("GITHUB_OAUTH_CLIENT_SECRET"))
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    !secret.trim().is_empty()
+}
+
 /// Top-level fetch handler for the Cloudflare Worker.
 #[event(fetch)]
 pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -184,7 +199,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 let (bundle, _) = state::load_state(&kv, now).await
                     .map_err(|e| Error::RustError(e.to_string()))?;
                 let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
-                let status = auth::check_session(session, &bundle.state.controlled_targets, &added_admins, false);
+                let global_admins = is_global_admins_enabled(&env);
+                let status = auth::check_session(session, &bundle.state.controlled_targets, &added_admins, global_admins);
 
                 match status {
                     auth::SessionCheckStatus::Ok => {
@@ -244,8 +260,70 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 return error_response(403, "forbidden", "Administrator permissions required");
             }
 
-            let update_req: state::UpdateScalingRequest = req.json().await?;
+            let raw_val: Value = req.json().await?;
+            let role = raw_val
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cicd_runner")
+                .to_string();
+            let base_policy = if role == "rust_builder" {
+                serde_json::to_value(&bundle.state.scaling.rust_builder).unwrap_or(Value::Null)
+            } else {
+                serde_json::to_value(&bundle.state.scaling.cicd_runner).unwrap_or(Value::Null)
+            };
+            let patch_val = raw_val.get("policy").unwrap_or(&raw_val);
+            let merged_policy = match (base_policy, patch_val) {
+                (Value::Object(mut base_map), Value::Object(patch_map)) => {
+                    for (k, v) in patch_map {
+                        if k != "role" && k != "telemetry" && k != "add_github_oom_run" {
+                            base_map.insert(k.clone(), v.clone());
+                        }
+                    }
+                    Value::Object(base_map)
+                }
+                (_, other) => other.clone(),
+            };
+            let update_req = state::UpdateScalingRequest {
+                role,
+                policy: merged_policy,
+            };
             match state::handle_post_scaling(&kv, update_req, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(e) => error_response(400, "bad_request", &e.to_string()),
+            }
+        }
+
+        (Method::Post, "/api/budget") => {
+            let session = match verified_session {
+                Some(s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now).await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+            let budget_req: state::BudgetConfig = req.json().await?;
+            match state::handle_post_budget(&kv, budget_req, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(e) => error_response(400, "bad_request", &e.to_string()),
+            }
+        }
+
+        (Method::Post, "/api/regions") => {
+            let session = match verified_session {
+                Some(s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now).await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+            let body_val: Value = req.json().await?;
+            match state::handle_post_regions(&kv, body_val, now).await {
                 Ok((status_code, body)) => json_response(status_code, &body),
                 Err(e) => error_response(400, "bad_request", &e.to_string()),
             }
@@ -346,7 +424,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 return error_response(401, "unauthorized", "Sign in required");
             }
             let repo = url.query_pairs()
-                .find(|(k, _)| k == "repo")
+                .find(|(k, _)| k == "repo" || k == "path")
                 .map(|(_, v)| v.to_string())
                 .unwrap_or_default();
             let gh_token = env.secret("SPOT_CONFIG_GH_TOKEN")
@@ -404,7 +482,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 let (bundle, _) = state::load_state(&kv, now).await
                     .map_err(|e| Error::RustError(e.to_string()))?;
                 let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
-                let status_enum = auth::check_session(session, &bundle.state.controlled_targets, &added_admins, false);
+                let global_admins = is_global_admins_enabled(&env);
+                let status_enum = auth::check_session(session, &bundle.state.controlled_targets, &added_admins, global_admins);
 
                 let (status_str, missing_targets) = match status_enum {
                     auth::SessionCheckStatus::Ok => ("authorized", Vec::new()),
@@ -536,7 +615,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 .map(|s| s.to_string())
                 .unwrap_or_default();
 
-            let (login, uid) = if !client_id.is_empty() && !client_secret.is_empty() && !code.starts_with("mock") && !code.starts_with("gh_auth_code") {
+            let (login, uid) = if !client_id.is_empty() && !client_secret.is_empty() {
                 let verifier = auth::pkce_verifier(session_secret, &state);
                 let redirect_uri = env.var("GITHUB_OAUTH_REDIRECT_URI")
                     .map(|s| s.to_string())
@@ -707,8 +786,11 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             }
         }
 
-        // Test Helper Endpoints for E2E suites
+        // Test Helper Endpoints for E2E suites (disabled when production OAuth secret is set)
         (Method::Post, "/api/test/authorize-device") => {
+            if is_production_oauth_configured(&env) {
+                return error_response(404, "not_found", "Not found");
+            }
             let body_val: Value = req.json().await.unwrap_or(Value::Null);
             let dev_code = body_val.get("device_code").and_then(|v| v.as_str()).unwrap_or_default();
             if auth::authorize_device(dev_code, auth::ALLOWED_ADMIN_LOGIN, auth::ALLOWED_ADMIN_ID) {
@@ -720,6 +802,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Reconciler Simulation & Control Endpoints
         (Method::Post, "/api/reconciler/tick") => {
+            if is_production_oauth_configured(&env) && verified_session.is_none() {
+                return error_response(401, "unauthorized", "Sign in required");
+            }
             let sa_key = env.secret("GCP_SERVICE_ACCOUNT_KEY")
                 .map(|s| s.to_string())
                 .or_else(|_| env.var("GCP_SERVICE_ACCOUNT_KEY").map(|v| v.to_string()))
@@ -738,6 +823,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Get, "/api/test/kv-stats") => {
+            if is_production_oauth_configured(&env) {
+                return error_response(404, "not_found", "Not found");
+            }
             let (puts, gets, hits) = reconciler::get_kv_stats();
             let body = serde_json::json!({
                 "kv_puts": puts,
@@ -748,6 +836,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/test/inject-terminated-vm") => {
+            if is_production_oauth_configured(&env) {
+                return error_response(404, "not_found", "Not found");
+            }
             let body_val: Value = req.json().await.unwrap_or(Value::Null);
             let vm_name = body_val.get("name").and_then(|v| v.as_str()).unwrap_or("oxidex-runners-preempted");
             reconciler::inject_terminated_vm(vm_name.to_string());
@@ -759,6 +850,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/test/inject-stale-runner") => {
+            if is_production_oauth_configured(&env) {
+                return error_response(404, "not_found", "Not found");
+            }
             let body_val: Value = req.json().await.unwrap_or(Value::Null);
             let runner_id = body_val.get("runner_id").and_then(|v| v.as_str()).unwrap_or("runner-stale-999");
             reconciler::inject_stale_runner(runner_id.to_string());
@@ -770,12 +864,18 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/test/reset") => {
+            if is_production_oauth_configured(&env) {
+                return error_response(404, "not_found", "Not found");
+            }
             reconciler::reset_reconciler_state();
             state::invalidate_state_cache();
             json_response(200, &serde_json::json!({"status": "ok"}))
         }
 
         (Method::Post, "/api/test/set-revocation-cutoff") => {
+            if is_production_oauth_configured(&env) {
+                return error_response(404, "not_found", "Not found");
+            }
             json_response(200, &serde_json::json!({"status": "ok"}))
         }
 
