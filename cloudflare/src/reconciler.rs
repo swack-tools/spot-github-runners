@@ -37,6 +37,18 @@ pub const RECONCILER_LEASE_TTL_SECS: u64 = 240;
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 1800; // 30 minutes
 pub const LAUNCH_TIMEOUT_SECS: u64 = 900; // 15 minutes
 
+/// Generate a unique 8-character hex entropy suffix for instance names.
+/// Uses getrandom (supported in Wasm via js and native targets).
+fn generate_unique_suffix(now: u64) -> String {
+    let mut bytes = [0u8; 4];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        hex::encode(bytes)
+    } else {
+        let tick = TICK_COUNTER.load(Ordering::Relaxed);
+        format!("{:08x}", (now ^ (tick as u64)) as u32)
+    }
+}
+
 // ============================================================================
 // Data Types & State Machine Models
 // ============================================================================
@@ -358,6 +370,14 @@ pub fn set_reconciler_lease(expires_at: Option<u64>) {
     *RECONCILER_LEASE.lock().unwrap() = expires_at;
 }
 
+pub fn inject_active_launch(op: LaunchOperation) {
+    ACTIVE_LAUNCHES.lock().unwrap().push(op);
+}
+
+pub fn get_active_launches() -> Vec<LaunchOperation> {
+    ACTIVE_LAUNCHES.lock().unwrap().clone()
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SimulatedFleetProvider;
 
@@ -613,23 +633,91 @@ where
     let org = bundle.state.org.clone();
 
     // 2. Query Current GCP & GitHub Fleet State
-    let instances = gcp.list_instances(&project, now).await.unwrap_or_default();
-    let runners = gh
-        .list_runners(&format!("orgs/{}", org))
-        .await
-        .unwrap_or_default();
+    let instances = match gcp.list_instances(&project, now).await {
+        Ok(inst) => {
+            let fi = serde_json::json!({
+                "source": "gce",
+                "last_success_at": crate::state::chrono_iso(now),
+                "last_success_epoch": now,
+                "stale": false,
+                "stale_reason": serde_json::Value::Null,
+                "last_error": serde_json::Value::Null
+            });
+            bundle.state.fleet_inventory = fi.clone();
+            if let Some(ref mut ov) = bundle.state.overview {
+                if let Some(obj) = ov.as_object_mut() {
+                    obj.insert("fleet_inventory".to_string(), fi.clone());
+                    if let Some(iv) = obj
+                        .get_mut("instances_view")
+                        .and_then(|v| v.as_object_mut())
+                    {
+                        iv.insert("fleet_inventory".to_string(), fi);
+                    }
+                }
+            }
+            inst
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let controlled_targets = if bundle.state.controlled_targets.is_empty() {
+        CONTROLLED_TARGETS
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    } else {
+        bundle.state.controlled_targets.clone()
+    };
+
+    // Build target-aware list of API targets used for provisioning
+    let mut target_paths = vec![format!("orgs/{}", org)];
+    for target in &controlled_targets {
+        let path = if target.contains('/') {
+            format!("repos/{}", target)
+        } else {
+            format!("orgs/{}", target)
+        };
+        if !target_paths.contains(&path) {
+            target_paths.push(path);
+        }
+    }
+
+    // Query runners across every target used for provisioning
+    let mut runners: Vec<SimpleGitHubRunner> = Vec::new();
+    let mut runner_target_map: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
+
+    for target_path in &target_paths {
+        if let Ok(target_runners) = gh.list_runners(target_path).await {
+            for r in target_runners {
+                if !runner_target_map.contains_key(&r.id) {
+                    runner_target_map.insert(r.id, target_path.clone());
+                    runners.push(r);
+                }
+            }
+        }
+    }
 
     // Sum queued jobs backlog across controlled targets
     let mut queued_jobs = 0u32;
-    for target in CONTROLLED_TARGETS {
+    let mut backlog_known = true;
+    for target in &controlled_targets {
         let (owner, repo) = if target.contains('/') {
             let mut parts = target.splitn(2, '/');
             (parts.next().unwrap_or(&org), parts.next().unwrap_or(target))
         } else {
             (org.as_str(), "oxidex")
         };
-        if let Ok(count) = gh.count_queued_jobs(owner, repo).await {
-            queued_jobs += count;
+        match gh.count_queued_jobs(owner, repo).await {
+            Ok(count) => {
+                queued_jobs += count;
+            }
+            Err(_) => {
+                // If counting queued jobs fails for a target (e.g. rate limit, 403, or outage),
+                // mark backlog as unknown so backlog scale-up is suppressed, but continue
+                // independent fleet maintenance (terminated VM cleanup, launch tracking, floor targets).
+                backlog_known = false;
+            }
         }
     }
 
@@ -673,10 +761,17 @@ where
         .collect();
 
     for runner in &runners {
-        if runner.status.eq_ignore_ascii_case("offline") && !runner.busy {
+        if runner.status.eq_ignore_ascii_case("offline")
+            && !runner.busy
+            && (runner.name.starts_with("oxidex") || runner.name.contains("oxidex-runners"))
+        {
             let matches_active = active_vm_names.iter().any(|&vm| runner.name.contains(vm));
             if !matches_active {
-                let _ = gh.delete_runner(&format!("orgs/{}", org), runner.id).await;
+                let target_path = runner_target_map
+                    .get(&runner.id)
+                    .map(|s| s.as_str())
+                    .unwrap_or_else(|| &target_paths[0]);
+                let _ = gh.delete_runner(target_path, runner.id).await;
                 cleaned_runners.push(runner.name.clone());
             }
         }
@@ -734,22 +829,16 @@ where
     }
 
     // 8. Floor Target Keeper (Ensure >= 1 Host Per Target)
-    let controlled_targets = if bundle.state.controlled_targets.is_empty() {
-        CONTROLLED_TARGETS
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-    } else {
-        bundle.state.controlled_targets.clone()
-    };
-
     for target in &controlled_targets {
         let target_slug = target.replace('/', "-").to_lowercase();
+        let safe_slug = if target_slug.len() > 24 {
+            &target_slug[..24]
+        } else {
+            &target_slug
+        };
         let active_count = instances
             .iter()
-            .filter(|i| {
-                !i.status.eq_ignore_ascii_case("TERMINATED") && i.name.contains(&target_slug)
-            })
+            .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED") && i.name.contains(safe_slug))
             .count();
 
         let in_flight = ACTIVE_LAUNCHES
@@ -759,7 +848,8 @@ where
             .any(|l| l.target == *target);
 
         if active_count == 0 && !in_flight {
-            let host_name = format!("oxidex-runners-{}-{}", target_slug, &now.to_string()[..6]);
+            let hex_suffix = generate_unique_suffix(now);
+            let host_name = format!("oxidex-runners-{}-{}-{}", safe_slug, now, hex_suffix);
             let deployment_id = format!("dep-{}", now);
 
             // Mint 2-slot JIT configs with fallback to registration token
@@ -889,8 +979,12 @@ where
         .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
         .count();
 
-    if queued_jobs >= MIN_QUEUED_JOBS_THRESHOLD && current_live < (max_instances as usize) {
-        let scale_host = format!("oxidex-runners-scale-{}", &now.to_string()[..6]);
+    if backlog_known
+        && queued_jobs >= MIN_QUEUED_JOBS_THRESHOLD
+        && current_live < (max_instances as usize)
+    {
+        let hex_suffix = generate_unique_suffix(now);
+        let scale_host = format!("oxidex-runners-scale-{}-{}", now, hex_suffix);
         let deployment_id = format!("dep-scale-{}", now);
         let runner_prefix = "oxidex";
         let labels = vec![
@@ -994,27 +1088,56 @@ where
     let heartbeat_elapsed = now.saturating_sub(bundle.written_at) >= HEARTBEAT_INTERVAL_SECS;
 
     let snapshot_written = if has_mutations || heartbeat_elapsed {
-        // Sync instances_view with active instances
+        // Sync instances_view with active instances while preserving dedicated builders
+        let existing_by_name: std::collections::HashMap<String, InstanceRecord> = bundle
+            .state
+            .instances
+            .iter()
+            .map(|inst| (inst.name.clone(), inst.clone()))
+            .collect();
+
         bundle.state.instances_view = instances
             .iter()
             .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
-            .map(|i| InstanceRecord {
-                id: i.id.clone().unwrap_or_else(|| i.name.clone()),
-                name: i.name.clone(),
-                zone: i.zone.clone(),
-                region: i.zone.split('-').take(2).collect::<Vec<_>>().join("-"),
-                machine_type: i.machine_type.clone(),
-                status: i.status.clone(),
-                role: "cicd_runner".to_string(),
-                vcpu: MIN_HOST_VCPU,
-                ram_gib: MIN_HOST_RAM_GIB,
-                runners_count: RUNNERS_PER_HOST,
-                runners_count_known: true,
-                runner_limits_known: true,
+            .map(|i| {
+                if let Some(existing) = existing_by_name.get(&i.name) {
+                    if existing.role == "rust_builder" || i.name.starts_with("builder-") {
+                        let mut rec = existing.clone();
+                        rec.status = i.status.clone();
+                        rec.zone = i.zone.clone();
+                        rec.region = i.zone.split('-').take(2).collect::<Vec<_>>().join("-");
+                        rec.machine_type = i.machine_type.clone();
+                        return rec;
+                    }
+                }
+                let is_builder = i.name.starts_with("builder-");
+                InstanceRecord {
+                    id: i.id.clone().unwrap_or_else(|| i.name.clone()),
+                    name: i.name.clone(),
+                    zone: i.zone.clone(),
+                    region: i.zone.split('-').take(2).collect::<Vec<_>>().join("-"),
+                    machine_type: i.machine_type.clone(),
+                    status: i.status.clone(),
+                    role: if is_builder {
+                        "rust_builder".to_string()
+                    } else {
+                        "cicd_runner".to_string()
+                    },
+                    vcpu: if is_builder { 16 } else { MIN_HOST_VCPU },
+                    ram_gib: if is_builder { 32 } else { MIN_HOST_RAM_GIB },
+                    runners_count: if is_builder { 0 } else { RUNNERS_PER_HOST },
+                    runners_count_known: true,
+                    runner_limits_known: true,
+                }
             })
             .collect();
 
-        bundle.state.scaling_telemetry.queued_jobs = queued_jobs;
+        // Synchronize state.instances with live instances_view for unified action inventory
+        bundle.state.instances = bundle.state.instances_view.clone();
+
+        if backlog_known {
+            bundle.state.scaling_telemetry.queued_jobs = queued_jobs;
+        }
         bundle.state.scaling_telemetry.current_runners = runners
             .iter()
             .filter(|r| r.status.eq_ignore_ascii_case("online"))

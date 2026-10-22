@@ -624,38 +624,67 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/cloud-init/save") => {
-            let body_val: Value = req.json().await.unwrap_or(Value::Null);
-            let id = body_val
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("custom-template");
-            let name = body_val
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Custom Template");
-            let role = body_val
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cicd_runner");
-            let resp = serde_json::json!({
-                "status": "ok",
-                "template": {
-                    "id": id,
-                    "name": name,
-                    "role": role
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+
+            let save_req: state::SaveCloudInitRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            match state::handle_post_cloud_init_save(&kv, save_req, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
                 }
-            });
-            json_response(200, &resp)
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
         }
 
         // VM Instance Templates
         (Method::Post, "/api/vm-templates/from-instance") => {
-            let resp = serde_json::json!({
-                "status": "ok",
-                "message": "VM instance template registered",
-                "template_name": "custom-runner-template"
-            });
-            json_response(200, &resp)
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+
+            let tpl_req: state::CreateVmTemplateRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            match state::handle_post_vm_templates_from_instance(&kv, tpl_req, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
         }
 
         // Rust Build Telemetry
@@ -670,11 +699,34 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/rust-builds") => {
-            let resp = serde_json::json!({
-                "status": "ok",
-                "message": "Rust build recorded"
-            });
-            json_response(200, &resp)
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+
+            let record_req: state::RecordRustBuildRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            match state::handle_post_rust_builds(&kv, record_req, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
         }
 
         // Legacy Live Hot Patching (Deprecated in favor of PR Patch Console)
@@ -881,94 +933,116 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 .map(|s| s.to_string())
                 .unwrap_or_default();
 
-            let (login, uid) = if !client_id.is_empty() && !client_secret.is_empty() {
-                let verifier = auth::pkce_verifier(session_secret, &state);
-                let redirect_uri = env
-                    .var("GITHUB_OAUTH_REDIRECT_URI")
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|_| {
-                        let scheme = url.scheme();
-                        let host = url.host_str().unwrap_or("spot.swacktech.com");
-                        format!("{}://{}/auth/github/callback", scheme, host)
-                    });
-
-                let token_form = format!(
-                    "client_id={}&client_secret={}&code={}&redirect_uri={}&code_verifier={}",
-                    percent_encoding::utf8_percent_encode(
-                        &client_id,
-                        percent_encoding::NON_ALPHANUMERIC
-                    ),
-                    percent_encoding::utf8_percent_encode(
-                        &client_secret,
-                        percent_encoding::NON_ALPHANUMERIC
-                    ),
-                    percent_encoding::utf8_percent_encode(
-                        &code,
-                        percent_encoding::NON_ALPHANUMERIC
-                    ),
-                    percent_encoding::utf8_percent_encode(
-                        &redirect_uri,
-                        percent_encoding::NON_ALPHANUMERIC
-                    ),
-                    percent_encoding::utf8_percent_encode(
-                        &verifier,
-                        percent_encoding::NON_ALPHANUMERIC
-                    ),
+            if client_id.is_empty() || client_secret.is_empty() {
+                return ui::serve_login_gate(
+                    &req,
+                    "GitHub OAuth application is not configured on this server (GITHUB_OAUTH_CLIENT_ID or GITHUB_OAUTH_CLIENT_SECRET missing). Sign-in refused.",
+                    "",
+                    500,
                 );
+            }
 
-                let mut init = RequestInit::new();
-                init.with_method(Method::Post);
-                let gh_headers = Headers::new();
-                gh_headers.set("Content-Type", "application/x-www-form-urlencoded")?;
-                gh_headers.set("Accept", "application/json")?;
-                gh_headers.set("User-Agent", "spot-dashboard-edge")?;
-                init.with_headers(gh_headers);
-                init.with_body(Some(worker::wasm_bindgen::JsValue::from_str(&token_form)));
+            let verifier = auth::pkce_verifier(session_secret, &state);
+            let redirect_uri = env
+                .var("GITHUB_OAUTH_REDIRECT_URI")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| {
+                    let scheme = url.scheme();
+                    let host = url.host_str().unwrap_or("spot.swacktech.com");
+                    format!("{}://{}/auth/github/callback", scheme, host)
+                });
 
-                let gh_req =
-                    Request::new_with_init("https://github.com/login/oauth/access_token", &init)?;
-                let mut gh_resp = Fetch::Request(gh_req).send().await?;
-                let token_json: Value = gh_resp
-                    .json()
-                    .await
-                    .map_err(|e| Error::RustError(e.to_string()))?;
+            let token_form = format!(
+                "client_id={}&client_secret={}&code={}&redirect_uri={}&code_verifier={}",
+                percent_encoding::utf8_percent_encode(
+                    &client_id,
+                    percent_encoding::NON_ALPHANUMERIC
+                ),
+                percent_encoding::utf8_percent_encode(
+                    &client_secret,
+                    percent_encoding::NON_ALPHANUMERIC
+                ),
+                percent_encoding::utf8_percent_encode(&code, percent_encoding::NON_ALPHANUMERIC),
+                percent_encoding::utf8_percent_encode(
+                    &redirect_uri,
+                    percent_encoding::NON_ALPHANUMERIC
+                ),
+                percent_encoding::utf8_percent_encode(
+                    &verifier,
+                    percent_encoding::NON_ALPHANUMERIC
+                ),
+            );
 
-                let access_token = match token_json.get("access_token").and_then(|v| v.as_str()) {
-                    Some(tok) => tok.to_string(),
-                    None => return error_response(403, "forbidden", "GitHub code exchange failed"),
-                };
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post);
+            let gh_headers = Headers::new();
+            gh_headers.set("Content-Type", "application/x-www-form-urlencoded")?;
+            gh_headers.set("Accept", "application/json")?;
+            gh_headers.set("User-Agent", "spot-dashboard-edge")?;
+            init.with_headers(gh_headers);
+            init.with_body(Some(worker::wasm_bindgen::JsValue::from_str(&token_form)));
 
-                let mut user_init = RequestInit::new();
-                user_init.with_method(Method::Get);
-                let user_headers = Headers::new();
-                user_headers.set("Authorization", &format!("Bearer {}", access_token))?;
-                user_headers.set("Accept", "application/vnd.github+json")?;
-                user_headers.set("User-Agent", "spot-dashboard-edge")?;
-                user_headers.set("X-GitHub-Api-Version", "2022-11-28")?;
-                user_init.with_headers(user_headers);
+            let gh_req =
+                Request::new_with_init("https://github.com/login/oauth/access_token", &init)?;
+            let mut gh_resp = Fetch::Request(gh_req).send().await?;
+            let token_json: Value = gh_resp
+                .json()
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
 
-                let user_req = Request::new_with_init("https://api.github.com/user", &user_init)?;
-                let mut user_resp = Fetch::Request(user_req).send().await?;
-                let user_json: Value = user_resp
-                    .json()
-                    .await
-                    .map_err(|e| Error::RustError(e.to_string()))?;
+            let access_token = match token_json.get("access_token").and_then(|v| v.as_str()) {
+                Some(tok) => tok.to_string(),
+                None => {
+                    let err_desc = token_json
+                        .get("error_description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Code exchange failed");
+                    return ui::serve_login_gate(
+                        &req,
+                        &format!("GitHub OAuth Error: {}", err_desc),
+                        "",
+                        403,
+                    );
+                }
+            };
 
-                let gh_login = user_json
-                    .get("login")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let gh_id = user_json
-                    .get("id")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or_default();
-                (gh_login, gh_id)
-            } else {
-                (
-                    auth::ALLOWED_ADMIN_LOGIN.to_string(),
-                    auth::ALLOWED_ADMIN_ID,
-                )
+            let mut user_init = RequestInit::new();
+            user_init.with_method(Method::Get);
+            let user_headers = Headers::new();
+            user_headers.set("Authorization", &format!("Bearer {}", access_token))?;
+            user_headers.set("Accept", "application/vnd.github+json")?;
+            user_headers.set("User-Agent", "spot-dashboard-edge")?;
+            user_headers.set("X-GitHub-Api-Version", "2022-11-28")?;
+            user_init.with_headers(user_headers);
+
+            let user_req = Request::new_with_init("https://api.github.com/user", &user_init)?;
+            let mut user_resp = Fetch::Request(user_req).send().await?;
+            let user_json: Value = user_resp
+                .json()
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+
+            let login = match user_json.get("login").and_then(|v| v.as_str()) {
+                Some(l) => l.to_string(),
+                None => {
+                    return ui::serve_login_gate(
+                        &req,
+                        "Failed to retrieve GitHub user identity",
+                        "",
+                        403,
+                    );
+                }
+            };
+            let uid = match user_json.get("id").and_then(|v| v.as_u64()) {
+                Some(id) => id,
+                None => {
+                    return ui::serve_login_gate(
+                        &req,
+                        "Failed to retrieve GitHub user ID",
+                        "",
+                        403,
+                    );
+                }
             };
 
             let (bundle, _) = state::load_state(&kv, now)
@@ -1157,7 +1231,35 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             )
             .await
             {
-                Ok(report) => json_response(200, &report),
+                Ok(report) => {
+                    if !report.snapshot_written {
+                        if let Ok((mut bundle, _)) = state::load_state(&kv, now).await {
+                            let fi = serde_json::json!({
+                                "source": "gce",
+                                "last_success_at": state::chrono_iso(now),
+                                "last_success_epoch": now,
+                                "stale": false,
+                                "stale_reason": serde_json::Value::Null,
+                                "last_error": serde_json::Value::Null
+                            });
+                            bundle.state.fleet_inventory = fi.clone();
+                            if let Some(ref mut ov) = bundle.state.overview {
+                                if let Some(obj) = ov.as_object_mut() {
+                                    obj.insert("fleet_inventory".to_string(), fi.clone());
+                                    if let Some(iv) = obj
+                                        .get_mut("instances_view")
+                                        .and_then(|v| v.as_object_mut())
+                                    {
+                                        iv.insert("fleet_inventory".to_string(), fi);
+                                    }
+                                }
+                            }
+                            bundle.state.updated_at = now;
+                            let _ = state::save_state(&kv, &mut bundle, now).await;
+                        }
+                    }
+                    json_response(200, &report)
+                }
                 Err(e) => error_response(500, "reconciliation_failed", &e.to_string()),
             }
         }

@@ -528,6 +528,33 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
                     obj.insert("profiles".to_string(), pr);
                 }
             }
+            if let Ok(cit) = serde_json::to_value(&bundle.state.cloud_init_templates) {
+                obj.insert("cloud_init_templates".to_string(), cit);
+            }
+            if let Ok(vmt) = serde_json::to_value(&bundle.state.vm_templates) {
+                obj.insert("vm_templates".to_string(), vmt);
+            }
+            if let Ok(rb) = serde_json::to_value(&bundle.state.rust_builds) {
+                obj.insert("rust_builds".to_string(), rb);
+            }
+            if let Ok(da) = serde_json::to_value(&bundle.state.dashboard_admins) {
+                obj.insert("dashboard_admins".to_string(), da);
+            }
+            if !bundle.state.fleet_inventory.is_null() {
+                obj.insert(
+                    "fleet_inventory".to_string(),
+                    bundle.state.fleet_inventory.clone(),
+                );
+                if let Some(iv) = obj
+                    .get_mut("instances_view")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    iv.insert(
+                        "fleet_inventory".to_string(),
+                        bundle.state.fleet_inventory.clone(),
+                    );
+                }
+            }
         }
         return Ok((200, ov));
     }
@@ -553,6 +580,7 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
         "regions": [],
         "instances_view": {
             "instances": bundle.state.instances_view,
+            "fleet_inventory": bundle.state.fleet_inventory,
             "window_hours": 24.0,
             "total_window_spend_usd": 0.0,
             "active_hourly_burn_usd": 0.0,
@@ -572,6 +600,8 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
             "active_instances_count": 0
         },
         "fleet_inventory": bundle.state.fleet_inventory,
+        "cloud_init_templates": bundle.state.cloud_init_templates,
+        "vm_templates": bundle.state.vm_templates,
         "rust_builds": bundle.state.rust_builds,
         "dashboard_admins": bundle.state.dashboard_admins
     });
@@ -888,6 +918,445 @@ pub async fn handle_post_admins_remove<K: KvStoreBackend>(
 }
 
 // ============================================================================
+// Cloud-Init Templates, VM Templates & Rust Builds Handlers
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveCloudInitRequest {
+    pub id: Option<String>,
+    pub mode: Option<String>,
+    pub role: String,
+    pub name: String,
+    pub content: String,
+    #[serde(default)]
+    pub assign_to_profile: bool,
+}
+
+pub(crate) fn generate_record_id(prefix: &str, now: u64) -> String {
+    let mut bytes = [0u8; 4];
+    let hex_entropy = if getrandom::getrandom(&mut bytes).is_ok() {
+        hex::encode(bytes)
+    } else {
+        format!("{:08x}", now as u32)
+    };
+    format!("{}-{}-{}", prefix, now, hex_entropy)
+}
+
+pub(crate) fn derive_hardware_profile(
+    machine_type: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    let mt = machine_type.trim();
+    if mt.starts_with("c4d-") {
+        Some(("AMD Turin", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("n4d-") {
+        Some(("AMD Turin", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("c2d-") {
+        Some(("AMD Milan", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("n2d-") {
+        Some(("AMD Milan", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("n4-") {
+        Some(("Intel Emerald Rapids", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("c4-") {
+        Some((
+            "Intel Emerald Rapids",
+            "hyperdisk_balanced",
+            "hyperdisk-balanced",
+        ))
+    } else if mt.starts_with("c3-") {
+        Some((
+            "Intel Sapphire Rapids",
+            "hyperdisk_balanced",
+            "hyperdisk-balanced",
+        ))
+    } else if mt.starts_with("n2-") {
+        Some(("Intel Ice Lake", "pd_balanced", "pd-balanced"))
+    } else {
+        None
+    }
+}
+
+pub async fn handle_post_cloud_init_save<K: KvStoreBackend>(
+    kv: &K,
+    req: SaveCloudInitRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(StateError::Validation(
+            "Template name cannot be empty".into(),
+        ));
+    }
+    let content = req.content.trim();
+    if content.is_empty() {
+        return Err(StateError::Validation(
+            "Template content cannot be empty".into(),
+        ));
+    }
+    if req.role != "cicd_runner" && req.role != "rust_builder" {
+        return Err(StateError::Validation(format!(
+            "Unsupported workload role: {}",
+            req.role
+        )));
+    }
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+
+    let is_save_as = req.mode.as_deref() == Some("save_as");
+    let requested_id = req.id.as_deref().unwrap_or("").trim();
+
+    let template_id = if is_save_as || requested_id.is_empty() {
+        generate_record_id(&format!("{}-custom", req.role.replace('_', "-")), now)
+    } else {
+        requested_id.to_string()
+    };
+
+    let updated_iso = chrono_iso(now);
+    let saved_template = CloudInitTemplate {
+        id: template_id.clone(),
+        name: name.to_string(),
+        role: req.role.clone(),
+        description: format!("Updated via Patch Console at {}", updated_iso),
+        updated_at: updated_iso,
+        content: req.content.clone(),
+    };
+
+    if let Some(existing) = bundle
+        .state
+        .cloud_init_templates
+        .iter_mut()
+        .find(|t| t.id == template_id)
+    {
+        if existing.role != req.role {
+            return Err(StateError::Validation(format!(
+                "Cannot change workload role of existing template '{}' from '{}' to '{}'; use save_as to create a new template for a different role",
+                template_id, existing.role, req.role
+            )));
+        }
+        *existing = saved_template.clone();
+    } else {
+        bundle
+            .state
+            .cloud_init_templates
+            .push(saved_template.clone());
+    }
+
+    if req.assign_to_profile {
+        if let Some(profile) = bundle.state.profiles.get_mut(&req.role) {
+            profile.cloud_init_template_id = template_id.clone();
+        }
+    }
+
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "template": saved_template
+        }),
+    ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateVmTemplateRequest {
+    pub instance_id: String,
+    pub template_name: String,
+}
+
+pub async fn handle_post_vm_templates_from_instance<K: KvStoreBackend>(
+    kv: &K,
+    req: CreateVmTemplateRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let raw_id = req.instance_id.trim();
+    let instance_id = if raw_id == "undefined" { "" } else { raw_id };
+
+    if instance_id.is_empty() {
+        return Err(StateError::Validation("instance_id cannot be empty".into()));
+    }
+    let template_name = req.template_name.trim();
+    if template_name.is_empty() {
+        return Err(StateError::Validation(
+            "template_name cannot be empty".into(),
+        ));
+    }
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+
+    let inst = bundle
+        .state
+        .instances_view
+        .iter()
+        .chain(bundle.state.instances.iter())
+        .find(|i| i.id == instance_id || i.name == instance_id)
+        .cloned()
+        .ok_or_else(|| {
+            StateError::NotFound(format!(
+                "Source instance '{}' not found in live fleet inventory",
+                instance_id
+            ))
+        })?;
+
+    let (cpu_platform, disk_cat, disk_type) = derive_hardware_profile(&inst.machine_type)
+        .ok_or_else(|| {
+            StateError::Validation(format!(
+                "Cannot derive hardware profile for unknown machine type '{}'",
+                inst.machine_type
+            ))
+        })?;
+
+    let tpl_id = generate_record_id("vmtpl", now);
+    let runner_vcpu = if inst.runners_count > 0 {
+        inst.vcpu / inst.runners_count
+    } else {
+        4
+    };
+    let runner_ram_gib = if inst.runners_count > 0 {
+        inst.ram_gib / inst.runners_count
+    } else {
+        16
+    };
+
+    let new_template = VmTemplate {
+        id: tpl_id,
+        name: template_name.to_string(),
+        role: inst.role.clone(),
+        machine_type: inst.machine_type.clone(),
+        vcpu: inst.vcpu,
+        ram_gib: inst.ram_gib,
+        cpu_platform: cpu_platform.to_string(),
+        benchmark_score: inst.vcpu * 120,
+        disk_category: disk_cat.to_string(),
+        boot_disk_type: disk_type.to_string(),
+        boot_disk_gb: 30,
+        data_disk_type: disk_type.to_string(),
+        data_disk_gb: if inst.role == "rust_builder" {
+            375
+        } else {
+            100
+        },
+        runners_count: inst.runners_count,
+        runner_vcpu,
+        runner_ram_gib,
+        cloud_init_template_id: if inst.role == "rust_builder" {
+            "rust-builder-default".to_string()
+        } else {
+            "cicd-runner-default".to_string()
+        },
+        created_at: chrono_iso(now),
+    };
+
+    bundle.state.vm_templates.push(new_template.clone());
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "message": "VM instance template registered",
+            "template_name": template_name,
+            "template": new_template,
+            "vm_template": new_template
+        }),
+    ))
+}
+
+pub const MAX_RUST_BUILDS_HISTORY: usize = 50;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordRustBuildRequest {
+    pub status: String,
+    pub project_name: Option<String>,
+    pub commit_sha: Option<String>,
+    pub profile: Option<String>,
+    pub compile_duration_seconds: Option<f64>,
+    pub delivery_duration_seconds: Option<f64>,
+    pub instance_name: Option<String>,
+    pub zone: Option<String>,
+    pub machine_type: Option<String>,
+    pub cpu_platform: Option<String>,
+    pub vcpu: Option<u32>,
+    pub origin_ip: Option<String>,
+    pub cache_hits: Option<u32>,
+    pub total_crates: Option<u32>,
+    pub peak_ram_gib: Option<f64>,
+    pub cpu_time_seconds: Option<f64>,
+}
+
+pub async fn handle_post_rust_builds<K: KvStoreBackend>(
+    kv: &K,
+    req: RecordRustBuildRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    if req.status.trim().is_empty() {
+        return Err(StateError::Validation(
+            "Build status cannot be empty".into(),
+        ));
+    }
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+
+    let build_id = generate_record_id("build", now);
+    let iso_now = chrono_iso(now);
+
+    let compile_sec = req.compile_duration_seconds.unwrap_or(0.0);
+    let delivery_sec = req.delivery_duration_seconds.unwrap_or(0.0);
+    let total_duration = compile_sec + delivery_sec;
+
+    let hits = req.cache_hits.unwrap_or(0);
+    let crates = req.total_crates.unwrap_or(0);
+    let hit_rate = if crates > 0 {
+        ((hits as f64 / crates as f64) * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    let bench = req.vcpu.map(|v| v * 120);
+    let cpu_pts = match (req.cpu_time_seconds, bench) {
+        (Some(sec), Some(b)) => Some(((sec * b as f64) / 1000.0).round() as u64),
+        _ => None,
+    };
+    let cpu_formula = match (req.cpu_time_seconds, bench) {
+        (Some(sec), Some(b)) => Some(format!("{:.1}s CPU × bench {} / 1000", sec, b)),
+        _ => None,
+    };
+
+    let (origin_hostname, geo, net_sec) = if let Some(ref ip) = req.origin_ip {
+        let is_local = ip.starts_with("127.") || ip.starts_with("10.") || ip == "::1";
+        let hostname = if is_local {
+            "direct.local"
+        } else {
+            "gateway.swacktech.com"
+        };
+        let g = serde_json::json!({
+            "city": if is_local { "Local Subnet" } else { "Council Bluffs" },
+            "country": "United States",
+            "country_code": "US",
+            "asn": "AS15169",
+            "isp": "Google Cloud"
+        });
+        let ns = serde_json::json!({
+            "is_tor": false,
+            "is_vpn": false,
+            "badge_text": "Direct (Clean)",
+            "provider_label": "Direct Datacenter"
+        });
+        (Some(hostname.to_string()), Some(g), Some(ns))
+    } else {
+        (None, None, None)
+    };
+
+    let single_build = serde_json::json!({
+        "build_id": build_id,
+        "status": req.status,
+        "project_name": req.project_name,
+        "commit_sha": req.commit_sha,
+        "profile": req.profile,
+        "requested_at": iso_now,
+        "finished_at": iso_now,
+        "delivered_at": iso_now,
+        "total_duration_seconds": total_duration,
+        "compile_duration_seconds": compile_sec,
+        "delivery_duration_seconds": delivery_sec,
+        "cache_hits": hits,
+        "total_crates": crates,
+        "cache_misses": crates.saturating_sub(hits),
+        "cache_hit_rate_percent": hit_rate,
+        "instance_name": req.instance_name,
+        "machine_type": req.machine_type,
+        "zone": req.zone,
+        "instance_benchmark_score": bench,
+        "origin_ip": req.origin_ip,
+        "origin_hostname": origin_hostname,
+        "geolocation": geo,
+        "network_security": net_sec,
+        "peak_ram_gib": req.peak_ram_gib,
+        "container_ram_cap_gib": 28,
+        "cpu_time_seconds": req.cpu_time_seconds,
+        "cpu_points": cpu_pts,
+        "cpu_points_formula": cpu_formula,
+    });
+
+    let mut builds_vec: Vec<serde_json::Value> = bundle
+        .state
+        .rust_builds
+        .get("builds")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    builds_vec.insert(0, single_build.clone());
+    if builds_vec.len() > MAX_RUST_BUILDS_HISTORY {
+        builds_vec.truncate(MAX_RUST_BUILDS_HISTORY);
+    }
+
+    let total_builds = builds_vec.len();
+    let avg_duration = if total_builds > 0 {
+        let sum_dur: f64 = builds_vec
+            .iter()
+            .filter_map(|b| b.get("total_duration_seconds").and_then(|v| v.as_f64()))
+            .sum();
+        (sum_dur / total_builds as f64).round()
+    } else {
+        0.0
+    };
+
+    let total_hits: u64 = builds_vec
+        .iter()
+        .filter_map(|b| b.get("cache_hits").and_then(|v| v.as_u64()))
+        .sum();
+    let total_crates: u64 = builds_vec
+        .iter()
+        .filter_map(|b| b.get("total_crates").and_then(|v| v.as_u64()))
+        .sum();
+    let overall_hit_rate = if total_crates > 0 {
+        ((total_hits as f64 / total_crates as f64) * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    let max_peak_ram = builds_vec
+        .iter()
+        .filter_map(|b| b.get("peak_ram_gib").and_then(|v| v.as_f64()))
+        .fold(0.0, f64::max);
+
+    let total_pts: u64 = builds_vec
+        .iter()
+        .filter_map(|b| b.get("cpu_points").and_then(|v| v.as_u64()))
+        .sum();
+    let total_cpu_time: f64 = builds_vec
+        .iter()
+        .filter_map(|b| b.get("cpu_time_seconds").and_then(|v| v.as_f64()))
+        .sum();
+
+    bundle.state.rust_builds = serde_json::json!({
+        "total_builds": total_builds,
+        "average_duration_seconds": avg_duration,
+        "total_cache_hits": total_hits,
+        "overall_cache_hit_rate_percent": overall_hit_rate,
+        "max_peak_ram_gib": max_peak_ram,
+        "total_cpu_points": total_pts,
+        "total_cpu_time_seconds": total_cpu_time.round(),
+        "vpn_or_tor_count": 0,
+        "builds": builds_vec
+    });
+
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "message": "Rust build recorded",
+            "build": single_build
+        }),
+    ))
+}
+
+// ============================================================================
 // Instance Action Safety Gates (Plan Previews Only)
 // ============================================================================
 
@@ -909,17 +1378,18 @@ pub async fn handle_post_instances_delete<K: KvStoreBackend>(
 
     let inst = bundle
         .state
-        .instances
+        .instances_view
         .iter()
+        .chain(bundle.state.instances.iter())
         .find(|i| (!id.is_empty() && i.id == id) || (!name.is_empty() && i.name == name))
-        .ok_or_else(|| StateError::NotFound("Instance not found".into()))?;
+        .ok_or_else(|| StateError::NotFound("Instance not found in live fleet inventory".into()))?;
 
     let next_step = if inst.role == "rust_builder" {
         "Dedicated builders keep their cache disk (auto-delete=no); retire the VM only when no \
         build or runtime update holds it, and delete the cache disk separately if intended."
     } else {
-        "Runner hosts are drained and retired by spot_runner_autoscaler.py so no job loses its \
-        runner; lower the runner floor or let the autoscaler scale in."
+        "Runner hosts are drained and retired by the Cloudflare scheduled reconciler so no job loses its \
+        runner; lower the runner floor or let the reconciler scale in."
     };
 
     Ok((
@@ -961,9 +1431,13 @@ pub async fn handle_post_instances_scale_region<K: KvStoreBackend>(
 
     let (bundle, _) = load_state(kv, now).await?;
 
-    let current_in_region = bundle
-        .state
-        .instances
+    let source_instances = if !bundle.state.instances_view.is_empty() {
+        &bundle.state.instances_view
+    } else {
+        &bundle.state.instances
+    };
+
+    let current_in_region = source_instances
         .iter()
         .filter(|i| i.region == req.region && i.status == "RUNNING" && i.role == req.role)
         .count() as u32;
@@ -1077,7 +1551,17 @@ pub fn default_dashboard_bundle(now: u64) -> Result<DashboardBundle, StateError>
         instances_view: Vec::new(),
         fleet_summary: serde_json::Value::Null,
         fleet_inventory: serde_json::Value::Null,
-        rust_builds: serde_json::Value::Null,
+        rust_builds: serde_json::json!({
+            "total_builds": 0,
+            "average_duration_seconds": 0.0,
+            "total_cache_hits": 0,
+            "overall_cache_hit_rate_percent": 0.0,
+            "max_peak_ram_gib": 0.0,
+            "total_cpu_points": 0,
+            "total_cpu_time_seconds": 0.0,
+            "vpn_or_tor_count": 0,
+            "builds": []
+        }),
         dashboard_admins: Vec::new(),
         dashboard_admins_history: Vec::new(),
         controlled_targets: Vec::new(),

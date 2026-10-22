@@ -231,14 +231,16 @@ fn test_peer_owner_and_ancestry_walk() {
     };
 
     // 1. UID 0 -> Builder
-    let (owner, kind) = peer_owner(502, 0, &config, &sys).unwrap();
+    let (owner, kind, runner_name) = peer_owner(502, 0, &config, &sys).unwrap();
     assert_eq!(kind, AdmissionKind::Builder);
     assert!(owner.starts_with("host:502:"));
+    assert_eq!(runner_name, None);
 
     // 2. UID 1001 -> Valid Runner
-    let (owner, kind) = peer_owner(502, 1001, &config, &sys).unwrap();
+    let (owner, kind, runner_name) = peer_owner(502, 1001, &config, &sys).unwrap();
     assert_eq!(kind, AdmissionKind::Runner);
     assert_eq!(owner, format!("runner:{cid}:2026-10-22:501:1010"));
+    assert_eq!(runner_name.as_deref(), Some("runner-test"));
 
     // 3. UID 1000 -> Unauthorized
     let err = peer_owner(502, 1000, &config, &sys).unwrap_err();
@@ -335,4 +337,50 @@ fn test_owner_alive_builder_lease_preserved_when_builders_running() {
         !host_agent::admission::peer::owner_alive(owner, &sys),
         "Builder lease must be pruned when no builder containers are running"
     );
+}
+
+#[test]
+fn test_calculate_runner_memory_heavy_policy_matching() {
+    use host_agent::admission::server::calculate_runner_memory;
+    use host_agent::admission::types::{AdmissionConfig, SingleHeavyRunnerPolicy};
+
+    let config = AdmissionConfig {
+        role: Some("runner".into()),
+        work_gib: 28.0,
+        runner_gib: 14.0,
+        builder_gib: 28.0,
+        runner_names: vec!["runner-1".into(), "runner-2".into()],
+        heavy_runner: Some(SingleHeavyRunnerPolicy {
+            name: "runner-heavy".into(),
+            memory_gib: 32,
+            cpus: 16,
+        }),
+        heavy_runners: Some(vec!["runner-2".into()]),
+    };
+
+    let owner = "runner:1111111111111111111111111111111111111111111111111111111111111111:2026-10-22:501:1010";
+
+    // Regular runner (runner-1) -> 14 GiB
+    let mem1 = calculate_runner_memory(&config, Some("runner-1"), owner);
+    assert_eq!(mem1, 14.0);
+
+    // Heavy runner via heavy_runners list (runner-2) -> 32 GiB
+    let mem2 = calculate_runner_memory(&config, Some("runner-2"), owner);
+    assert_eq!(mem2, 32.0);
+
+    // Runner with prefix overlap (runner-20) -> strictly regular 14 GiB (not heavy)
+    let mem_overlap = calculate_runner_memory(&config, Some("runner-20"), owner);
+    assert_eq!(mem_overlap, 14.0);
+
+    // Docker inspected name with leading slash (/runner-2) -> 32 GiB
+    let mem_slash = calculate_runner_memory(&config, Some("/runner-2"), owner);
+    assert_eq!(mem_slash, 32.0);
+
+    // Heavy runner via single heavy_runner policy (runner-heavy) -> 32 GiB
+    let mem3 = calculate_runner_memory(&config, Some("runner-heavy"), owner);
+    assert_eq!(mem3, 32.0);
+
+    // Missing runner name -> defaults to runner_gib (14 GiB)
+    let mem_none = calculate_runner_memory(&config, None, owner);
+    assert_eq!(mem_none, 14.0);
 }
