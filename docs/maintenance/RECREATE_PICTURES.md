@@ -87,9 +87,9 @@ The dashboard UI is embedded in `cloudflare/src/ui.rs` as two raw HTML strings (
      - A dark pill `<rect>` (`#0f172a`) with a colored status dot and bold white label text.
    - Remove `#__doc_callout` immediately after `.screenshot()` completes.
 
-## Recreate the 17 terminal captures
+## Recreate the 20 terminal captures and VS Code screenshot
 
-To recreate the `term-*.png` images when command-line tool flags, test counts, or API shapes change:
+To recreate the `term-*.png` images and `vscode-remote-build.png` when command-line tool flags, test counts, or API shapes change:
 
 1. **Capture real read-only command outputs** from a clean worktree (with `PATH="$HOME/.cargo/bin:$PATH"`):
    - `term-host-agent-help.png`: `cargo run -q --manifest-path host-agent/Cargo.toml -- --help` (displayed as `$ host-agent --help`).
@@ -102,14 +102,15 @@ To recreate the `term-*.png` images when command-line tool flags, test counts, o
    - `term-host-agent-admission.png`, `term-clean-target.png`, `term-toolchain-probe.png`: real subcommand outputs against temporary paths (`/tmp/demo/target`).
    - `term-env-example.png`, `term-m4air-compose.png`: sanitized excerpts of `.env.example` and `m4air/docker-compose.yml`.
    - `term-gcp-project.png`, `term-api-health.png`, `term-api-scaling.png`, `term-patch-validate.png`, `term-builder-readiness.png`: example outputs matching the exact JSON structures in `cloudflare/src/` and `cloud-init/builder-startup.sh`.
+   - `term-client-just-build.png`, `term-client-cargo-profiles.png`, `term-client-llm-agent.png`, `vscode-remote-build.png`: client workstation examples showing `select-idle-rust-builder` skipping a busy builder (`builder-uscentral1-f-demo01`) and selecting an idle builder (`builder-uscentral1-f-demo02`) for `just`, `cargo` (`debug` and `release`), VS Code `.vscode/tasks.json`, and LLM coding agents (`codex` / `claude`).
 2. **Sanitize with word boundaries**:
    - Strip ANSI escape sequences, replace home directory paths with `~`, and use word-boundary regular expressions (`\b...\b`) when scrubbing local usernames so substrings inside words like `challenger` (`test_adversarial_challenger_1.rs`) are never altered.
 3. **Render in the macOS terminal HTML template with callouts**:
    - Render each `.txt` capture inside a `1120px` dark terminal window (`.terminal-window`), locate the target `#callout-anchor` line, inject the SVG highlight box + vector arrow + callout pill (`filterUnits="userSpaceOnUse"`), and screenshot `.terminal-window` with Playwright.
 
-## Recreate the 18 SVG flowcharts
+## Recreate the 19 SVG flowcharts
 
-The 18 `docs/images/flow-*.svg` files are standalone `1280×560` dark-slate SVG diagrams (`viewBox="0 0 1280 560"`):
+The 19 `docs/images/flow-*.svg` files are standalone `1280×560` dark-slate SVG diagrams (`viewBox="0 0 1280 560"`):
 
 - `flow-architecture-overview.svg` (`docs/index.md`)
 - `flow-getting-started.svg` (`docs/getting-started.md`)
@@ -123,6 +124,7 @@ The 18 `docs/images/flow-*.svg` files are standalone `1280×560` dark-slate SVG 
 - `flow-dedicated-builder-launch.svg` (`docs/dedicated-builders.md`)
 - `flow-builder-in-place-update.svg` (`docs/builder-runtime-updates.md`)
 - `flow-remote-build-execution.svg` (`docs/remote-builds.md`)
+- `flow-idle-builder-selection.svg` (`docs/client-workstation-setup.md`)
 - `flow-local-arm64-lifecycle.svg` (`docs/local-arm64-runners.md`)
 - `flow-config-precedence.svg` (`docs/configuration.md`)
 - `flow-oom-classification.svg` (`docs/operations.md`)

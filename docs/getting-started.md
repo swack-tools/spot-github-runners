@@ -87,7 +87,7 @@ The [configuration reference](configuration.md) lists every variable.
 
 Keep real secrets out of Git. Do not commit `.env`, SSH private keys, service account JSON files, rendered launch
 directories, or operational state. Store deployment output under a directory outside the checkout, such as
-`$HOME/oxidex-ops`.
+`$HOME/example-rust-project-ops`.
 
 ## Run the read-only commands
 

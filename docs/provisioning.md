@@ -108,4 +108,4 @@ under `/opt/runner-rust` in a shared read-only volume. Cargo downloads and tools
 the writable `/work/.cargo` cache.
 
 After a job completes, the cleanup hook removes only the validated workspace `target/` directory. Setting
-`OXIDEX_CLEAN_TARGET=0` turns off automatic cleanup.
+`EXAMPLE_RUST_PROJECT_CLEAN_TARGET=0` turns off automatic cleanup.

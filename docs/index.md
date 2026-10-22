@@ -1,6 +1,6 @@
 # Spot runner fleet and dedicated builders
 
-This repository provisions and operates persistent GitHub Actions runners and dedicated Rust build VMs on GCP (Google's cloud platform) Spot instances. It mainly serves `swack-tools/oxidex`. It also includes a web dashboard hosted at the edge and a set of persistent local ARM64 Docker runners.
+This repository provisions and operates persistent GitHub Actions runners and dedicated Rust build VMs on GCP (Google's cloud platform) Spot instances. It mainly serves `example-org/example-rust-project`. It also includes a web dashboard hosted at the edge and a set of persistent local ARM64 Docker runners.
 
 This site describes the source on `main`. Merging source does not update a running controller, container, or VM.
 Inspect the deployed configuration and the actual tool versions before you route work to a host.
@@ -51,7 +51,7 @@ Inspect the deployed configuration and the actual tool versions before you route
 
 | Component | What it does |
 | --- | --- |
-| Runner fleet | Spot VMs named `oxidex-runners-*` run Docker containers that register as GitHub Actions listeners. The edge reconciler provisions, replaces, and drains them. |
+| Runner fleet | Spot VMs named `example-rust-project-runners-*` run Docker containers that register as GitHub Actions listeners. The edge reconciler provisions, replaces, and drains them. |
 | Edge reconciler | A Cloudflare Worker cron trigger running every 5 minutes that maintains a runner floor, scales up on queued backlog (>=20 jobs), cleans terminated VMs, and syncs KV state. |
 | Dedicated builders | `builder-*` VMs that register no GitHub runner. They run Rust builds in one resource-limited, unprivileged container with persistent caches. |
 | Dashboard | A web UI for fleet telemetry, runner patches, and administrators. It runs as a compiled WebAssembly Worker at Cloudflare's edge backed by Workers KV. |
@@ -67,7 +67,7 @@ flowchart LR
     worker <-->|"GitHub API (JIT, runners, PRs)"| github["GitHub"]
 
     subgraph gcp["GCP Project"]
-        hosts["Runner hosts<br/>oxidex-runners-*<br/>(host-agent)"]
+        hosts["Runner hosts<br/>example-rust-project-runners-*<br/>(host-agent)"]
         builders["Dedicated builders<br/>builder-*<br/>(host-agent)"]
     end
 
@@ -86,8 +86,9 @@ The scheduled edge reconciler is the autonomous component that manages runner ho
 - **Changing runner hosts?** Read [Runner patches](runner-patches.md).
 - **Running the dashboard?** Read [Dashboard](dashboard.md) and the
   [edge hosting guide](edge-dashboard.md).
-- **Building Rust remotely?** Read [Set up a builder](dedicated-builders.md) and
-  [Remote builds and clients](remote-builds.md).
+- **Building Rust remotely?** Read [Set up a builder](dedicated-builders.md),
+  [Remote builds and clients](remote-builds.md), and
+  [Client workstation setup](client-workstation-setup.md).
 - **Updating the documentation or screenshots?** Read
   [Documentation maintenance](maintenance/README.md) and
   [Recreate pictures, callouts, and flowcharts](maintenance/RECREATE_PICTURES.md).

@@ -43,7 +43,7 @@ The bootstrap scripts `cloud-init/startup.sh` and `cloud-init/builder-startup.sh
 VM instances. Never replay them on an occupied runner host or dedicated builder:
 
 - Runner hosts execute `startup.sh` once during initial boot; the script deletes its metadata upon completion.
-- Builder bootstrap scripts check `/var/lib/oxidex-builder-bootstrap.complete` and hold execution with exit status 75
+- Builder bootstrap scripts check `/var/lib/example-rust-project-builder-bootstrap.complete` and hold execution with exit status 75
   if existing runner processes or admission services are detected.
 - To update runtime binaries or toolchains on a dedicated builder, follow the update procedure in
   [Runtime updates](builder-runtime-updates.md).
@@ -53,8 +53,8 @@ VM instances. Never replay them on an occupied runner host or dedicated builder:
 Do not remove or edit protective state files to bypass holds, drains, or recovery locks:
 
 - The admission lease ledger `/var/lib/gha-admission/leases.json` on runner hosts and builders.
-- Drain markers `/run/gha-runner-cordon/draining` and `/run/oxidex-build-draining`.
-- Builder readiness receipts in `/var/lib/oxidex-builder/` and bootstrap markers.
+- Drain markers `/run/gha-runner-cordon/draining` and `/run/example-rust-project-build-draining`.
+- Builder readiness receipts in `/var/lib/example-rust-project-builder/` and bootstrap markers.
 - Edge state snapshots stored under the `dashboard:state` key in Workers KV.
 
 A hold records why execution paused. Resolve the underlying cause and permit the subsystem that placed
@@ -64,7 +64,7 @@ the hold to clear it.
 
 | Property | Runner host | Dedicated builder |
 | --- | --- | --- |
-| Instance naming | `oxidex-runners-*` | `builder-*` |
+| Instance naming | `example-rust-project-runners-*` | `builder-*` |
 | GitHub registration | Registers runner listeners in designated runner group. | Registers zero GitHub runners. |
 | Attached disk | Data disk provisioned with `auto-delete=yes`. Deleting VM removes disk. | Cache disk provisioned with `auto-delete=no`. Disk survives VM deletion. |
 | Drain mechanism | Cordon host, transition runners to drain group, await job completion. | Deny new builds, await active compilations, leases, and cache locks. |
@@ -105,7 +105,7 @@ qualification from local tests or bootstrap probes.
 | --- | --- | --- |
 | Edge control plane (Cloudflare Worker) | Cloudflare Worker real-time logs via `wrangler tail`. | Workers KV namespace binding `SPOT_KV` key `dashboard:state`. |
 | Runner host | `/var/log/gha-runner-bootstrap.log`, `journalctl -u google-startup-scripts.service`. | `/var/lib/gha-runner-bootstrap.complete`, `/var/lib/gha-admission/leases.json`, `/run/gha-runner-cordon/draining`. |
-| Dedicated builder | `/var/log/oxidex-builder-bootstrap.log`. | `/var/lib/oxidex-builder-bootstrap.complete`, `/var/lib/oxidex-builder-readiness.json`, `/run/oxidex-build-draining`. |
+| Dedicated builder | `/var/log/example-rust-project-builder-bootstrap.log`. | `/var/lib/example-rust-project-builder-bootstrap.complete`, `/var/lib/example-rust-project-builder-readiness.json`, `/run/example-rust-project-build-draining`. |
 | Host agent daemon | Systemd service journal for `gha-admission.service`. | UNIX socket at `/run/gha-admission/socket`, state in `/run/gha-docker-wrapper/`. |
 
 ## Inspect a host
@@ -118,7 +118,7 @@ state without mutating files:
 sudo journalctl -u google-startup-scripts.service --no-pager
 
 # Check builder readiness and toolchain verification
-sudo cat /var/lib/oxidex-builder-readiness.json
+sudo cat /var/lib/example-rust-project-builder-readiness.json
 
 # Check admission leases and memory headroom
 sudo cat /var/lib/gha-admission/leases.json
@@ -149,13 +149,13 @@ The edge reconciler evaluates VM instances against GitHub runner registrations:
 
 If a dedicated builder bootstrap or runtime update is interrupted:
 
-- Check the bootstrap log at `/var/log/oxidex-builder-bootstrap.log` or systemd startup service logs:
+- Check the bootstrap log at `/var/log/example-rust-project-builder-bootstrap.log` or systemd startup service logs:
   ```bash
   sudo journalctl -u google-startup-scripts.service --no-pager
   ```
 - Check whether a bootstrap lock or drain is held:
   ```bash
-  ls -l /run/oxidex-builder-bootstrap.lock /run/oxidex-build-draining
+  ls -l /run/example-rust-project-builder-bootstrap.lock /run/example-rust-project-build-draining
   ```
 - Verify admission service status and lease ledger:
   ```bash
@@ -165,7 +165,7 @@ If a dedicated builder bootstrap or runtime update is interrupted:
 - If an in-place container rebuild was interrupted, verify Docker images and run the toolchain probe:
   ```bash
   sudo docker images
-  sudo /usr/local/bin/oxidex-remote-build bootstrap-tools /usr/local/bin/oxidex-toolchain-probe
+  sudo /usr/local/bin/example-rust-project-remote-build bootstrap-tools /usr/local/bin/example-rust-project-toolchain-probe
   ```
 - If host state remains inconsistent, drain the instance and rotate to a fresh VM instance while preserving the persistent cache disk.
 
@@ -198,7 +198,7 @@ evaluates capacity against policies, and commits a fresh JSON state snapshot.
 | Log shows `Retirement held: live heavy route has no verified replacement` | The reconciler protects active heavy-runner routes until a replacement host is verified. Verify replacement host capacity and registration. |
 | Dashboard sign-in fails with HTTP 403 | GitHub OAuth 2.0 user lacks administrator permissions on controlled repositories or organizations. Verify `DASHBOARD_GLOBAL_ADMINS` or repository roles. |
 | Dashboard patch save fails | Token lacks pull request write permissions on configuration repository. Verify `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` scopes. |
-| Dedicated builder rejects build with exit 75 | The builder is draining, bootstrap is incomplete, or memory admission denied the lease. Check `/run/oxidex-build-draining` and active leases. |
-| Uploader transfer permission denied | User account or key does not match approved uploader mapping. Verify `/etc/oxidex-remote-build.json` and SSH keys. Do not broaden file permissions. |
+| Dedicated builder rejects build with exit 75 | The builder is draining, bootstrap is incomplete, or memory admission denied the lease. Check `/run/example-rust-project-build-draining` and active leases. |
+| Uploader transfer permission denied | User account or key does not match approved uploader mapping. Verify `/etc/example-rust-project-remote-build.json` and SSH keys. Do not broaden file permissions. |
 | Process killed with exit status 137 | Examine cgroup and kernel logs for OOM signatures. Distinguish host memory pressure from container limits before modifying allocations. |
 | Runner registration timeout | Bootstrap did not complete within the timeout threshold. Check `/var/log/gha-runner-bootstrap.log` and verify network reachability and GitHub token validity. |

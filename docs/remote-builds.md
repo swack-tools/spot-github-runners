@@ -2,11 +2,13 @@
 
 This page describes the host launcher on a dedicated builder, the clients that start a build, and where build
 data lives. To create a builder, see [Set up a builder](dedicated-builders.md). To change a builder that already
-runs jobs, see [Runtime updates](builder-runtime-updates.md).
+runs jobs, see [Runtime updates](builder-runtime-updates.md). To configure a lightweight laptop or development
+box to pick an idle builder and run builds through `just`, `cargo`, VS Code, or an AI coding agent, see
+[Client workstation setup](client-workstation-setup.md).
 
 ## Host launcher
 
-The host launcher is `/usr/local/bin/oxidex-remote-build` (backed by `host-agent host-launcher`). Its configuration is `/etc/oxidex-remote-build.json`.
+The host launcher is `/usr/local/bin/example-rust-project-remote-build` (backed by `host-agent host-launcher`). Its configuration is `/etc/example-rust-project-remote-build.json`.
 It checks the project identifier, the allowed command, and the image identity. The Docker admission wrapper
 (`host-agent docker-admission`) then checks the mounts and limits and takes the admission ledger lease before the container starts. Containers run as UID and GID 1001 without a Docker socket, added capabilities, or
 privilege escalation. See the [security model](security.md).
@@ -18,8 +20,8 @@ mismatch.
 On a host with an already prepared source project, an example build command is:
 
 ```bash
-sudo -n /usr/local/bin/oxidex-remote-build oxidex-example \
-  cargo build --release --locked --bin oxidex
+sudo -n /usr/local/bin/example-rust-project-remote-build example-rust-project \
+  cargo build --release --locked --bin example-rust-project
 ```
 
 - `prepare` creates the project directories, gives the uploader source access, and gives UID 1001 the
@@ -62,33 +64,33 @@ it fits.
 </div>
 <!-- /shot -->
 
-OxiDex repository-owned `just` recipes and worker configuration are maintained in the OxiDex repository. Configure
+`example-rust-project` repository-owned `just` recipes and worker configuration are maintained in the `example-rust-project` repository. Configure
 that client for the approved dedicated host, uploader identity, source, image, and cache before you enable its
-route. This repository does not update OxiDex's workflow or registry. See
+route. This repository does not update `example-rust-project` workflow or registry. See
 [Simplify remote builds](simplification.md) for the target workflow.
 
 ### Execute builds remotely
 
 The build client snapshots tracked source files, synchronizes them to the dedicated builder through authenticated
-`rsync` over SSH as `oxidex-uploader`, and executes the build using `/usr/local/bin/oxidex-remote-build`:
+`rsync` over SSH as `example-rust-project-uploader`, and executes the build using `/usr/local/bin/example-rust-project-remote-build`:
 
 ```bash
 # Transfer source to builder
 rsync -avz --delete \
   --exclude='.git' --exclude='target' \
-  ./ oxidex-uploader@BUILDER_HOST:/mnt/runner-data/remote-build/sources/oxidex/
+  ./ example-rust-project-uploader@BUILDER_HOST:/mnt/runner-data/remote-build/sources/example-rust-project/
 
 # Execute remote compilation through host launcher
-ssh oxidex-uploader@BUILDER_HOST \
-  "sudo -n /usr/local/bin/oxidex-remote-build oxidex cargo build --release --locked"
+ssh example-rust-project-uploader@BUILDER_HOST \
+  "sudo -n /usr/local/bin/example-rust-project-remote-build example-rust-project cargo build --release --locked"
 
 # Download compiled artifact
-scp oxidex-uploader@BUILDER_HOST:/mnt/runner-data/remote-build/targets/oxidex/release/oxidex \
-  ./target/remote-linux/release/oxidex
+scp example-rust-project-uploader@BUILDER_HOST:/mnt/runner-data/remote-build/targets/example-rust-project/release/example-rust-project \
+  ./target/remote-linux/release/example-rust-project
 ```
 
 - Use a dedicated evidence directory for each run to retain verification receipts and artifact hashes.
-- Dedicated builders accept only direct authenticated SSH for `oxidex-uploader` with pinned host keys. Never use
+- Dedicated builders accept only direct authenticated SSH for `example-rust-project-uploader` with pinned host keys. Never use
   `gcloud compute ssh` to bypass uploader isolation.
 - Linux artifacts from remote builders do not run natively on macOS. Cross targets and SDK-free framework interfaces
   do not replace native artifact validation. A full ExifTool comparison needs its own pinned oracle, fixtures, and
