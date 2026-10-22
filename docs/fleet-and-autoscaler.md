@@ -57,6 +57,10 @@ If no active runner host exists for a target, the reconciler immediately provisi
 
 ## Scale-up and backlog management
 
+![Scaling and OOM Deep-Links tab](images/dashboard-scaling.png)
+
+*The Scaling and OOM Deep-Links tab sets scale-up and scale-down triggers and budget caps, and shows the current controller decision.*
+
 When GitHub Actions reports a queued job backlog of 20 or more jobs (`queued_jobs >= 20`), the reconciler triggers
 scale-up:
 

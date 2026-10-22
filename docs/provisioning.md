@@ -17,6 +17,10 @@ The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 
 ## Startup bootstrap and host agent installation
 
+![The cloud-init and VM templates tab](images/dashboard-cloudinit.png)
+
+*The `cloud-init` editor with an example runner template, its stage breakdown, and saved VM templates.*
+
 When a new runner host boots, `cloud-init/startup.sh` executes the bootstrap sequence:
 
 1. **Storage formatting**: formats the persistent data disk with ext4, mounts it to `/mnt/runner-data`, and sets permissions.

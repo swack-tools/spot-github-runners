@@ -26,6 +26,23 @@ qualifying offers, and scaling alerts) and a daily budget tracking bar.
 | Runner Patches | Edits and validates patch manifests in the configuration repository. See [The patch console](#the-patch-console). |
 | Admins | Owner only. Manages added administrators. See [Manage administrators](#manage-administrators). |
 
+!!! info "Screenshots use example data"
+    The screenshots on these pages render the real dashboard UI against a local mock API. Every project, organization,
+    instance name, IP address, user, and template in them is made up.
+
+![World Map and Fleet Inspector tab](images/dashboard-map.png)
+
+*The World Map and Fleet Inspector tab. Selecting a region shows its running hosts, Spot prices, and a copyable SSH command.*
+
+![Instances and Cost History tab](images/dashboard-instances.png)
+
+*The Instances and Cost History tab lists running and deleted instances with runtime, hourly rate, and cost in the selected window.*
+
+![Sizing and Benchmark Qualifier tab](images/dashboard-sizing.png)
+
+*The Sizing and Benchmark Qualifier tab sets per-runner and per-builder hardware floors, disks, budgets, and templates.*
+
+
 !!! note "The dashboard preserves safety gates"
     The dashboard operations for instance deletion and regional scaling operate as safety-gated execution plan
     previews. They update the dashboard telemetry state and return execution plans without mutating live cloud
@@ -45,6 +62,10 @@ Environment variables and bindings are configured in `cloudflare/wrangler.toml`.
 
 ## Authentication and sign-in
 
+![Dashboard sign-in page](images/login-gate.png)
+
+*The sign-in page offers each enabled method, such as GitHub web sign-in, a GitHub device code, or an operator token.*
+
 When `GITHUB_OAUTH_CLIENT_ID` is set, the dashboard signs users in using GitHub OAuth 2.0:
 
 - **Flows**: the web flow uses OAuth 2.0 authorization code flow with Proof Key for Code Exchange (PKCE, `S256`).
@@ -58,6 +79,10 @@ When `GITHUB_OAUTH_CLIENT_ID` is set, the dashboard signs users in using GitHub 
 - **Bulk revocation**: setting `SESSION_NOT_BEFORE` to a Unix timestamp rejects all sessions issued prior to that cutoff.
 
 ## Manage administrators
+
+![Admins tab](images/dashboard-admins.png)
+
+*The Admins tab lists owners, added administrators, and recent changes. Only owners see this tab.*
 
 The **Admins** tab and `/api/admins` endpoints allow the owner to manage dashboard administrators:
 

@@ -228,9 +228,17 @@ Label sync runs at two points:
 
 ## Apply a patch
 
+![Runner Patches tab](images/dashboard-patches.png)
+
+*The Runner Patches tab loads a manifest from the configuration repository, validates it, and shows the effective patch digest.*
+
 To apply a patch, commit the manifest to the configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`). Operators author, validate, and preview manifests in the Runner Patch Console on the edge dashboard or through its REST APIs. Saving a manifest opens a pull request on the configuration repository. After review and merge into the default branch (`main`), the autonomous Cloudflare Worker fleet reconciler (`cloudflare/src/reconciler.rs`) provisions replacement Spot instances or rotates running hosts according to the merged manifest.
 
 ### Validate and preview with the patch console
+
+![Patch rollout preview](images/dashboard-patch-rollout.png)
+
+*The rollout preview classifies each running host. Live hot-patching is off; the reconciler rolls out merged manifests.*
 
 Before applying any change, validate the manifest syntax and preview its classification against the running fleet. You can perform these checks in the dashboard Web UI or by calling the edge endpoints:
 

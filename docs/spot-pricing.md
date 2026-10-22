@@ -8,6 +8,10 @@ Neither price queries nor dashboard views create VMs, reserve capacity, or mutat
 
 ## Spot offer evaluation at the edge
 
+![Qualifying instances matrix](images/dashboard-qualifier.png)
+
+*The qualifying instances matrix compares each candidate shape with the benchmark floor and the Spot budget. Offers over the budget show Exceeds Budget Cap.*
+
 The edge reconciler evaluates qualifying Spot offers against deployment constraints on every reconciliation tick:
 
 - **Hardware sizing floor**: runner hosts require shapes with at least 16 vCPUs and 32 GiB RAM, providing capacity
@@ -22,6 +26,10 @@ Operators inspect real-time pricing and qualifying shapes directly through the w
 `https://spot.swacktech.com` or via the read-only REST API endpoint `/api/overview`.
 
 ## Inspecting pricing via the API
+
+![Regions and Latency Filter tab](images/dashboard-regions.png)
+
+*The Regions and Latency Filter tab enables or deselects regions by latency, continent, machine family, CPU platform, and disk type.*
 
 You can query the current precomputed pricing and fleet inventory from the edge control plane:
 
