@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::process::{Child, Command};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -112,10 +111,20 @@ pub fn checked_worktree_boundary(path: &Path) -> Result<(), WorktreeError> {
 }
 
 fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let res = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if res == 0 && ts.tv_sec >= 0 && ts.tv_nsec >= 0 {
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64)
+    } else {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let start = START.get_or_init(std::time::Instant::now);
+        start.elapsed().as_nanos() as u64
+    }
 }
 
 pub fn run_worktree_jobs(

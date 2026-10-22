@@ -272,10 +272,21 @@ uploader_user=$(jq -re .username /etc/oxidex-builder-uploader.json)
 uploader_uid=$(jq -re .uid /etc/oxidex-builder-uploader.json)
 uploader_pubkey=$(jq -re .public_key /etc/oxidex-builder-uploader.json)
 
-if ! id "$uploader_user" >/dev/null 2>&1; then
-  useradd -u "$uploader_uid" -g oxidex-build -m -s /bin/bash "$uploader_user"
-else
+# Verify UID and username mapping before modifying groups or granting build authority
+if id "$uploader_user" >/dev/null 2>&1; then
+  existing_uid=$(id -u "$uploader_user")
+  if [ "$existing_uid" -ne "$uploader_uid" ]; then
+    echo "FATAL: Configured uploader username '$uploader_user' already exists with mismatched UID $existing_uid (expected $uploader_uid)" >&2
+    exit 1
+  fi
   usermod -aG oxidex-build "$uploader_user"
+else
+  existing_by_uid=$(getent passwd "$uploader_uid" | cut -d: -f1)
+  if [ -n "$existing_by_uid" ]; then
+    echo "FATAL: Configured uploader UID $uploader_uid is already used by username '$existing_by_uid' (expected '$uploader_user')" >&2
+    exit 1
+  fi
+  useradd -u "$uploader_uid" -g oxidex-build -m -s /bin/bash "$uploader_user"
 fi
 
 home_dir=$(getent passwd "$uploader_user" | cut -d: -f6)
