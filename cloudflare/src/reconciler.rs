@@ -813,8 +813,19 @@ where
                 resource_monitoring: false,
             };
 
-            let rendered_script = crate::github::render_startup_script(&startup_params, None)
-                .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
+            let manifest_val = crate::patch_console::make_valid_manifest_json(target);
+            let patch_sha = crate::patch::compute_canonical_patch_sha256(&manifest_val)
+                .unwrap_or_else(|_| {
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+                });
+            let patch_json_str =
+                serde_json::to_string(&manifest_val).unwrap_or_else(|_| "{}".to_string());
+            let runner_patch =
+                serde_json::from_value::<crate::patch::RunnerPatch>(manifest_val.clone()).ok();
+
+            let rendered_script =
+                crate::github::render_startup_script(&startup_params, runner_patch.as_ref())
+                    .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
 
             let vm_cfg = crate::gcp::RunnerVmConfig {
                 instance_name: &host_name,
@@ -823,8 +834,8 @@ where
                 target,
                 runner_prefix,
                 startup_script: &rendered_script,
-                patch_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-                patch_json: "{}",
+                patch_sha256: &patch_sha,
+                patch_json: &patch_json_str,
                 runner_1_jitconfig: jit1.as_deref(),
                 runner_2_jitconfig: jit2.as_deref(),
                 source_image: None,
@@ -916,8 +927,19 @@ where
             resource_monitoring: false,
         };
 
-        let rendered_script = crate::github::render_startup_script(&startup_params, None)
-            .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
+        let manifest_val = crate::patch_console::make_valid_manifest_json("swack-tools");
+        let patch_sha =
+            crate::patch::compute_canonical_patch_sha256(&manifest_val).unwrap_or_else(|_| {
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            });
+        let patch_json_str =
+            serde_json::to_string(&manifest_val).unwrap_or_else(|_| "{}".to_string());
+        let runner_patch =
+            serde_json::from_value::<crate::patch::RunnerPatch>(manifest_val.clone()).ok();
+
+        let rendered_script =
+            crate::github::render_startup_script(&startup_params, runner_patch.as_ref())
+                .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
 
         let vm_cfg = crate::gcp::RunnerVmConfig {
             instance_name: &scale_host,
@@ -926,8 +948,8 @@ where
             target: "swack-tools",
             runner_prefix,
             startup_script: &rendered_script,
-            patch_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-            patch_json: "{}",
+            patch_sha256: &patch_sha,
+            patch_json: &patch_json_str,
             runner_1_jitconfig: jit1.as_deref(),
             runner_2_jitconfig: jit2.as_deref(),
             source_image: None,

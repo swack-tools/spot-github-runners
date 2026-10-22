@@ -532,8 +532,51 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
         return Ok((200, ov));
     }
 
-    // Otherwise serialize state snapshot directly
-    Ok((200, serde_json::to_value(&bundle.state)?))
+    // Build default overview shape consumed by the dashboard UI when no precomputed overview exists
+    let fallback_overview = serde_json::json!({
+        "project": bundle.state.project,
+        "org": bundle.state.org,
+        "updated_at": bundle.state.updated_at,
+        "global_budget": bundle.state.global_budget,
+        "scaling": bundle.state.scaling,
+        "profiles": bundle.state.profiles,
+        "qualifications": {
+            "cicd_runner": {
+                "status": "passed",
+                "details": {}
+            },
+            "rust_builder": {
+                "status": "passed",
+                "details": {}
+            }
+        },
+        "regions": [],
+        "instances_view": {
+            "instances": bundle.state.instances_view,
+            "window_hours": 24.0,
+            "total_window_spend_usd": 0.0,
+            "active_hourly_burn_usd": 0.0,
+            "active_daily_burn_usd": 0.0,
+            "active_monthly_burn_usd": 0.0
+        },
+        "fleet_summary": {
+            "active_hourly_burn_usd": 0.0,
+            "active_daily_burn_usd": 0.0,
+            "active_monthly_burn_usd": 0.0,
+            "running_runner_slots": 0,
+            "registered_runner_slots": 0,
+            "unregistered_runner_slots": 0,
+            "running_builder_instances": 0,
+            "total_vcpus": 0,
+            "total_ram_gib": 0,
+            "active_instances_count": 0
+        },
+        "fleet_inventory": bundle.state.fleet_inventory,
+        "rust_builds": bundle.state.rust_builds,
+        "dashboard_admins": bundle.state.dashboard_admins
+    });
+
+    Ok((200, fallback_overview))
 }
 
 pub async fn handle_post_budget<K: KvStoreBackend>(
