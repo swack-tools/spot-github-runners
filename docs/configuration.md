@@ -16,7 +16,7 @@ for the edge dashboard.
 | --- | --- | --- | --- |
 | `GH_TOKEN` | None. | Cloudflare Worker reconciler and `just` tasks. | **Secret.** Renewable GitHub personal access token or GitHub App installation token with organization runner-management permissions. |
 | `SPOT_CONFIG_GH_TOKEN` | Empty (falls back to `GH_TOKEN`). | Cloudflare Worker (`cloudflare/src/patch.rs`). | **Secret.** Optional token for the central configuration repository. Read access covers listing and diff previews; opening patch pull requests requires repository write access. |
-| `SPOT_CONFIG_REPO` | `swack-tools/spot-runners-config`. | Cloudflare Worker. | The central runner configuration repository, formatted as `owner/repo`. The Worker monitors target definitions in this repository. |
+| `CONFIG_REPO` | Compile-time constant (`cloudflare/src/patch_console.rs`). | Cloudflare Worker. | Pinned configuration repository identifier (for example `example-org/spot-runners-config`). This setting is a compile-time constant, not an environment variable. |
 | `GCP_SERVICE_ACCOUNT_KEY` | Empty. | Cloudflare Worker (`cloudflare/src/gcp.rs`). | **Secret.** Service account JSON key with Compute Engine administration permissions (`compute.instances.*`) used to manage Spot VM lifecycles directly via REST. Set in production using `wrangler secret put`. |
 | `GITHUB_OAUTH_CLIENT_ID` | Empty (sign-in off). | Cloudflare Worker (`cloudflare/src/auth.rs`). | Client ID of the GitHub OAuth 2.0 App. Required to enable web dashboard sign-in. |
 | `GITHUB_OAUTH_CLIENT_SECRET` | Empty. | Cloudflare Worker (`cloudflare/src/auth.rs`). | **Secret.** Client secret for the GitHub OAuth 2.0 App. Set in production using `wrangler secret put`. |
@@ -34,7 +34,7 @@ edge dashboard.
 | `SESSION_SECRET` | None. | Cloudflare Worker (`cloudflare/src/auth.rs`). | **Secret.** Cryptographic HMAC key of at least 32 bytes used to sign and verify `__Host-spot_session` cookies. Set in production using `wrangler secret put`. |
 | `DASHBOARD_SESSION_TTL_SECONDS` | `43200` (12 hours). | Cloudflare Worker (`cloudflare/src/auth.rs`). | Session lifetime in seconds. Accepted range is 60 to 604800 seconds. |
 | `SESSION_NOT_BEFORE` | `0` (no cut-off). | Cloudflare Worker (`cloudflare/src/auth.rs`). | Unix timestamp epoch seconds. Sessions issued before this timestamp are rejected, enabling immediate global sign-out. |
-| `DASHBOARD_GLOBAL_ADMINS` | `swackhamer:619624`. | Cloudflare Worker (`cloudflare/src/auth.rs`). | Administrator identities formatted as `login:numeric_id`. Users matching this list bypass target-specific permission checks. |
+| `DASHBOARD_GLOBAL_ADMINS` | `example-owner:100001`. | Cloudflare Worker (`cloudflare/src/auth.rs`). | Administrator identities formatted as `login:numeric_id`. The primary owner is fixed in code; users matching this list bypass target-specific permission checks. |
 
 ## Cloudflare Worker and deployment settings
 

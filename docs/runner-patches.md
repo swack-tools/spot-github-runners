@@ -9,18 +9,16 @@ This page covers the manifest, how the tools classify a change, the receipts tha
 
 ## Where manifests live
 
-Manifests live in a central configuration repository, `<org>/spot-runners-config` by default. The `--config-repo` option overrides the repository, and `--org` sets the organization (default `swack-tools`).
+Manifests live in the central configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`).
 
 | File | Purpose |
 | --- | --- |
 | `defaults.yaml` | Settings that every repository inherits. Optional. |
-| `repos/<owner>/<repo>.yaml` | The override for one repository. Required for a repository that uses `--patch-repo`. |
+| `repos/<owner>/<repo>.yaml` | The override for one repository. |
 
-When you pass `--patch-repo OWNER/REPO`, the tools resolve the default branch of the configuration repository, pin its head commit, and read both files at that commit. A missing `defaults.yaml` is treated as empty. A missing repository file is an error.
+When resolving manifests for a repository `OWNER/REPO`, the Runner Patch Console and Worker reconciler pin the default branch head commit in the configuration repository and read both files at that commit. A missing `defaults.yaml` is treated as empty. A missing repository file is an error.
 
 A manifest that declares a `repository` must name the target repository, compared without regard to case. A manifest that names another repository is refused, and so is a merged result that does.
-
-The `--patch-file PATH` option loads one local file instead. It skips `defaults.yaml` and the merge, and `repository` can be empty. You can pass `--patch-repo` or `--patch-file`, but not both.
 
 ### Supported formats
 
@@ -119,36 +117,25 @@ The identity of a patch is the SHA-256 digest of its canonical JSON. The tools b
 
 ## How a patch applies
 
-A patch reaches a host in one of three ways, from least to most disruptive.
+The Runner Patch Console computes rollout classifications to preview how manifest changes affect active runner hosts. The `/api/patch-console/preview` endpoint (aliased as `/api/patches/preview`) compares the target patch with each running host:
 
-| Strategy | When it applies | Effect |
+| Classification | Meaning | Action taken |
 | --- | --- | --- |
-| Hot patch | The host runs, and the change only adds or rewrites. | `--patch-live` runs a script on the running VM. It rebuilds the runner image and executes the container steps inside each running runner container. The script doesn't restart the containers. |
-| Container recreate | The change adds or alters a container mount. | Containers must be drained and recreated. `--patch-live` refuses this case. |
-| VM replacement | The host can't reach the patch in place. | Provision a new VM with `--patch-repo`. The autoscaler can rotate hosts with the same source. |
+| `noop` | The host already runs the target. The digests match. | No changes required. |
+| `hot_patch` | Changes only add packages, files, or non-destructive sysctls. | Packages and files are installed in place. Direct live hot-patching (`POST /api/patches/hot-patch`) is deprecated; rollout occurs on the next scheduled reconciler tick after pull request merge. |
+| `recreate_containers` | Container mounts or Dockerfile commands differ. | The reconciler drains and recreates runner containers. |
+| `replace_vm` | Hardware settings, host boot scripts, or host sysctls differ. | The reconciler provisions a replacement Spot VM and drains the old instance. |
 
-### Classification
+The Patch Console bootstrap endpoint (`GET /api/patch-console/bootstrap`, aliased as `/api/patches`) reports `executor.available=false` with the reason "Serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick." All manifest changes are submitted as pull requests, reviewed, merged into `main`, and deployed autonomously by the edge reconciler.
 
-The classification function compares the last completed patch on a host (from its receipt) with the target patch, and returns one of four values. The dashboard adds a fifth value, `unknown`, for hosts it can't classify.
+### Classification rules
 
-| Value | Meaning |
-| --- | --- |
-| `noop` | The host already runs the target. The digests match. |
-| `hot_patch` | An in-place live patch can apply the change. |
-| `recreate_containers` | Only the container mounts differ, so containers must be recreated. |
-| `replace_vm` | The host needs a different VM. |
-| `unknown` | The dashboard can't establish what the host runs. It is never `noop` and blocks a dashboard hot patch. |
+The classification function compares the last completed patch on a host (from its receipt) with the target patch:
 
-The rules apply in this order:
-
-1. **Unfinished attempt at another patch.** If the host has a pending marker or pending metadata that names a patch other than the target, the result is `replace_vm`. The partial effects of that attempt are unknown, and only a new VM removes them. A pending attempt at the target itself is re-applied. A pending marker or pending metadata whose value is `none` doesn't force this result.
-2. **A completed patch exists.**
-    1. If the digests match, the result is `noop`.
-    2. If the architecture differs, or the target adds an ISA that the current patch doesn't have, the result is `replace_vm`.
-    3. If the destructive-diff rule finds a drop, the result is `replace_vm`.
-    4. If the container mounts differ, the result is `recreate_containers`.
-    5. Otherwise the result is `hot_patch`.
-3. **No completed patch exists.** If the target isn't `x86_64` or lists any ISA, the result is `replace_vm`. If the target has container mounts, the result is `recreate_containers`. Otherwise the result is `hot_patch`.
+1. If the digests match, the result is `noop`.
+2. If hardware settings, host boot scripts, or host sysctl values differ, the result is `replace_vm`.
+3. If container mounts or Dockerfile commands differ, the result is `recreate_containers`.
+4. Otherwise, the result is `hot_patch`.
 
 #### The destructive-diff rule
 
@@ -171,7 +158,7 @@ Before any change, the tools check the observed host against every hardware cons
 - `hardware.min_vcpu` and `hardware.min_ram_gib` must not exceed the host's observed vCPU count and RAM.
 - For `hardware.isa`, the machine family and CPU platform must appear in the preceding ISA table.
 
-A violation means the host can never run the patch, so the dashboard classifies it as `replace_vm`. A value that the tools can't observe, such as a missing CPU platform, is `unknown`. Both outcomes block `--patch-live` before it touches the host.
+A violation means the host can never run the patch, so the dashboard classifies it as `replace_vm`. A value that the tools can't observe, such as a missing CPU platform, is `unknown`.
 
 #### Additional dashboard rules
 
@@ -180,8 +167,7 @@ The dashboard classifies each host in this order and stops at the first match:
 1. A host found only by its name prefix, with no recorded patch metadata, is `unknown`. The host predates patch recording.
 2. A hardware violation is `replace_vm`, and a constraint that the dashboard can't verify is `unknown`.
 3. A host with pending patch metadata is `unknown`, even when the applied keys match.
-4. Where a hot-patch executor can reach the host, the dashboard reads the host receipt and classifies from it. When the host names the target but has no completion receipt from its current boot, the result changes from `noop` to `hot_patch`, so a live apply writes a proof.
-5. Without an executor, as on the control VM, the dashboard classifies from the patch recorded in instance metadata. The result is `unknown` when that record is missing, fails its SHA-256 check, has no boot binding, or names a boot other than the instance's current `lastStartTimestamp`. A manifest that was too large to record is `unknown` unless its digest equals the target's. The reason says to reprovision the host or run `--patch-live` again.
+4. In the edge dashboard, the reconciler classifies from the patch recorded in instance metadata. The result is `unknown` when that record is missing, fails its SHA-256 check, has no boot binding, or names a boot other than the instance's current `lastStartTimestamp`. A manifest that was too large to record is `unknown` unless its digest equals the target's. Reprovision the host or submit an updated manifest via the patch console.
 
 ## Receipts and metadata
 
@@ -235,32 +221,29 @@ Each runner registers with a label list, and the manager keeps that list in sync
 
 GitHub's built-in labels (`self-hosted`, `Linux`, `X64`, `Windows`, `macOS`, `ARM64`, and `ARM`) are excluded from the comparison. For each expected runner (`<prefix>-<vm>-<n>`), a mismatch triggers a `PUT` that replaces the runner's custom labels, and the manager reads the result back and checks it.
 
-Label sync runs at three points:
+Label sync runs at two points:
 
-- **After provisioning.** It runs once every expected runner is online and before the storage check and the patch record. A failure fails the deployment, and the host stays pending.
-- **After a live patch.** It runs after `LIVE_PATCH_APPLIED` and before the applied record. A failure leaves the host pending, and running `--patch-live` again re-applies the patch and retries the sync.
-- **For a host already at the patch.** A `--patch-live` run on a verified `noop` host syncs labels before it records the patch. A dashboard hot patch only syncs the labels of each `noop` host, and it doesn't record the patch.
-
-Before a live patch changes anything, it checks everything that label sync needs: the runner group, strict-pool membership, and that GitHub lists every expected runner. Label sync therefore can't fail because of missing inputs after the host changed. Label sync raises an error when GitHub doesn't list an expected runner or when the labels read back differ.
+- **After provisioning:** once every expected runner is online and before the storage check and patch record. A failure keeps the deployment pending.
+- **During reconciliation:** on each 5-minute cron cycle, the edge reconciler verifies runner labels and issues GitHub API updates if labels deviate from the merged manifest.
 
 ## Apply a patch
 
-To apply a patch, commit the manifest to the configuration repository (`swack-tools/spot-runners-config`). Operators author, validate, and preview manifests in the Runner Patch Console on the edge dashboard or through its REST APIs. Saving a manifest opens a pull request on the configuration repository. After review and merge into the default branch (`main`), the autonomous Cloudflare Worker fleet reconciler (`cloudflare/src/reconciler.rs`) provisions replacement Spot instances or rotates running hosts according to the merged manifest.
+To apply a patch, commit the manifest to the configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`). Operators author, validate, and preview manifests in the Runner Patch Console on the edge dashboard or through its REST APIs. Saving a manifest opens a pull request on the configuration repository. After review and merge into the default branch (`main`), the autonomous Cloudflare Worker fleet reconciler (`cloudflare/src/reconciler.rs`) provisions replacement Spot instances or rotates running hosts according to the merged manifest.
 
 ### Validate and preview with the patch console
 
 Before applying any change, validate the manifest syntax and preview its classification against the running fleet. You can perform these checks in the dashboard Web UI or by calling the edge endpoints:
 
-1. **Manifest validation (`POST /api/patch-console/validate`):** the endpoint verifies the schema version (`spot-runner-patch-v1`), parses YAML or JSON syntax, checks hardware sizing floors (at least 16 vCPUs, 32 GiB host RAM, 2 runners at 7 vCPUs and 14 GiB RAM each, 4 GiB host overhead, and `queued_jobs_threshold >= 20`), and verifies that container mounts do not expose forbidden paths such as `/var/run/docker.sock` or `/var/lib/gha-admission`. It returns the canonical SHA-256 digest:
+1. **Manifest validation (`POST /api/patch-console/validate`):** the endpoint (aliased as `/api/patches/validate`) verifies the schema version (`spot-runner-patch-v1`), parses YAML or JSON syntax, checks hardware sizing floors (at least 16 vCPUs, 32 GiB host RAM, 2 runners at 7 vCPUs and 14 GiB RAM each, 4 GiB host overhead, and `queued_jobs_threshold >= 20`), and verifies that container mounts do not expose forbidden paths such as `/var/run/docker.sock` or `/var/lib/gha-admission`. It returns the canonical SHA-256 digest:
 
 ```bash
 curl -X POST https://spot.swacktech.com/api/patch-console/validate \
   -H "Content-Type: application/json" \
   -H "Cookie: __Host-spot_session=<session-cookie>" \
-  -d '{"content": "schema: spot-runner-patch-v1\nrepository: swack-tools/oxidex\nhardware:\n  min_vcpu: 16\n  min_ram_gib: 32\n  runners_count: 2\n  runner_vcpu: 7\n  runner_ram_gib: 14\n  host_overhead_gib: 4\n  queued_jobs_threshold: 20\n"}'
+  -d '{"content": "schema: spot-runner-patch-v1\nrepository: example-org/example-repo\nhardware:\n  min_vcpu: 16\n  min_ram_gib: 32\n  runners_count: 2\n  runner_vcpu: 7\n  runner_ram_gib: 14\n  host_overhead_gib: 4\n  queued_jobs_threshold: 20\n"}'
 ```
 
-2. **Rollout classification preview (`POST /api/patch-console/preview`):** the preview endpoint compares the target manifest against running hosts and classifies required actions:
+2. **Rollout classification preview (`POST /api/patch-console/preview`):** the preview endpoint (aliased as `/api/patches/preview`) compares the target manifest against running hosts and classifies required actions:
    - `noop`: the host already runs the target patch (SHA-256 digests match).
    - `hot_patch`: the changes only add packages, files, or non-destructive sysctl settings that apply in place.
    - `recreate_containers`: only container mounts differ, requiring container re-creation.
@@ -268,14 +251,14 @@ curl -X POST https://spot.swacktech.com/api/patch-console/validate \
 
 ### Submit changes through the pull request workflow
 
-Saving a patch creates a pull request on the configuration repository (`swack-tools/spot-runners-config`) using `POST /api/patch-console/save`:
+Saving a patch creates a pull request on the configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`) using `POST /api/patch-console/save` (aliased as `/api/patches/save`):
 
 ```bash
 curl -X POST https://spot.swacktech.com/api/patch-console/save \
   -H "Content-Type: application/json" \
   -H "Cookie: __Host-spot_session=<session-cookie>" \
-  -H "Idempotency-Key: patch-oxidex-20261022" \
-  -d '{"path": "repos/swack-tools/oxidex.yaml", "manifest": {"schema": "spot-runner-patch-v1", "repository": "swack-tools/oxidex", "hardware": {"min_vcpu": 16, "min_ram_gib": 32, "runners_count": 2, "runner_vcpu": 7, "runner_ram_gib": 14, "host_overhead_gib": 4, "queued_jobs_threshold": 20}}}'
+  -H "Idempotency-Key: patch-sample-20261022" \
+  -d '{"path": "repos/example-org/example-repo.yaml", "manifest": {"schema": "spot-runner-patch-v1", "repository": "example-org/example-repo", "hardware": {"min_vcpu": 16, "min_ram_gib": 32, "runners_count": 2, "runner_vcpu": 7, "runner_ram_gib": 14, "host_overhead_gib": 4, "queued_jobs_threshold": 20}}}'
 ```
 
 The pull request workflow enforces configuration safety:
@@ -289,8 +272,8 @@ The pull request workflow enforces configuration safety:
 
 After operators review and merge the pull request into the default branch (`main`), the Cloudflare Worker reconciler (`cloudflare/src/reconciler.rs`) automates fleet updates on its 5-minute scheduled cron cadence (`#[event(scheduled)]`):
 
-1. **Manifest synchronization:** on each tick, the reconciler reads merged manifests from `swack-tools/spot-runners-config`.
-2. **Floor maintenance:** for each controlled target in `SPOT_RUNNER_FLOOR_TARGETS`, the reconciler ensures at least one 16-vCPU Spot runner host is active. If no host exists or an existing host requires replacement, the reconciler provisions a new Spot VM.
+1. **Manifest synchronization:** on each tick, the reconciler reads merged manifests from the configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`).
+2. **Floor maintenance:** for each controlled target in `controlled_targets`, the reconciler ensures at least one 16-vCPU Spot runner host is active. If no host exists or an existing host requires replacement, the reconciler provisions a new Spot VM.
 3. **Template rendering and JIT configuration:** the reconciler renders `cloud-init/startup.sh` with the merged patch manifest, requests 2-slot Just-In-Time (JIT) credentials from GitHub Actions (`POST /orgs/{org}/actions/runners/generate-jitconfig`), and records the canonical `spot-runner-patch-sha256` digest in instance metadata.
 4. **Demand-driven autoscaling:** if GitHub Actions reports a backlog of 20 or more queued jobs (`queued_jobs >= 20`), the reconciler provisions additional Spot runner hosts up to the configured fleet limit.
 5. **Label reconciliation:** the reconciler automatically synchronizes GitHub Actions runner labels to match the instance type, region, instruction set architecture flags, and extra labels defined in the manifest.
@@ -318,18 +301,17 @@ hardware:
 
 host:
   apt_packages:
-    - jq
-    - zstd
+    - curl
+    - git
   sysctl:
-    vm.max_map_count: 262144
-    fs.inotify.max_user_watches: 524288
+    net.core.somaxconn: 4096
 ```
 
-A repository manifest under `repos/<owner>/<repo>.yaml` inherits those defaults and can add repository-specific ISA flags (such as `avx512` or `avx512-vbmi2`), extra scheduling labels (`ubuntu-latest`), host directories, container mounts, and Dockerfile commands:
+A repository manifest under `repos/<owner>/<repo>.yaml` inherits those defaults and can add repository-specific ISA flags (such as `avx512` or `avx512-vbmi2`), extra scheduling labels (`fast-compute`), host directories, container mounts, and Dockerfile commands:
 
 ```yaml
 schema: spot-runner-patch-v1
-repository: swack-tools/oxidex
+repository: example-org/example-repo
 
 hardware:
   arch: x86_64
@@ -337,7 +319,7 @@ hardware:
     - avx512
     - avx512-vbmi2
   extra_labels:
-    - oxidex-fast
+    - fast-compute
   min_vcpu: 16
   min_ram_gib: 32
   runners_count: 2
@@ -348,12 +330,12 @@ hardware:
 
 host:
   boot_mkdirs:
-    - /mnt/runner-data/cargo-shared
+    - /mnt/runner-data/custom-cache
 
 container:
   mounts:
-    - source: /mnt/runner-data/cargo-shared
-      target: /cache/cargo
+    - source: /mnt/runner-data/custom-cache
+      target: /cache/custom
       read_only: false
 ```
 

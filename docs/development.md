@@ -22,7 +22,7 @@ The repository consists of two Rust workspaces and edge deployment tooling:
 Run focused tests while iterating, and run the complete workspace test suite before committing:
 
 ```bash
-# Run all 268 tests across host-agent and cloudflare workspaces
+# Run all tests across host-agent and cloudflare workspaces
 just test
 
 # Alternatively, test workspaces directly via Cargo
@@ -96,13 +96,13 @@ gates pass. It does not authorize force-pushing, changing branch protections, or
 
 - Develop on a dedicated feature branch or isolated Git worktree based on latest `origin/main`. Never push
   directly to `main`.
-- Author and SSH-sign commits as `swackhamer` (`user.name=swackhamer`,
-  `user.email=swackhamer@users.noreply.github.com`, `commit.gpgsign=true`). Verify local signatures with
+- Author and SSH-sign commits with your verified GitHub identity (`user.name=your-username`,
+  `user.email=your-username@users.noreply.github.com`, `commit.gpgsign=true`). Verify local signatures with
   `git cat-file commit HEAD`, and verify GitHub's verification status on pushed commits.
-- When multiple `gh` accounts exist, export the `swackhamer` token for the shell session:
+- When multiple `gh` accounts exist, export your active GitHub token for the shell session:
 
   ```bash
-  export GH_TOKEN="$(gh auth token --user swackhamer)"
+  export GH_TOKEN="$(gh auth token --user your-username)"
   gh pr status --repo swack-tools/spot-github-runners
   ```
 
