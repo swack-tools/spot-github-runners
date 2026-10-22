@@ -26,6 +26,20 @@ the uploader account. See [Set up a builder](dedicated-builders.md).
 
 ## Clone and sign in
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Dashboard sign-in page](images/login-gate.png)
+<figcaption markdown>The sign-in page offers GitHub web sign-in and a GitHub device code.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Device code sign-in](images/login-device-code.png)
+<figcaption markdown>Device sign-in shows a one-time code to enter at the GitHub device page.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 ```bash
 git clone https://github.com/swack-tools/spot-github-runners.git
 cd spot-github-runners
@@ -38,6 +52,12 @@ gh auth status
 ```
 
 ## Create the environment file
+
+<figure class="shot" markdown>
+![Environment file template](images/term-env-example.png)
+<figcaption markdown>`.env.example` lists every variable with placeholder values only.</figcaption>
+</figure>
+<!-- /shot -->
 
 For local testing and configuration, copy `.env.example` to `.env`:
 
@@ -66,6 +86,24 @@ directories, or operational state. Store deployment output under a directory out
 `$HOME/oxidex-ops`.
 
 ## Run the read-only commands
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Host agent help](images/term-host-agent-help.png)
+<figcaption markdown>`host-agent --help` lists the subcommands of the multi-call binary.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Just recipes](images/term-just-list.png)
+<figcaption markdown>`just --list` shows the build, test, lint, and deploy recipes.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Test suites](images/term-cargo-test.png)
+<figcaption markdown>`just test` runs the host agent and Worker test suites.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Run these commands from the repository root. Each one reads state and prints a result. None of them
 creates, changes, or deletes a VM, disk, or runner registration.

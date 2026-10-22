@@ -25,6 +25,24 @@ website tools are installed on previously launched builders.
 
 ## Render once, launch with one command
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Builder sizing profile](images/sizing-builder-profile.png)
+<figcaption markdown>The builder profile: 16 vCPU, a 28 GiB container cap, and the builder benchmark floor.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder template](images/cloudinit-builder-editor.png)
+<figcaption markdown>An example dedicated builder `cloud-init` template.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder offers](images/qualifier-builders.png)
+<figcaption markdown>Qualifying Spot offers for dedicated builders.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Prepare the private JSON configuration below and a separate explicitly approved
 public uploader mapping file. Do not use a private SSH key. The mapping must
 contain exactly `schema` (`root-approved-ssh-mapping-v1`),
@@ -134,6 +152,20 @@ rendered payload.
 
 ## Verify startup and readiness
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Builder readiness record](images/term-builder-readiness.png)
+<figcaption markdown>Example builder readiness record.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builders in the instance list](images/instances-builders.png)
+<figcaption markdown>Rust Builders Only filters the instance list to dedicated builders.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Startup records two files on the builder:
 
 ```text
@@ -173,6 +205,12 @@ SSH trust, installed launcher, and resource admission before executing work.
 Then use `just build`; use `just build-local` for an explicit local build.
 
 ## Storage, access, and draining
+
+<figure class="shot" markdown>
+![Builder scaling](images/scaling-builder-policy.png)
+<figcaption markdown>Builder scaling keeps at least one builder and scales down idle builders.</figcaption>
+</figure>
+<!-- /shot -->
 
 The launch command uses a 40 GiB Hyperdisk Balanced boot disk and a 100 GiB
 Hyperdisk Balanced cache disk through NVMe, with 3,000 IOPS and 140 MiB/s baseline

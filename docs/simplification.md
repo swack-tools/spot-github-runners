@@ -2,12 +2,32 @@
 
 ## User workflow
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Remote builds](images/rust-builds.png)
+<figcaption markdown>Remote builds as users see them in the dashboard.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Device sign-in](images/login-device-code.png)
+<figcaption markdown>Device sign-in for terminal users.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The intended interface is `just build` for a remote build and
 `just build-local` for an explicit local build. Ordinary build and test recipes
 should use the same configured remote builder. OxiDex owns those recipes; this repository
 provides the VM startup payload and restricted host launcher.
 
 ## Setup workflow
+
+<figure class="shot" markdown>
+![One deploy command](images/term-gcp-project.png)
+<figcaption markdown>One command deploys the Worker with the gcloud project.</figcaption>
+</figure>
+<!-- /shot -->
 
 1. Choose a zone for the fixed `n4-highcpu-16` builder shape, and check its
    Spot price with the 40 GB boot disk and the 100 GB persistent cache disk.

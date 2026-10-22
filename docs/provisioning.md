@@ -7,6 +7,20 @@ The startup script installs the native pure-Rust `host-agent` binary and configu
 
 ## Automated provisioning by the edge reconciler
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Running hosts by region](images/map-region-iowa.png)
+<figcaption markdown>Running runner hosts and builders by region, with the plan-only scale controls.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Region without hosts](images/map-europe-empty.png)
+<figcaption markdown>A region without hosts offers plan-only buttons; the dashboard never creates VMs itself.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 
 - **Floor target maintenance**: ensures at least one 16-vCPU Spot runner host per configured controlled target (`controlled_targets`).
@@ -17,9 +31,23 @@ The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 
 ## Startup bootstrap and host agent installation
 
-![The cloud-init and VM templates tab](images/dashboard-cloudinit.png)
-
-*The `cloud-init` editor with an example runner template and saved VM templates.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Template editor](images/cloudinit-runner.png)
+<figcaption markdown>The `cloud-init` editor with an example runner template and saved VM templates.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder template](images/cloudinit-builder-editor.png)
+<figcaption markdown>An example dedicated builder template.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![VM templates](images/vm-templates.png)
+<figcaption markdown>Saved VM templates record a shape, CPU platform, benchmark, and disk.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 When a new runner host boots, `cloud-init/startup.sh` executes the bootstrap sequence:
 
@@ -39,6 +67,20 @@ Dedicated builder cache disks are different: they use `auto-delete=no` and persi
 See [Set up a builder](dedicated-builders.md).
 
 ## Runner sizing and admission
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Runner sizing profile](images/sizing-runner-profile.png)
+<figcaption markdown>The runner profile sets per-runner vCPU and RAM, the benchmark floor, disks, budget, and templates.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Sizing tab](images/sizing-tab.png)
+<figcaption markdown>The sizing tab shows the runner and builder profiles side by side.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Runner hosts use 16-vCPU shapes with at least 32 GiB RAM:
 

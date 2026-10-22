@@ -9,6 +9,20 @@ For template values that you copy into a file, see
 
 ## Credentials and sign-in
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Environment template](images/term-env-example.png)
+<figcaption markdown>`.env.example` with placeholder values.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Sign-in page](images/login-gate.png)
+<figcaption markdown>The sign-in methods that the OAuth 2.0 settings enable.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 These variables configure GitHub API access, GCP service account credentials, and OAuth 2.0 authentication
 for the edge dashboard.
 
@@ -35,6 +49,20 @@ edge dashboard.
 | `DASHBOARD_GLOBAL_ADMINS` | Unset (enabled). | Cloudflare Worker (`cloudflare/src/lib.rs`). | Toggle controlling whether added administrators skip per-target checks. The literal `none` disables the exemption (requiring added administrators to administer every controlled target); unset or any other value enables it. The primary owner is fixed in code. |
 
 ## Cloudflare Worker and deployment settings
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![GCP project from gcloud](images/term-gcp-project.png)
+<figcaption markdown>The deploy recipe reads `GCP_PROJECT` from the active gcloud configuration.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Configured header](images/ui-header.png)
+<figcaption markdown>The dashboard header shows the configured project and organization.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 These variables configure deployment identifiers, Workers KV storage bindings, and Cloudflare API credentials.
 

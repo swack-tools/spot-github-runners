@@ -19,6 +19,24 @@ The repository consists of two Rust workspaces and edge deployment tooling:
 
 ## Build and test workflows
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Test suites](images/term-cargo-test.png)
+<figcaption markdown>`just test`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Worker build](images/term-worker-build.png)
+<figcaption markdown>`worker-build --release`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Format check](images/term-fmt-check.png)
+<figcaption markdown>`just fmt-check`.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Run focused tests while iterating, and run the complete workspace test suite before committing:
 
 ```bash
@@ -49,6 +67,20 @@ Local tests, proof runs, GitHub CI checks, merged commits on `main`, and live cl
 prove different properties. State the exact command, target, and environment for every verification claim.
 
 ## Documentation and prose checks
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Vale](images/term-vale.png)
+<figcaption markdown>`vale` with the Google style.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![MkDocs build](images/term-mkdocs-build.png)
+<figcaption markdown>`mkdocs build --strict`.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Documentation follows the [Google developer documentation style guide](https://developers.google.com/style):
 sentence-case headings, active voice, direct instructions, and explicit prerequisites.

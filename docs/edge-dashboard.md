@@ -31,6 +31,20 @@ The serverless Worker eliminates the legacy control plane components:
 
 ## Edge user interface serving
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Dashboard header](images/ui-header.png)
+<figcaption markdown>The Worker renders the GCP project from the `GCP_PROJECT` variable into the header.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![World map](images/map-world.png)
+<figcaption markdown>The world map is drawn in the browser from the overview data.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The dashboard single-page web app is embedded directly into Worker memory at compile time in `cloudflare/src/ui.rs`.
 
 - **Sub-15 ms response latency**: requests for `GET /` and `GET /index.html` respond directly from Worker memory in under 15 milliseconds, requiring zero origin round trips, or network fetches.
@@ -39,6 +53,24 @@ The dashboard single-page web app is embedded directly into Worker memory at com
 - **Path normalization**: the request router normalizes percent-encoded paths, resolves dot segments, and collapses slashes before evaluation. Any request targeting `/api/control*` receives HTTP 404.
 
 ## Sign-in
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Sign-in page](images/login-gate.png)
+<figcaption markdown>Unauthenticated requests get the sign-in page.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Device code](images/login-device-code.png)
+<figcaption markdown>The device flow for terminals and shared machines.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Administrators](images/admins.png)
+<figcaption markdown>Owners manage added administrators.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The dashboard provides authentication through GitHub OAuth 2.0. Sign-in succeeds only when the user meets these criteria:
 
@@ -112,6 +144,20 @@ Unchanged cron ticks perform zero KV writes. In steady state, the Worker perform
 
 ## Scheduled fleet reconciliation
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Scale decision](images/scaling-decision-scale-up.png)
+<figcaption markdown>The scaling evaluation when queued jobs reach the 20-job scale-up threshold.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Health endpoint](images/term-api-health.png)
+<figcaption markdown>Example `/api/health` response.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The Worker executes scheduled reconciliation every 5 minutes by using Cloudflare Cron Triggers (`#[event(scheduled)]`):
 
 ```rust
@@ -150,6 +196,20 @@ The fleet reconciler supports GitHub Actions Just-In-Time (JIT) runner configura
 - **Registration token fallback**: if JIT configuration generation is unavailable, the reconciler automatically falls back to generating standard runner registration tokens.
 
 ## Runner patches
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Patch console](images/patches-validated.png)
+<figcaption markdown>The patch console validates manifests at the edge.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Rollout preview](images/patches-preview.png)
+<figcaption markdown>The rollout preview with live hot-patching off.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The **Runner Patches** tab and `/api/patches` routes (aliased under `/api/patch-console/*`) edit, validate, preview, and save runner configurations:
 
@@ -204,6 +264,12 @@ When external services experience outages:
 - **KV read errors**: if the state document cannot be retrieved on worker cold start, the Worker creates a valid default state bundle (`default_dashboard_bundle`) and logs an alert.
 
 ## Configuration
+
+<figure class="shot" markdown>
+![Deploy with the gcloud project](images/term-gcp-project.png)
+<figcaption markdown>`just deploy-worker` passes the default gcloud project as `GCP_PROJECT`.</figcaption>
+</figure>
+<!-- /shot -->
 
 Set these variables in `cloudflare/wrangler.toml` or as Cloudflare Worker secrets:
 

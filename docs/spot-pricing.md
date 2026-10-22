@@ -8,9 +8,31 @@ Neither price queries nor dashboard views create VMs, reserve capacity, or mutat
 
 ## Spot offer evaluation at the edge
 
-![Qualifying instances matrix](images/dashboard-qualifier.png)
-
-*The qualifying instances matrix compares each candidate shape with the benchmark floor and the Spot budget. Offers over the budget show Exceeds Budget Cap.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Runner offer matrix](images/qualifier-runners.png)
+<figcaption markdown>Runner candidates compared with the benchmark floor and the Spot budget. Offers over the budget show Exceeds Budget Cap.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Spot-qualifying offers only](images/qualifier-spot-only.png)
+<figcaption markdown>Show Only Spot-Price-Qualifying hides offers that exceed the budget.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder offer matrix](images/qualifier-builders.png)
+<figcaption markdown>Rust builder candidates use the builder benchmark floor and budget.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Region price cards](images/map-inspector.png)
+<figcaption markdown>The region inspector shows Spot price per hour, day, and month for each running host.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Compute-only prices](images/map-inspector-compute-only.png)
+<figcaption markdown>Clearing Show Prices With Disk & Taxes shows the compute Spot price alone.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The edge reconciler evaluates qualifying Spot offers against deployment constraints on every reconciliation tick:
 
@@ -27,9 +49,27 @@ Operators inspect real-time pricing and qualifying shapes directly through the w
 
 ## Inspecting pricing via the API
 
-![Regions and Latency Filter tab](images/dashboard-regions.png)
-
-*The Regions and Latency Filter tab enables or deselects regions by latency, continent, machine family, CPU platform, and disk type.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Regions and latency filter](images/regions-all.png)
+<figcaption markdown>Regions with their latency, machine families, CPU platforms, and disk types.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Low-latency regions](images/regions-low-latency.png)
+<figcaption markdown>A 60 ms latency limit narrows the region list.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Regions in Europe](images/regions-europe.png)
+<figcaption markdown>The continent filter shows one world area.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Live budget bar](images/ui-header.png)
+<figcaption markdown>The live budget bar sets the hourly, daily, and monthly caps from any tab.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 You can query the current precomputed pricing and fleet inventory from the edge control plane:
 

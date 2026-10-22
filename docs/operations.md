@@ -5,6 +5,20 @@ recovery procedures, and troubleshooting guidance for the pure-Rust runner fleet
 
 ## Safety rules
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Plan-only controls](images/map-europe-empty.png)
+<figcaption markdown>Scale controls in the dashboard only plan; they never create or delete VMs.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Running instances](images/instances-running-only.png)
+<figcaption markdown>The instance list mirrors live Compute Engine inventory.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 ### Preview before changing resources
 
 Code or documentation edits do not authorize live cloud mutations. Before creating, modifying,
@@ -55,9 +69,19 @@ Runner idleness does not indicate dedicated builder availability, and builder dr
 
 ### Classify out-of-memory exits with evidence
 
-![OOM evidence panel](images/dashboard-oom-evidence.png)
-
-*The OOM panel separates confirmed out-of-memory kills (exit code 137 with cgroup evidence) from timeouts, and links to the exact job step and log line.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![OOM evidence](images/scaling-oom-panel.png)
+<figcaption markdown>Confirmed OOM kills (exit code 137 with cgroup evidence) are separated from timeouts and linked to the exact job step.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Record an OOM link](images/scaling-oom-record.png)
+<figcaption markdown>Record a GitHub Actions OOM link with its run, job, step, and line.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Exit status 137 indicates that a process received `SIGKILL`. It does not confirm an out-of-memory event or
 identify the affected boundary. Correlate kernel and cgroup metrics within the exact job execution interval:
@@ -148,6 +172,20 @@ If an edge write conflict occurs, the reconciler re-reads current GCE instance l
 evaluates capacity against policies, and commits a fresh JSON state snapshot.
 
 ## Troubleshooting
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Refresh inventory](images/instances-refresh-toast.png)
+<figcaption markdown>Refresh Inventory re-lists Compute Engine instances when the list looks stale.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Health check](images/term-api-health.png)
+<figcaption markdown>Example `/api/health` response.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 | Symptom | Cause and recovery action |
 | --- | --- |

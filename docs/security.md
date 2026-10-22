@@ -32,6 +32,12 @@ in the organization group. Ensure runner group permissions restrict access stric
 
 ## Job admission on runner hosts
 
+<figure class="shot" markdown>
+![Memory admission](images/term-host-agent-admission.png)
+<figcaption markdown>`host-agent admission` reserves memory before a job starts.</figcaption>
+</figure>
+<!-- /shot -->
+
 Registered GitHub runner listener counts do not equal available physical memory capacity. The root-owned
 `host-agent admission` daemon manages memory allocations before jobs begin.
 
@@ -59,6 +65,20 @@ Runner containers mount this directory read-only. The runner `job-started.sh` ho
 new jobs before admission or step execution, allowing existing jobs to complete undisturbed.
 
 ## Dedicated builder security
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Forbidden mount](images/patches-invalid.png)
+<figcaption markdown>Manifests that mount the Docker socket are rejected.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Forbidden mount response](images/term-patch-validate.png)
+<figcaption markdown>Example validation response for a forbidden mount.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Dedicated builders execute remote compilations for the approved uploader account under strict containment.
 
@@ -103,6 +123,24 @@ Dedicated builders accept an explicit, root-approved mapping file conforming to 
 - Requires direct authenticated SSH connections; `gcloud compute ssh` is forbidden.
 
 ## Edge dashboard security and authentication
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Sign-in page](images/login-gate.png)
+<figcaption markdown>Only the owner and added administrators can sign in.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Administrators](images/admins.png)
+<figcaption markdown>Owners add and remove administrators by numeric GitHub user ID.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Device flow](images/login-device-code.png)
+<figcaption markdown>Device sign-in.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The web dashboard is served directly from Cloudflare Worker memory (`cloudflare/src/ui.rs`), providing an
 isolated control interface without intermediate VM hops.

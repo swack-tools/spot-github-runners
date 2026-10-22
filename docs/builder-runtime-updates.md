@@ -4,6 +4,20 @@ Use this administrative guide when updating the runtime binary or container imag
 
 ## Dedicated builder architecture
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Dedicated builders](images/instances-builders.png)
+<figcaption markdown>Dedicated builders with their persistent cache disk size.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder telemetry summary](images/rust-kpis.png)
+<figcaption markdown>Build totals, cache hit rate, peak memory, and CPU points across builds.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Dedicated builders are single-purpose build VMs (`builder-*`) using the `n4-highcpu-16` machine shape (16 vCPUs, 32 GiB RAM) without registering GitHub runner listeners. The pure-Rust architecture separates immutable compute from persistent storage:
 
 - **Persistent cache disk**: A 100 GiB Hyperdisk Balanced disk provisioned with `auto-delete=no` and mounted at `/mnt/runner-data`. This disk retains Cargo downloads (`/mnt/runner-data/remote-build/cargo`), per-project worktree build targets (`/mnt/runner-data/remote-build/targets`), and local Docker data (`/mnt/runner-data/docker`). The cache disk survives VM recreation.
@@ -131,6 +145,20 @@ Verify that the JSON payload contains `"workload_qualified": false` with valid `
 Update the remote builder endpoint in OxiDex's `.cargo/config.toml` under the `[env]` table to point to the new builder instance name. Run a test compilation using `just build` to qualify the builder for project workloads.
 
 ## In-place runtime update procedure
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Readiness after an update](images/term-builder-readiness.png)
+<figcaption markdown>Example readiness record written after bootstrap.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Toolchain probe](images/term-toolchain-probe.png)
+<figcaption markdown>The `host-agent toolchain-probe` subcommand.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 If VM rotation is impractical and an administrator needs to update the `host-agent` binary or rebuild the container image directly on an existing VM:
 

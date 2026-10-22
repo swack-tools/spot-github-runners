@@ -8,6 +8,12 @@ Use them for native ARM64 Linux Docker work. Route native macOS work to native h
 
 ## What the files define
 
+<figure class="shot" markdown>
+![Local runner Compose file](images/term-m4air-compose.png)
+<figcaption markdown>The Docker Compose file for the local ARM64 runners.</figcaption>
+</figure>
+<!-- /shot -->
+
 | File | Purpose |
 | --- | --- |
 | `m4air/Dockerfile` | An Ubuntu 24.04 image with the GitHub Actions runner (a pinned version and SHA-256 for `linux-arm64`), the Docker command-line tool, Buildx, and Compose from a pinned Docker image, Rust 1.97.1 with rustfmt, and Perl and build dependencies. |
@@ -56,6 +62,12 @@ Never commit that file or any `.env` file. Changing `RUNNER_LABELS` affects only
 labels of runners that are already registered through the GitHub API.
 
 ## Verification record
+
+<figure class="shot" markdown>
+![Just recipes](images/term-just-list.png)
+<figcaption markdown>Recipes for checking the repository before changing local runners.</figcaption>
+</figure>
+<!-- /shot -->
 
 The repository README for this directory records a check on September 30, 2026. Both containers reached the
 Docker server as the `runner` user and built an image with `docker buildx build --load` on both the default

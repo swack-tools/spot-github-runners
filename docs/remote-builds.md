@@ -40,9 +40,23 @@ it fits.
 
 ## Remote build client workflow
 
-![Rust Builders Telemetry tab](images/dashboard-rust.png)
-
-*The Rust Builders Telemetry tab records each remote build: duration, cache hits, builder, origin location, peak memory, and CPU points. The API redacts origin IP addresses and hostnames.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Remote build records](images/rust-builds.png)
+<figcaption markdown>Each remote build: duration, cache hits, builder, origin location, peak memory, and CPU points. The API redacts origin IP addresses and hostnames.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Filter builds](images/rust-builds-vpn-filter.png)
+<figcaption markdown>The search box filters builds by project, builder, location, or network badge.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Record a build](images/rust-record-build.png)
+<figcaption markdown>Record a build manually; fields left empty are stored as not reported.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 OxiDex repository-owned `just` recipes and worker configuration are maintained in the OxiDex repository. Configure
 that client for the approved dedicated host, uploader identity, source, image, and cache before you enable its
@@ -88,6 +102,12 @@ the actual startup, authority, mounts, process lifetime, disk, network, and work
 qualified from a successful source-only test suite or a bootstrap tool probe.
 
 ## Storage and cache lifecycle
+
+<figure class="shot" markdown>
+![Cache and memory summary](images/rust-kpis.png)
+<figcaption markdown>Cache hit rate and peak active memory across builds.</figcaption>
+</figure>
+<!-- /shot -->
 
 | Data | Host path |
 | --- | --- |

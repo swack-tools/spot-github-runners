@@ -26,6 +26,24 @@ The table below summarizes the retirement of legacy infrastructure and its pure-
 
 ## Scheduled cron reconciler design
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Reconciler decision](images/scaling-decision-scale-up.png)
+<figcaption markdown>The scaling evaluation panel when queued jobs reach the 20-job threshold.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Autoscaler lifecycle triggers](images/instances-search.png)
+<figcaption markdown>Instances record why they started or stopped, such as a scale-down drain.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Inventory refresh](images/instances-refresh-toast.png)
+<figcaption markdown>Refresh Inventory asks the Worker to list Compute Engine instances again.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The edge reconciler executes in Cloudflare's global edge network every 5 minutes:
 
 - **Direct REST API orchestration**: the Worker communicates directly with Google Compute Engine REST APIs
@@ -54,6 +72,20 @@ All control plane state is consolidated into a single document in `SPOT_KV`:
   and immediately refreshes the local in-isolate cache.
 
 ## Operational safety and monitoring
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Health endpoint](images/term-api-health.png)
+<figcaption markdown>Example `/api/health` response with the reconciler tick count.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Scaling endpoint](images/term-api-scaling.png)
+<figcaption markdown>Example `/api/scaling` response for the runner policy.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 - **Health probe**: `curl https://spot.swacktech.com/api/health` reports the latest edge reconciliation timestamp,
   reconciler ticks, and active instance counts.

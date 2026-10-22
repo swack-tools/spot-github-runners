@@ -1,0 +1,72 @@
+/* Screenshot figures and carousels for the documentation site. */
+
+.md-typeset figure.shot {
+  margin: 1.2em 0;
+}
+
+.md-typeset figure.shot img,
+.md-typeset .carousel img {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 6px;
+  box-shadow: var(--md-shadow-z1);
+}
+
+.md-typeset figure.shot figcaption,
+.md-typeset .carousel figcaption {
+  max-width: none;
+  font-size: 0.68rem;
+  color: var(--md-default-fg-color--light);
+}
+
+.md-typeset .carousel {
+  position: relative;
+  margin: 1.2em 0;
+}
+
+.md-typeset .carousel-track {
+  display: flex;
+  gap: 1rem;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  scroll-behavior: smooth;
+  padding-bottom: 0.4rem;
+}
+
+.md-typeset .carousel-track > figure {
+  flex: 0 0 100%;
+  margin: 0;
+  scroll-snap-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.md-typeset .carousel-track > figure img {
+  max-height: 34rem;
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+}
+
+.md-typeset .carousel-nav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.8rem;
+  margin-top: 0.3rem;
+  font-size: 0.7rem;
+}
+
+.md-typeset .carousel-nav button {
+  cursor: pointer;
+  border: 1px solid var(--md-default-fg-color--lighter);
+  border-radius: 4px;
+  padding: 0.1rem 0.6rem;
+  background: var(--md-default-bg-color);
+  color: var(--md-default-fg-color);
+}
+
+.md-typeset .carousel-nav button:hover {
+  border-color: var(--md-accent-fg-color);
+  color: var(--md-accent-fg-color);
+}

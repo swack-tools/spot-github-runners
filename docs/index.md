@@ -5,7 +5,42 @@ This repository provisions and operates persistent GitHub Actions runners and de
 This site describes the source on `main`. Merging source does not update a running controller, container, or VM.
 Inspect the deployed configuration and the actual tool versions before you route work to a host.
 
+!!! info "Screenshots use example data"
+    Every screenshot on this site renders the real dashboard or command output with made-up data. Project,
+    organization, instance names, IP addresses, users, and templates are examples, not a live deployment.
+    Pages with several screenshots show them in a carousel: use **Previous** and **Next**, or scroll sideways.
+
 ## What the repository contains
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Dashboard world map](images/map-region-iowa.png)
+<figcaption markdown>The edge dashboard: fleet burn rate, online runners and builders, qualifying Spot offers, and the scaling decision, with a live region map.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Instances and cost history](images/instances-all.png)
+<figcaption markdown>Every running and deleted instance with its runtime, hourly rate, and cost in the selected window.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Scale-up decision](images/scaling-decision-scale-up.png)
+<figcaption markdown>The scaling decision panel shows the queued-jobs trigger (24 queued jobs >= threshold 20) and the projected spend for the target runner count.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Rust builder telemetry](images/rust-builds.png)
+<figcaption markdown>Dedicated Rust builders report duration, cache hits, peak memory, and CPU points for every remote build.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Runner patch console](images/patches-pr-opened.png)
+<figcaption markdown>Runner patches are edited and validated in the dashboard and saved as pull requests.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Host agent help](images/term-host-agent-help.png)
+<figcaption markdown>The `host-agent` multi-call binary runs admission, cleanup, Docker admission, and builder tooling on hosts.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 | Component | What it does |
 | --- | --- |
@@ -64,6 +99,12 @@ The scheduled edge reconciler is the autonomous component that manages runner ho
 See the [command reference](commands.md) for every flag.
 
 ## Registered listeners are not capacity
+
+<figure class="shot" markdown>
+![Fleet summary cards](images/ui-kpis.png)
+<figcaption markdown>The summary cards show registered runner slots and VMs separately from memory admission headroom.</figcaption>
+</figure>
+<!-- /shot -->
 
 Twenty registered runners do not mean that twenty jobs can each use 32 GiB at once. Admission reserves memory
 before a job starts. The physical host also needs space for its operating system, services, and idle listeners.

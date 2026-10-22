@@ -15,6 +15,28 @@ The repository features two primary execution environments:
 
 ## Host agent subcommands
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Host agent help](images/term-host-agent-help.png)
+<figcaption markdown>`host-agent --help`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Admission subcommand](images/term-host-agent-admission.png)
+<figcaption markdown>`host-agent admission`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Target cleanup](images/term-clean-target.png)
+<figcaption markdown>`host-agent clean-target`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Toolchain probe](images/term-toolchain-probe.png)
+<figcaption markdown>`host-agent toolchain-probe`.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The `host-agent` binary runs on runner hosts and dedicated builder VMs. It provides eight subcommands
 and supports execution either directly or through symlink aliases.
 
@@ -138,6 +160,20 @@ Validates that compiler toolchains, browser binaries, and cgroup v2 controllers 
 
 ## Just recipes
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Just recipes](images/term-just-list.png)
+<figcaption markdown>`just --list`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Deploy recipe](images/term-gcp-project.png)
+<figcaption markdown>`just gcp-project` and `just deploy-worker`.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Development and verification tasks are managed through `just` recipes defined in `justfile`.
 
 ```bash
@@ -156,6 +192,12 @@ just <recipe> [arguments...]
 | `just probe-edge` | Probes the Cloudflare Worker edge dashboard health and overview endpoints. |
 
 ## Wrangler commands
+
+<figure class="shot" markdown>
+![Worker build](images/term-worker-build.png)
+<figcaption markdown>`worker-build --release` and the resulting Wasm size.</figcaption>
+</figure>
+<!-- /shot -->
 
 The Cloudflare Worker edge control plane is managed using the Wrangler command-line tool from the
 `cloudflare/` directory.
@@ -202,6 +244,20 @@ wrangler kv key get --binding=SPOT_KV "dashboard:state"
 ```
 
 ## Cargo verification commands
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Test suites](images/term-cargo-test.png)
+<figcaption markdown>`just test`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Format check](images/term-fmt-check.png)
+<figcaption markdown>`just fmt-check`.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Cargo provides direct access to test, lint, and build targets:
 
