@@ -212,7 +212,7 @@ Set these variables in `cloudflare/wrangler.toml` or as Cloudflare Worker secret
 | `SESSION_SECRET` | Secret | Secret key for signing and validating HMAC-SHA256 session cookies. |
 | `SESSION_NOT_BEFORE` | Variable | Optional Unix timestamp cut-off for invalidating earlier sessions. |
 | `SPOT_KV` | Binding | Cloudflare Workers KV namespace binding for consolidated state storage. |
-| `GCP_PROJECT` | Variable | Target GCP project identifier (for example `YOUR_PROJECT`). |
+| `GCP_PROJECT` | Variable | GCP project shown in the dashboard header. `just deploy-worker` sets it from the active gcloud project. |
 | `GCP_SERVICE_ACCOUNT_KEY` | Secret | JSON service account key with Compute Engine administration permissions. |
 | `GITHUB_ORG` | Variable | Primary GitHub organization (default `swack-tools`). |
 | `GITHUB_OAUTH_CLIENT_ID` | Variable | GitHub OAuth 2.0 app client ID. |

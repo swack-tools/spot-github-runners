@@ -65,3 +65,20 @@ clean:
     cargo clean --manifest-path host-agent/Cargo.toml
     cargo clean --manifest-path cloudflare/Cargo.toml
     rm -rf cloudflare/build
+
+# Print the GCP project the Worker will be deployed with (the active gcloud default project).
+gcp-project:
+    @gcloud config get-value project 2>/dev/null
+
+# This changes the live Worker: run it only when you intend a production deploy.
+# Deploy the Cloudflare Worker with GCP_PROJECT taken from the active gcloud configuration.
+deploy-worker:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    project="$(gcloud config get-value project 2>/dev/null)"
+    if [ -z "$project" ] || [ "$project" = "(unset)" ]; then
+        echo "No default gcloud project. Run: gcloud config set project PROJECT_ID" >&2
+        exit 1
+    fi
+    echo "Deploying spot-dashboard-edge with GCP_PROJECT=$project"
+    cd cloudflare && wrangler deploy --var "GCP_PROJECT:$project"

@@ -534,7 +534,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div>
           <div class="brand-title">Spot GitHub Runners &amp; Rust Remote Builders Control Plane</div>
           <div class="brand-sub">
-            <span id="hdr-project-org">GCP Project: homelab-424523 · GitHub Org: swack-tools</span>
+            <span id="hdr-project-org">GCP Project: not configured · GitHub Org: not configured</span>
             <span class="tz-pill" id="browser-tz-pill">🕒 TZ: Detecting...</span>
           </div>
         </div>
@@ -3754,23 +3754,30 @@ pub fn html_escape(input: &str) -> String {
 }
 
 /// Render the complete dashboard HTML with custom GCP project and GitHub Org parameters.
+///
+/// The project comes from the `GCP_PROJECT` Worker variable, which `just deploy-worker` sets from the
+/// active gcloud configuration (`gcloud config get-value project`). No project ID is compiled in.
 pub fn render_dashboard_html(project: &str, org: &str) -> String {
-    let proj = if project.is_empty() {
-        "homelab-424523"
-    } else {
-        project
-    };
-    let github_org = if org.is_empty() { "swack-tools" } else { org };
+    let proj = project.trim();
+    let github_org = org.trim();
 
-    // If default values are requested, avoid replacement allocations
-    if proj == "homelab-424523" && github_org == "swack-tools" {
+    // If nothing is configured, serve the static placeholder header without a replacement allocation
+    if proj.is_empty() && github_org.is_empty() {
         return DASHBOARD_HTML.to_string();
     }
 
-    let safe_project = html_escape(proj);
-    let safe_org = html_escape(github_org);
+    let safe_project = html_escape(if proj.is_empty() {
+        "not configured"
+    } else {
+        proj
+    });
+    let safe_org = html_escape(if github_org.is_empty() {
+        "not configured"
+    } else {
+        github_org
+    });
 
-    let target = r#"<span id="hdr-project-org">GCP Project: homelab-424523 · GitHub Org: swack-tools</span>"#;
+    let target = r#"<span id="hdr-project-org">GCP Project: not configured · GitHub Org: not configured</span>"#;
     let replacement = format!(
         r#"<span id="hdr-project-org">GCP Project: {} · GitHub Org: {}</span>"#,
         safe_project, safe_org

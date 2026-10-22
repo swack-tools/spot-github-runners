@@ -32,10 +32,10 @@ BcuCVTR8lS9DUeNpVpcHlg==\n\
 
 fn make_test_credentials() -> GcpCredentials {
     GcpCredentials {
-        client_email: "spot-controller@homelab-424523.iam.gserviceaccount.com".to_string(),
+        client_email: "spot-controller@example-project.iam.gserviceaccount.com".to_string(),
         private_key: TEST_PRIVATE_KEY_PEM.to_string(),
         token_uri: DEFAULT_TOKEN_URI.to_string(),
-        project_id: Some("homelab-424523".to_string()),
+        project_id: Some("example-project".to_string()),
     }
 }
 
@@ -301,7 +301,7 @@ fn test_golden_boot_disk_resolution() {
 async fn test_instances_insert_with_source_instance_template() {
     let creds = make_test_credentials();
     let transport = MockGcpHttpTransport::new();
-    let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport.clone());
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport.clone());
     let now = 1700000000;
 
     let cfg = RunnerVmConfig {
@@ -319,7 +319,7 @@ async fn test_instances_insert_with_source_instance_template() {
         golden_image_family: None,
         boot_disk_type: None,
     };
-    let req = build_spot_runner_vm_request("homelab-424523", &cfg).unwrap();
+    let req = build_spot_runner_vm_request("example-project", &cfg).unwrap();
 
     // 1. Insert with sourceInstanceTemplate
     client
@@ -335,14 +335,14 @@ async fn test_instances_insert_with_source_instance_template() {
         .contains("/zones/us-central1-a/instances?sourceInstanceTemplate="));
     assert!(last_call
         .1
-        .contains("projects%2Fhomelab-424523%2Fglobal%2FinstanceTemplates%2Fc4d-template-v1"));
+        .contains("projects%2Fexample-project%2Fglobal%2FinstanceTemplates%2Fc4d-template-v1"));
 }
 
 #[tokio::test]
 async fn test_instances_delete_includes_delete_disk_all() {
     let creds = make_test_credentials();
     let transport = MockGcpHttpTransport::new();
-    let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport.clone());
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport.clone());
     let now = 1700000000;
 
     client
@@ -362,7 +362,7 @@ async fn test_instances_delete_includes_delete_disk_all() {
 async fn test_instances_scrub_startup_script() {
     let creds = make_test_credentials();
     let transport = MockGcpHttpTransport::new();
-    let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport.clone());
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport.clone());
     let now = 1700000000;
 
     let metadata = GceMetadata {
@@ -442,7 +442,7 @@ async fn test_orphan_disks_detection() {
 
     transport.set_json_response("aggregated/disks", 200, &mock_disks_page);
 
-    let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport.clone());
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport.clone());
     let now = 1700000000;
 
     let orphans = client.list_orphan_runner_disks(now).await.unwrap();
@@ -489,7 +489,7 @@ async fn test_instances_aggregated_list_pagination() {
     transport.set_json_response("maxResults=500", 200, &page1);
     transport.set_json_response("pageToken=page-2-token", 200, &page2);
 
-    let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport);
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport);
     let now = 1700000000;
 
     let instances = client.list_instances(now).await.unwrap();

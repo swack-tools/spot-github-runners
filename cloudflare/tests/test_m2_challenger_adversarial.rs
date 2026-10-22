@@ -327,14 +327,14 @@ fn test_golden_image_and_instance_template_deep_oracle() {
 
     // 2. Setting each additive field produces deterministic, distinct hashes
     let mut m_img = v6_manifest.clone();
-    m_img["source_image"] = json!("projects/homelab-424523/global/images/runner-golden-20261021");
+    m_img["source_image"] = json!("projects/example-project/global/images/runner-golden-20261021");
     let p_img = serde_json::from_value::<RunnerPatch>(m_img).unwrap();
     let sha_img = p_img.patch_sha256();
     assert_ne!(sha_img, v6_sha);
 
     let mut m_fam = v6_manifest.clone();
     m_fam["golden_image_family"] =
-        json!("projects/homelab-424523/global/imageFamilies/spot-runners-golden");
+        json!("projects/example-project/global/imageFamilies/spot-runners-golden");
     let p_fam = serde_json::from_value::<RunnerPatch>(m_fam).unwrap();
     let sha_fam = p_fam.patch_sha256();
     assert_ne!(sha_fam, v6_sha);
@@ -342,7 +342,7 @@ fn test_golden_image_and_instance_template_deep_oracle() {
 
     let mut m_tpl = v6_manifest.clone();
     m_tpl["source_instance_template"] =
-        json!("projects/homelab-424523/global/instanceTemplates/runner-template-16vcpu");
+        json!("projects/example-project/global/instanceTemplates/runner-template-16vcpu");
     let p_tpl = serde_json::from_value::<RunnerPatch>(m_tpl).unwrap();
     let sha_tpl = p_tpl.patch_sha256();
     assert_ne!(sha_tpl, v6_sha);
@@ -352,7 +352,7 @@ fn test_golden_image_and_instance_template_deep_oracle() {
     // 3. Avalanche effect: a 1-character difference in source_image must change the SHA-256 completely
     let mut m_img_perturbed = v6_manifest.clone();
     m_img_perturbed["source_image"] =
-        json!("projects/homelab-424523/global/images/runner-golden-20261022");
+        json!("projects/example-project/global/images/runner-golden-20261022");
     let p_img_perturbed = serde_json::from_value::<RunnerPatch>(m_img_perturbed).unwrap();
     let sha_perturbed = p_img_perturbed.patch_sha256();
     assert_ne!(sha_perturbed, sha_img);

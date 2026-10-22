@@ -1000,7 +1000,7 @@ fn test_tier5_patch_golden_image_and_instance_template_omission_parity() {
     // Manifest with concrete golden image values produces different, deterministic hash
     let mut golden_manifest = base_manifest.clone();
     golden_manifest["source_instance_template"] =
-        json!("projects/homelab-424523/global/instanceTemplates/runner-tmpl-v1");
+        json!("projects/example-project/global/instanceTemplates/runner-tmpl-v1");
     golden_manifest["golden_image_family"] = json!("oxidex-runner-golden");
 
     let golden_sha = compute_canonical_patch_sha256(&golden_manifest).unwrap();

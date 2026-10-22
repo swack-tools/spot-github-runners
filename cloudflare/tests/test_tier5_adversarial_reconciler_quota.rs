@@ -53,10 +53,10 @@ BcuCVTR8lS9DUeNpVpcHlg==\n\
 
 fn make_test_credentials() -> GcpCredentials {
     GcpCredentials {
-        client_email: "spot-controller@homelab-424523.iam.gserviceaccount.com".to_string(),
+        client_email: "spot-controller@example-project.iam.gserviceaccount.com".to_string(),
         private_key: TEST_PRIVATE_KEY_PEM.to_string(),
         token_uri: DEFAULT_TOKEN_URI.to_string(),
-        project_id: Some("homelab-424523".to_string()),
+        project_id: Some("example-project".to_string()),
     }
 }
 
@@ -396,7 +396,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
 
     let creds = make_test_credentials();
     let transport = MockGcpHttpTransport::new();
-    let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport.clone());
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport.clone());
     let now = 2600000000u64;
 
     let base_req = GceInsertInstanceRequest {
@@ -424,7 +424,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         .expect("call 1");
     assert_eq!(
         call1.1,
-        "https://compute.googleapis.com/compute/v1/projects/homelab-424523/zones/us-central1-a/instances"
+        "https://compute.googleapis.com/compute/v1/projects/example-project/zones/us-central1-a/instances"
     );
 
     // Case 2: sourceInstanceTemplate is short name -> query parameter correctly appended and encoded
@@ -447,7 +447,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         .expect("call 2");
     assert!(call2.1.contains("?sourceInstanceTemplate="));
     assert!(call2.1.contains(
-        "projects%2Fhomelab-424523%2Fglobal%2FinstanceTemplates%2Fspot-runner-template-v1"
+        "projects%2Fexample-project%2Fglobal%2FinstanceTemplates%2Fspot-runner-template-v1"
     ));
 
     // Case 3: sourceInstanceTemplate is full path -> query parameter preserves full path
@@ -489,7 +489,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         golden_image_family: Some("golden-family-2026"),
         boot_disk_type: Some("pd-balanced"),
     };
-    let req_both = build_spot_runner_vm_request("homelab-424523", &cfg_both).unwrap();
+    let req_both = build_spot_runner_vm_request("example-project", &cfg_both).unwrap();
     let img_both = req_both.disks[0]
         .initialize_params
         .as_ref()
@@ -498,7 +498,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         .as_ref()
         .unwrap();
     assert_eq!(
-        img_both, "projects/homelab-424523/global/images/golden-custom-image-2026",
+        img_both, "projects/example-project/global/images/golden-custom-image-2026",
         "source_image must take precedence over family"
     );
 
@@ -507,7 +507,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         golden_image_family: Some("golden-family-2026"),
         ..cfg_both
     };
-    let req_family = build_spot_runner_vm_request("homelab-424523", &cfg_family_only).unwrap();
+    let req_family = build_spot_runner_vm_request("example-project", &cfg_family_only).unwrap();
     let img_family = req_family.disks[0]
         .initialize_params
         .as_ref()
@@ -517,7 +517,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         .unwrap();
     assert_eq!(
         img_family,
-        "projects/homelab-424523/global/images/family/golden-family-2026"
+        "projects/example-project/global/images/family/golden-family-2026"
     );
 
     let cfg_neither = RunnerVmConfig {
@@ -525,7 +525,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         golden_image_family: None,
         ..cfg_both
     };
-    let req_debian = build_spot_runner_vm_request("homelab-424523", &cfg_neither).unwrap();
+    let req_debian = build_spot_runner_vm_request("example-project", &cfg_neither).unwrap();
     let img_debian = req_debian.disks[0]
         .initialize_params
         .as_ref()
@@ -540,7 +540,8 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         machine_type: "e2-standard-4",
         ..cfg_both
     };
-    let err_bad_shape = build_spot_runner_vm_request("homelab-424523", &cfg_bad_shape).unwrap_err();
+    let err_bad_shape =
+        build_spot_runner_vm_request("example-project", &cfg_bad_shape).unwrap_err();
     assert!(matches!(err_bad_shape, GcpError::Validation(_)));
 }
 
@@ -555,7 +556,7 @@ async fn test_tier5_adversarial_gcp_delete_disk_all_and_orphan_disk_filtering() 
 
     let creds = make_test_credentials();
     let transport = MockGcpHttpTransport::new();
-    let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport.clone());
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport.clone());
     let now = 1700000000u64;
 
     // 1. Verify deleteDisk=ALL query parameter
@@ -573,7 +574,7 @@ async fn test_tier5_adversarial_gcp_delete_disk_all_and_orphan_disk_filtering() 
         .expect("delete call");
     assert_eq!(
         delete_call.1,
-        "https://compute.googleapis.com/compute/v1/projects/homelab-424523/zones/us-central1-a/instances/oxidex-runners-homelab-1?deleteDisk=ALL"
+        "https://compute.googleapis.com/compute/v1/projects/example-project/zones/us-central1-a/instances/oxidex-runners-homelab-1?deleteDisk=ALL"
     );
 
     // 2. Orphan Disk Detection Matrix
