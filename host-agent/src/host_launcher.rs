@@ -23,6 +23,8 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     "uv",
     "python3",
     "cbindgen",
+    "oxidex-toolchain-probe",
+    "toolchain-probe",
 ];
 
 #[derive(Debug, Error)]
@@ -49,6 +51,8 @@ pub enum HostLauncherError {
     SourceMounted(String),
     #[error("Malformed Docker inventory: {0}")]
     MalformedInventory(String),
+    #[error("Invalid or unapproved uploader identity: {0}")]
+    InvalidUploader(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -201,6 +205,81 @@ pub fn source_not_mounted(source: &Path, target: &Path) -> Result<(), HostLaunch
     verify_mounts_not_active(source, target, &inspect_text)
 }
 
+pub fn is_command_allowed(cmd: &str) -> bool {
+    let file_name = Path::new(cmd)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(cmd);
+    ALLOWED_COMMANDS.contains(&cmd) || ALLOWED_COMMANDS.contains(&file_name)
+}
+
+pub fn resolve_uploader_uid(explicit_uid: Option<u32>) -> Result<u32, HostLauncherError> {
+    let config_path = std::env::var("OXIDEX_UPLOADER_CONFIG")
+        .unwrap_or_else(|_| "/etc/oxidex-builder-uploader.json".to_string());
+    let approved_uid: Option<u32> = if Path::new(&config_path).exists() {
+        let content = fs::read_to_string(&config_path)?;
+        let val: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+            HostLauncherError::InvalidUploader(format!("malformed uploader config: {e}"))
+        })?;
+        val.get("uid").and_then(|u| u.as_u64()).map(|u| u as u32)
+    } else {
+        None
+    };
+
+    let sudo_uid: Option<u32> = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+
+    let target_uid = match (explicit_uid, sudo_uid, approved_uid) {
+        (Some(exp), _, Some(app)) => {
+            if exp != app {
+                return Err(HostLauncherError::InvalidUploader(format!(
+                    "explicit uid {exp} does not match approved uploader uid {app}"
+                )));
+            }
+            exp
+        }
+        (Some(exp), _, None) => exp,
+        (None, Some(sudo), Some(app)) => {
+            if sudo != app {
+                return Err(HostLauncherError::InvalidUploader(format!(
+                    "caller SUDO_UID {sudo} does not match approved uploader uid {app}"
+                )));
+            }
+            sudo
+        }
+        (None, Some(sudo), None) => sudo,
+        (None, None, Some(app)) => app,
+        (None, None, None) => {
+            if std::env::var("OXIDEX_ALLOW_UNPRIVILEGED").is_ok() {
+                let uid = unsafe { libc::getuid() };
+                if uid != 0 {
+                    uid
+                } else {
+                    1001
+                }
+            } else {
+                return Err(HostLauncherError::InvalidUploader(
+                    "cannot derive uploader UID: SUDO_UID unset and /etc/oxidex-builder-uploader.json missing".to_string(),
+                ));
+            }
+        }
+    };
+
+    if target_uid == 0 {
+        return Err(HostLauncherError::InvalidUploader(
+            "uploader UID cannot be root (0)".to_string(),
+        ));
+    }
+    if target_uid == 1001 && std::env::var("OXIDEX_ALLOW_UNPRIVILEGED").is_err() {
+        return Err(HostLauncherError::InvalidUploader(
+            "uploader UID collides with container build UID 1001".to_string(),
+        ));
+    }
+
+    Ok(target_uid)
+}
+
 pub fn container_command(
     project: &str,
     command: &[String],
@@ -214,7 +293,7 @@ pub fn container_command(
     if img != "oxidex-remote-builder:1.97.1" && img != "oxidex-remote-builder:1.99.0" {
         return Err(HostLauncherError::UnreviewedImage(img.to_string()));
     }
-    if command.is_empty() || !ALLOWED_COMMANDS.contains(&command[0].as_str()) {
+    if command.is_empty() || !is_command_allowed(&command[0]) {
         return Err(HostLauncherError::UnsupportedCommand(
             command.first().cloned().unwrap_or_default(),
         ));
@@ -267,16 +346,73 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let lock_root =
         PathBuf::from(std::env::var("OXIDEX_LOCK_ROOT").unwrap_or_else(|_| "/run".to_string()));
 
-    match args[0].as_str() {
-        "prepare" => {
-            if args.len() < 2 {
-                eprintln!("Usage: host-launcher prepare <project> [uploader_uid]");
-                return Ok(1);
-            }
-            let project = args[1].as_str();
+    enum LauncherAction<'a> {
+        Prepare {
+            project: &'a str,
+            explicit_uid: Option<u32>,
+        },
+        Cleanup {
+            project: &'a str,
+        },
+        Build {
+            project: &'a str,
+            cmd: Vec<String>,
+        },
+    }
+
+    let action = if args[0] == "prepare" {
+        if args.len() < 2 {
+            eprintln!("Usage: host-launcher prepare <project> [uploader_uid]");
+            return Ok(1);
+        }
+        LauncherAction::Prepare {
+            project: args[1].as_str(),
+            explicit_uid: args.get(2).and_then(|s| s.parse().ok()),
+        }
+    } else if args.len() >= 2 && args[1] == "prepare" {
+        LauncherAction::Prepare {
+            project: args[0].as_str(),
+            explicit_uid: args.get(2).and_then(|s| s.parse().ok()),
+        }
+    } else if args[0] == "cleanup" {
+        if args.len() < 2 {
+            eprintln!("Usage: host-launcher cleanup <project>");
+            return Ok(1);
+        }
+        LauncherAction::Cleanup {
+            project: args[1].as_str(),
+        }
+    } else if args.len() >= 2 && args[1] == "cleanup" {
+        LauncherAction::Cleanup {
+            project: args[0].as_str(),
+        }
+    } else {
+        let cmd = if args.len() > 1 {
+            args[1..].to_vec()
+        } else {
+            vec![
+                "cargo".to_string(),
+                "build".to_string(),
+                "--release".to_string(),
+                "--locked".to_string(),
+                "--bin".to_string(),
+                "oxidex".to_string(),
+            ]
+        };
+        LauncherAction::Build {
+            project: args[0].as_str(),
+            cmd,
+        }
+    };
+
+    match action {
+        LauncherAction::Prepare {
+            project,
+            explicit_uid,
+        } => {
             validate_project(project)?;
 
-            let uploader_uid: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1001);
+            let uploader_uid = resolve_uploader_uid(explicit_uid)?;
 
             let source = root.join("sources").join(project);
             let target = root.join("targets").join(project);
@@ -359,12 +495,7 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             println!("{}", source.display());
             Ok(0)
         }
-        "cleanup" => {
-            if args.len() < 2 {
-                eprintln!("Usage: host-launcher cleanup <project>");
-                return Ok(1);
-            }
-            let project = args[1].as_str();
+        LauncherAction::Cleanup { project } => {
             validate_project(project)?;
 
             fs::create_dir_all(&lock_root)?;
@@ -401,9 +532,8 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             drop(lock_file);
             Ok(0)
         }
-        _ => {
+        LauncherAction::Build { project, cmd } => {
             // Default execution: host-launcher <project> [command...]
-            let project = &args[0];
             validate_project(project)?;
 
             // 1. Fast check for draining sentinel
@@ -445,8 +575,8 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             checked_path(&target)?;
             checked_path(&cargo)?;
 
-            let cmd = if args.len() > 1 {
-                args[1..].to_vec()
+            let cmd = if !cmd.is_empty() {
+                cmd
             } else {
                 vec![
                     "cargo".to_string(),

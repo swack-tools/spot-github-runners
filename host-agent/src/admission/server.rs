@@ -65,6 +65,34 @@ pub fn run_server(
     Ok(())
 }
 
+/// Calculates the memory allocation for a runner, checking heavy runner policies
+/// against the inspected container name as well as backward-compatible owner substring.
+pub fn calculate_runner_memory(
+    config: &AdmissionConfig,
+    runner_name: Option<&str>,
+    owner: &str,
+) -> f64 {
+    let mut runner_mem = config.runner_gib;
+    let r_name = runner_name.unwrap_or("");
+    if let Some(ref hr) = config.heavy_runner {
+        if (!r_name.is_empty() && (r_name == hr.name || r_name.contains(&hr.name)))
+            || owner.contains(&hr.name)
+        {
+            runner_mem = hr.memory_gib as f64;
+        }
+    }
+    if let Some(ref hrs) = config.heavy_runners {
+        for hr_name in hrs {
+            if (!r_name.is_empty() && (r_name == hr_name || r_name.contains(hr_name)))
+                || owner.contains(hr_name)
+            {
+                runner_mem = 32.0;
+            }
+        }
+    }
+    runner_mem
+}
+
 fn handle_client(
     mut stream: &std::os::unix::net::UnixStream,
     config_path: &Path,
@@ -88,7 +116,7 @@ fn handle_client(
         }
     };
 
-    let (owner, peer_kind) = peer_owner(pid, uid, &config, sys)?;
+    let (owner, peer_kind, runner_name) = peer_owner(pid, uid, &config, sys)?;
 
     let mut buf = vec![0u8; 4096];
     let n = stream.read(&mut buf)?;
@@ -121,21 +149,7 @@ fn handle_client(
         }
         AdmissionAction::Acquire => {
             let amount = if peer_kind == AdmissionKind::Runner {
-                // Check if runner is configured for heavy runner memory
-                let mut runner_mem = config.runner_gib;
-                if let Some(ref hr) = config.heavy_runner {
-                    if owner.contains(&hr.name) {
-                        runner_mem = hr.memory_gib as f64;
-                    }
-                }
-                if let Some(ref hrs) = config.heavy_runners {
-                    for hr_name in hrs {
-                        if owner.contains(hr_name) {
-                            runner_mem = 32.0;
-                        }
-                    }
-                }
-                runner_mem
+                calculate_runner_memory(&config, runner_name.as_deref(), &owner)
             } else {
                 // Dedicated builder: check draining
                 if Path::new("/run/oxidex-build-draining").exists() {

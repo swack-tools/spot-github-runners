@@ -572,6 +572,8 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
             "active_instances_count": 0
         },
         "fleet_inventory": bundle.state.fleet_inventory,
+        "cloud_init_templates": bundle.state.cloud_init_templates,
+        "vm_templates": bundle.state.vm_templates,
         "rust_builds": bundle.state.rust_builds,
         "dashboard_admins": bundle.state.dashboard_admins
     });
@@ -888,6 +890,372 @@ pub async fn handle_post_admins_remove<K: KvStoreBackend>(
 }
 
 // ============================================================================
+// Cloud-Init Templates, VM Templates & Rust Builds Handlers
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveCloudInitRequest {
+    pub id: Option<String>,
+    pub mode: Option<String>,
+    pub role: String,
+    pub name: String,
+    pub content: String,
+    #[serde(default)]
+    pub assign_to_profile: bool,
+}
+
+pub async fn handle_post_cloud_init_save<K: KvStoreBackend>(
+    kv: &K,
+    req: SaveCloudInitRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(StateError::Validation(
+            "Template name cannot be empty".into(),
+        ));
+    }
+    let content = req.content.trim();
+    if content.is_empty() {
+        return Err(StateError::Validation(
+            "Template content cannot be empty".into(),
+        ));
+    }
+    if req.role != "cicd_runner" && req.role != "rust_builder" {
+        return Err(StateError::Validation(format!(
+            "Unsupported workload role: {}",
+            req.role
+        )));
+    }
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+
+    let is_save_as = req.mode.as_deref() == Some("save_as");
+    let requested_id = req.id.as_deref().unwrap_or("").trim();
+
+    let template_id = if is_save_as || requested_id.is_empty() {
+        format!("{}-custom-{}", req.role.replace('_', "-"), now)
+    } else {
+        requested_id.to_string()
+    };
+
+    let updated_iso = chrono_iso(now);
+    let saved_template = CloudInitTemplate {
+        id: template_id.clone(),
+        name: name.to_string(),
+        role: req.role.clone(),
+        description: format!("Updated via Patch Console at {}", updated_iso),
+        updated_at: updated_iso,
+        content: req.content.clone(),
+    };
+
+    if let Some(existing) = bundle
+        .state
+        .cloud_init_templates
+        .iter_mut()
+        .find(|t| t.id == template_id)
+    {
+        *existing = saved_template.clone();
+    } else {
+        bundle
+            .state
+            .cloud_init_templates
+            .push(saved_template.clone());
+    }
+
+    if req.assign_to_profile {
+        if let Some(profile) = bundle.state.profiles.get_mut(&req.role) {
+            profile.cloud_init_template_id = template_id.clone();
+        }
+    }
+
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "template": saved_template
+        }),
+    ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateVmTemplateRequest {
+    pub instance_id: String,
+    pub template_name: String,
+}
+
+pub async fn handle_post_vm_templates_from_instance<K: KvStoreBackend>(
+    kv: &K,
+    req: CreateVmTemplateRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let instance_id = req.instance_id.trim();
+    if instance_id.is_empty() {
+        return Err(StateError::Validation("instance_id cannot be empty".into()));
+    }
+    let template_name = req.template_name.trim();
+    if template_name.is_empty() {
+        return Err(StateError::Validation(
+            "template_name cannot be empty".into(),
+        ));
+    }
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+
+    let inst = bundle
+        .state
+        .instances_view
+        .iter()
+        .chain(bundle.state.instances.iter())
+        .find(|i| i.id == instance_id || i.name == instance_id)
+        .cloned()
+        .ok_or_else(|| {
+            StateError::NotFound(format!(
+                "Source instance '{}' not found in live fleet inventory",
+                instance_id
+            ))
+        })?;
+
+    let tpl_id = format!("vmtpl-{}", now);
+    let runner_vcpu = if inst.runners_count > 0 {
+        inst.vcpu / inst.runners_count
+    } else {
+        4
+    };
+    let runner_ram_gib = if inst.runners_count > 0 {
+        inst.ram_gib / inst.runners_count
+    } else {
+        16
+    };
+
+    let new_template = VmTemplate {
+        id: tpl_id,
+        name: template_name.to_string(),
+        role: inst.role.clone(),
+        machine_type: inst.machine_type.clone(),
+        vcpu: inst.vcpu,
+        ram_gib: inst.ram_gib,
+        cpu_platform: "Intel Sapphire Rapids".to_string(),
+        benchmark_score: inst.vcpu * 120,
+        disk_category: "hyperdisk_balanced".to_string(),
+        boot_disk_type: "hyperdisk-balanced".to_string(),
+        boot_disk_gb: 30,
+        data_disk_type: "hyperdisk-balanced".to_string(),
+        data_disk_gb: if inst.role == "rust_builder" {
+            375
+        } else {
+            100
+        },
+        runners_count: inst.runners_count,
+        runner_vcpu,
+        runner_ram_gib,
+        cloud_init_template_id: if inst.role == "rust_builder" {
+            "rust-builder-default".to_string()
+        } else {
+            "cicd-runner-default".to_string()
+        },
+        created_at: chrono_iso(now),
+    };
+
+    bundle.state.vm_templates.push(new_template.clone());
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "message": "VM instance template registered",
+            "template_name": template_name,
+            "template": new_template
+        }),
+    ))
+}
+
+pub const MAX_RUST_BUILDS_HISTORY: usize = 50;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordRustBuildRequest {
+    pub status: String,
+    pub project_name: Option<String>,
+    pub commit_sha: Option<String>,
+    pub profile: Option<String>,
+    pub compile_duration_seconds: Option<f64>,
+    pub delivery_duration_seconds: Option<f64>,
+    pub instance_name: Option<String>,
+    pub zone: Option<String>,
+    pub machine_type: Option<String>,
+    pub cpu_platform: Option<String>,
+    pub vcpu: Option<u32>,
+    pub origin_ip: Option<String>,
+    pub cache_hits: Option<u32>,
+    pub total_crates: Option<u32>,
+    pub peak_ram_gib: Option<f64>,
+    pub cpu_time_seconds: Option<f64>,
+}
+
+pub async fn handle_post_rust_builds<K: KvStoreBackend>(
+    kv: &K,
+    req: RecordRustBuildRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    if req.status.trim().is_empty() {
+        return Err(StateError::Validation(
+            "Build status cannot be empty".into(),
+        ));
+    }
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+
+    let build_id = format!("build-{}", now);
+    let iso_now = chrono_iso(now);
+
+    let compile_sec = req.compile_duration_seconds.unwrap_or(0.0);
+    let delivery_sec = req.delivery_duration_seconds.unwrap_or(0.0);
+    let total_duration = compile_sec + delivery_sec;
+
+    let hits = req.cache_hits.unwrap_or(0);
+    let crates = req.total_crates.unwrap_or(0);
+    let hit_rate = if crates > 0 {
+        ((hits as f64 / crates as f64) * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    let cpu_sec = req.cpu_time_seconds.unwrap_or(0.0);
+    let bench = req.vcpu.unwrap_or(16) * 120;
+    let cpu_pts = ((cpu_sec * bench as f64) / 1000.0).round() as u64;
+
+    let origin_ip = req
+        .origin_ip
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let is_local =
+        origin_ip.starts_with("127.") || origin_ip.starts_with("10.") || origin_ip == "::1";
+
+    let single_build = serde_json::json!({
+        "build_id": build_id,
+        "status": req.status,
+        "project_name": req.project_name.unwrap_or_else(|| "swack-tools/oxidex".to_string()),
+        "commit_sha": req.commit_sha.unwrap_or_else(|| "head".to_string()),
+        "profile": req.profile.unwrap_or_else(|| "release".to_string()),
+        "requested_at": iso_now,
+        "finished_at": iso_now,
+        "delivered_at": iso_now,
+        "total_duration_seconds": total_duration,
+        "compile_duration_seconds": compile_sec,
+        "delivery_duration_seconds": delivery_sec,
+        "cache_hits": hits,
+        "total_crates": crates,
+        "cache_misses": crates.saturating_sub(hits),
+        "cache_hit_rate_percent": hit_rate,
+        "instance_name": req.instance_name.unwrap_or_else(|| "builder-n4-1".to_string()),
+        "machine_type": req.machine_type.unwrap_or_else(|| "n4-highcpu-16".to_string()),
+        "zone": req.zone.unwrap_or_else(|| "us-central1-a".to_string()),
+        "instance_benchmark_score": bench,
+        "origin_ip": origin_ip,
+        "origin_hostname": if is_local { "direct.local" } else { "gateway.swacktech.com" },
+        "geolocation": {
+            "city": if is_local { "Local Subnet" } else { "Council Bluffs" },
+            "country": "United States",
+            "country_code": "US",
+            "asn": "AS15169",
+            "isp": "Google Cloud"
+        },
+        "network_security": {
+            "is_tor": false,
+            "is_vpn": false,
+            "badge_text": "Direct (Clean)",
+            "provider_label": "Direct Datacenter"
+        },
+        "peak_ram_gib": req.peak_ram_gib.unwrap_or(12.4),
+        "container_ram_cap_gib": 28,
+        "cpu_time_seconds": cpu_sec,
+        "cpu_points": cpu_pts,
+        "cpu_points_formula": format!("{:.1}s CPU × bench {} / 1000", cpu_sec, bench)
+    });
+
+    let mut builds_vec: Vec<serde_json::Value> = bundle
+        .state
+        .rust_builds
+        .get("builds")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    builds_vec.insert(0, single_build.clone());
+    if builds_vec.len() > MAX_RUST_BUILDS_HISTORY {
+        builds_vec.truncate(MAX_RUST_BUILDS_HISTORY);
+    }
+
+    let total_builds = builds_vec.len();
+    let avg_duration = if total_builds > 0 {
+        let sum_dur: f64 = builds_vec
+            .iter()
+            .filter_map(|b| b.get("total_duration_seconds").and_then(|v| v.as_f64()))
+            .sum();
+        (sum_dur / total_builds as f64).round()
+    } else {
+        0.0
+    };
+
+    let total_hits: u64 = builds_vec
+        .iter()
+        .filter_map(|b| b.get("cache_hits").and_then(|v| v.as_u64()))
+        .sum();
+    let total_crates: u64 = builds_vec
+        .iter()
+        .filter_map(|b| b.get("total_crates").and_then(|v| v.as_u64()))
+        .sum();
+    let overall_hit_rate = if total_crates > 0 {
+        ((total_hits as f64 / total_crates as f64) * 1000.0).round() / 10.0
+    } else {
+        0.0
+    };
+
+    let max_peak_ram = builds_vec
+        .iter()
+        .filter_map(|b| b.get("peak_ram_gib").and_then(|v| v.as_f64()))
+        .fold(0.0, f64::max);
+
+    let total_pts: u64 = builds_vec
+        .iter()
+        .filter_map(|b| b.get("cpu_points").and_then(|v| v.as_u64()))
+        .sum();
+    let total_cpu_time: f64 = builds_vec
+        .iter()
+        .filter_map(|b| b.get("cpu_time_seconds").and_then(|v| v.as_f64()))
+        .sum();
+
+    bundle.state.rust_builds = serde_json::json!({
+        "total_builds": total_builds,
+        "average_duration_seconds": avg_duration,
+        "total_cache_hits": total_hits,
+        "overall_cache_hit_rate_percent": overall_hit_rate,
+        "max_peak_ram_gib": max_peak_ram,
+        "total_cpu_points": total_pts,
+        "total_cpu_time_seconds": total_cpu_time.round(),
+        "vpn_or_tor_count": 0,
+        "builds": builds_vec
+    });
+
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "message": "Rust build recorded",
+            "build": single_build
+        }),
+    ))
+}
+
+// ============================================================================
 // Instance Action Safety Gates (Plan Previews Only)
 // ============================================================================
 
@@ -909,17 +1277,18 @@ pub async fn handle_post_instances_delete<K: KvStoreBackend>(
 
     let inst = bundle
         .state
-        .instances
+        .instances_view
         .iter()
+        .chain(bundle.state.instances.iter())
         .find(|i| (!id.is_empty() && i.id == id) || (!name.is_empty() && i.name == name))
-        .ok_or_else(|| StateError::NotFound("Instance not found".into()))?;
+        .ok_or_else(|| StateError::NotFound("Instance not found in live fleet inventory".into()))?;
 
     let next_step = if inst.role == "rust_builder" {
         "Dedicated builders keep their cache disk (auto-delete=no); retire the VM only when no \
         build or runtime update holds it, and delete the cache disk separately if intended."
     } else {
-        "Runner hosts are drained and retired by spot_runner_autoscaler.py so no job loses its \
-        runner; lower the runner floor or let the autoscaler scale in."
+        "Runner hosts are drained and retired by the Cloudflare scheduled reconciler so no job loses its \
+        runner; lower the runner floor or let the reconciler scale in."
     };
 
     Ok((
@@ -961,9 +1330,13 @@ pub async fn handle_post_instances_scale_region<K: KvStoreBackend>(
 
     let (bundle, _) = load_state(kv, now).await?;
 
-    let current_in_region = bundle
-        .state
-        .instances
+    let source_instances = if !bundle.state.instances_view.is_empty() {
+        &bundle.state.instances_view
+    } else {
+        &bundle.state.instances
+    };
+
+    let current_in_region = source_instances
         .iter()
         .filter(|i| i.region == req.region && i.status == "RUNNING" && i.role == req.role)
         .count() as u32;
@@ -1077,7 +1450,17 @@ pub fn default_dashboard_bundle(now: u64) -> Result<DashboardBundle, StateError>
         instances_view: Vec::new(),
         fleet_summary: serde_json::Value::Null,
         fleet_inventory: serde_json::Value::Null,
-        rust_builds: serde_json::Value::Null,
+        rust_builds: serde_json::json!({
+            "total_builds": 0,
+            "average_duration_seconds": 0.0,
+            "total_cache_hits": 0,
+            "overall_cache_hit_rate_percent": 0.0,
+            "max_peak_ram_gib": 0.0,
+            "total_cpu_points": 0,
+            "total_cpu_time_seconds": 0.0,
+            "vpn_or_tor_count": 0,
+            "builds": []
+        }),
         dashboard_admins: Vec::new(),
         dashboard_admins_history: Vec::new(),
         controlled_targets: Vec::new(),

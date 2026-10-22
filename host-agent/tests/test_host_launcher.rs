@@ -4,7 +4,8 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 
 use host_agent::host_launcher::{
-    checked_path, cleanup_source, container_command, validate_project, HostLauncherError,
+    checked_path, cleanup_source, container_command, is_command_allowed, resolve_uploader_uid,
+    validate_project, HostLauncherError,
 };
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -664,4 +665,102 @@ fn test_cleanup_preserves_external_files_untouched() {
             path
         );
     }
+}
+
+#[test]
+fn test_toolchain_probe_allowed_in_container_command() {
+    assert!(is_command_allowed("oxidex-toolchain-probe"));
+    assert!(is_command_allowed("/usr/local/bin/oxidex-toolchain-probe"));
+    assert!(is_command_allowed("toolchain-probe"));
+    assert!(is_command_allowed("/opt/bin/toolchain-probe"));
+    assert!(!is_command_allowed("bash"));
+    assert!(!is_command_allowed("/bin/sh"));
+
+    let cmd = vec!["/usr/local/bin/oxidex-toolchain-probe".to_string()];
+    let res = container_command("my-proj", &cmd, 16, 28, None, None);
+    assert!(res.is_ok());
+    let args = res.unwrap();
+    assert!(args.contains(&"/usr/local/bin/oxidex-toolchain-probe".to_string()));
+}
+
+#[test]
+fn test_resolve_uploader_uid_matrix() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = TempDir::new().unwrap();
+    let config_file = temp.path().join("uploader.json");
+    fs::write(
+        &config_file,
+        r#"{"principal":"swackhamer","username":"oxidex-uploader","uid":1002}"#,
+    )
+    .unwrap();
+
+    std::env::set_var("OXIDEX_UPLOADER_CONFIG", config_file.to_str().unwrap());
+    std::env::set_var("OXIDEX_ALLOW_UNPRIVILEGED", "1");
+
+    // 1. Matched SUDO_UID
+    std::env::set_var("SUDO_UID", "1002");
+    assert_eq!(resolve_uploader_uid(None).unwrap(), 1002);
+
+    // 2. Mismatched SUDO_UID
+    std::env::set_var("SUDO_UID", "1005");
+    let err = resolve_uploader_uid(None).unwrap_err();
+    assert!(matches!(err, HostLauncherError::InvalidUploader(_)));
+
+    // 3. Matched explicit uid
+    std::env::remove_var("SUDO_UID");
+    assert_eq!(resolve_uploader_uid(Some(1002)).unwrap(), 1002);
+
+    // 4. Mismatched explicit uid
+    let err = resolve_uploader_uid(Some(1003)).unwrap_err();
+    assert!(matches!(err, HostLauncherError::InvalidUploader(_)));
+
+    // 5. Config only without SUDO_UID or explicit UID
+    assert_eq!(resolve_uploader_uid(None).unwrap(), 1002);
+
+    // 6. Root UID 0 is strictly rejected
+    std::env::remove_var("OXIDEX_UPLOADER_CONFIG");
+    let root_cfg = temp.path().join("root_uploader.json");
+    fs::write(
+        &root_cfg,
+        r#"{"principal":"root","username":"root","uid":0}"#,
+    )
+    .unwrap();
+    std::env::set_var("OXIDEX_UPLOADER_CONFIG", root_cfg.to_str().unwrap());
+    let err = resolve_uploader_uid(None).unwrap_err();
+    assert!(matches!(err, HostLauncherError::InvalidUploader(_)));
+
+    // Cleanup env
+    std::env::remove_var("OXIDEX_UPLOADER_CONFIG");
+    std::env::remove_var("SUDO_UID");
+}
+
+#[test]
+fn test_host_launcher_run_positional_syntax() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let lock_root = temp.path().join("run");
+    fs::create_dir_all(&lock_root).unwrap();
+
+    std::env::set_var("OXIDEX_BUILD_ROOT", root.to_str().unwrap());
+    std::env::set_var("OXIDEX_LOCK_ROOT", lock_root.to_str().unwrap());
+    std::env::set_var("OXIDEX_ALLOW_UNPRIVILEGED", "1");
+
+    // Standard prepare: prepare <project>
+    let res1 = host_agent::host_launcher::run(&["prepare".to_string(), "alpha".to_string()]);
+    assert_eq!(res1.unwrap(), 0);
+    assert!(root.join("sources").join("alpha").exists());
+
+    // Inverted prepare: <project> prepare
+    let res2 = host_agent::host_launcher::run(&["beta".to_string(), "prepare".to_string()]);
+    assert_eq!(res2.unwrap(), 0);
+    assert!(root.join("sources").join("beta").exists());
+
+    // Standard cleanup: cleanup <project>
+    let res3 = host_agent::host_launcher::run(&["cleanup".to_string(), "alpha".to_string()]);
+    assert_eq!(res3.unwrap(), 0);
+
+    // Inverted cleanup: <project> cleanup
+    let res4 = host_agent::host_launcher::run(&["beta".to_string(), "cleanup".to_string()]);
+    assert_eq!(res4.unwrap(), 0);
 }

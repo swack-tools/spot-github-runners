@@ -37,6 +37,18 @@ pub const RECONCILER_LEASE_TTL_SECS: u64 = 240;
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 1800; // 30 minutes
 pub const LAUNCH_TIMEOUT_SECS: u64 = 900; // 15 minutes
 
+/// Generate a unique 8-character hex entropy suffix for instance names.
+/// Uses getrandom (supported in Wasm via js and native targets).
+fn generate_unique_suffix(now: u64) -> String {
+    let mut bytes = [0u8; 4];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        hex::encode(bytes)
+    } else {
+        let tick = TICK_COUNTER.load(Ordering::Relaxed);
+        format!("{:08x}", (now ^ (tick as u64)) as u32)
+    }
+}
+
 // ============================================================================
 // Data Types & State Machine Models
 // ============================================================================
@@ -358,6 +370,14 @@ pub fn set_reconciler_lease(expires_at: Option<u64>) {
     *RECONCILER_LEASE.lock().unwrap() = expires_at;
 }
 
+pub fn inject_active_launch(op: LaunchOperation) {
+    ACTIVE_LAUNCHES.lock().unwrap().push(op);
+}
+
+pub fn get_active_launches() -> Vec<LaunchOperation> {
+    ACTIVE_LAUNCHES.lock().unwrap().clone()
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SimulatedFleetProvider;
 
@@ -614,22 +634,64 @@ where
 
     // 2. Query Current GCP & GitHub Fleet State
     let instances = gcp.list_instances(&project, now).await.unwrap_or_default();
-    let runners = gh
-        .list_runners(&format!("orgs/{}", org))
-        .await
-        .unwrap_or_default();
+
+    let controlled_targets = if bundle.state.controlled_targets.is_empty() {
+        CONTROLLED_TARGETS
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    } else {
+        bundle.state.controlled_targets.clone()
+    };
+
+    // Build target-aware list of API targets used for provisioning
+    let mut target_paths = vec![format!("orgs/{}", org)];
+    for target in &controlled_targets {
+        let path = if target.contains('/') {
+            format!("repos/{}", target)
+        } else {
+            format!("orgs/{}", target)
+        };
+        if !target_paths.contains(&path) {
+            target_paths.push(path);
+        }
+    }
+
+    // Query runners across every target used for provisioning
+    let mut runners: Vec<SimpleGitHubRunner> = Vec::new();
+    let mut runner_target_map: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
+
+    for target_path in &target_paths {
+        if let Ok(target_runners) = gh.list_runners(target_path).await {
+            for r in target_runners {
+                if !runner_target_map.contains_key(&r.id) {
+                    runner_target_map.insert(r.id, target_path.clone());
+                    runners.push(r);
+                }
+            }
+        }
+    }
 
     // Sum queued jobs backlog across controlled targets
     let mut queued_jobs = 0u32;
-    for target in CONTROLLED_TARGETS {
+    for target in &controlled_targets {
         let (owner, repo) = if target.contains('/') {
             let mut parts = target.splitn(2, '/');
             (parts.next().unwrap_or(&org), parts.next().unwrap_or(target))
         } else {
             (org.as_str(), "oxidex")
         };
-        if let Ok(count) = gh.count_queued_jobs(owner, repo).await {
-            queued_jobs += count;
+        match gh.count_queued_jobs(owner, repo).await {
+            Ok(count) => {
+                queued_jobs += count;
+            }
+            Err(e) => {
+                return Err(ReconcilerError::Github(format!(
+                    "Failed to count queued jobs for {}/{}: {}",
+                    owner, repo, e
+                )));
+            }
         }
     }
 
@@ -676,7 +738,11 @@ where
         if runner.status.eq_ignore_ascii_case("offline") && !runner.busy {
             let matches_active = active_vm_names.iter().any(|&vm| runner.name.contains(vm));
             if !matches_active {
-                let _ = gh.delete_runner(&format!("orgs/{}", org), runner.id).await;
+                let target_path = runner_target_map
+                    .get(&runner.id)
+                    .map(|s| s.as_str())
+                    .unwrap_or_else(|| &target_paths[0]);
+                let _ = gh.delete_runner(target_path, runner.id).await;
                 cleaned_runners.push(runner.name.clone());
             }
         }
@@ -734,15 +800,6 @@ where
     }
 
     // 8. Floor Target Keeper (Ensure >= 1 Host Per Target)
-    let controlled_targets = if bundle.state.controlled_targets.is_empty() {
-        CONTROLLED_TARGETS
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-    } else {
-        bundle.state.controlled_targets.clone()
-    };
-
     for target in &controlled_targets {
         let target_slug = target.replace('/', "-").to_lowercase();
         let active_count = instances
@@ -759,7 +816,13 @@ where
             .any(|l| l.target == *target);
 
         if active_count == 0 && !in_flight {
-            let host_name = format!("oxidex-runners-{}-{}", target_slug, &now.to_string()[..6]);
+            let hex_suffix = generate_unique_suffix(now);
+            let safe_slug = if target_slug.len() > 24 {
+                &target_slug[..24]
+            } else {
+                &target_slug
+            };
+            let host_name = format!("oxidex-runners-{}-{}-{}", safe_slug, now, hex_suffix);
             let deployment_id = format!("dep-{}", now);
 
             // Mint 2-slot JIT configs with fallback to registration token
@@ -890,7 +953,8 @@ where
         .count();
 
     if queued_jobs >= MIN_QUEUED_JOBS_THRESHOLD && current_live < (max_instances as usize) {
-        let scale_host = format!("oxidex-runners-scale-{}", &now.to_string()[..6]);
+        let hex_suffix = generate_unique_suffix(now);
+        let scale_host = format!("oxidex-runners-scale-{}-{}", now, hex_suffix);
         let deployment_id = format!("dep-scale-{}", now);
         let runner_prefix = "oxidex";
         let labels = vec![
@@ -1013,6 +1077,8 @@ where
                 runner_limits_known: true,
             })
             .collect();
+        // Synchronize state.instances with live instances_view for unified action inventory
+        bundle.state.instances = bundle.state.instances_view.clone();
 
         bundle.state.scaling_telemetry.queued_jobs = queued_jobs;
         bundle.state.scaling_telemetry.current_runners = runners

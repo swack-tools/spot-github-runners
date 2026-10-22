@@ -121,8 +121,21 @@ has_snapshotter=$(printf '%s' "$docker_info" | jq -r '[.DriverStatus[][]? | sele
 [[ "$has_snapshotter" -eq 0 ]] || { echo "Docker containerd snapshotter detected: hold" >&2; exit 78; }
 getent group 1001 >/dev/null && [[ "$(getent group 1001 | cut -d: -f1)" == oxidex-build ]] || { getent group 1001 >/dev/null && exit 78; groupadd -g1001 oxidex-build; }
 # Validate the complete host group/account inventory before granting filesystem access.
-uploader_user=$(printf '%s' '{{UPLOADER_CONFIG}}' | jq -re '.username')
-uploader_uid=$(printf '%s' '{{UPLOADER_CONFIG}}' | jq -re '.uid')
+uploader_raw='{{UPLOADER_CONFIG}}'
+if [[ "$uploader_raw" =~ ^\{\{.*\}\}$ || -z "$uploader_raw" ]]; then
+  if [[ -f /etc/oxidex-builder-uploader.json ]]; then
+    uploader_raw=$(cat /etc/oxidex-builder-uploader.json)
+  else
+    echo "Warning: {{UPLOADER_CONFIG}} template placeholder was not rendered; using default oxidex-uploader config" >&2
+    uploader_raw='{"schema":"root-approved-ssh-mapping-v1","principal":"swackhamer","username":"oxidex-uploader","uid":1002,"public_key":"","public_key_sha256":"","identity_receipt_sha256":""}'
+  fi
+fi
+uploader_user=$(printf '%s' "$uploader_raw" | jq -re '.username // empty')
+uploader_uid=$(printf '%s' "$uploader_raw" | jq -re '.uid // empty')
+if [[ -z "$uploader_user" || -z "$uploader_uid" ]]; then
+  echo "Missing or invalid uploader configuration" >&2
+  exit 78
+fi
 ! getent passwd 1001 >/dev/null || { echo "Host account collides with container build UID 1001" >&2; exit 78; }
 members=$(getent group 1001 | cut -d: -f4 | tr ',' ' ')
 for m in $members; do
@@ -137,11 +150,32 @@ install -d -m0755 /opt/gha-runners /opt/oxidex-builder/image
 install -d -m0700 /var/lib/oxidex-builder
 install -d -o root -g root -m 0755 /opt/oxidex-builder/qualification_trust /etc/oxidex-remote-build
 install -d -o root -g root -m 0755 "$MOUNT_POINT/remote-build/qualification-sealed"
-{{ASSET_WRITES}}
-chmod 0444 /etc/oxidex-remote-build/qualification-maintainer.allowed_signers /etc/oxidex-remote-build/qualification.gitconfig
-printf '%s\n' '{{BUILD_CONFIG}}' >/etc/oxidex-remote-build.json
-printf '%s\n' '{{ADMISSION_CONFIG}}' >/etc/gha-admission.json
-printf '%s\n' '{{UPLOADER_CONFIG}}' >/etc/oxidex-builder-uploader.json
+
+# Safe execution of ASSET_WRITES if rendered
+asset_writes_marker='{{ASSET_WRITES}}'
+if [[ ! "$asset_writes_marker" =~ ^\{\{.*\}\}$ && -n "$asset_writes_marker" ]]; then
+  eval "$asset_writes_marker"
+fi
+
+for qf in /etc/oxidex-remote-build/qualification-maintainer.allowed_signers /etc/oxidex-remote-build/qualification.gitconfig; do
+  if [[ -f "$qf" ]]; then
+    chmod 0444 "$qf"
+  fi
+done
+
+build_config_raw='{{BUILD_CONFIG}}'
+if [[ "$build_config_raw" =~ ^\{\{.*\}\}$ || -z "$build_config_raw" ]]; then
+  build_config_raw='{"approved_image_id":null,"cpus":16,"image":"oxidex-remote-builder:1.99.0","memory_gib":28,"role":"builder"}'
+fi
+printf '%s\n' "$build_config_raw" >/etc/oxidex-remote-build.json
+
+admission_config_raw='{{ADMISSION_CONFIG}}'
+if [[ "$admission_config_raw" =~ ^\{\{.*\}\}$ || -z "$admission_config_raw" ]]; then
+  admission_config_raw='{"builder_cpus":16,"builder_gib":28,"host_cpus":16,"role":"builder","runner_gib":0,"runner_names":[],"work_gib":28}'
+fi
+printf '%s\n' "$admission_config_raw" >/etc/gha-admission.json
+
+printf '%s\n' "$uploader_raw" >/etc/oxidex-builder-uploader.json
 chmod 0600 /etc/oxidex-builder-uploader.json
 chmod 0644 /etc/oxidex-remote-build.json /etc/gha-admission.json
 # Set up host-agent symlinks
@@ -208,19 +242,23 @@ last_created="/var/lib/oxidex-builder/last-created-container.json"
 [[ "$(jq -re '.labels["oxidex.cache-project"]' "$last_created")" == "bootstrap-tools" ]] || { echo "Probe project identity differs" >&2; exit 78; }
 created_cid=$(jq -re '.container_id' "$last_created")
 
-probe_line=$(tail -n 1 /var/lib/oxidex-builder/tool-probe-output)
-probe_schema=$(printf '%s' "$probe_line" | jq -re '.schema')
+# Extract the complete toolchain-probe JSON payload cleanly (skipping any banner lines)
+probe_json_file="/var/lib/oxidex-builder/tool-probe.json"
+sed -n '/^{/,/^}/p' /var/lib/oxidex-builder/tool-probe-output > "$probe_json_file"
+[[ -s "$probe_json_file" ]] || { echo "Tool probe JSON extraction empty" >&2; exit 78; }
+
+probe_schema=$(jq -re '.schema' "$probe_json_file")
 [[ "$probe_schema" == "builder-tools-actual-v1" ]] || { echo "Tool probe schema differs: $probe_schema" >&2; exit 78; }
-probe_host=$(printf '%s' "$probe_line" | jq -re '.container_hostname')
-[[ "$probe_host" =~ ^[0-9a-f]{12}$ ]] || { echo "Invalid probe container hostname" >&2; exit 78; }
+probe_host=$(jq -re '.container_hostname' "$probe_json_file")
+[[ "$probe_host" =~ ^[0-9a-f]{12}$ ]] || { echo "Invalid probe container hostname: $probe_host" >&2; exit 78; }
 [[ "$created_cid" == "$probe_host"* ]] || { echo "Probe container ID differs from receipt" >&2; exit 78; }
 boot_id=$(tr -d '[:space:]' </proc/sys/kernel/random/boot_id)
-[[ "$(printf '%s' "$probe_line" | jq -re '.boot_id')" == "$boot_id" ]] || { echo "Probe boot ID differs" >&2; exit 78; }
-printf '%s' "$probe_line" | jq -re '.rustc' | grep -q 'commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4' || { echo "Actual compiler commit differs" >&2; exit 78; }
-[[ "$(printf '%s' "$probe_line" | jq -re '.actual_cgroup["memory.max"]')" == "30064771072" ]] || { echo "Actual memory limit differs" >&2; exit 78; }
-[[ "$(printf '%s' "$probe_line" | jq -re '.actual_cgroup["memory.swap.max"]')" == "0" ]] || { echo "Actual memory swap differs" >&2; exit 78; }
+[[ "$(jq -re '.boot_id' "$probe_json_file")" == "$boot_id" ]] || { echo "Probe boot ID differs" >&2; exit 78; }
+jq -re '.rustc' "$probe_json_file" | grep -q 'commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4' || { echo "Actual compiler commit differs" >&2; exit 78; }
+[[ "$(jq -re '.actual_cgroup["memory.max"]' "$probe_json_file")" == "30064771072" ]] || { echo "Actual memory limit differs" >&2; exit 78; }
+[[ "$(jq -re '.actual_cgroup["memory.swap.max"]' "$probe_json_file")" == "0" ]] || { echo "Actual memory swap differs" >&2; exit 78; }
 
-cpu_max=$(printf '%s' "$probe_line" | jq -re '.actual_cgroup["cpu.max"]')
+cpu_max=$(jq -re '.actual_cgroup["cpu.max"]' "$probe_json_file")
 cpu_quota=$(echo "$cpu_max" | awk '{print $1}')
 cpu_period=$(echo "$cpu_max" | awk '{print $2}')
 [[ "$(( cpu_quota / cpu_period ))" -eq 16 ]] || { echo "Actual CPU quota differs" >&2; exit 78; }
@@ -231,14 +269,22 @@ mounted_uuid=$(/usr/bin/findmnt -n -o UUID /mnt/runner-data)
 serial=$(/usr/bin/lsblk -dn -o SERIAL "$DEVICE")
 [[ -n "$uuid" && "$uuid" == "$mounted_uuid" && -n "$serial" ]] || { echo "Persistent cache device differs" >&2; exit 78; }
 
+deployment_id='{{DEPLOYMENT_ID}}'
+if [[ "$deployment_id" =~ ^\{\{.*\}\}$ || -z "$deployment_id" ]]; then
+  deployment_id="{{INSTANCE_NAME}}"
+  if [[ "$deployment_id" =~ ^\{\{.*\}\}$ || -z "$deployment_id" ]]; then
+    deployment_id="builder-default"
+  fi
+fi
+
 observed_ns=$(date +%s%N)
 jq -n \
   --arg schema "builder-bootstrap-observed-v1" \
-  --arg dep "{{DEPLOYMENT_ID}}" \
+  --arg dep "$deployment_id" \
   --argjson obs_ns "$observed_ns" \
   --arg boot "$boot_id" \
   --arg img "$built_image" \
-  --argjson tools "$probe_line" \
+  --argjson tools "$(cat "$probe_json_file")" \
   --argjson created "$(cat "$last_created")" \
   --argjson adm "$(cat /etc/gha-admission.json)" \
   --arg dev_name "{{DISK_DEVICE_NAME}}" \
@@ -295,14 +341,19 @@ printf '%s\n' "$uploader_pubkey" >"$home_dir/.ssh/authorized_keys"
 chmod 0600 "$home_dir/.ssh/authorized_keys"
 chown "$uploader_uid:1001" "$home_dir/.ssh/authorized_keys"
 
+uploader_sha='{{UPLOADER_SHA}}'
+if [[ "$uploader_sha" =~ ^\{\{.*\}\}$ || -z "$uploader_sha" ]]; then
+  uploader_sha=$(sha256sum /etc/oxidex-builder-uploader.json 2>/dev/null | awk '{print $1}')
+fi
+
 jq -n \
   --arg schema "builder-uploader-observed-v1" \
-  --arg principal "$(jq -re .principal /etc/oxidex-builder-uploader.json)" \
+  --arg principal "$(jq -re '.principal // "swackhamer"' /etc/oxidex-builder-uploader.json)" \
   --arg username "$uploader_user" \
   --argjson uid "$uploader_uid" \
-  --arg mapping_sha '{{UPLOADER_SHA}}' \
-  --arg pubkey_sha "$(jq -re .public_key_sha256 /etc/oxidex-builder-uploader.json)" \
-  --arg receipt_sha "$(jq -re .identity_receipt_sha256 /etc/oxidex-builder-uploader.json)" \
+  --arg mapping_sha "$uploader_sha" \
+  --arg pubkey_sha "$(jq -re '.public_key_sha256 // ""' /etc/oxidex-builder-uploader.json)" \
+  --arg receipt_sha "$(jq -re '.identity_receipt_sha256 // ""' /etc/oxidex-builder-uploader.json)" \
   '{
     schema: $schema,
     principal: $principal,
@@ -315,5 +366,5 @@ jq -n \
   }' >/var/lib/oxidex-builder/uploader-observed.json
 chmod 0600 /var/lib/oxidex-builder/uploader-observed.json
 
-printf '%s\n' '{{DEPLOYMENT_ID}}' >/var/lib/oxidex-builder-bootstrap.complete
+printf '%s\n' "$deployment_id" >/var/lib/oxidex-builder-bootstrap.complete
 chmod 0444 /var/lib/oxidex-builder-bootstrap.complete

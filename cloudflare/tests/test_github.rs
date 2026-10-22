@@ -450,3 +450,62 @@ fn test_render_startup_script_patch_injection() {
     assert!(script.contains("--sysctl=net.core.somaxconn=4096"));
     assert!(script.contains("/mnt/runner-data/custom-cache:/opt/custom-cache"));
 }
+
+#[tokio::test]
+async fn test_count_queued_jobs_propagates_non_200_errors() {
+    let transport = Arc::new(CustomMockGitHubTransport::new());
+
+    // 1. Simulate HTTP 403 (Rate limit exceeded)
+    transport.set_response(
+        "actions/runs?status=queued",
+        403,
+        serde_json::json!({ "message": "API rate limit exceeded" }),
+    );
+
+    let client = GitHubActionsClient::new("token".to_string(), transport.clone());
+    let err_403 = client
+        .count_queued_jobs_for_repo("swack-tools", "oxidex")
+        .await
+        .unwrap_err();
+
+    match err_403 {
+        GitHubError::Api {
+            status,
+            ref message,
+        } => {
+            assert_eq!(status, 403);
+            assert!(message.contains("API rate limit exceeded"));
+        }
+        other => panic!("Expected GitHubError::Api, got {:?}", other),
+    }
+
+    // 2. Simulate HTTP 429 (Too Many Requests)
+    transport.set_response(
+        "actions/runs?status=queued",
+        429,
+        serde_json::json!({ "message": "Too many requests" }),
+    );
+    let err_429 = client
+        .count_queued_jobs_for_repo("swack-tools", "oxidex")
+        .await
+        .unwrap_err();
+    match err_429 {
+        GitHubError::Api { status, .. } => assert_eq!(status, 429),
+        other => panic!("Expected GitHubError::Api, got {:?}", other),
+    }
+
+    // 3. Simulate HTTP 500 (GitHub server outage)
+    transport.set_response(
+        "actions/runs?status=queued",
+        500,
+        serde_json::json!({ "message": "Internal Server Error" }),
+    );
+    let err_500 = client
+        .count_queued_jobs_for_repo("swack-tools", "oxidex")
+        .await
+        .unwrap_err();
+    match err_500 {
+        GitHubError::Api { status, .. } => assert_eq!(status, 500),
+        other => panic!("Expected GitHubError::Api, got {:?}", other),
+    }
+}

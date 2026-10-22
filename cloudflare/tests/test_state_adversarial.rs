@@ -616,10 +616,7 @@ async fn test_instance_action_safety_gates_delete_never_mutates_state_and_zero_w
     assert_eq!(resp1["applied"], false);
     assert_eq!(resp1["status"], "not_applied");
     assert_eq!(resp1["message"], LIFECYCLE_ACTIONS_DISABLED_MESSAGE);
-    assert!(resp1["next_step"]
-        .as_str()
-        .unwrap()
-        .contains("spot_runner_autoscaler.py"));
+    assert!(resp1["next_step"].as_str().unwrap().contains("reconciler"));
     assert_eq!(
         kv.put_count.load(Ordering::SeqCst),
         puts_baseline,

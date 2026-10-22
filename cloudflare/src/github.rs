@@ -394,7 +394,11 @@ impl GitHubActionsClient {
             .map_err(GitHubError::Http)?;
 
         if status != 200 {
-            return Ok(0);
+            let msg = String::from_utf8_lossy(&bytes).to_string();
+            return Err(GitHubError::Api {
+                status,
+                message: msg,
+            });
         }
 
         let runs_resp: WorkflowRunsResponse = serde_json::from_slice(&bytes)?;
@@ -411,16 +415,21 @@ impl GitHubActionsClient {
                 .await
                 .map_err(GitHubError::Http)?;
 
-            if j_status == 200 {
-                if let Ok(jobs_resp) = serde_json::from_slice::<WorkflowJobsResponse>(&j_bytes) {
-                    for job in jobs_resp.jobs {
-                        match job.status.as_str() {
-                            "queued" | "waiting" | "pending" | "requested" => {
-                                queued_count += 1;
-                            }
-                            _ => {}
-                        }
+            if j_status != 200 {
+                let msg = String::from_utf8_lossy(&j_bytes).to_string();
+                return Err(GitHubError::Api {
+                    status: j_status,
+                    message: msg,
+                });
+            }
+
+            let jobs_resp: WorkflowJobsResponse = serde_json::from_slice(&j_bytes)?;
+            for job in jobs_resp.jobs {
+                match job.status.as_str() {
+                    "queued" | "waiting" | "pending" | "requested" => {
+                        queued_count += 1;
                     }
+                    _ => {}
                 }
             }
         }

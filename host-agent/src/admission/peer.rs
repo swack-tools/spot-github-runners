@@ -66,12 +66,12 @@ pub fn peer_owner(
     uid: u32,
     config: &AdmissionConfig,
     sys: &dyn SystemInspector,
-) -> Result<(String, AdmissionKind), AdmissionError> {
+) -> Result<(String, AdmissionKind, Option<String>), AdmissionError> {
     if uid == 0 {
         let identity = sys
             .process_identity(pid)
             .map_err(|e| AdmissionError::System(format!("Process identity error: {e}")))?;
-        return Ok((identity, AdmissionKind::Builder));
+        return Ok((identity, AdmissionKind::Builder, None));
     }
 
     if uid != 1001 {
@@ -96,15 +96,15 @@ pub fn peer_owner(
         ));
     }
 
-    let clean_name = inspect.name.trim_start_matches('/');
-    if !config.runner_names.is_empty() && !config.runner_names.iter().any(|n| n == clean_name) {
+    let clean_name = inspect.name.trim_start_matches('/').to_string();
+    if !config.runner_names.is_empty() && !config.runner_names.iter().any(|n| n == &clean_name) {
         return Err(AdmissionError::InvalidBudget(
             "Container is outside this runner deployment".to_string(),
         ));
     }
 
     let owner = worker_owner(pid, &container_id, &inspect.started_at, sys)?;
-    Ok((owner, AdmissionKind::Runner))
+    Ok((owner, AdmissionKind::Runner, Some(clean_name)))
 }
 
 pub fn legacy_owner_for_worker(owner: &str) -> Result<String, AdmissionError> {

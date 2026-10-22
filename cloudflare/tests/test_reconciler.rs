@@ -126,6 +126,7 @@ impl GcpReconcilerClient for MockGcpReconciler {
 #[derive(Default, Clone)]
 pub struct MockGitHubReconciler {
     pub runners: Arc<Mutex<Vec<SimpleGitHubRunner>>>,
+    pub target_runners: Arc<Mutex<HashMap<String, Vec<SimpleGitHubRunner>>>>,
     pub deleted_runners: Arc<Mutex<Vec<u64>>>,
     pub queued_jobs: Arc<Mutex<u32>>,
 }
@@ -134,8 +135,11 @@ pub struct MockGitHubReconciler {
 impl GitHubReconcilerClient for MockGitHubReconciler {
     async fn list_runners(
         &self,
-        _target_api_path: &str,
+        target_api_path: &str,
     ) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
+        if let Some(target_list) = self.target_runners.lock().unwrap().get(target_api_path) {
+            return Ok(target_list.clone());
+        }
         Ok(self.runners.lock().unwrap().clone())
     }
 
@@ -576,4 +580,146 @@ async fn test_concurrency_lease_240s_skips_overlapping_ticks() {
     let report2 = run_reconciliation(&kv, &gcp, &gh, now + 101).await.unwrap();
     assert_eq!(report2.status, "reconciled");
     assert_eq!(RECONCILER_LEASE_TTL_SECS, 240);
+}
+
+#[tokio::test]
+async fn test_backlog_scale_up_unique_instance_names_across_successive_ticks() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+
+    // 4 floor hosts present
+    for target in [
+        "swack-tools",
+        "xbmc4lyfe-newznab-tmux",
+        "xbmc4lyfe-rustnzb",
+        "xbmc4lyfe-nntp-proxy",
+    ] {
+        gcp.instances.lock().unwrap().push(SimpleGceInstance {
+            id: Some(format!("vm-{}", target)),
+            name: format!("oxidex-runners-{}-healthy", target),
+            zone: "us-central1-a".to_string(),
+            machine_type: "c4d-highcpu-16".to_string(),
+            status: "RUNNING".to_string(),
+            metadata: GceMetadata::default(),
+            disks: vec![],
+        });
+    }
+
+    *gh.queued_jobs.lock().unwrap() = 25; // Trigger backlog scale-up
+
+    // Tick 1
+    let now1 = 1700000000;
+    let rep1 = run_reconciliation(&kv, &gcp, &gh, now1).await.unwrap();
+    assert_eq!(rep1.launched_hosts.len(), 1);
+    let name1 = rep1.launched_hosts[0].clone();
+    assert!(name1.starts_with("oxidex-runners-scale-"));
+    assert!(name1.len() <= 63);
+
+    // Advance time by 300s (still within the 10,000s window where &now[..6] was constant)
+    let now2 = 1700000300;
+    set_reconciler_lease(None);
+    let rep2 = run_reconciliation(&kv, &gcp, &gh, now2).await.unwrap();
+    assert_eq!(rep2.launched_hosts.len(), 1);
+    let name2 = rep2.launched_hosts[0].clone();
+    assert!(name2.starts_with("oxidex-runners-scale-"));
+    assert!(name2.len() <= 63);
+
+    // Crucial check: names must be completely distinct
+    assert_ne!(
+        name1, name2,
+        "Scale-up instance names across successive ticks must never collide"
+    );
+}
+
+#[tokio::test]
+async fn test_reconciler_queries_runners_across_org_and_repo_targets() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+
+    // Set up repo target runner
+    let repo_target = "repos/xbmc4lyfe/newznab-tmux";
+    gh.target_runners.lock().unwrap().insert(
+        repo_target.to_string(),
+        vec![
+            SimpleGitHubRunner {
+                id: 991,
+                name: "oxidex-runners-xbmc4lyfe-newznab-tmux-r1".to_string(),
+                status: "online".to_string(),
+                busy: false,
+            },
+            SimpleGitHubRunner {
+                id: 992,
+                name: "oxidex-runners-xbmc4lyfe-newznab-tmux-r2".to_string(),
+                status: "online".to_string(),
+                busy: false,
+            },
+        ],
+    );
+
+    // Set up active launch waiting in Booting phase
+    inject_active_launch(LaunchOperation {
+        target: "xbmc4lyfe/newznab-tmux".to_string(),
+        host_name: "oxidex-runners-xbmc4lyfe-newznab-tmux-vm".to_string(),
+        zone: "us-central1-a".to_string(),
+        machine_type: "c4d-highcpu-16".to_string(),
+        phase: LaunchPhase::Booting,
+        deployment_id: "dep-test".to_string(),
+        started_at: 1700000000,
+        instance_id: Some("vm-newznab".to_string()),
+        expected_runners: vec![
+            "oxidex-runners-xbmc4lyfe-newznab-tmux-r1".to_string(),
+            "oxidex-runners-xbmc4lyfe-newznab-tmux-r2".to_string(),
+        ],
+    });
+
+    gcp.instances.lock().unwrap().push(SimpleGceInstance {
+        id: Some("vm-newznab".to_string()),
+        name: "oxidex-runners-xbmc4lyfe-newznab-tmux-vm".to_string(),
+        zone: "us-central1-a".to_string(),
+        machine_type: "c4d-highcpu-16".to_string(),
+        status: "RUNNING".to_string(),
+        metadata: GceMetadata::default(),
+        disks: vec![],
+    });
+
+    // Add healthy running hosts for the other 3 targets so Section 8 does not trigger floor launches
+    for target in ["swack-tools", "xbmc4lyfe-rustnzb", "xbmc4lyfe-nntp-proxy"] {
+        gcp.instances.lock().unwrap().push(SimpleGceInstance {
+            id: Some(format!("vm-{}", target)),
+            name: format!("oxidex-runners-{}-healthy", target),
+            zone: "us-central1-a".to_string(),
+            machine_type: "c4d-highcpu-16".to_string(),
+            status: "RUNNING".to_string(),
+            metadata: GceMetadata::default(),
+            disks: vec![],
+        });
+    }
+
+    let now = 1700000010;
+    let _report = run_reconciliation(&kv, &gcp, &gh, now).await.unwrap();
+
+    // Verify launch transitioned to Done and was pruned from ACTIVE_LAUNCHES
+    let remaining_launches = get_active_launches();
+    assert!(
+        !remaining_launches
+            .iter()
+            .any(|l| l.target == "xbmc4lyfe/newznab-tmux"),
+        "Expected xbmc4lyfe/newznab-tmux launch to complete and be removed from in-flight launches"
+    );
+
+    // Verify startup script was scrubbed
+    assert_eq!(
+        gcp.scrubbed_instances.lock().unwrap().as_slice(),
+        &["oxidex-runners-xbmc4lyfe-newznab-tmux-vm"]
+    );
 }

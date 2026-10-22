@@ -47,15 +47,32 @@ gcloud compute instances delete "builder-old-name" \
 Render `cloud-init/builder-startup.sh` with the updated parameters, referencing the existing persistent cache disk device name:
 
 ```bash
-sed -e 's/{{INSTANCE_NAME}}/builder-new-name/g' \
-    -e 's/{{PROJECT}}/your-project/g' \
-    -e 's/{{ZONE}}/asia-east2-a/g' \
-    -e 's/{{DISK_DEVICE_NAME}}/builder-cache-disk/g' \
+INSTANCE_NAME="builder-new-name"
+PROJECT="your-project"
+ZONE="asia-east2-a"
+DISK_DEVICE_NAME="builder-cache-disk"
+DEPLOYMENT_ID="${INSTANCE_NAME}"
+UPLOADER_MAPPING="/path/to/approved-uploader-mapping.json"
+UPLOADER_CONFIG=$(jq -c . "$UPLOADER_MAPPING")
+UPLOADER_SHA=$(sha256sum "$UPLOADER_MAPPING" | awk '{print $1}')
+BUILD_CONFIG='{"approved_image_id":null,"cpus":16,"image":"oxidex-remote-builder:1.99.0","memory_gib":28,"role":"builder"}'
+ADMISSION_CONFIG='{"builder_cpus":16,"builder_gib":28,"host_cpus":16,"role":"builder","runner_gib":0,"runner_names":[],"work_gib":28}'
+
+sed -e "s/{{INSTANCE_NAME}}/${INSTANCE_NAME}/g" \
+    -e "s/{{PROJECT}}/${PROJECT}/g" \
+    -e "s/{{ZONE}}/${ZONE}/g" \
+    -e "s/{{DISK_DEVICE_NAME}}/${DISK_DEVICE_NAME}/g" \
+    -e "s/{{DEPLOYMENT_ID}}/${DEPLOYMENT_ID}/g" \
+    -e "s|{{UPLOADER_CONFIG}}|${UPLOADER_CONFIG}|g" \
+    -e "s/{{UPLOADER_SHA}}/${UPLOADER_SHA}/g" \
+    -e "s|{{BUILD_CONFIG}}|${BUILD_CONFIG}|g" \
+    -e "s|{{ADMISSION_CONFIG}}|${ADMISSION_CONFIG}|g" \
+    -e "s|{{ASSET_WRITES}}||g" \
     cloud-init/builder-startup.sh > /private/builder-startup.sh
 
-gcloud compute instances create "builder-new-name" \
-  --project="your-project" \
-  --zone="asia-east2-a" \
+gcloud compute instances create "${INSTANCE_NAME}" \
+  --project="${PROJECT}" \
+  --zone="${ZONE}" \
   --machine-type="n4-highcpu-16" \
   --provisioning-model="SPOT" \
   --instance-termination-action="STOP" \
