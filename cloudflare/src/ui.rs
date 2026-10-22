@@ -2353,27 +2353,35 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function triggerLiveInventoryRefresh(silent = false) {
-      if (!silent) showToast("Refreshing live Compute Engine & GitHub inventory...");
+      if (!silent) showToast("Refreshing live Compute Engine inventory...");
+      let success = false;
       try {
         const res = await fetch("/api/inventory/refresh", {
           method: "POST",
           headers: { "Content-Type": "application/json" }
         });
-        if (!res.ok) {
+        if (res.ok) {
+          success = true;
+        } else {
           const resFallback = await fetch("/api/reconciler/tick?read_only=true", {
             method: "POST",
             headers: { "Content-Type": "application/json" }
           });
-          if (!resFallback.ok) {
+          if (resFallback.ok) {
+            success = true;
+          } else {
             const err = await resFallback.json().catch(() => ({}));
             showToast(`Refresh warning: ${err.message || resFallback.statusText}`);
           }
         }
       } catch (e) {
         console.warn("Manual inventory refresh error:", e);
+        showToast(`Refresh error: ${e.message || e}`);
       }
-      await loadOverview();
-      if (!silent) showToast("Refreshed live Compute Engine & GitHub inventory");
+      if (success) {
+        await loadOverview();
+        if (!silent) showToast("Refreshed live Compute Engine inventory");
+      }
     }
 
     async function refreshInstancesTable() {

@@ -566,3 +566,96 @@ async fn test_read_only_inventory_refresh_never_mutates_fleet() {
     assert_eq!(fresh_bundle.state.fleet_inventory["source"], "gce");
     assert_eq!(fresh_bundle.state.fleet_inventory["stale"], false);
 }
+
+#[tokio::test]
+async fn test_overview_filter_nan_and_inf_window_hours_handling() {
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    bundle.state.overview = Some(create_sample_overview(now));
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    let query_nan = OverviewQuery {
+        window_hours: Some(f64::NAN),
+        ..Default::default()
+    };
+    let (status, resp) = handle_api_overview(&kv, query_nan, now).await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(resp["instances_view"]["window_hours"], 24.0);
+
+    let query_inf = OverviewQuery {
+        window_hours: Some(f64::INFINITY),
+        ..Default::default()
+    };
+    let (status2, resp2) = handle_api_overview(&kv, query_inf, now).await.unwrap();
+    assert_eq!(status2, 200);
+    assert_eq!(resp2["instances_view"]["window_hours"], 24.0);
+}
+
+#[tokio::test]
+async fn test_read_only_inventory_refresh_marks_unqueried_runners_unknown() {
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    bundle.state.instances = vec![];
+    bundle.state.instances_view = vec![];
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    // Host discovered in GCP: 1 builder and 1 runner host
+    let gcp = MockGcpFloorClient {
+        instances: vec![
+            SimpleGceInstance {
+                id: Some("1".into()),
+                name: "builder-dedicated-asia".to_string(),
+                zone: "asia-east2-a".to_string(),
+                machine_type: "n4-highcpu-16".to_string(),
+                status: "RUNNING".to_string(),
+                metadata: spot_dashboard_edge::gcp::GceMetadata {
+                    fingerprint: None,
+                    items: vec![],
+                },
+                disks: vec![],
+            },
+            SimpleGceInstance {
+                id: Some("2".into()),
+                name: "oxidex-runners-swack-tools-1001".to_string(),
+                zone: "us-central1-a".to_string(),
+                machine_type: "c4d-standard-16".to_string(),
+                status: "RUNNING".to_string(),
+                metadata: spot_dashboard_edge::gcp::GceMetadata {
+                    fingerprint: None,
+                    items: vec![],
+                },
+                disks: vec![],
+            },
+        ],
+    };
+
+    let report = run_inventory_refresh(&kv, &gcp, now).await.unwrap();
+    assert_eq!(report.status, "inventory_refresh_success");
+
+    let (fresh_bundle, _) = load_state(&kv, now).await.unwrap();
+    let builder_rec = fresh_bundle
+        .state
+        .instances_view
+        .iter()
+        .find(|i| i.name == "builder-dedicated-asia")
+        .unwrap();
+    assert_eq!(builder_rec.runners_count, 0);
+    assert!(builder_rec.runners_count_known);
+
+    let runner_rec = fresh_bundle
+        .state
+        .instances_view
+        .iter()
+        .find(|i| i.name == "oxidex-runners-swack-tools-1001")
+        .unwrap();
+    // GitHub was not queried during inventory refresh, so runner count is unknown
+    assert_eq!(runner_rec.runners_count, 0);
+    assert!(!runner_rec.runners_count_known);
+}
+

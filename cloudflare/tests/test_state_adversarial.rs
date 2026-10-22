@@ -585,6 +585,8 @@ async fn test_instance_action_safety_gates_delete_never_mutates_state_and_zero_w
             runners_count: 2,
             runners_count_known: true,
             runner_limits_known: true,
+            created_at: None,
+            created_epoch: None,
         },
         InstanceRecord {
             id: "inst-builder-200".into(),
@@ -599,6 +601,8 @@ async fn test_instance_action_safety_gates_delete_never_mutates_state_and_zero_w
             runners_count: 0,
             runners_count_known: true,
             runner_limits_known: true,
+            created_at: None,
+            created_epoch: None,
         },
     ];
     save_state(&kv, &mut bundle, now).await.unwrap();
@@ -689,6 +693,8 @@ async fn test_instance_action_safety_gates_scale_region_never_mutates_state_and_
             runners_count: 2,
             runners_count_known: true,
             runner_limits_known: true,
+            created_at: None,
+            created_epoch: None,
         },
         InstanceRecord {
             id: "inst-eu-2".into(),
@@ -703,6 +709,8 @@ async fn test_instance_action_safety_gates_scale_region_never_mutates_state_and_
             runners_count: 2,
             runners_count_known: true,
             runner_limits_known: true,
+            created_at: None,
+            created_epoch: None,
         },
     ];
     save_state(&kv, &mut bundle, now).await.unwrap();

@@ -576,17 +576,25 @@ where
         .iter()
         .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
         .map(|i| {
-            if let Some(existing) = existing_by_name.get(&i.name) {
-                if existing.role == "rust_builder" || i.name.starts_with("builder-") {
-                    let mut rec = existing.clone();
-                    rec.status = i.status.clone();
-                    rec.zone = i.zone.clone();
-                    rec.region = i.zone.split('-').take(2).collect::<Vec<_>>().join("-");
-                    rec.machine_type = i.machine_type.clone();
-                    return rec;
-                }
-            }
             let is_builder = i.name.starts_with("builder-");
+            if let Some(existing) = existing_by_name.get(&i.name) {
+                let mut rec = existing.clone();
+                rec.status = i.status.clone();
+                rec.zone = i.zone.clone();
+                rec.region = i.zone.split('-').take(2).collect::<Vec<_>>().join("-");
+                rec.machine_type = i.machine_type.clone();
+                if is_builder {
+                    rec.role = "rust_builder".to_string();
+                    rec.vcpu = 16;
+                    rec.ram_gib = 32;
+                    rec.runners_count = 0;
+                    rec.runners_count_known = true;
+                    rec.runner_limits_known = true;
+                }
+                return rec;
+            }
+            let launch_epoch = crate::state::parse_launch_epoch_from_name(&i.name);
+            let created_at = launch_epoch.map(crate::state::chrono_iso);
             InstanceRecord {
                 id: i.id.clone().unwrap_or_else(|| i.name.clone()),
                 name: i.name.clone(),
@@ -601,9 +609,11 @@ where
                 },
                 vcpu: if is_builder { 16 } else { MIN_HOST_VCPU },
                 ram_gib: if is_builder { 32 } else { MIN_HOST_RAM_GIB },
-                runners_count: if is_builder { 0 } else { RUNNERS_PER_HOST },
-                runners_count_known: true,
-                runner_limits_known: true,
+                runners_count: 0,
+                runners_count_known: is_builder,
+                runner_limits_known: is_builder,
+                created_at,
+                created_epoch: launch_epoch,
             }
         })
         .collect();
@@ -1264,6 +1274,8 @@ where
                     }
                 }
                 let is_builder = i.name.starts_with("builder-");
+                let launch_epoch = crate::state::parse_launch_epoch_from_name(&i.name);
+                let created_at = launch_epoch.map(crate::state::chrono_iso);
                 InstanceRecord {
                     id: i.id.clone().unwrap_or_else(|| i.name.clone()),
                     name: i.name.clone(),
@@ -1281,6 +1293,8 @@ where
                     runners_count: if is_builder { 0 } else { RUNNERS_PER_HOST },
                     runners_count_known: true,
                     runner_limits_known: true,
+                    created_at,
+                    created_epoch: launch_epoch,
                 }
             })
             .collect();

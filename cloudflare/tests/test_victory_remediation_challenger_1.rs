@@ -419,6 +419,8 @@ async fn test_adversarial_vm_templates_from_instance_missing_and_persisted() {
         runners_count: 2,
         runners_count_known: true,
         runner_limits_known: true,
+        created_at: None,
+        created_epoch: None,
     });
     save_state(&kv, &mut bundle, now).await.unwrap();
 

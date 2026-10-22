@@ -236,7 +236,7 @@ pub struct VmTemplate {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct InstanceRecord {
     pub id: String,
     pub name: String,
@@ -252,6 +252,10 @@ pub struct InstanceRecord {
     pub runners_count_known: bool,
     #[serde(default)]
     pub runner_limits_known: bool,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub created_epoch: Option<u64>,
 }
 
 // ============================================================================
@@ -507,6 +511,92 @@ pub struct OverviewQuery {
     pub is_authenticated: Option<bool>,
 }
 
+pub fn parse_launch_epoch_from_name(name: &str) -> Option<u64> {
+    let tokens: Vec<&str> = name.split('-').collect();
+    if tokens.len() >= 3 {
+        if let Ok(epoch) = tokens[tokens.len() - 2].parse::<u64>() {
+            if epoch >= 1_000_000_000 && epoch <= 4_000_000_000 {
+                return Some(epoch);
+            }
+        }
+    }
+    None
+}
+
+fn lookup_instance_pricing(
+    qualifications: Option<&serde_json::Value>,
+    regions: Option<&serde_json::Value>,
+    base_instances: &[serde_json::Value],
+    machine_type: &str,
+    zone: &str,
+    region: &str,
+    is_builder: bool,
+) -> Option<serde_json::Value> {
+    for inst in base_instances {
+        if inst.get("machine_type").and_then(|v| v.as_str()) == Some(machine_type)
+            && inst.get("zone").and_then(|v| v.as_str()) == Some(zone)
+        {
+            if let Some(pricing) = inst.get("pricing") {
+                if pricing.is_object() && pricing.get("total_hourly_usd").is_some() {
+                    return Some(pricing.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(qual) = qualifications.and_then(|v| v.as_object()) {
+        let role_key = if is_builder { "rust_builder" } else { "cicd_runner" };
+        if let Some(role_qual) = qual.get(role_key).and_then(|v| v.as_object()) {
+            for list_key in &["spot_price_qualifying", "hardware_qualifying"] {
+                if let Some(list) = role_qual.get(*list_key).and_then(|v| v.as_array()) {
+                    for item in list {
+                        if item.get("machine_type").and_then(|v| v.as_str()) == Some(machine_type)
+                            && (item.get("zone").and_then(|v| v.as_str()) == Some(zone)
+                                || item.get("region").and_then(|v| v.as_str()) == Some(region))
+                        {
+                            if let Some(pricing) = item.get("pricing") {
+                                if pricing.is_object() && pricing.get("total_hourly_usd").is_some() {
+                                    return Some(pricing.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(regs) = regions.and_then(|v| v.as_array()) {
+        for reg in regs {
+            if reg.get("region").and_then(|v| v.as_str()) == Some(region) {
+                if let Some(insts) = reg.get("running_instances").and_then(|v| v.as_array()) {
+                    for inst in insts {
+                        if inst.get("machine_type").and_then(|v| v.as_str()) == Some(machine_type) {
+                            if let Some(pricing) = inst.get("pricing") {
+                                if pricing.is_object() && pricing.get("total_hourly_usd").is_some() {
+                                    return Some(pricing.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for inst in base_instances {
+        if inst.get("machine_type").and_then(|v| v.as_str()) == Some(machine_type) {
+            if let Some(pricing) = inst.get("pricing") {
+                if pricing.is_object() && pricing.get("total_hourly_usd").is_some() {
+                    return Some(pricing.clone());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub fn apply_dynamic_overview_filtering(
     ov: &mut serde_json::Value,
     query: &OverviewQuery,
@@ -517,6 +607,9 @@ pub fn apply_dynamic_overview_filtering(
         Some(obj) => obj,
         None => return,
     };
+
+    let qual_val = ov_obj.get("qualifications").cloned();
+    let regions_val = ov_obj.get("regions").cloned();
 
     if !ov_obj.contains_key("instances_view") || !ov_obj["instances_view"].is_object() {
         ov_obj.insert("instances_view".to_string(), serde_json::json!({}));
@@ -543,8 +636,41 @@ pub fn apply_dynamic_overview_filtering(
             }
         } else {
             let is_builder = rec.role == "rust_builder" || rec.name.starts_with("builder-");
-            let hourly_compute = if is_builder { 0.1608 } else { 0.1436 };
-            let hourly_total = if is_builder { 0.1983 } else { 0.1811 };
+            let pricing_opt = lookup_instance_pricing(
+                qual_val.as_ref(),
+                regions_val.as_ref(),
+                &base_instances,
+                &rec.machine_type,
+                &rec.zone,
+                &rec.region,
+                is_builder,
+            );
+            let pricing_known = pricing_opt.is_some();
+            let pricing = pricing_opt.unwrap_or(serde_json::Value::Null);
+
+            let launch_epoch_from_name = parse_launch_epoch_from_name(&rec.name);
+            let (started_epoch, started_at) = if let Some(epoch) = rec.created_epoch {
+                (epoch as f64, chrono_iso(epoch))
+            } else if let Some(ref at) = rec.created_at {
+                let ep = chrono::DateTime::parse_from_rfc3339(at)
+                    .map(|dt| dt.timestamp() as f64)
+                    .unwrap_or(now as f64);
+                (ep, at.clone())
+            } else if let Some(epoch) = launch_epoch_from_name {
+                (epoch as f64, chrono_iso(epoch))
+            } else {
+                (now as f64, chrono_iso(now))
+            };
+
+            let compute_hourly = pricing
+                .get("compute_hourly_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let total_hourly = pricing
+                .get("total_hourly_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(compute_hourly);
+
             base_instances.push(serde_json::json!({
                 "id": rec.id,
                 "name": rec.name,
@@ -567,32 +693,28 @@ pub fn apply_dynamic_overview_filtering(
                 "data_disk_gb": if is_builder { 100 } else { 50 },
                 "data_disk_type": "pd-ssd",
                 "disk_category": "SSD",
-                "started_at": chrono_iso(now.saturating_sub(3600)),
-                "started_epoch": (now.saturating_sub(3600)) as f64,
+                "started_at": started_at,
+                "started_epoch": started_epoch,
                 "deleted_at": serde_json::Value::Null,
                 "deleted_epoch": serde_json::Value::Null,
                 "deletion_trigger": serde_json::Value::Null,
-                "pricing": {
-                    "compute_hourly_usd": hourly_compute,
-                    "compute_daily_usd": hourly_compute * 24.0,
-                    "compute_monthly_usd": hourly_compute * 720.0,
-                    "total_hourly_usd": hourly_total,
-                    "total_daily_usd": hourly_total * 24.0,
-                    "total_monthly_usd": hourly_total * 720.0,
-                },
-                "runtime_hours": 1.0,
-                "hours_in_window": 1.0,
-                "active_hourly_usd": hourly_total,
-                "active_daily_usd": hourly_total * 24.0,
-                "active_monthly_usd": hourly_total * 720.0,
-                "total_cost_in_window_usd": hourly_total,
+                "pricing": pricing,
+                "pricing_known": pricing_known,
+                "runtime_hours": ((now as f64 - started_epoch) / 3600.0).max(0.0),
+                "hours_in_window": 0.0,
+                "active_hourly_usd": total_hourly,
+                "total_cost_in_window_usd": 0.0,
                 "ssh_command": format!("gcloud compute ssh {}", rec.name)
             }));
         }
     }
 
     let include_deleted = query.include_deleted.unwrap_or(true);
-    let window_hours = query.window_hours.unwrap_or(24.0).clamp(0.1, 744.0);
+    let window_hours = query
+        .window_hours
+        .filter(|w| w.is_finite() && *w > 0.0)
+        .unwrap_or(24.0)
+        .clamp(0.1, 744.0);
     let include_disk_and_tax = query.include_disk_and_tax.unwrap_or(true);
     let role_filter = query.role.as_deref().unwrap_or("all").trim();
     let search_filter = query.search.as_deref().unwrap_or("").trim().to_lowercase();
@@ -603,7 +725,8 @@ pub fn apply_dynamic_overview_filtering(
     let window_start = now_f64 - (window_hours * 3600.0);
 
     let mut filtered: Vec<serde_json::Value> = Vec::new();
-    for mut inst in base_instances {
+    for inst_ref in &base_instances {
+        let mut inst = inst_ref.clone();
         let status = inst.get("status").and_then(|v| v.as_str()).unwrap_or("RUNNING");
         let is_running = status.eq_ignore_ascii_case("RUNNING");
 
@@ -611,8 +734,8 @@ pub fn apply_dynamic_overview_filtering(
             continue;
         }
 
-        let started_epoch = inst.get("started_epoch").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let deleted_epoch = inst.get("deleted_epoch").and_then(|v| v.as_f64());
+        let started_epoch = inst.get("started_epoch").and_then(|v| v.as_f64()).filter(|v| v.is_finite()).unwrap_or(0.0);
+        let deleted_epoch = inst.get("deleted_epoch").and_then(|v| v.as_f64()).filter(|v| v.is_finite());
         let end_ts = deleted_epoch.unwrap_or(now_f64);
 
         if !is_running && end_ts < window_start {
@@ -621,8 +744,19 @@ pub fn apply_dynamic_overview_filtering(
 
         let eff_start = started_epoch.max(window_start);
         let eff_end = end_ts.min(now_f64).max(eff_start);
-        let hours_in_window = (((eff_end - eff_start) / 3600.0).clamp(0.0, window_hours) * 100.0).round() / 100.0;
-        let runtime_hours = (((end_ts.max(started_epoch) - started_epoch) / 3600.0) * 100.0).round() / 100.0;
+        let hours_raw = (eff_end - eff_start) / 3600.0;
+        let hours_clamped = if hours_raw.is_finite() {
+            hours_raw.clamp(0.0, window_hours)
+        } else {
+            0.0
+        };
+        let hours_in_window = (hours_clamped * 100.0).round() / 100.0;
+        let runtime_raw = (end_ts.max(started_epoch) - started_epoch) / 3600.0;
+        let runtime_hours = if runtime_raw.is_finite() {
+            (runtime_raw * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
 
         inst["hours_in_window"] = serde_json::json!(hours_in_window);
         inst["runtime_hours"] = serde_json::json!(runtime_hours);
@@ -746,6 +880,88 @@ pub fn apply_dynamic_overview_filtering(
     iv.insert("window_hours".to_string(), serde_json::json!(window_hours));
     iv.insert("sort_by".to_string(), serde_json::json!(sort_by));
     iv.insert("sort_dir".to_string(), serde_json::json!(sort_dir));
+
+    // Synchronize fleet_summary and regions with refreshed live inventory
+    let all_running: Vec<&serde_json::Value> = base_instances
+        .iter()
+        .filter(|inst| {
+            inst.get("status")
+                .and_then(|v| v.as_str())
+                .map_or(false, |s| s.eq_ignore_ascii_case("RUNNING"))
+        })
+        .collect();
+
+    let mut fs_hourly_burn = 0.0;
+    let mut fs_running_runner_slots = 0;
+    let mut fs_running_runner_vms = 0;
+    let mut fs_unconfirmed_runner_hosts = 0;
+    let mut fs_running_builder_vms = 0;
+    let mut fs_total_vcpus = 0;
+    let mut fs_total_ram_gib = 0;
+
+    for inst in &all_running {
+        let is_builder = inst.get("role").and_then(|v| v.as_str()) == Some("rust_builder");
+        let vcpu = inst.get("vcpu").and_then(|v| v.as_u64()).unwrap_or(16) as u32;
+        let ram = inst.get("ram_gib").and_then(|v| v.as_u64()).unwrap_or(32) as u32;
+        fs_total_vcpus += vcpu;
+        fs_total_ram_gib += ram;
+
+        let active_hourly = inst.get("active_hourly_usd").and_then(|v| v.as_f64()).unwrap_or_else(|| {
+            inst.get("pricing")
+                .and_then(|p| p.get("total_hourly_usd"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+        });
+        fs_hourly_burn += active_hourly;
+
+        if is_builder {
+            fs_running_builder_vms += 1;
+        } else {
+            fs_running_runner_vms += 1;
+            let count = inst.get("runners_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            fs_running_runner_slots += count;
+            if inst.get("runners_count_known") == Some(&serde_json::json!(false)) {
+                fs_unconfirmed_runner_hosts += 1;
+            }
+        }
+    }
+
+    let fs_hourly_rounded = (fs_hourly_burn * 10000.0).round() / 10000.0;
+    let fs_daily_rounded = (fs_hourly_burn * 24.0 * 100.0).round() / 100.0;
+    let fs_monthly_rounded = (fs_hourly_burn * 720.0 * 100.0).round() / 100.0;
+
+    ov_obj.insert(
+        "fleet_summary".to_string(),
+        serde_json::json!({
+            "active_hourly_burn_usd": fs_hourly_rounded,
+            "active_daily_burn_usd": fs_daily_rounded,
+            "active_monthly_burn_usd": fs_monthly_rounded,
+            "running_runner_slots": fs_running_runner_slots,
+            "running_runner_vms": fs_running_runner_vms,
+            "unconfirmed_runner_hosts": fs_unconfirmed_runner_hosts,
+            "running_builder_instances": fs_running_builder_vms,
+            "running_builder_vms": fs_running_builder_vms,
+            "total_vcpus": fs_total_vcpus,
+            "total_ram_gib": fs_total_ram_gib,
+            "active_instances_count": all_running.len()
+        }),
+    );
+
+    if let Some(regions_arr) = ov_obj.get_mut("regions").and_then(|v| v.as_array_mut()) {
+        for reg in regions_arr.iter_mut() {
+            if let Some(reg_obj) = reg.as_object_mut() {
+                let reg_id = reg_obj.get("region").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let running_in_reg: Vec<serde_json::Value> = all_running
+                    .iter()
+                    .filter(|inst| {
+                        inst.get("region").and_then(|v| v.as_str()) == Some(reg_id.as_str())
+                    })
+                    .map(|v| (*v).clone())
+                    .collect();
+                reg_obj.insert("running_instances".to_string(), serde_json::Value::Array(running_in_reg));
+            }
+        }
+    }
 
     if query.is_authenticated != Some(true) {
         if let Some(rb) = ov_obj.get_mut("rust_builds").and_then(|v| v.as_object_mut()) {
@@ -1502,20 +1718,7 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
         });
         (Some(hostname.to_string()), Some(g), Some(ns))
     } else {
-        let default_geo = serde_json::json!({
-            "city": "Unknown",
-            "country": "Unknown",
-            "country_code": "—",
-            "asn": "Unknown",
-            "isp": "Unknown"
-        });
-        let default_ns = serde_json::json!({
-            "is_tor": false,
-            "is_vpn": false,
-            "badge_text": "Direct (Clean)",
-            "provider_label": "Direct Datacenter"
-        });
-        (Some("not reported".to_string()), Some(default_geo), Some(default_ns))
+        (None, None, None)
     };
 
     let single_build = serde_json::json!({

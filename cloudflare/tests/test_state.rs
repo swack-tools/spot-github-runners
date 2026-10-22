@@ -204,6 +204,8 @@ async fn test_instance_actions_safety_gate_returns_plan_with_zero_kv_writes() {
         runners_count: 2,
         runners_count_known: true,
         runner_limits_known: true,
+        created_at: None,
+        created_epoch: None,
     });
     save_state(&kv, &mut bundle, now).await.unwrap();
     let initial_puts = kv.put_count.load(Ordering::SeqCst);
