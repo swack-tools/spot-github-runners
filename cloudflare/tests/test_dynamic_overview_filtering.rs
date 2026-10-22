@@ -47,7 +47,7 @@ impl KvStoreBackend for MockKvStore {
 fn create_sample_overview(now: u64) -> serde_json::Value {
     let now_f64 = now as f64;
     serde_json::json!({
-        "project": "homelab-424523",
+        "project": "example-project",
         "org": "swack-tools",
         "instances_view": {
             "instances": [

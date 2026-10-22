@@ -520,10 +520,15 @@ pub async fn reconcile_worker_fleet<K: KvStoreBackend>(
     if let (Some(sa_key), Some(gh_tok)) = (env_gcp_sa_key, env_gh_token) {
         if !sa_key.trim().is_empty() && !gh_tok.trim().is_empty() {
             if let Ok(creds) = serde_json::from_str::<crate::gcp::GcpCredentials>(sa_key) {
-                let project = creds
-                    .project_id
-                    .clone()
-                    .unwrap_or_else(|| "homelab-424523".to_string());
+                // The project always comes from the service account key; no project ID is compiled in.
+                let project = match creds.project_id.clone().filter(|p| !p.trim().is_empty()) {
+                    Some(p) => p,
+                    None => {
+                        return Err(ReconcilerError::Gcp(
+                            "GCP service account key has no project_id".to_string(),
+                        ));
+                    }
+                };
                 let gcp_client = crate::gcp::GceComputeClient::new(
                     creds,
                     project,
@@ -703,10 +708,15 @@ pub async fn refresh_fleet_inventory<K: KvStoreBackend>(
         if !sa_key.trim().is_empty() {
             match serde_json::from_str::<crate::gcp::GcpCredentials>(sa_key) {
                 Ok(creds) => {
-                    let project = creds
-                        .project_id
-                        .clone()
-                        .unwrap_or_else(|| "homelab-424523".to_string());
+                    // The project always comes from the service account key; no project ID is compiled in.
+                    let project = match creds.project_id.clone().filter(|p| !p.trim().is_empty()) {
+                        Some(p) => p,
+                        None => {
+                            return Err(ReconcilerError::Gcp(
+                                "GCP service account key has no project_id".to_string(),
+                            ));
+                        }
+                    };
                     let gcp_client = crate::gcp::GceComputeClient::new(
                         creds,
                         project,

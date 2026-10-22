@@ -40,7 +40,7 @@ These variables configure deployment identifiers, Workers KV storage bindings, a
 
 | Variable | Default | Read by | Meaning |
 | --- | --- | --- | --- |
-| `GCP_PROJECT` | `your-gcp-project-id`. | Cloudflare Worker (`cloudflare/wrangler.toml` `[vars]`). | GCP project ID hosting the Spot runner fleet and dedicated builders. |
+| `GCP_PROJECT` | Unset (the header shows "not configured"). | Cloudflare Worker (`cloudflare/src/lib.rs`). | GCP project ID shown in the dashboard header. `just deploy-worker` passes it with `wrangler deploy --var`, taken from `gcloud config get-value project`. The reconciler calls Compute Engine with the `project_id` from `GCP_SERVICE_ACCOUNT_KEY` and stops with an error if the key has none. |
 | `GITHUB_ORG` | `swack-tools`. | Cloudflare Worker (`cloudflare/wrangler.toml` `[vars]`). | GitHub organization whose runner registrations are managed by the edge reconciler. |
 | `CLOUDFLARE_ACCOUNT_ID` | None. | Wrangler command-line tool. | Cloudflare account identifier that owns the Worker and Workers KV namespace. |
 | `CLOUDFLARE_KV_NAMESPACE_ID` | None. | Wrangler command-line tool. | Workers KV namespace binding identifier for `SPOT_KV`, storing dashboard state. |

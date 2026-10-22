@@ -159,14 +159,14 @@ fn test_fast_boot_golden_image_and_instance_template_omission_parity() {
     // Setting source_image changes hash deterministically
     let mut m_img = v6_manifest.clone();
     m_img["source_image"] =
-        serde_json::json!("projects/homelab-424523/global/images/runner-golden-20261021");
+        serde_json::json!("projects/example-project/global/images/runner-golden-20261021");
     let p_img = serde_json::from_value::<RunnerPatch>(m_img).unwrap();
     assert_ne!(p_img.patch_sha256(), expected_v6_sha);
 
     // Setting source_instance_template changes hash deterministically
     let mut m_tpl = v6_manifest.clone();
     m_tpl["source_instance_template"] =
-        serde_json::json!("projects/homelab-424523/global/instanceTemplates/runner-template-1");
+        serde_json::json!("projects/example-project/global/instanceTemplates/runner-template-1");
     let p_tpl = serde_json::from_value::<RunnerPatch>(m_tpl).unwrap();
     assert_ne!(p_tpl.patch_sha256(), expected_v6_sha);
 }

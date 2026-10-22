@@ -204,7 +204,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             let project = env
                 .var("GCP_PROJECT")
                 .map(|v| v.to_string())
-                .unwrap_or_else(|_| "homelab-424523".to_string());
+                .unwrap_or_default();
             let org = env
                 .var("GITHUB_ORG")
                 .map(|v| v.to_string())

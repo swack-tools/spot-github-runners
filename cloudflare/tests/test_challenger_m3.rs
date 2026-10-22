@@ -51,10 +51,10 @@ BcuCVTR8lS9DUeNpVpcHlg==\n\
 
 fn make_test_credentials() -> GcpCredentials {
     GcpCredentials {
-        client_email: "spot-controller@homelab-424523.iam.gserviceaccount.com".to_string(),
+        client_email: "spot-controller@example-project.iam.gserviceaccount.com".to_string(),
         private_key: TEST_PRIVATE_KEY_PEM.to_string(),
         token_uri: DEFAULT_TOKEN_URI.to_string(),
-        project_id: Some("homelab-424523".to_string()),
+        project_id: Some("example-project".to_string()),
     }
 }
 
@@ -186,7 +186,7 @@ async fn test_zero_kv_operations_during_token_exchange_and_caching() {
 async fn test_source_instance_template_query_param_and_body_construction() {
     let creds = make_test_credentials();
     let transport = MockGcpHttpTransport::new();
-    let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport.clone());
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport.clone());
     let now = 1_700_000_000u64;
 
     let cfg = RunnerVmConfig {
@@ -204,7 +204,7 @@ async fn test_source_instance_template_query_param_and_body_construction() {
         golden_image_family: None,
         boot_disk_type: Some("hyperdisk-balanced"),
     };
-    let req = build_spot_runner_vm_request("homelab-424523", &cfg).unwrap();
+    let req = build_spot_runner_vm_request("example-project", &cfg).unwrap();
 
     // Verify Request Body Construction Invariants:
     assert_eq!(req.name, "oxidex-runners-us-central1-a-tpl");
@@ -265,7 +265,7 @@ async fn test_source_instance_template_query_param_and_body_construction() {
     );
     assert!(
         call1.1.contains(
-            "projects%2Fhomelab-424523%2Fglobal%2FinstanceTemplates%2Fc4d-spot-template-v2"
+            "projects%2Fexample-project%2Fglobal%2FinstanceTemplates%2Fc4d-spot-template-v2"
         ),
         "Template short name must be expanded to full projects path and percent-encoded"
     );
@@ -848,12 +848,12 @@ async fn test_gce_api_error_handling_and_metadata_scrubbing() {
         serde_json::to_vec(&serde_json::json!({
             "error": {
                 "code": 403,
-                "message": "Compute Engine API has not been used in project homelab-424523 before or it is disabled."
+                "message": "Compute Engine API has not been used in project example-project before or it is disabled."
             }
         })).unwrap(),
     );
 
-    let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport);
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport);
     let now = 1_700_000_000u64;
 
     let err = client.list_instances(now).await.unwrap_err();

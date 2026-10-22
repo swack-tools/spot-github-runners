@@ -15,7 +15,7 @@ obtain explicit authorization.
 | --- | --- | --- |
 | `just check`, `just test` | Validates Rust code and runs local test suites | Nothing in the cloud |
 | `wrangler dev` | Emulates Worker execution and Workers KV locally | Nothing in the cloud |
-| `wrangler deploy` | Previews bundle changes during compilation | Deploys Worker bundle and updates edge Cron Triggers |
+| `just deploy-worker` | Prints the gcloud project that it deploys with | Deploys Worker bundle and updates edge Cron Triggers |
 | `host-agent toolchain-probe` | Validates compiler, browser, and cgroup limits | Emits structured JSON without modifying system state |
 | Edge reconciler (`cloudflare/src/reconciler.rs`) | Evaluates fleet state against policy on schedule | Executes GCE REST calls when runner demand changes |
 

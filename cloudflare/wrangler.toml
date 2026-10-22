@@ -30,9 +30,10 @@ command = "worker-build --release"
 [vars]
 # Optional bulk sign-out cut-off timestamp (epoch seconds)
 SESSION_NOT_BEFORE = ""
-# GCP project and GitHub Org identifiers used when serving default dashboard header
-GCP_PROJECT = "your-gcp-project-id"
+# GitHub Org identifier shown in the dashboard header.
 GITHUB_ORG = "swack-tools"
+# GCP_PROJECT is intentionally not set here. `just deploy-worker` passes it from the active gcloud
+# configuration (`gcloud config get-value project`), so no project ID is committed.
 
 [triggers]
 crons = ["*/5 * * * *"]

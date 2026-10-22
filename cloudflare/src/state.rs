@@ -2249,7 +2249,8 @@ pub fn chrono_iso(epoch: u64) -> String {
 
 pub fn default_dashboard_bundle(now: u64) -> Result<DashboardBundle, StateError> {
     let state = DashboardState {
-        project: "homelab-424523".into(),
+        // Filled from the GCP_PROJECT Worker variable or the service account key; never compiled in.
+        project: String::new(),
         org: "swack-tools".into(),
         updated_at: now,
         global_budget: BudgetConfig {
