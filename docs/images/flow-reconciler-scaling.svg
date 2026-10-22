@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 560" width="1280" height="560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" filterUnits="userSpaceOnUse" x="0" y="0" width="1280" height="560">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#1e293b" stroke-width="0.7" opacity="0.55"/>
+    </pattern>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/></marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/></marker>
+    <marker id="arrow-rose" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fb7185"/></marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8"/></marker>
+  </defs>
+  <rect width="1280" height="560" rx="14" fill="url(#bgGrad)" stroke="#334155" stroke-width="2"/>
+  <rect x="2" y="68" width="1276" height="490" fill="url(#grid)"/>
+  <rect x="2" y="2" width="1276" height="66" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="28" cy="35" r="7" fill="#38bdf8"/>
+  <text x="48" y="31" fill="#f8fafc" font-size="18" font-weight="700">Fleet Autoscaling, Memory Lease Admission &amp; Target Cleanup Flow</text>
+  <text x="48" y="52" fill="#94a3b8" font-size="12.5">How edge scaling coordinates with on-host memory admission (host-agent admission) so jobs never overcommit RAM.</text>
+  <rect x="1115" y="18" width="142" height="30" rx="6" fill="#1e293b" stroke="#38bdf8" stroke-width="1"/>
+  <text x="1186" y="38" text-anchor="middle" fill="#38bdf8" font-size="11.5" font-weight="700">MERMAID FLOW SVG</text>
+  <path d="M 260.0 207.5 C 280.5 207.5, 280.5 207.5, 301.0 207.5" fill="none" stroke="#38bdf8" stroke-width="2.4" marker-end="url(#arrow-blue)"/>
+  <rect x="231.7" y="186.5" width="97.6" height="20" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="1"/>
+  <text x="280.5" y="200.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Provision VM</text>
+  <path d="M 525.0 207.5 C 545.5 207.5, 545.5 207.5, 566.0 207.5" fill="none" stroke="#fb7185" stroke-width="2.4" marker-end="url(#arrow-rose)"/>
+  <rect x="489.9" y="186.5" width="111.2" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>
+  <text x="545.5" y="200.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">job-started.sh</text>
+  <path d="M 795.0 207.5 C 815.5 207.5, 815.5 207.5, 836.0 207.5" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#arrow-emerald)"/>
+  <rect x="763.3" y="186.5" width="104.4" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="815.5" y="200.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Lease granted</text>
+  <path d="M 1035.0 207.5 C 1053.0 207.5, 1053.0 207.5, 1071.0 207.5" fill="none" stroke="#a78bfa" stroke-width="2.4" marker-end="url(#arrow-purple)"/>
+  <rect x="1000.8" y="186.5" width="104.4" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+  <text x="1053.0" y="200.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">job-completed</text>
+  <g filter="url(#shadow)">    <rect x="40" y="140" width="220" height="135" rx="10" fill="#332108" stroke="#fbbf24" stroke-width="2"/>    <rect x="52" y="150" width="91" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>    <text x="59" y="164" fill="#fbbf24" font-size="10.5" font-weight="700">EDGE SIGNAL</text>    <text x="54" y="188" fill="#ffffff" font-size="14" font-weight="700">GitHub Queue Backlog</text>
+    <text x="54" y="208" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">queued_jobs &gt;= 20 triggers</text>
+    <text x="54" y="226" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">scale_up_step (+2 runners)</text>
+    <text x="54" y="244" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Capped at max_runners</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="305" y="140" width="220" height="135" rx="10" fill="#0f2942" stroke="#38bdf8" stroke-width="2"/>    <rect x="317" y="150" width="91" height="20" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="1"/>    <text x="324" y="164" fill="#38bdf8" font-size="10.5" font-weight="700">RUNNER HOST</text>    <text x="319" y="188" fill="#ffffff" font-size="14" font-weight="700">Registered Listeners</text>
+    <text x="319" y="208" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">2 listeners per 32 GiB VM</text>
+    <text x="319" y="226" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Listeners != RAM capacity</text>
+    <text x="319" y="244" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Job hook intercepts start</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="570" y="140" width="225" height="135" rx="10" fill="#38111c" stroke="#fb7185" stroke-width="2"/>    <rect x="582" y="150" width="112" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>    <text x="589" y="164" fill="#fb7185" font-size="10.5" font-weight="700">ADMISSION GATE</text>    <text x="584" y="188" fill="#ffffff" font-size="14" font-weight="700">host-agent admission</text>
+    <text x="584" y="208" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">job-started.sh acquires</text>
+    <text x="584" y="226" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Checks /proc/meminfo</text>
+    <text x="584" y="244" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Writes leases.json lock</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="840" y="140" width="195" height="135" rx="10" fill="#062e22" stroke="#34d399" stroke-width="2"/>    <rect x="852" y="150" width="105" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>    <text x="859" y="164" fill="#34d399" font-size="10.5" font-weight="700">JOB EXECUTION</text>    <text x="854" y="188" fill="#ffffff" font-size="14" font-weight="700">Container Workload</text>
+    <text x="854" y="208" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">docker-wrapper loopback</text>
+    <text x="854" y="226" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">--gw-priority -1</text>
+    <text x="854" y="244" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Runs within RAM lease</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="1075" y="140" width="170" height="135" rx="10" fill="#241646" stroke="#a78bfa" stroke-width="2"/>    <rect x="1087" y="150" width="105" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>    <text x="1094" y="164" fill="#a78bfa" font-size="10.5" font-weight="700">POST-JOB HOOK</text>    <text x="1089" y="188" fill="#ffffff" font-size="14" font-weight="700">Release &amp; Cleanup</text>
+    <text x="1089" y="208" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">admission release</text>
+    <text x="1089" y="226" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">clean-target unlinkat</text>
+    <text x="1089" y="244" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Refuses symlinks</text>
+  </g>
+  <rect x="664" y="259" width="32" height="32" rx="16" fill="none" stroke="#fb7185" stroke-width="2.5" stroke-dasharray="5,4"/>
+  <path d="M 625.0 360 L 680 275" fill="none" stroke="#fb7185" stroke-width="2.5" stroke-dasharray="6,4" marker-end="url(#arrow-rose)"/>
+  <g filter="url(#shadow)">    <rect x="305" y="360" width="640" height="58" rx="9" fill="#0f172a" stroke="#fb7185" stroke-width="2.2"/>    <text x="319" y="383" fill="#fb7185" font-size="12.5" font-weight="700">CRITICAL SAFETY BOUNDARY</text>    <text x="319" y="403" fill="#e2e8f0" font-size="12">A runner listener cannot start a build until host-agent admission reserves its memory lease in leases.json.</text>  </g>
+</svg>

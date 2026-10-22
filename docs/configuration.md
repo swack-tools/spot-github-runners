@@ -9,6 +9,24 @@ For template values that you copy into a file, see
 
 ## Credentials and sign-in
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Configuration and secret binding flowchart](images/flow-config-precedence.svg)
+<figcaption markdown>Flowchart illustrating how `just deploy-worker` reads the active `gcloud` project for `GCP_PROJECT` while Wrangler secrets and `.env` supply credentials.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Environment template](images/term-env-example.png)
+<figcaption markdown>Sanitized `.env.example` listing required and optional environment variables with placeholder values.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Sign-in page](images/login-gate.png)
+<figcaption markdown>Dashboard login gate enabled by configuring the GitHub OAuth 2.0 app and session secret.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 These variables configure GitHub API access, GCP service account credentials, and OAuth 2.0 authentication
 for the edge dashboard.
 
@@ -35,6 +53,20 @@ edge dashboard.
 | `DASHBOARD_GLOBAL_ADMINS` | Unset (enabled). | Cloudflare Worker (`cloudflare/src/lib.rs`). | Toggle controlling whether added administrators skip per-target checks. The literal `none` disables the exemption (requiring added administrators to administer every controlled target); unset or any other value enables it. The primary owner is fixed in code. |
 
 ## Cloudflare Worker and deployment settings
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![GCP project from gcloud](images/term-gcp-project.png)
+<figcaption markdown>Terminal output showing `just gcp-project` resolving the active `gcloud` project and `just deploy-worker` passing it via `--var GCP_PROJECT`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Configured header](images/ui-header.png)
+<figcaption markdown>Dashboard top bar displaying the configured `GCP_PROJECT` and `GITHUB_ORG` values alongside the live budget bar.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 These variables configure deployment identifiers, Workers KV storage bindings, and Cloudflare API credentials.
 

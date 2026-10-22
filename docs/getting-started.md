@@ -26,6 +26,24 @@ the uploader account. See [Set up a builder](dedicated-builders.md).
 
 ## Clone and sign in
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Onboarding and verification flowchart](images/flow-getting-started.svg)
+<figcaption markdown>Step-by-step onboarding flowchart from cloning the repository and creating an outside-Git `.env` file to running read-only local checks and signing in to the edge dashboard.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Dashboard sign-in page](images/login-gate.png)
+<figcaption markdown>The edge dashboard sign-in gate offering browser-based GitHub OAuth 2.0 login alongside RFC 8628 GitHub Device Code sign-in.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Device code sign-in](images/login-device-code.png)
+<figcaption markdown>The active device-code sign-in box displaying the one-time eight-character user code to enter at the GitHub device verification page.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 ```bash
 git clone https://github.com/swack-tools/spot-github-runners.git
 cd spot-github-runners
@@ -38,6 +56,12 @@ gh auth status
 ```
 
 ## Create the environment file
+
+<figure class="shot" markdown>
+![Environment file template](images/term-env-example.png)
+<figcaption markdown>Terminal view of `.env.example` showing placeholder environment variables for GCP, GitHub, and Cloudflare Worker configuration.</figcaption>
+</figure>
+<!-- /shot -->
 
 For local testing and configuration, copy `.env.example` to `.env`:
 
@@ -66,6 +90,24 @@ directories, or operational state. Store deployment output under a directory out
 `$HOME/oxidex-ops`.
 
 ## Run the read-only commands
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Host agent help](images/term-host-agent-help.png)
+<figcaption markdown>Output of `host-agent --help` listing the memory admission, target cleanup, Docker wrapper, Docker admission, and builder subcommands.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Just recipes](images/term-just-list.png)
+<figcaption markdown>Output of `just --list` displaying the available local build, test, formatting, lint, and Worker deployment recipes.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Test suites](images/term-cargo-test.png)
+<figcaption markdown>Output of `just test` executing the pure-Rust unit, concurrency, and adversarial test suites across `host-agent` and `cloudflare`.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Run these commands from the repository root. Each one reads state and prints a result. None of them
 creates, changes, or deletes a VM, disk, or runner registration.

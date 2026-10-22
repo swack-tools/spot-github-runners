@@ -5,7 +5,49 @@ This repository provisions and operates persistent GitHub Actions runners and de
 This site describes the source on `main`. Merging source does not update a running controller, container, or VM.
 Inspect the deployed configuration and the actual tool versions before you route work to a host.
 
+!!! info "Screenshots use example data"
+    Every screenshot and flowchart on this site uses made-up data (`example-ci-fleet`, `example-org`, example
+    hosts, RFC 5737 IP addresses, and example templates), not a live deployment. Each figure includes a
+    **Reference** footer explaining what it shows. Click any screenshot or SVG flowchart to open the full-screen
+    viewer on the same page: left-click an area to zoom in, use the bottom slider or **Reset 100%** button to
+    adjust zoom, and press the Left/Right arrow keys (or click the side arrows) to cycle through every image on
+    the current page.
+
 ## What the repository contains
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Architecture overview flowchart](images/flow-architecture-overview.svg)
+<figcaption markdown>End-to-end architecture flowchart showing the two-tier pure-Rust design: the Cloudflare Worker edge control plane backed by Workers KV (`SPOT_KV`) and the native `host-agent` multi-call binary on Spot runner and dedicated builder VMs.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Dashboard world map](images/map-region-iowa.png)
+<figcaption markdown>The edge dashboard world map view showing active fleet burn rate, online runners and builders, qualifying Spot offers, the scaling decision, and the region inspector for Iowa.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Instances and cost history](images/instances-all.png)
+<figcaption markdown>The Instances and Cost History table listing running and deleted Spot VMs with runtime hours, hourly and daily Spot rates, window spend, lifecycle trigger, and copyable SSH command.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Scale-up decision](images/scaling-decision-scale-up.png)
+<figcaption markdown>The scaling evaluation panel showing a `SCALE_UP` decision (`6` to `8` runners across `4` VMs) triggered when queued jobs reach the `20`-job threshold, with projected hourly, daily, and monthly spend.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Rust builder telemetry](images/rust-builds.png)
+<figcaption markdown>The Rust Builders Telemetry table recording compile and delivery duration, crate cache hit rate, peak active container RAM, and CPU points for each remote build.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Runner patch console](images/patches-pr-opened.png)
+<figcaption markdown>The Runner Patches console after validating a repository manifest and saving the change as a GitHub pull request on the configuration repository.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Host agent help](images/term-host-agent-help.png)
+<figcaption markdown>Terminal output of `host-agent --help` showing the eight subcommands compiled into the single native binary deployed on runner hosts and dedicated builders.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 | Component | What it does |
 | --- | --- |
@@ -64,6 +106,12 @@ The scheduled edge reconciler is the autonomous component that manages runner ho
 See the [command reference](commands.md) for every flag.
 
 ## Registered listeners are not capacity
+
+<figure class="shot" markdown>
+![Fleet summary cards](images/ui-kpis.png)
+<figcaption markdown>Top-level summary cards separating registered runner slots and running VM counts from per-job memory lease admission headroom.</figcaption>
+</figure>
+<!-- /shot -->
 
 Twenty registered runners do not mean that twenty jobs can each use 32 GiB at once. Admission reserves memory
 before a job starts. The physical host also needs space for its operating system, services, and idle listeners.

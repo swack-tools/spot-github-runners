@@ -38,9 +38,16 @@ theme:
 plugins:
   - search
 
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/carousel.js
+
 markdown_extensions:
   - admonition
   - attr_list
+  - md_in_html
   - tables
   - toc:
       permalink: true

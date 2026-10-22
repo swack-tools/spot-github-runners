@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 560" width="1280" height="560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" filterUnits="userSpaceOnUse" x="0" y="0" width="1280" height="560">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#1e293b" stroke-width="0.7" opacity="0.55"/>
+    </pattern>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/></marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/></marker>
+    <marker id="arrow-rose" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fb7185"/></marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8"/></marker>
+  </defs>
+  <rect width="1280" height="560" rx="14" fill="url(#bgGrad)" stroke="#334155" stroke-width="2"/>
+  <rect x="2" y="68" width="1276" height="490" fill="url(#grid)"/>
+  <rect x="2" y="2" width="1276" height="66" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="28" cy="35" r="7" fill="#38bdf8"/>
+  <text x="48" y="31" fill="#f8fafc" font-size="18" font-weight="700">Workstation Setup, Local Verification &amp; Edge Sign-In Flow</text>
+  <text x="48" y="52" fill="#94a3b8" font-size="12.5">End-to-end onboarding sequence from cloning the repository to running read-only checks and signing in.</text>
+  <rect x="1115" y="18" width="142" height="30" rx="6" fill="#1e293b" stroke="#38bdf8" stroke-width="1"/>
+  <text x="1186" y="38" text-anchor="middle" fill="#38bdf8" font-size="11.5" font-weight="700">MERMAID FLOW SVG</text>
+  <path d="M 255.0 215.0 C 275.5 215.0, 275.5 215.0, 296.0 215.0" fill="none" stroke="#38bdf8" stroke-width="2.4" marker-end="url(#arrow-blue)"/>
+  <rect x="236.9" y="194.0" width="77.2" height="20" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="1"/>
+  <text x="275.5" y="208.0" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Configure</text>
+  <path d="M 515.0 215.0 C 535.5 215.0, 535.5 215.0, 556.0 215.0" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#arrow-emerald)"/>
+  <rect x="490.1" y="194.0" width="90.8" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="535.5" y="208.0" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Verify Rust</text>
+  <path d="M 775.0 215.0 C 795.5 215.0, 795.5 215.0, 816.0 215.0" fill="none" stroke="#a78bfa" stroke-width="2.4" marker-end="url(#arrow-purple)"/>
+  <rect x="753.5" y="194.0" width="84.0" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+  <text x="795.5" y="208.0" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Build Wasm</text>
+  <path d="M 1020.0 215.0 C 1038.0 215.0, 1038.0 215.0, 1056.0 215.0" fill="none" stroke="#fbbf24" stroke-width="2.4" marker-end="url(#arrow-amber)"/>
+  <rect x="1006.2" y="194.0" width="63.6" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>
+  <text x="1038.0" y="208.0" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Sign in</text>
+  <g filter="url(#shadow)">    <rect x="40" y="150" width="215" height="130" rx="10" fill="#162032" stroke="#94a3b8" stroke-width="2"/>    <rect x="52" y="160" width="56" height="20" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-width="1"/>    <text x="59" y="174" fill="#94a3b8" font-size="10.5" font-weight="700">STEP 1</text>    <text x="54" y="198" fill="#ffffff" font-size="14" font-weight="700">Clone Repository</text>
+    <text x="54" y="218" fill="#f1f5f9" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">git clone spot-github-runners</text>
+    <text x="54" y="236" fill="#f1f5f9" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">cd spot-github-runners</text>
+    <text x="54" y="254" fill="#f1f5f9" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Rust 1.80+ &amp; just installed</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="300" y="150" width="215" height="130" rx="10" fill="#0f2942" stroke="#38bdf8" stroke-width="2"/>    <rect x="312" y="160" width="56" height="20" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="1"/>    <text x="319" y="174" fill="#38bdf8" font-size="10.5" font-weight="700">STEP 2</text>    <text x="314" y="198" fill="#ffffff" font-size="14" font-weight="700">Create Outside-Git .env</text>
+    <text x="314" y="218" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">cp .env.example ~/ops/.env</text>
+    <text x="314" y="236" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Keep secrets outside Git</text>
+    <text x="314" y="254" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Set example placeholders</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="560" y="150" width="215" height="130" rx="10" fill="#062e22" stroke="#34d399" stroke-width="2"/>    <rect x="572" y="160" width="56" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>    <text x="579" y="174" fill="#34d399" font-size="10.5" font-weight="700">STEP 3</text>    <text x="574" y="198" fill="#ffffff" font-size="14" font-weight="700">Read-Only Local Checks</text>
+    <text x="574" y="218" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">host-agent --help</text>
+    <text x="574" y="236" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">just --list</text>
+    <text x="574" y="254" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">just test (cargo test)</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="820" y="150" width="200" height="130" rx="10" fill="#241646" stroke="#a78bfa" stroke-width="2"/>    <rect x="832" y="160" width="56" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>    <text x="839" y="174" fill="#a78bfa" font-size="10.5" font-weight="700">STEP 4</text>    <text x="834" y="198" fill="#ffffff" font-size="14" font-weight="700">Verify Wasm &amp; Docs</text>
+    <text x="834" y="218" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">worker-build --release</text>
+    <text x="834" y="236" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">vale docs/*.md</text>
+    <text x="834" y="254" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">mkdocs build --strict</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="1060" y="150" width="185" height="130" rx="10" fill="#332108" stroke="#fbbf24" stroke-width="2"/>    <rect x="1072" y="160" width="56" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>    <text x="1079" y="174" fill="#fbbf24" font-size="10.5" font-weight="700">STEP 5</text>    <text x="1074" y="198" fill="#ffffff" font-size="14" font-weight="700">Dashboard Sign-In</text>
+    <text x="1074" y="218" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">GitHub Web OAuth 2.0</text>
+    <text x="1074" y="236" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">or Device Code flow</text>
+    <text x="1074" y="254" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">__Host-spot_session</text>
+  </g>
+  <rect x="649" y="264" width="32" height="32" rx="16" fill="none" stroke="#34d399" stroke-width="2.5" stroke-dasharray="5,4"/>
+  <path d="M 610.0 360 L 665 280" fill="none" stroke="#34d399" stroke-width="2.5" stroke-dasharray="6,4" marker-end="url(#arrow-emerald)"/>
+  <g filter="url(#shadow)">    <rect x="300" y="360" width="620" height="58" rx="9" fill="#0f172a" stroke="#34d399" stroke-width="2.2"/>    <text x="314" y="383" fill="#34d399" font-size="12.5" font-weight="700">READ-ONLY DEFAULT</text>    <text x="314" y="403" fill="#e2e8f0" font-size="12">Local test and build recipes never create or mutate Google Cloud VMs or Cloudflare resources.</text>  </g>
+</svg>

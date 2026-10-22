@@ -19,6 +19,28 @@ The repository consists of two Rust workspaces and edge deployment tooling:
 
 ## Build and test workflows
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Pre-PR verification and review flowchart](images/flow-pre-pr-verification.svg)
+<figcaption markdown>Development verification and review gate flowchart: run Rust tests and Wasm build, run Vale and strict MkDocs build, sign commits with SSH, pass independent and `@codex` review, and squash-merge.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Test suites](images/term-cargo-test.png)
+<figcaption markdown>Terminal output of `just test` running the `host-agent` and `cloudflare` test suites.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Worker build](images/term-worker-build.png)
+<figcaption markdown>Terminal output of `worker-build --release` confirming a clean Wasm build under the `3 MiB` bundle limit.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Format check](images/term-fmt-check.png)
+<figcaption markdown>Terminal output of `just fmt-check` confirming clean formatting across all Rust files.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Run focused tests while iterating, and run the complete workspace test suite before committing:
 
 ```bash
@@ -49,6 +71,20 @@ Local tests, proof runs, GitHub CI checks, merged commits on `main`, and live cl
 prove different properties. State the exact command, target, and environment for every verification claim.
 
 ## Documentation and prose checks
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Vale](images/term-vale.png)
+<figcaption markdown>Terminal output of `vale README.md AGENTS.md CLAUDE.md docs/*.md` passing with `0` errors, `0` warnings, and `0` suggestions.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![MkDocs build](images/term-mkdocs-build.png)
+<figcaption markdown>Terminal output of `mkdocs build --strict` building the static documentation site with zero broken links or warnings.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Documentation follows the [Google developer documentation style guide](https://developers.google.com/style):
 sentence-case headings, active voice, direct instructions, and explicit prerequisites.

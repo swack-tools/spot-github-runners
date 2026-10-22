@@ -8,7 +8,57 @@ The dashboard runs as a pure-Rust app compiled to WebAssembly inside the Cloudfl
 plane (`cloudflare/src/ui.rs`). It is served directly from edge memory on `https://spot.swacktech.com` with
 sub-15 ms latency, backed by Cloudflare Workers KV (`SPOT_KV`). Zero control VMs are required.
 
+!!! info "Screenshots use example data"
+    Every screenshot and flowchart on this site uses made-up data (`example-ci-fleet`, `example-org`, example
+    hosts, RFC 5737 IP addresses, and example templates), not a live deployment. Each figure includes a
+    **Reference** footer explaining what it shows. Click any screenshot or SVG flowchart to open the full-screen
+    viewer on the same page: left-click an area to zoom in, use the bottom slider or **Reset 100%** button to
+    adjust zoom, and press the Left/Right arrow keys (or click the side arrows) to cycle through every image on
+    the current page.
+
 ## Pages and tabs
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![World Map and Fleet Inspector](images/map-region-iowa.png)
+<figcaption markdown>Tab 1 (World Map and Fleet Inspector): global region pins, active VMs per region, all-in Spot rates, and SSH commands.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Instances and Cost History](images/instances-all.png)
+<figcaption markdown>Tab 2 (Instances and Cost History): sortable inventory of running and deleted Spot VMs with window spend and lifecycle triggers.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Sizing and Benchmark Qualifier](images/sizing-tab.png)
+<figcaption markdown>Tab 3 (Sizing and Benchmark Qualifier): per-role vCPU, RAM, benchmark floors, disk profiles, and qualifying Spot offer tables.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Scaling and OOM Deep-Links](images/scaling-tab.png)
+<figcaption markdown>Tab 4 (Scaling and OOM Deep-Links): autoscaling policy thresholds, live scenario evaluator, and GitHub Actions OOM step/line deep-links.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Template studio](images/cloudinit-runner.png)
+<figcaption markdown>Tab 5 (`cloud-init` and VM Templates): interactive YAML editor, boot-stage visualizer, and saved VM shape templates.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Regions and Latency Filter](images/regions-all.png)
+<figcaption markdown>Tab 6 (Regions and Latency Filter): per-region enablement toggles filtered by backend latency, continent, machine series, and CPU platform.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Rust Builders Telemetry](images/rust-builds.png)
+<figcaption markdown>Tab 7 (Rust Builders Telemetry and IP Intel): remote build durations, crate cache hit rates, peak container RAM, CPU points, and network badges.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Runner Patches](images/patches-validated.png)
+<figcaption markdown>Tab 8 (Runner Patches): `spot-runner-patch-v1` manifest editor, security validator, effective JSON view, and pull request creator.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Admins](images/admins.png)
+<figcaption markdown>Tab 9 (Admins): owner-only dashboard administrator allowlist keyed by numeric GitHub user ID with an audit history table.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The dashboard is a single-page app with multiple functional tabs. The **Admins** tab appears only for
 a signed-in owner. The header features summary metrics (fleet burn rate, online runners, online builders,
@@ -26,28 +76,26 @@ qualifying offers, and scaling alerts) and a daily budget tracking bar.
 | Runner Patches | Edits and validates patch manifests in the configuration repository. See [The patch console](#the-patch-console). |
 | Admins | Owner only. Manages added administrators. See [Manage administrators](#manage-administrators). |
 
-!!! info "Screenshots use example data"
-    The screenshots on these pages render the real dashboard UI against a local mock API. Every project, organization,
-    instance name, IP address, user, and template in them is made up.
-
-![World Map and Fleet Inspector tab](images/dashboard-map.png)
-
-*The World Map and Fleet Inspector tab. Selecting a region shows its running hosts, Spot prices, and a copyable SSH command.*
-
-![Instances and Cost History tab](images/dashboard-instances.png)
-
-*The Instances and Cost History tab lists running and deleted instances with runtime, hourly rate, and cost in the selected window.*
-
-![Sizing and Benchmark Qualifier tab](images/dashboard-sizing.png)
-
-*The Sizing and Benchmark Qualifier tab sets per-runner and per-builder hardware floors, disks, budgets, and templates.*
-
 !!! note "The dashboard preserves safety gates"
     The dashboard operations for instance deletion and regional scaling operate as safety-gated execution plan
     previews. They update the dashboard telemetry state and return execution plans without mutating live cloud
     resources. Live fleet provisioning is orchestrated by the autonomous scheduled edge reconciler.
 
 ## Local development with wrangler
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Dashboard header](images/ui-header.png)
+<figcaption markdown>Top navigation header showing the configured GCP project, GitHub organization, browser time zone badge, and live budget controls.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Summary cards](images/ui-kpis.png)
+<figcaption markdown>Five top-level KPI cards summarizing active Spot burn rate, online CI/CD runners, dedicated Rust builders, qualifying Spot offers, and scaling state.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 To run and test the dashboard locally, use the Cloudflare Workers development command-line tool in the `cloudflare/` directory:
 
@@ -61,9 +109,23 @@ Environment variables and bindings are configured in `cloudflare/wrangler.toml`.
 
 ## Authentication and sign-in
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Dashboard sign-in flowchart](images/flow-device-signin.svg)
+<figcaption markdown>Authentication flowchart comparing the GitHub Web OAuth 2.0 redirect path and RFC 8628 Device Code path before issuing the HMAC-SHA256 `__Host-spot_session` cookie.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Dashboard sign-in page](images/login-gate.png)
-
-*The sign-in page offers GitHub web sign-in and a GitHub device code.*
+<figcaption markdown>Sign-in page presented to unauthenticated visitors with buttons for GitHub Web OAuth 2.0 and GitHub Device Code authentication.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Device code sign-in](images/login-device-code.png)
+<figcaption markdown>Device Code prompt displaying a one-time user code and verification link while polling for authorization completion.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 When `GITHUB_OAUTH_CLIENT_ID` is set, the dashboard signs users in using GitHub OAuth 2.0:
 
@@ -79,9 +141,19 @@ When `GITHUB_OAUTH_CLIENT_ID` is set, the dashboard signs users in using GitHub 
 
 ## Manage administrators
 
-![Admins tab](images/dashboard-admins.png)
-
-*The Admins tab lists owners, added administrators, and recent changes. Only owners see this tab.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Admins tab](images/admins.png)
+<figcaption markdown>Dashboard Administrators panel listing configured owners, added administrators by numeric GitHub UID, and the change history log.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Administrator added](images/admins-added.png)
+<figcaption markdown>Dashboard Administrators panel immediately after adding `new-operator`; it shows the updated allowlist and the audit log entry.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The **Admins** tab and `/api/admins` endpoints allow the owner to manage dashboard administrators:
 
@@ -97,6 +169,20 @@ The **Admins** tab and `/api/admins` endpoints allow the owner to manage dashboa
 - Administrative state is persisted atomically in `SPOT_KV` key `dashboard:state`.
 
 ## The patch console
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Patch console](images/patches-list.png)
+<figcaption markdown>Runner Patches console displaying the configuration repository branch, commit SHA, and manifest file list.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Pull request opened](images/patches-pr-opened.png)
+<figcaption markdown>Runner Patches console after saving an edit as a pull request on the configuration repository.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The **Runner Patches** tab edits [runner patch](runner-patches.md) manifests in the configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`),
 validates schemas, previews rollout classifications, and opens pull requests. Routes under `/api/patch-console/*`

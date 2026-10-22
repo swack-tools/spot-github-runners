@@ -40,9 +40,27 @@ it fits.
 
 ## Remote build client workflow
 
-![Rust Builders Telemetry tab](images/dashboard-rust.png)
-
-*The Rust Builders Telemetry tab records each remote build: duration, cache hits, builder, origin location, peak memory, and CPU points. The API redacts origin IP addresses and hostnames.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Remote build execution flowchart](images/flow-remote-build-execution.svg)
+<figcaption markdown>End-to-end remote build execution flowchart through `host-agent host-launcher`, `docker-admission`, `builder-entrypoint`, and `worktree-commands`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Remote build records](images/rust-builds.png)
+<figcaption markdown>Rust Builders Telemetry table displaying compile and delivery durations, crate cache hit rates, builder VM metadata, peak RAM, and CPU points (with origin IPs redacted).</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Filter builds](images/rust-builds-vpn-filter.png)
+<figcaption markdown>Rust Builders Telemetry table filtered by `vpn` to isolate builds originating from VPN or proxy networks.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Record a build](images/rust-record-build.png)
+<figcaption markdown>Manual and API build telemetry recording form inside the Rust Builders tab.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 OxiDex repository-owned `just` recipes and worker configuration are maintained in the OxiDex repository. Configure
 that client for the approved dedicated host, uploader identity, source, image, and cache before you enable its
@@ -88,6 +106,12 @@ the actual startup, authority, mounts, process lifetime, disk, network, and work
 qualified from a successful source-only test suite or a bootstrap tool probe.
 
 ## Storage and cache lifecycle
+
+<figure class="shot" markdown>
+![Cache and memory summary](images/rust-kpis.png)
+<figcaption markdown>Rust builder KPI bar highlighting the `87.9%` crate cache hit rate on the persistent NVMe/Hyperdisk volume and the `26.1 GiB` peak RAM high-water mark.</figcaption>
+</figure>
+<!-- /shot -->
 
 | Data | Host path |
 | --- | --- |

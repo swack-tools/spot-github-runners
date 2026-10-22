@@ -31,6 +31,24 @@ The serverless Worker eliminates the legacy control plane components:
 
 ## Edge user interface serving
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Edge Worker request routing flowchart](images/flow-edge-worker-request.svg)
+<figcaption markdown>Request routing flowchart inside `cloudflare/src/lib.rs` (`#[event(fetch)]`) showing session verification, administrator revalidation, and KV state access.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Dashboard header](images/ui-header.png)
+<figcaption markdown>Dashboard header rendered at the edge with the `GCP_PROJECT` Worker variable injected into the project badge.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![World map](images/map-world.png)
+<figcaption markdown>Interactive SVG world map rendered client-side from `/api/overview` telemetry with green pins for active regions and blue pins for enabled regions.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The dashboard single-page web app is embedded directly into Worker memory at compile time in `cloudflare/src/ui.rs`.
 
 - **Sub-15 ms response latency**: requests for `GET /` and `GET /index.html` respond directly from Worker memory in under 15 milliseconds, requiring zero origin round trips, or network fetches.
@@ -39,6 +57,24 @@ The dashboard single-page web app is embedded directly into Worker memory at com
 - **Path normalization**: the request router normalizes percent-encoded paths, resolves dot segments, and collapses slashes before evaluation. Any request targeting `/api/control*` receives HTTP 404.
 
 ## Sign-in
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Sign-in page](images/login-gate.png)
+<figcaption markdown>Unauthenticated sign-in gate served at `/login` before any dashboard HTML or API payload is exposed.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Device code](images/login-device-code.png)
+<figcaption markdown>RFC 8628 device authorization flow for signing in from headless environments or restricted browsers.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Administrators](images/admins.png)
+<figcaption markdown>Owner-only administrator management table backed by `auth/admins/v1` in Cloudflare Workers KV.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The dashboard provides authentication through GitHub OAuth 2.0. Sign-in succeeds only when the user meets these criteria:
 
@@ -112,6 +148,20 @@ Unchanged cron ticks perform zero KV writes. In steady state, the Worker perform
 
 ## Scheduled fleet reconciliation
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Scale decision](images/scaling-decision-scale-up.png)
+<figcaption markdown>Scaling evaluation panel showing a backlog-driven scale-up when queued jobs reach the `20`-job threshold.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Health endpoint](images/term-api-health.png)
+<figcaption markdown>Example `/api/health` response showing Worker status, KV health, and the scheduled reconciler tick counter.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The Worker executes scheduled reconciliation every 5 minutes by using Cloudflare Cron Triggers (`#[event(scheduled)]`):
 
 ```rust
@@ -150,6 +200,20 @@ The fleet reconciler supports GitHub Actions Just-In-Time (JIT) runner configura
 - **Registration token fallback**: if JIT configuration generation is unavailable, the reconciler automatically falls back to generating standard runner registration tokens.
 
 ## Runner patches
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Patch console](images/patches-validated.png)
+<figcaption markdown>Edge manifest validation displaying the merged `spot-runner-patch-v1` configuration and SHA-256 digest.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Rollout preview](images/patches-preview.png)
+<figcaption markdown>Rollout preview panel confirming that live hot-patching is off and merged pull requests roll out via the scheduled reconciler.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The **Runner Patches** tab and `/api/patches` routes (aliased under `/api/patch-console/*`) edit, validate, preview, and save runner configurations:
 
@@ -204,6 +268,12 @@ When external services experience outages:
 - **KV read errors**: if the state document cannot be retrieved on worker cold start, the Worker creates a valid default state bundle (`default_dashboard_bundle`) and logs an alert.
 
 ## Configuration
+
+<figure class="shot" markdown>
+![Deploy with the gcloud project](images/term-gcp-project.png)
+<figcaption markdown>Terminal capture of `just gcp-project` and `just deploy-worker` injecting the active `gcloud` project as `GCP_PROJECT`.</figcaption>
+</figure>
+<!-- /shot -->
 
 Set these variables in `cloudflare/wrangler.toml` or as Cloudflare Worker secrets:
 

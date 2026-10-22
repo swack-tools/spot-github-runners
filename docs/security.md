@@ -32,6 +32,12 @@ in the organization group. Ensure runner group permissions restrict access stric
 
 ## Job admission on runner hosts
 
+<figure class="shot" markdown>
+![Memory admission](images/term-host-agent-admission.png)
+<figcaption markdown>`host-agent admission` command-line tool output showing the lease acquisition and release commands invoked by runner job hooks.</figcaption>
+</figure>
+<!-- /shot -->
+
 Registered GitHub runner listener counts do not equal available physical memory capacity. The root-owned
 `host-agent admission` daemon manages memory allocations before jobs begin.
 
@@ -59,6 +65,20 @@ Runner containers mount this directory read-only. The runner `job-started.sh` ho
 new jobs before admission or step execution, allowing existing jobs to complete undisturbed.
 
 ## Dedicated builder security
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Forbidden mount](images/patches-invalid.png)
+<figcaption markdown>Runner Patches console rejecting a manifest that attempts to mount `/var/run/docker.sock` inside a container.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Forbidden mount response](images/term-patch-validate.png)
+<figcaption markdown>JSON error response from `/api/patch-console/validate` blocking `/var/run/docker.sock` mounts.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Dedicated builders execute remote compilations for the approved uploader account under strict containment.
 
@@ -103,6 +123,28 @@ Dedicated builders accept an explicit, root-approved mapping file conforming to 
 - Requires direct authenticated SSH connections; `gcloud compute ssh` is forbidden.
 
 ## Edge dashboard security and authentication
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Defense-in-depth security flowchart](images/flow-defense-in-depth.svg)
+<figcaption markdown>Four-layer defense-in-depth flowchart spanning Edge HMAC session auth, Patch Console manifest validation, `host-launcher` workspace permissions, and `docker-admission` container isolation.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Sign-in page](images/login-gate.png)
+<figcaption markdown>Authentication gate requiring GitHub OAuth 2.0 or Device Code sign-in as the configured owner or an allowlisted administrator.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Administrators](images/admins.png)
+<figcaption markdown>Owner-only administrator allowlist keyed by immutable numeric GitHub user ID (`uid`) rather than mutable usernames.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Device flow](images/login-device-code.png)
+<figcaption markdown>GitHub Device Code flow issuing an `HttpOnly; Secure; SameSite=Lax` `__Host-spot_session` cookie upon approval.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The web dashboard is served directly from Cloudflare Worker memory (`cloudflare/src/ui.rs`), providing an
 isolated control interface without intermediate VM hops.

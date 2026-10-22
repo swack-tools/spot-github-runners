@@ -8,9 +8,35 @@ Neither price queries nor dashboard views create VMs, reserve capacity, or mutat
 
 ## Spot offer evaluation at the edge
 
-![Qualifying instances matrix](images/dashboard-qualifier.png)
-
-*The qualifying instances matrix compares each candidate shape with the benchmark floor and the Spot budget. Offers over the budget show Exceeds Budget Cap.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Spot offer qualification flowchart](images/flow-spot-qualification.svg)
+<figcaption markdown>Flowchart for identifying the cheapest qualifying Spot runner or builder offer for a specific project: filter enabled regions and latency, check the hardware benchmark floor, add disk and tax costs, and compare against the active budget cap.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Runner offer matrix](images/qualifier-runners.png)
+<figcaption markdown>Qualifying Instances Matrix for CI/CD runner candidates comparing CPU benchmark scores and all-in Spot rates against the daily budget cap.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Spot-qualifying offers only](images/qualifier-spot-only.png)
+<figcaption markdown>Qualifying Instances Matrix with Show Only Spot-Price-Qualifying enabled so offers that exceed the daily budget cap are hidden.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder offer matrix](images/qualifier-builders.png)
+<figcaption markdown>Qualifying Instances Matrix switched to Rust Builder Candidates, showing `n4-highcpu-16` offers with `375 GB` `hyperdisk-balanced` storage.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Region price cards](images/map-inspector.png)
+<figcaption markdown>Region inspector panel listing each running Spot VM in South Carolina with its all-in hourly, daily, and monthly Spot cost.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Compute-only prices](images/map-inspector-compute-only.png)
+<figcaption markdown>Region inspector panel with Show Prices With Disk & Taxes cleared so cards display compute-only Spot pricing.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 The edge reconciler evaluates qualifying Spot offers against deployment constraints on every reconciliation tick:
 
@@ -27,9 +53,27 @@ Operators inspect real-time pricing and qualifying shapes directly through the w
 
 ## Inspecting pricing via the API
 
-![Regions and Latency Filter tab](images/dashboard-regions.png)
-
-*The Regions and Latency Filter tab enables or deselects regions by latency, continent, machine family, CPU platform, and disk type.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Regions and latency filter](images/regions-all.png)
+<figcaption markdown>World Deployment Regions table displaying backend latency, offered machine series, CPU platforms, disk types, and active VM counts.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Low-latency regions](images/regions-low-latency.png)
+<figcaption markdown>World Deployment Regions table filtered to a `60 ms` maximum latency cap, narrowing candidate regions to four nearby North American data centers.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Regions in Europe](images/regions-europe.png)
+<figcaption markdown>World Deployment Regions table filtered to the Europe continent (`europe-west4` and `europe-west1`).</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Live budget bar](images/ui-header.png)
+<figcaption markdown>Dashboard top bar highlighting the live hourly, daily, and monthly budget inputs that re-evaluate Spot offer qualification on the fly.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 You can query the current precomputed pricing and fleet inventory from the edge control plane:
 

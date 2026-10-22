@@ -9,6 +9,24 @@ This page covers the manifest, how the tools classify a change, the receipts tha
 
 ## Where manifests live
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Runner patch lifecycle flowchart](images/flow-runner-patch-lifecycle.svg)
+<figcaption markdown>Flowchart of the Runner Patch Console lifecycle: load `defaults.yaml` and repository manifests, compute the merged patch and SHA-256, enforce security gates, and open a pull request.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Manifest list](images/patches-list.png)
+<figcaption markdown>Runner Patches console listing the organization-wide `defaults.yaml` and per-repository manifests loaded from the configuration repository.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Organization defaults](images/patches-defaults.png)
+<figcaption markdown>Manifest editor loaded with `defaults.yaml`, showing default hardware floors and package lists inherited by every repository.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Manifests live in the central configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`).
 
 | File | Purpose |
@@ -227,17 +245,35 @@ Label sync runs when a runner host is provisioned:
 
 ## Apply a patch
 
-![Runner Patches tab](images/dashboard-patches.png)
-
-*The Runner Patches tab loads a manifest from the configuration repository, validates it, and shows the effective patch digest.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Validated manifest](images/patches-validated.png)
+<figcaption markdown>Validated repository manifest showing the merged effective configuration and its canonical SHA-256 digest.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Rejected manifest](images/patches-invalid.png)
+<figcaption markdown>Validation error display when a manifest attempts to mount `/var/run/docker.sock`; it clears the effective patch and surfaces the exact field error.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Validation API](images/term-patch-validate.png)
+<figcaption markdown>Example `POST /api/patch-console/validate` JSON response rejecting a forbidden `/var/run/docker.sock` container mount.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Pull request opened](images/patches-pr-opened.png)
+<figcaption markdown>Runner Patches status banner linking to the newly created GitHub pull request after saving a validated manifest change.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Rollout preview](images/patches-preview.png)
+<figcaption markdown>Rollout impact preview table showing that live hot-patching stays off at the edge and merged changes roll out on the next 5-minute cron tick.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 To apply a patch, commit the manifest to the configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`). Operators author, validate, and preview manifests in the Runner Patch Console on the edge dashboard or through its REST APIs. Saving a manifest opens a pull request on the configuration repository. After review and merge into the default branch (`main`), the autonomous Cloudflare Worker fleet reconciler (`cloudflare/src/reconciler.rs`) provisions replacement Spot instances or rotates running hosts according to the merged manifest.
 
 ### Validate and preview with the patch console
-
-![Patch rollout preview](images/dashboard-patch-rollout.png)
-
-*The rollout preview. Per-host results are empty because the edge preview compares manifests, not live hosts; live hot-patching is off.*
 
 Before applying any change, validate the manifest syntax and preview its classification against the running fleet. You can perform these checks in the dashboard Web UI or by calling the edge endpoints:
 

@@ -15,6 +15,28 @@ The repository features two primary execution environments:
 
 ## Host agent subcommands
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Host agent help](images/term-host-agent-help.png)
+<figcaption markdown>Terminal output of `host-agent --help` showing all subcommands of the multi-call binary.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Admission subcommand](images/term-host-agent-admission.png)
+<figcaption markdown>Terminal output of `host-agent admission` for memory lease reservation and headroom queries.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Target cleanup](images/term-clean-target.png)
+<figcaption markdown>Terminal output of `host-agent clean-target` performing descriptor-safe directory cleanup without following symlinks.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Toolchain probe](images/term-toolchain-probe.png)
+<figcaption markdown>Terminal output of `host-agent toolchain-probe` checking toolchain binaries and cgroup resource caps.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The `host-agent` binary runs on runner hosts and dedicated builder VMs. It provides eight subcommands
 and supports execution either directly or through symlink aliases.
 
@@ -138,6 +160,20 @@ Validates that compiler toolchains, browser binaries, and cgroup v2 controllers 
 
 ## Just recipes
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Just recipes](images/term-just-list.png)
+<figcaption markdown>Output of `just --list` showing every task runner recipe in the root `justfile`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Deploy recipe](images/term-gcp-project.png)
+<figcaption markdown>Output of `just gcp-project` and `just deploy-worker` passing the active `gcloud` project to Wrangler.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Development and verification tasks are managed through `just` recipes defined in `justfile`.
 
 ```bash
@@ -156,6 +192,12 @@ just <recipe> [arguments...]
 | `just probe-edge` | Probes the Cloudflare Worker edge dashboard health and overview endpoints. |
 
 ## Wrangler commands
+
+<figure class="shot" markdown>
+![Worker build](images/term-worker-build.png)
+<figcaption markdown>Output of `cd cloudflare && worker-build --release` showing the compiled Wasm bundle size (`2.12 MiB`, well under the `3 MiB` limit).</figcaption>
+</figure>
+<!-- /shot -->
 
 The Cloudflare Worker edge control plane is managed using the Wrangler command-line tool from the
 `cloudflare/` directory.
@@ -202,6 +244,20 @@ wrangler kv key get --binding=SPOT_KV "dashboard:state"
 ```
 
 ## Cargo verification commands
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Test suites](images/term-cargo-test.png)
+<figcaption markdown>Condensed output of `just test` running all `host-agent` and `cloudflare` integration and adversarial test suites.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Format check](images/term-fmt-check.png)
+<figcaption markdown>Output of `just fmt-check` verifying zero `rustfmt` diffs across both Rust crates.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Cargo provides direct access to test, lint, and build targets:
 

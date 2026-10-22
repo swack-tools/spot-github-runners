@@ -25,6 +25,28 @@ website tools are installed on previously launched builders.
 
 ## Render once, launch with one command
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Dedicated builder launch flowchart](images/flow-dedicated-builder-launch.svg)
+<figcaption markdown>Dedicated builder launch flowchart illustrating out-of-tree configuration rendering, the persistent `375 GB` cache disk (`auto-delete=no`), and `n4-highcpu-16` Spot VM startup.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder sizing profile](images/sizing-builder-profile.png)
+<figcaption markdown>Dedicated Rust builder sizing profile showing the fixed `16` vCPU / `32 GiB` host shape, `28 GiB` container memory cap, `1400` benchmark floor, and `375 GB` cache disk.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder template](images/cloudinit-builder-editor.png)
+<figcaption markdown>Example dedicated builder `cloud-init` configuration mounting `/dev/disk/by-id/google-cache` before starting the builder container.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder offers](images/qualifier-builders.png)
+<figcaption markdown>Qualifying Spot offers for dedicated builders showing `n4-highcpu-16` candidates with `375 GB` `hyperdisk-balanced` storage.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Prepare the private JSON configuration below and a separate explicitly approved
 public uploader mapping file. Do not use a private SSH key. The mapping must
 contain exactly `schema` (`root-approved-ssh-mapping-v1`),
@@ -134,6 +156,20 @@ rendered payload.
 
 ## Verify startup and readiness
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Builder readiness record](images/term-builder-readiness.png)
+<figcaption markdown>Example `/var/lib/oxidex-builder-readiness.json` file confirming Rust `1.99.0` toolchain verification, UID `1001`, and the `28 GiB` cgroup memory limit.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builders in the instance list](images/instances-builders.png)
+<figcaption markdown>Instances table filtered to Rust Builders Only (`rust_builder`), showing the running `n4-highcpu-16` VM and its `375 GB` cache disk.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 Startup records two files on the builder:
 
 ```text
@@ -173,6 +209,12 @@ SSH trust, installed launcher, and resource admission before executing work.
 Then use `just build`; use `just build-local` for an explicit local build.
 
 ## Storage, access, and draining
+
+<figure class="shot" markdown>
+![Builder scaling](images/scaling-builder-policy.png)
+<figcaption markdown>Rust Remote Builders scaling subpanel showing the `1`-instance minimum floor and idle build scale-down policy.</figcaption>
+</figure>
+<!-- /shot -->
 
 The launch command uses a 40 GiB Hyperdisk Balanced boot disk and a 100 GiB
 Hyperdisk Balanced cache disk through NVMe, with 3,000 IOPS and 140 MiB/s baseline

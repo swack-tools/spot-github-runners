@@ -2,12 +2,36 @@
 
 ## User workflow
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Simplified operator and developer workflow flowchart](images/flow-workflow-simplification.svg)
+<figcaption markdown>Flowchart comparing the two-step operator deployment (`gcloud config` + `just deploy-worker`) and the single-command developer remote build workflow.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Remote builds](images/rust-builds.png)
+<figcaption markdown>Rust Builders Telemetry view showing completed remote builds, crate cache hit rates, and compile durations.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Device sign-in](images/login-device-code.png)
+<figcaption markdown>One-time GitHub Device Code sign-in used from terminal sessions.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The intended interface is `just build` for a remote build and
 `just build-local` for an explicit local build. Ordinary build and test recipes
 should use the same configured remote builder. OxiDex owns those recipes; this repository
 provides the VM startup payload and restricted host launcher.
 
 ## Setup workflow
+
+<figure class="shot" markdown>
+![One deploy command](images/term-gcp-project.png)
+<figcaption markdown>`just deploy-worker` reading the default `gcloud` project and deploying the Worker in a single step.</figcaption>
+</figure>
+<!-- /shot -->
 
 1. Choose a zone for the fixed `n4-highcpu-16` builder shape, and check its
    Spot price with the 40 GB boot disk and the 100 GB persistent cache disk.

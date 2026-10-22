@@ -10,6 +10,28 @@ and workspace cleanup.
 
 ## What the edge reconciler does
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Autoscaling and memory admission flowchart](images/flow-reconciler-scaling.svg)
+<figcaption markdown>Flowchart showing how edge backlog scaling (`queued_jobs >= 20`) coordinates with on-host memory lease admission (`host-agent admission`) and post-job target cleanup.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Scale-up summary](images/ui-kpis-scale-up.png)
+<figcaption markdown>Dashboard summary cards during a backlog scale-up event where `24` queued jobs trigger a scale-up from `6` to `8` runners.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Scale-up decision](images/scaling-decision-scale-up.png)
+<figcaption markdown>Live Controller Evaluation box showing `SCALE_UP (6 -> 8 CI/CD Runners / 4 VMs)` driven by `[queued_jobs] 24 queued jobs >= threshold 20`.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Steady state summary](images/ui-kpis.png)
+<figcaption markdown>Dashboard summary cards in steady state (`HOLD` at the `6`-runner floor across `3` VMs when queue depth is below threshold).</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The edge reconciler executes an autonomous control loop on every 5-minute cron trigger:
 
 1. **Inventory discovery**: queries Compute Engine (`instances.aggregatedList`, `disks.aggregatedList`) and GitHub Actions
@@ -52,9 +74,23 @@ If no active runner host exists for a target, the reconciler immediately provisi
 
 ## Scale-up and backlog management
 
-![Scaling and OOM Deep-Links tab](images/dashboard-scaling.png)
-
-*The Scaling and OOM Deep-Links tab sets scale-up and scale-down triggers and budget caps, and shows the current controller decision.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Runner scaling policy](images/scaling-runner-policy.png)
+<figcaption markdown>CI/CD runner autoscaling policy panel highlighting the `20`-job queued backlog threshold used by the scheduled reconciler alongside scenario evaluation inputs.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder scaling policy](images/scaling-builder-policy.png)
+<figcaption markdown>Dedicated Rust builder autoscaling subpanel showing instance floor and ceiling, queued build threshold, CPU threshold, and idle scale-down rules.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Scaling tab](images/scaling-tab.png)
+<figcaption markdown>Full Scaling and OOM Deep-Links tab combining policy configuration on the left with GitHub Actions and kernel journal OOM evidence on the right.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 When GitHub Actions reports a queued job backlog of 20 or more jobs (`queued_jobs >= 20`), the reconciler triggers
 scale-up:
@@ -65,6 +101,12 @@ scale-up:
 - When the queued backlog clears and runners become idle, the reconciler drains and terminates surplus hosts.
 
 ## Admission and memory leases
+
+<figure class="shot" markdown>
+![Admission subcommand](images/term-host-agent-admission.png)
+<figcaption markdown>Terminal output of `host-agent admission` showing the `serve`, `acquire`, `release`, and `headroom` subcommands that guard `/var/lib/gha-admission/leases.json`.</figcaption>
+</figure>
+<!-- /shot -->
 
 Runner hosts execute a root-owned host admission daemon managed by systemd (`systemctl status gha-admission`).
 The daemon listens on Unix domain socket `/run/gha-admission/socket` and manages the lease ledger:
@@ -80,6 +122,12 @@ The daemon listens on Unix domain socket `/run/gha-admission/socket` and manages
 Never edit or delete `/var/lib/gha-admission/leases.json` or its lock file to bypass an admission hold.
 
 ## Descriptor-relative target cleanup
+
+<figure class="shot" markdown>
+![Target cleanup](images/term-clean-target.png)
+<figcaption markdown>Terminal output demonstrating `host-agent clean-target` performing descriptor-relative `openat`/`unlinkat` cleanup while refusing symbolic links.</figcaption>
+</figure>
+<!-- /shot -->
 
 After a job completes, `runner/job-completed.sh` executes `host-agent clean-target <workspace_path>`. The tool:
 

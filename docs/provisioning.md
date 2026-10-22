@@ -7,6 +7,24 @@ The startup script installs the native pure-Rust `host-agent` binary and configu
 
 ## Automated provisioning by the edge reconciler
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Spot VM provisioning flowchart](images/flow-vm-provisioning.svg)
+<figcaption markdown>Automated provisioning flowchart showing how the edge reconciler detects a capacity deficit, calls the Compute Engine Spot insert API, runs `cloud-init`, and registers listeners.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Running hosts by region](images/map-region-iowa.png)
+<figcaption markdown>World Map and Fleet Inspector with Iowa selected, showing active runner and builder Spot VMs alongside plan-only regional scale controls.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Region without hosts](images/map-europe-empty.png)
+<figcaption markdown>World Map and Fleet Inspector for an enabled European region with zero running VMs, illustrating plan-only preview buttons that never mutate live capacity.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
 The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 
 - **Floor target maintenance**: ensures at least one 16-vCPU Spot runner host per configured controlled target (`controlled_targets`).
@@ -17,9 +35,23 @@ The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 
 ## Startup bootstrap and host agent installation
 
-![The cloud-init and VM templates tab](images/dashboard-cloudinit.png)
-
-*The `cloud-init` editor with an example runner template and saved VM templates.*
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Template editor](images/cloudinit-runner.png)
+<figcaption markdown>The `cloud-init` and VM Templates studio showing an example runner host configuration alongside parsed boot stages.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Builder template](images/cloudinit-builder-editor.png)
+<figcaption markdown>The `cloud-init` editor loaded with an example dedicated Rust builder template that mounts the persistent cache disk.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![VM templates](images/vm-templates.png)
+<figcaption markdown>Saved VM templates panel showing reusable machine shapes, CPU platforms, benchmark scores, and data disk configurations.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 When a new runner host boots, `cloud-init/startup.sh` executes the bootstrap sequence:
 
@@ -39,6 +71,20 @@ Dedicated builder cache disks are different: they use `auto-delete=no` and persi
 See [Set up a builder](dedicated-builders.md).
 
 ## Runner sizing and admission
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Runner sizing profile](images/sizing-runner-profile.png)
+<figcaption markdown>CI/CD Runner Sizing profile configuring minimum runners, per-runner vCPU and RAM, minimum CPU benchmark score, data disk size, and budget caps.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Sizing tab](images/sizing-tab.png)
+<figcaption markdown>Full Sizing and Benchmark Qualifier tab displaying the CI/CD runner profile and dedicated Rust builder profile side by side.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
 
 Runner hosts use 16-vCPU shapes with at least 32 GiB RAM:
 
