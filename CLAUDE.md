@@ -20,3 +20,9 @@ These model rules apply to Claude subagent launches. Keep the human-selected mai
 - Provide each subagent with the exact goal, relevant file paths, constraints, owned files, validation commands (`cargo test --manifest-path host-agent/Cargo.toml`, `cargo test --manifest-path cloudflare/Cargo.toml`), and required completion evidence. Give independent review subagents the acceptance contract and raw diff without the implementer's conclusions.
 - Parallelize read-only exploration freely. Give each writing subagent exclusive file ownership or an isolated Git worktree so concurrent edits never collide.
 - Verify model availability and resolved effort. Environment variables such as `CLAUDE_CODE_EFFORT_LEVEL` or forced subagent model settings can override per-launch parameters; if the active harness lacks per-invocation effort support, use an authorized command-line child with both flags or report the mismatch rather than silently claiming the requested route ran.
+
+## Pull request review policy
+
+- During `@codex review` on pull requests, only fix `P0` and `P1` issues in the pull request branch.
+- For any `P2` or lower findings, open a follow-up GitHub issue in `swack-tools/spot-github-runners` (`GH_TOKEN="$(gh auth token --user swackhamer)" gh issue create --repo swack-tools/spot-github-runners ...`), reply to the review comment stating that the issue should be tracked in a follow-up ticket (linking the created issue), and resolve the review thread via GraphQL.
+- Once a Codex review pass has zero `P0` or `P1` issues, all review threads are resolved, and required GitHub checks pass, the pull request is good to go (`gtg`) to squash-merge into `main` immediately without waiting for additional re-review cycles on `P2` items.

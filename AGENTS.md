@@ -178,9 +178,11 @@ A human task prompt authorizes agents to work on an isolated feature branch, com
 2. **Pull request review loop**:
    - Push the feature branch and open a pull request targeting `main` in `swack-tools/spot-github-runners`.
    - Obtain an independent Antigravity review on the pull request or trigger the GitHub Codex review (`@codex review`).
-   - Inspect every review comment against the codebase. Fix every valid issue, rerun unit tests and Vale checks, push the signed commit, reply to the review comment with the fix and verification evidence, and resolve the review thread.
-   - After resolving review comments, obtain a fresh Antigravity review or comment `@codex rereview` (or `@codex review` if required by the connector trigger) on the pull request and wait for the updated review on the new head commit.
-   - Repeat this resolve-and-rerequest cycle until the reviewer (Antigravity or Codex) reports no remaining issues (gives the go-ahead / `gtg` or 👍 reaction on the current head commit), all review threads are resolved, and required GitHub checks (such as CodeQL) pass.
+   - Inspect every review comment against the codebase. During `@codex review`, only fix `P0` and `P1` issues in the pull request branch.
+   - For any `P2` or lower findings, open a follow-up GitHub issue in `swack-tools/spot-github-runners` (`GH_TOKEN="$(gh auth token --user swackhamer)" gh issue create --repo swack-tools/spot-github-runners ...`), reply to the review comment stating that the issue should be tracked in a follow-up ticket (linking the created issue), and resolve the review thread via GraphQL.
+   - For `P0` and `P1` issues, fix the code, rerun unit tests and Vale checks, push the signed commit, reply to the review comment with the fix and verification evidence, and resolve the review thread.
+   - After resolving review comments, obtain a fresh Antigravity review or comment `@codex review` on the pull request if `P0` or `P1` issues were fixed.
+   - Once a review pass has zero `P0` or `P1` issues, all review threads are resolved, and required GitHub checks (such as CodeQL) pass, the pull request is good to go (`gtg`) to squash-merge into `main` immediately without waiting for additional re-review cycles on `P2` items.
 3. **Squash and merge**:
    - Confirm that `origin/main` has not advanced in a conflicting way and that the reviewed head commit matches the pull request head, then squash-merge the pull request into `main` while pinning the reviewed head commit so the review and CI gate cannot be raced:
      ```bash
