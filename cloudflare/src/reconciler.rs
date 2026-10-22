@@ -529,6 +529,127 @@ pub async fn reconcile_worker_fleet<K: KvStoreBackend>(
     run_reconciliation(kv, &sim, &sim, now).await
 }
 
+pub async fn run_inventory_refresh<K, G>(
+    kv: &K,
+    gcp: &G,
+    now: u64,
+) -> Result<ReconciliationReport, ReconcilerError>
+where
+    K: KvStoreBackend,
+    G: GcpReconcilerClient,
+{
+    let tick = TICK_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    let (mut bundle, _) = load_state(kv, now).await?;
+    let project = bundle.state.project.clone();
+
+    let instances = gcp
+        .list_instances(&project, now)
+        .await
+        .map_err(|e| ReconcilerError::Gcp(e.to_string()))?;
+
+    let fi = serde_json::json!({
+        "source": "gce",
+        "last_success_at": crate::state::chrono_iso(now),
+        "last_success_epoch": now,
+        "stale": false,
+        "stale_reason": serde_json::Value::Null,
+        "last_error": serde_json::Value::Null
+    });
+    bundle.state.fleet_inventory = fi.clone();
+    if let Some(ref mut ov) = bundle.state.overview {
+        if let Some(obj) = ov.as_object_mut() {
+            obj.insert("fleet_inventory".to_string(), fi.clone());
+            if let Some(iv) = obj.get_mut("instances_view").and_then(|v| v.as_object_mut()) {
+                iv.insert("fleet_inventory".to_string(), fi);
+            }
+        }
+    }
+
+    let existing_by_name: std::collections::HashMap<String, InstanceRecord> = bundle
+        .state
+        .instances
+        .iter()
+        .map(|inst| (inst.name.clone(), inst.clone()))
+        .collect();
+
+    bundle.state.instances_view = instances
+        .iter()
+        .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
+        .map(|i| {
+            if let Some(existing) = existing_by_name.get(&i.name) {
+                if existing.role == "rust_builder" || i.name.starts_with("builder-") {
+                    let mut rec = existing.clone();
+                    rec.status = i.status.clone();
+                    rec.zone = i.zone.clone();
+                    rec.region = i.zone.split('-').take(2).collect::<Vec<_>>().join("-");
+                    rec.machine_type = i.machine_type.clone();
+                    return rec;
+                }
+            }
+            let is_builder = i.name.starts_with("builder-");
+            InstanceRecord {
+                id: i.id.clone().unwrap_or_else(|| i.name.clone()),
+                name: i.name.clone(),
+                zone: i.zone.clone(),
+                region: i.zone.split('-').take(2).collect::<Vec<_>>().join("-"),
+                machine_type: i.machine_type.clone(),
+                status: i.status.clone(),
+                role: if is_builder {
+                    "rust_builder".to_string()
+                } else {
+                    "cicd_runner".to_string()
+                },
+                vcpu: if is_builder { 16 } else { MIN_HOST_VCPU },
+                ram_gib: if is_builder { 32 } else { MIN_HOST_RAM_GIB },
+                runners_count: if is_builder { 0 } else { RUNNERS_PER_HOST },
+                runners_count_known: true,
+                runner_limits_known: true,
+            }
+        })
+        .collect();
+
+    bundle.state.instances = bundle.state.instances_view.clone();
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+    TOTAL_KV_PUTS.fetch_add(1, Ordering::SeqCst);
+
+    Ok(ReconciliationReport {
+        tick,
+        status: "inventory_refresh_success".to_string(),
+        launched_hosts: vec![],
+        cleaned_vms: vec![],
+        cleaned_runners: vec![],
+        snapshot_written: true,
+        kv_puts: TOTAL_KV_PUTS.load(Ordering::SeqCst),
+    })
+}
+
+pub async fn refresh_fleet_inventory<K: KvStoreBackend>(
+    kv: &K,
+    env_gcp_sa_key: Option<&str>,
+    now: u64,
+) -> Result<ReconciliationReport, ReconcilerError> {
+    if let Some(sa_key) = env_gcp_sa_key {
+        if !sa_key.trim().is_empty() {
+            if let Ok(creds) = serde_json::from_str::<crate::gcp::GcpCredentials>(sa_key) {
+                let project = creds
+                    .project_id
+                    .clone()
+                    .unwrap_or_else(|| "homelab-424523".to_string());
+                let gcp_client = crate::gcp::GceComputeClient::new(
+                    creds,
+                    project,
+                    crate::gcp::WorkerGcpTransport,
+                );
+                return run_inventory_refresh(kv, &gcp_client, now).await;
+            }
+        }
+    }
+
+    let sim = SimulatedFleetProvider;
+    run_inventory_refresh(kv, &sim, now).await
+}
+
 // ============================================================================
 // Canonical Fleet Fingerprinting
 // ============================================================================
@@ -836,9 +957,41 @@ where
         } else {
             &target_slug
         };
+        let expected_prefix = format!("oxidex-runners-{}-", safe_slug);
+        let delimited_token = format!("-{}-", safe_slug);
         let active_count = instances
             .iter()
-            .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED") && i.name.contains(safe_slug))
+            .filter(|i| {
+                if i.status.eq_ignore_ascii_case("TERMINATED") {
+                    return false;
+                }
+                if let Some(target_meta) = i
+                    .metadata
+                    .get("spot-target")
+                    .or_else(|| i.metadata.get("spot-runner-target"))
+                {
+                    return target_meta == *target;
+                }
+                if !i.name.starts_with(&expected_prefix) && !i.name.contains(&delimited_token) {
+                    return false;
+                }
+                for other in &controlled_targets {
+                    if other != target && other.starts_with(target) && other.contains('/') {
+                        let other_slug = other.replace('/', "-").to_lowercase();
+                        let other_safe = if other_slug.len() > 24 {
+                            &other_slug[..24]
+                        } else {
+                            &other_slug
+                        };
+                        let other_prefix = format!("oxidex-runners-{}-", other_safe);
+                        let other_delim = format!("-{}-", other_safe);
+                        if i.name.starts_with(&other_prefix) || i.name.contains(&other_delim) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
             .count();
 
         let in_flight = ACTIVE_LAUNCHES
