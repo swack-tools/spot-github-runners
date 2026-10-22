@@ -1218,6 +1218,16 @@ pub fn apply_dynamic_overview_filtering(
     let fs_hourly_rounded = (fs_hourly_burn * 10000.0).round() / 10000.0;
     let fs_daily_rounded = (fs_hourly_burn * 24.0 * 100.0).round() / 100.0;
     let fs_monthly_rounded = (fs_hourly_burn * 720.0 * 100.0).round() / 100.0;
+    let hourly_cost_per_runner = if fs_running_runner_slots > 0 {
+        ((fs_hourly_burn / fs_running_runner_slots as f64) * 10000.0).round() / 10000.0
+    } else {
+        0.0
+    };
+    let daily_cost_per_runner = if fs_running_runner_slots > 0 {
+        ((fs_hourly_burn * 24.0 / fs_running_runner_slots as f64) * 100.0).round() / 100.0
+    } else {
+        0.0
+    };
 
     ov_obj.insert(
         "fleet_summary".to_string(),
@@ -1233,6 +1243,39 @@ pub fn apply_dynamic_overview_filtering(
             "total_vcpus": fs_total_vcpus,
             "total_ram_gib": fs_total_ram_gib,
             "active_instances_count": all_running.len()
+        }),
+    );
+
+    let spot_qualifying_offers = qual_val
+        .as_ref()
+        .and_then(|q| q.get("cicd_runner"))
+        .and_then(|c| c.get("spot_price_qualifying"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let spot_qualifying_count = spot_qualifying_offers
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let global_budget_val = ov_obj
+        .get("global_budget")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    ov_obj.insert(
+        "pricing".to_string(),
+        serde_json::json!({
+            "active_hourly_burn_usd": fs_hourly_rounded,
+            "active_daily_burn_usd": fs_daily_rounded,
+            "active_monthly_burn_usd": fs_monthly_rounded,
+            "active_instances_count": all_running.len(),
+            "running_runner_slots": fs_running_runner_slots,
+            "running_runner_vms": fs_running_runner_vms,
+            "running_builder_vms": fs_running_builder_vms,
+            "hourly_cost_per_runner_usd": hourly_cost_per_runner,
+            "daily_cost_per_runner_usd": daily_cost_per_runner,
+            "global_budget": global_budget_val,
+            "spot_price_qualifying_count": spot_qualifying_count,
+            "candidate_offers": spot_qualifying_offers,
         }),
     );
 
