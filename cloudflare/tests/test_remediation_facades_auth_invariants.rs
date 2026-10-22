@@ -163,6 +163,8 @@ async fn test_vm_templates_from_instance_success_and_persistence() {
         runners_count: 2,
         runners_count_known: true,
         runner_limits_known: true,
+        created_at: None,
+        created_epoch: None,
     });
     save_state(&kv, &mut bundle, now).await.unwrap();
 
@@ -297,6 +299,8 @@ async fn test_instance_actions_query_live_instances_view_inventory() {
         runners_count: 2,
         runners_count_known: true,
         runner_limits_known: true,
+        created_at: None,
+        created_epoch: None,
     });
     // Explicitly verify bundle.state.instances is EMPTY
     bundle.state.instances.clear();

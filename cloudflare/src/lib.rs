@@ -255,9 +255,72 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             json_response(status_code, &body)
         }
 
-        // Precomputed Overview Endpoint
+        // Dynamic Overview Endpoint with URL Query Parsing
         (Method::Get, "/api/overview") => {
-            let query = state::OverviewQuery::default();
+            let mut query = state::OverviewQuery::default();
+            let is_authed_admin = if let Some(ref session) = verified_session {
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
+                let global_admins = is_global_admins_enabled(&env);
+                matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                )
+            } else {
+                false
+            };
+            query.is_authenticated = Some(is_authed_admin);
+            for (k, v) in url.query_pairs() {
+                match k.as_ref() {
+                    "include_deleted" | "show_deleted" => {
+                        query.include_deleted = Some(v == "true" || v == "1");
+                    }
+                    "window_hours" | "window" => {
+                        if let Ok(hours) = v.parse::<f64>() {
+                            if hours.is_finite() && hours > 0.0 {
+                                query.window_hours = Some(hours.clamp(0.1, 744.0));
+                            }
+                        }
+                    }
+                    "include_disk_and_tax" | "include_disk_tax" => {
+                        query.include_disk_and_tax = Some(v == "true" || v == "1");
+                    }
+                    "sort_by" => {
+                        let trimmed = v.trim();
+                        if !trimmed.is_empty() {
+                            query.sort_by = Some(trimmed.to_string());
+                        }
+                    }
+                    "sort_dir" => {
+                        let trimmed = v.trim();
+                        if !trimmed.is_empty() {
+                            query.sort_dir = Some(trimmed.to_string());
+                        }
+                    }
+                    "search" => {
+                        query.search = Some(v.to_string());
+                    }
+                    "role" => {
+                        let trimmed = v.trim();
+                        if !trimmed.is_empty() {
+                            query.role = Some(trimmed.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
             match state::handle_api_overview(&kv, query, now).await {
                 Ok((status_code, body)) => json_response(status_code, &body),
                 Err(e) => error_response(500, "internal_error", &e.to_string()),
@@ -689,11 +752,49 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Rust Build Telemetry
         (Method::Get, "/api/rust-builds") => {
+            if is_production_oauth_configured(&env) && verified_session.is_none() {
+                return error_response(401, "unauthorized", "Sign in required");
+            }
             let (bundle, _) = state::load_state(&kv, now)
                 .await
                 .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            let global_admins = is_global_admins_enabled(&env);
+            let is_authed_admin = if let Some(ref session) = verified_session {
+                matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                )
+            } else {
+                false
+            };
+            let mut builds_val = bundle.state.rust_builds.clone();
+            if !is_authed_admin {
+                if let Some(builds_arr) =
+                    builds_val.get_mut("builds").and_then(|v| v.as_array_mut())
+                {
+                    for b in builds_arr.iter_mut() {
+                        if let Some(obj) = b.as_object_mut() {
+                            obj.remove("origin_ip");
+                            obj.remove("origin_hostname");
+                            obj.remove("ip");
+                            obj.remove("client_ip");
+                        }
+                    }
+                }
+            }
             let resp = serde_json::json!({
-                "builds": bundle.state.rust_builds
+                "builds": builds_val
             });
             json_response(200, &resp)
         }
@@ -1205,16 +1306,95 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             }
         }
 
-        // Reconciler Simulation & Control Endpoints
-        (Method::Post, "/api/reconciler/tick") => {
-            if is_production_oauth_configured(&env) && verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+        // Dedicated Read-Only Inventory Refresh Endpoint
+        (Method::Post, "/api/inventory/refresh") => {
+            if is_production_oauth_configured(&env) {
+                let session = match verified_session {
+                    Some(ref s) => s,
+                    None => return error_response(401, "unauthorized", "Sign in required"),
+                };
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
+                let global_admins = is_global_admins_enabled(&env);
+                if !matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                ) {
+                    return error_response(403, "forbidden", "Administrator permissions required");
+                }
             }
             let sa_key = env
                 .secret("GCP_SERVICE_ACCOUNT_KEY")
                 .map(|s| s.to_string())
                 .or_else(|_| env.var("GCP_SERVICE_ACCOUNT_KEY").map(|v| v.to_string()))
                 .ok();
+
+            match reconciler::refresh_fleet_inventory(&kv, sa_key.as_deref(), now).await {
+                Ok(report) => json_response(200, &report),
+                Err(e) => error_response(500, "inventory_refresh_failed", &e.to_string()),
+            }
+        }
+
+        // Reconciler Simulation & Control Endpoints
+        (Method::Post, "/api/reconciler/tick") => {
+            if is_production_oauth_configured(&env) {
+                let session = match verified_session {
+                    Some(ref s) => s,
+                    None => return error_response(401, "unauthorized", "Sign in required"),
+                };
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
+                let global_admins = is_global_admins_enabled(&env);
+                if !matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                ) {
+                    return error_response(403, "forbidden", "Administrator permissions required");
+                }
+            }
+            let is_read_only = url
+                .query_pairs()
+                .any(|(k, v)| (k == "read_only" || k == "dry_run") && (v == "true" || v == "1"));
+
+            let sa_key = env
+                .secret("GCP_SERVICE_ACCOUNT_KEY")
+                .map(|s| s.to_string())
+                .or_else(|_| env.var("GCP_SERVICE_ACCOUNT_KEY").map(|v| v.to_string()))
+                .ok();
+
+            if is_read_only {
+                match reconciler::refresh_fleet_inventory(&kv, sa_key.as_deref(), now).await {
+                    Ok(report) => return json_response(200, &report),
+                    Err(e) => {
+                        return error_response(500, "inventory_refresh_failed", &e.to_string())
+                    }
+                }
+            }
+
             let gh_token = env
                 .secret("SPOT_CONFIG_GH_TOKEN")
                 .map(|s| s.to_string())
@@ -1232,7 +1412,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             .await
             {
                 Ok(report) => {
-                    if !report.snapshot_written {
+                    if !report.snapshot_written
+                        && report.status != "skipped_lease_active"
+                        && report.status != "failed"
+                    {
                         if let Ok((mut bundle, _)) = state::load_state(&kv, now).await {
                             let fi = serde_json::json!({
                                 "source": "gce",

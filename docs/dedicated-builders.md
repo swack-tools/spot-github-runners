@@ -55,9 +55,37 @@ DISK_DEVICE_NAME="${INSTANCE_NAME}-data"
 DEPLOYMENT_ID="${INSTANCE_NAME}"
 UPLOADER_MAPPING="/path/to/approved-uploader-mapping.json"
 UPLOADER_CONFIG=$(jq -c . "$UPLOADER_MAPPING")
-UPLOADER_SHA=$(sha256sum "$UPLOADER_MAPPING" | awk '{print $1}')
+UPLOADER_SHA=$(printf '%s' "$UPLOADER_CONFIG" | sha256sum | awk '{print $1}')
+HOST_AGENT_VERSION="v0.1.0"
+HOST_AGENT_SHA=$(sha256sum /usr/local/bin/host-agent | awk '{print $1}')
 BUILD_CONFIG='{"approved_image_id":null,"cpus":16,"image":"oxidex-remote-builder:1.99.0","memory_gib":28,"role":"builder"}'
 ADMISSION_CONFIG='{"builder_cpus":16,"builder_gib":28,"host_cpus":16,"role":"builder","runner_gib":0,"runner_names":[],"work_gib":28}'
+
+# Prepare builder asset writes script to stage configuration and download host-agent without exceeding GCE's 256 KiB metadata limit
+cat << EOF > /tmp/builder_assets.sh
+install -d -m 0755 /usr/local/bin /opt/oxidex-builder/image
+# Download native host-agent binary from immutable versioned release and verify pinned checksum
+curl -fsSL --retry 3 --retry-connrefused "https://github.com/swack-tools/spot-github-runners/releases/download/${HOST_AGENT_VERSION}/host-agent" -o /usr/local/bin/host-agent
+echo "${HOST_AGENT_SHA}  /usr/local/bin/host-agent" | sha256sum -c -
+chmod 0755 /usr/local/bin/host-agent
+
+cat << 'ASSET_EOF' > /opt/oxidex-builder/image/Dockerfile
+EOF
+cat builder/standalone/Dockerfile >> /tmp/builder_assets.sh
+cat << 'EOF' >> /tmp/builder_assets.sh
+ASSET_EOF
+
+cat << 'ASSET_EOF' > /opt/oxidex-builder/image/website-package.json
+EOF
+cat builder/standalone/website-package.json >> /tmp/builder_assets.sh
+cat << 'EOF' >> /tmp/builder_assets.sh
+ASSET_EOF
+
+cat << 'ASSET_EOF' > /opt/oxidex-builder/image/website-package-lock.json
+EOF
+cat builder/standalone/website-package-lock.json >> /tmp/builder_assets.sh
+cat << 'EOF' >> /tmp/builder_assets.sh
+ASSET_EOF
 
 sed -e "s/{{INSTANCE_NAME}}/${INSTANCE_NAME}/g" \
     -e "s/{{PROJECT}}/${PROJECT}/g" \
@@ -68,8 +96,9 @@ sed -e "s/{{INSTANCE_NAME}}/${INSTANCE_NAME}/g" \
     -e "s/{{UPLOADER_SHA}}/${UPLOADER_SHA}/g" \
     -e "s|{{BUILD_CONFIG}}|${BUILD_CONFIG}|g" \
     -e "s|{{ADMISSION_CONFIG}}|${ADMISSION_CONFIG}|g" \
-    -e "s|{{ASSET_WRITES}}||g" \
+    -e '/{{ASSET_WRITES}}/{' -e 'r /tmp/builder_assets.sh' -e 'd' -e '}' \
     cloud-init/builder-startup.sh > /private/builder-startup.sh
+rm -f /tmp/builder_assets.sh
 
 gcloud compute instances create "${INSTANCE_NAME}" \
   --project="${PROJECT}" \
@@ -85,9 +114,12 @@ approved uploader mapping against its canonical SHA-256 before enabling SSH
 access, preventing silent identity replacement.
 
 The command executes **one `gcloud compute instances create` invocation**.
-It passes the complete embedded payload as `startup-script` metadata. The Debian
-13 GCE image runs this startup mechanism; a separate cloud-init agent is not
-required. `cloud-config.yaml` contains the equivalent payload for images with a
+It passes the rendered bootstrap script as `startup-script` metadata. Google
+documents that local instance metadata values are limited to 256 KiB; staging
+the compiled `host-agent` binary outside metadata via artifact storage keeps the
+script comfortably within this ceiling. For setups requiring entirely remote payloads,
+supply `startup-script-url` pointing to an external storage URL instead.
+`cloud-config.yaml` contains the equivalent payload for images with a
 cloud-init agent, but that alternative execution path has not been live-tested.
 
 Startup verifies fresh-host identity and the absence of existing runners/work,

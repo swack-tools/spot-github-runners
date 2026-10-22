@@ -130,12 +130,57 @@ if [[ "$uploader_raw" =~ ^\{\{.*\}\}$ || -z "$uploader_raw" ]]; then
     exit 78
   fi
 fi
+schema=$(printf '%s' "$uploader_raw" | jq -re '.schema // empty')
+if [[ "$schema" != "root-approved-ssh-mapping-v1" ]]; then
+  echo "Invalid or unsupported uploader mapping schema: $schema" >&2
+  exit 78
+fi
+
 uploader_user=$(printf '%s' "$uploader_raw" | jq -re '.username // empty')
 uploader_uid=$(printf '%s' "$uploader_raw" | jq -re '.uid // empty')
 uploader_pubkey=$(printf '%s' "$uploader_raw" | jq -re '.public_key // empty')
+expected_pubkey_sha=$(printf '%s' "$uploader_raw" | jq -re '.public_key_sha256 // empty')
+
 if [[ -z "$uploader_user" || -z "$uploader_uid" || -z "$uploader_pubkey" ]]; then
   echo "Missing or invalid uploader configuration (username, uid, or public_key empty)" >&2
   exit 78
+fi
+
+if [[ "$uploader_user" == "root" || ! "$uploader_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+  echo "Privileged or invalid uploader username: $uploader_user" >&2
+  exit 78
+fi
+
+if [[ ! "$uploader_uid" =~ ^[0-9]+$ || "$uploader_uid" -lt 1000 || "$uploader_uid" -eq 1001 ]]; then
+  echo "Invalid uploader UID (must be >= 1000 and != 1001): $uploader_uid" >&2
+  exit 78
+fi
+
+if [[ ! "$uploader_pubkey" =~ ^ssh-ed25519[[:space:]]+[A-Za-z0-9+/=]+([[:space:]]+.*)?$ ]]; then
+  echo "Invalid Ed25519 public key format for uploader" >&2
+  exit 78
+fi
+
+if [[ -n "$expected_pubkey_sha" ]]; then
+  actual_pubkey_sha=$(printf '%s' "$uploader_pubkey" | sha256sum | awk '{print $1}')
+  if [[ "$actual_pubkey_sha" != "$expected_pubkey_sha" ]]; then
+    echo "Uploader public key checksum mismatch: $actual_pubkey_sha vs $expected_pubkey_sha" >&2
+    exit 78
+  fi
+fi
+
+uploader_sha='{{UPLOADER_SHA}}'
+if [[ ! "$uploader_sha" =~ ^\{\{.*\}\}$ && -n "$uploader_sha" ]]; then
+  actual_mapping_sha=$(printf '%s' "$uploader_raw" | sha256sum | awk '{print $1}')
+  canonical_mapping_sha=$(printf '%s' "$uploader_raw" | jq -c . 2>/dev/null | sha256sum | awk '{print $1}')
+  file_mapping_sha=""
+  if [[ -f /etc/oxidex-builder-uploader.json ]]; then
+    file_mapping_sha=$(sha256sum /etc/oxidex-builder-uploader.json 2>/dev/null | awk '{print $1}')
+  fi
+  if [[ "$actual_mapping_sha" != "$uploader_sha" && "$canonical_mapping_sha" != "$uploader_sha" && "$file_mapping_sha" != "$uploader_sha" ]]; then
+    echo "Uploader mapping checksum mismatch against UPLOADER_SHA" >&2
+    exit 78
+  fi
 fi
 ! getent passwd 1001 >/dev/null || { echo "Host account collides with container build UID 1001" >&2; exit 78; }
 members=$(getent group 1001 | cut -d: -f4 | tr ',' ' ')
@@ -324,6 +369,11 @@ visudo -cf /etc/sudoers.d/oxidex-build
 uploader_user=$(jq -re .username /etc/oxidex-builder-uploader.json)
 uploader_uid=$(jq -re .uid /etc/oxidex-builder-uploader.json)
 uploader_pubkey=$(jq -re .public_key /etc/oxidex-builder-uploader.json)
+
+if [[ "$uploader_user" == "root" || "$uploader_uid" -lt 1000 || "$uploader_uid" -eq 1001 ]]; then
+  echo "FATAL: Uploader cannot be root or privileged UID: $uploader_user (UID $uploader_uid)" >&2
+  exit 1
+fi
 
 # Verify UID and username mapping before modifying groups or granting build authority
 if id "$uploader_user" >/dev/null 2>&1; then

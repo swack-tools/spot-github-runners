@@ -117,6 +117,19 @@ pub struct SimpleGceInstance {
     pub disks: Vec<GceAttachedDisk>,
 }
 
+impl SimpleGceInstance {
+    pub fn zone_short(&self) -> &str {
+        self.zone.rsplit('/').next().unwrap_or(&self.zone)
+    }
+
+    pub fn machine_type_short(&self) -> &str {
+        self.machine_type
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.machine_type)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpleGitHubRunner {
     pub id: u64,
@@ -529,6 +542,192 @@ pub async fn reconcile_worker_fleet<K: KvStoreBackend>(
     run_reconciliation(kv, &sim, &sim, now).await
 }
 
+pub async fn run_inventory_refresh<K, G>(
+    kv: &K,
+    gcp: &G,
+    now: u64,
+) -> Result<ReconciliationReport, ReconcilerError>
+where
+    K: KvStoreBackend,
+    G: GcpReconcilerClient,
+{
+    let tick = TICK_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // Check writer serialization lease: if reconciler is currently running, skip
+    {
+        let lease_guard = RECONCILER_LEASE.lock().unwrap();
+        if let Some(expires_at) = *lease_guard {
+            if now < expires_at {
+                return Ok(ReconciliationReport {
+                    tick,
+                    status: "skipped_lease_active".to_string(),
+                    launched_hosts: vec![],
+                    cleaned_vms: vec![],
+                    cleaned_runners: vec![],
+                    snapshot_written: false,
+                    kv_puts: TOTAL_KV_PUTS.load(Ordering::SeqCst),
+                });
+            }
+        }
+    }
+
+    let (initial_bundle, _) = load_state(kv, now).await?;
+    let project = initial_bundle.state.project.clone();
+
+    let instances = gcp
+        .list_instances(&project, now)
+        .await
+        .map_err(|e| ReconcilerError::Gcp(e.to_string()))?;
+
+    // Reload freshest state from KV right before merge and save to prevent clobbering concurrent state changes
+    let (mut fresh_bundle, _) = load_state(kv, now).await?;
+
+    let fi = serde_json::json!({
+        "source": "gce",
+        "last_success_at": crate::state::chrono_iso(now),
+        "last_success_epoch": now,
+        "stale": false,
+        "stale_reason": serde_json::Value::Null,
+        "last_error": serde_json::Value::Null
+    });
+    let initial_refresh = fresh_bundle.state.fleet_inventory.is_null();
+    fresh_bundle.state.fleet_inventory = fi.clone();
+    if let Some(ref mut ov) = fresh_bundle.state.overview {
+        if let Some(obj) = ov.as_object_mut() {
+            obj.insert("fleet_inventory".to_string(), fi.clone());
+            if let Some(iv) = obj
+                .get_mut("instances_view")
+                .and_then(|v| v.as_object_mut())
+            {
+                iv.insert("fleet_inventory".to_string(), fi);
+            }
+        }
+    }
+
+    let existing_by_name: std::collections::HashMap<String, InstanceRecord> = fresh_bundle
+        .state
+        .instances
+        .iter()
+        .map(|inst| (inst.name.clone(), inst.clone()))
+        .collect();
+
+    let new_instances_view: Vec<InstanceRecord> = instances
+        .iter()
+        .filter(|i| {
+            let is_runner = i.name.starts_with("oxidex-runners-");
+            let is_builder = i.name.starts_with("builder-");
+            (is_runner || is_builder) && !i.status.eq_ignore_ascii_case("TERMINATED")
+        })
+        .map(|i| {
+            let is_builder = i.name.starts_with("builder-");
+            let norm_zone = i.zone_short().to_string();
+            let norm_region = norm_zone.split('-').take(2).collect::<Vec<_>>().join("-");
+            let norm_machine_type = i.machine_type_short().to_string();
+            let gce_id = i.id.clone().unwrap_or_else(|| i.name.clone());
+
+            if let Some(existing) = existing_by_name.get(&i.name) {
+                // If GCE ID changed, a new VM was created under the same name: reset identity and start timestamps
+                let id_changed =
+                    !existing.id.is_empty() && !gce_id.is_empty() && existing.id != gce_id;
+                if !id_changed {
+                    let mut rec = existing.clone();
+                    rec.status = i.status.clone();
+                    rec.zone = norm_zone.clone();
+                    rec.region = norm_region.clone();
+                    rec.machine_type = norm_machine_type.clone();
+                    if is_builder {
+                        rec.role = "rust_builder".to_string();
+                        rec.vcpu = 16;
+                        rec.ram_gib = 32;
+                        rec.runners_count = 0;
+                        rec.runners_count_known = true;
+                        rec.runner_limits_known = true;
+                    }
+                    return rec;
+                }
+            }
+            let launch_epoch = crate::state::parse_launch_epoch_from_name(&i.name);
+            let created_at = launch_epoch.map(crate::state::chrono_iso);
+            InstanceRecord {
+                id: gce_id,
+                name: i.name.clone(),
+                zone: norm_zone,
+                region: norm_region,
+                machine_type: norm_machine_type,
+                status: i.status.clone(),
+                role: if is_builder {
+                    "rust_builder".to_string()
+                } else {
+                    "cicd_runner".to_string()
+                },
+                vcpu: if is_builder { 16 } else { MIN_HOST_VCPU },
+                ram_gib: if is_builder { 32 } else { MIN_HOST_RAM_GIB },
+                runners_count: 0,
+                runners_count_known: is_builder,
+                runner_limits_known: is_builder,
+                created_at,
+                created_epoch: launch_epoch,
+            }
+        })
+        .collect();
+
+    let instances_changed = fresh_bundle.state.instances_view != new_instances_view;
+    let snapshot_written = if instances_changed || initial_refresh {
+        fresh_bundle.state.instances_view = new_instances_view.clone();
+        fresh_bundle.state.instances = new_instances_view;
+        fresh_bundle.state.updated_at = now;
+        save_state(kv, &mut fresh_bundle, now).await?;
+        TOTAL_KV_PUTS.fetch_add(1, Ordering::SeqCst);
+        true
+    } else {
+        false
+    };
+
+    Ok(ReconciliationReport {
+        tick,
+        status: "inventory_refresh_success".to_string(),
+        launched_hosts: vec![],
+        cleaned_vms: vec![],
+        cleaned_runners: vec![],
+        snapshot_written,
+        kv_puts: TOTAL_KV_PUTS.load(Ordering::SeqCst),
+    })
+}
+
+pub async fn refresh_fleet_inventory<K: KvStoreBackend>(
+    kv: &K,
+    env_gcp_sa_key: Option<&str>,
+    now: u64,
+) -> Result<ReconciliationReport, ReconcilerError> {
+    if let Some(sa_key) = env_gcp_sa_key {
+        if !sa_key.trim().is_empty() {
+            match serde_json::from_str::<crate::gcp::GcpCredentials>(sa_key) {
+                Ok(creds) => {
+                    let project = creds
+                        .project_id
+                        .clone()
+                        .unwrap_or_else(|| "homelab-424523".to_string());
+                    let gcp_client = crate::gcp::GceComputeClient::new(
+                        creds,
+                        project,
+                        crate::gcp::WorkerGcpTransport,
+                    );
+                    return run_inventory_refresh(kv, &gcp_client, now).await;
+                }
+                Err(e) => {
+                    return Err(ReconcilerError::Gcp(format!(
+                        "Malformed GCP credentials: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    Err(ReconcilerError::Gcp(
+        "GCP service account key is missing or empty; cannot refresh live inventory without credentials".to_string(),
+    ))
+}
+
 // ============================================================================
 // Canonical Fleet Fingerprinting
 // ============================================================================
@@ -836,9 +1035,41 @@ where
         } else {
             &target_slug
         };
+        let expected_prefix = format!("oxidex-runners-{}-", safe_slug);
+        let delimited_token = format!("-{}-", safe_slug);
         let active_count = instances
             .iter()
-            .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED") && i.name.contains(safe_slug))
+            .filter(|i| {
+                if i.status.eq_ignore_ascii_case("TERMINATED") {
+                    return false;
+                }
+                if let Some(target_meta) = i
+                    .metadata
+                    .get("spot-target")
+                    .or_else(|| i.metadata.get("spot-runner-target"))
+                {
+                    return target_meta == *target;
+                }
+                if !i.name.starts_with(&expected_prefix) && !i.name.contains(&delimited_token) {
+                    return false;
+                }
+                for other in &controlled_targets {
+                    if other != target && other.starts_with(target) && other.contains('/') {
+                        let other_slug = other.replace('/', "-").to_lowercase();
+                        let other_safe = if other_slug.len() > 24 {
+                            &other_slug[..24]
+                        } else {
+                            &other_slug
+                        };
+                        let other_prefix = format!("oxidex-runners-{}-", other_safe);
+                        let other_delim = format!("-{}-", other_safe);
+                        if i.name.starts_with(&other_prefix) || i.name.contains(&other_delim) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
             .count();
 
         let in_flight = ACTIVE_LAUNCHES
@@ -1098,7 +1329,11 @@ where
 
         bundle.state.instances_view = instances
             .iter()
-            .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
+            .filter(|i| {
+                let is_runner = i.name.starts_with("oxidex-runners-");
+                let is_builder = i.name.starts_with("builder-");
+                (is_runner || is_builder) && !i.status.eq_ignore_ascii_case("TERMINATED")
+            })
             .map(|i| {
                 if let Some(existing) = existing_by_name.get(&i.name) {
                     if existing.role == "rust_builder" || i.name.starts_with("builder-") {
@@ -1111,6 +1346,8 @@ where
                     }
                 }
                 let is_builder = i.name.starts_with("builder-");
+                let launch_epoch = crate::state::parse_launch_epoch_from_name(&i.name);
+                let created_at = launch_epoch.map(crate::state::chrono_iso);
                 InstanceRecord {
                     id: i.id.clone().unwrap_or_else(|| i.name.clone()),
                     name: i.name.clone(),
@@ -1128,6 +1365,8 @@ where
                     runners_count: if is_builder { 0 } else { RUNNERS_PER_HOST },
                     runners_count_known: true,
                     runner_limits_known: true,
+                    created_at,
+                    created_epoch: launch_epoch,
                 }
             })
             .collect();

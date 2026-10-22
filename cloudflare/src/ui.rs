@@ -700,7 +700,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           </div>
           <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
             <label class="toggle-label">
-              <input type="checkbox" id="inst-show-deleted" checked onchange="refreshInstancesTable()" />
+              <input type="checkbox" id="inst-include-deleted" checked onchange="refreshInstancesTable()" />
               <strong>Show Deleted Instances</strong>
             </label>
             <label class="toggle-label">
@@ -714,12 +714,13 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:14px; background:var(--bg-card); padding:10px 12px; border-radius:9px; border:1px solid var(--border);">
           <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
             <span style="font-size:12px; color:var(--text-muted); font-weight:600;">Time Scale:</span>
-            <button class="btn btn-sm btn-secondary" onclick="setInstanceWindowHours(24)">Last 24h</button>
-            <button class="btn btn-sm btn-secondary" onclick="setInstanceWindowHours(50)">Last 50h</button>
-            <button class="btn btn-sm btn-secondary" onclick="setInstanceWindowHours(168)">Last 7d</button>
-            <button class="btn btn-sm btn-secondary" onclick="setInstanceWindowHours(720)">Last 30d</button>
+            <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(1)">1h</button>
+            <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(6)">6h</button>
+            <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(24)">24h</button>
+            <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(168)">7d</button>
+            <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(720)">30d</button>
             <div style="display:inline-flex; align-items:center; gap:5px; margin-left:4px;">
-              <input type="number" id="inst-custom-window-val" value="24" min="1" max="744" style="width:72px;" onchange="applyCustomWindow()" />
+              <input type="number" id="inst-custom-window-val" value="24" min="0.1" max="744" step="any" style="width:72px;" oninput="applyCustomWindow()" onchange="applyCustomWindow()" onkeydown="if(event.key==='Enter'){event.preventDefault();applyCustomWindow();}" />
               <select id="inst-custom-window-unit" onchange="applyCustomWindow()">
                 <option value="hours" selected>Hours</option>
                 <option value="days">Days</option>
@@ -728,13 +729,22 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           </div>
 
           <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-            <select id="inst-role-filter" onchange="refreshInstancesTable()">
+            <select id="inst-role-filter" onchange="applyRoleFilter()">
               <option value="all">All Roles (Runners + Builders)</option>
               <option value="cicd_runner">CI/CD Runners Only</option>
               <option value="rust_builder">Rust Builders Only</option>
             </select>
-            <input type="text" id="inst-search-input" placeholder="Filter by instance, region, spec, trigger..." style="width:240px;" oninput="refreshInstancesTable()" />
-            <button class="btn btn-sm" onclick="sortInstancesBy('total_cost_in_window_usd', 'desc')">Sort by Most Expensive ($)</button>
+            <input type="text" id="inst-search-input" placeholder="Filter by instance, region, spec, trigger..." style="width:240px;" oninput="refreshInstancesTable()" onkeydown="if(event.key==='Enter'){event.preventDefault();refreshInstancesTable();}" />
+            <select id="inst-sort-by" onchange="applySort(this.value)" style="padding:4px 8px; font-size:12px;">
+              <option value="total_cost_in_window_usd" selected>Sort by Total Cost ($)</option>
+              <option value="active_hourly_usd">Sort by Rate ($/hr)</option>
+              <option value="runtime_hours">Sort by Runtime</option>
+              <option value="benchmark_score">Sort by CPU Bench</option>
+              <option value="started_epoch">Sort by Start Time</option>
+              <option value="name">Sort by Name</option>
+              <option value="status">Sort by Status</option>
+              <option value="role">Sort by Role</option>
+            </select>
             <button class="btn btn-sm btn-purple" onclick="triggerLiveInventoryRefresh()">🔄 Refresh Inventory</button>
             <label style="font-size:12px; color:var(--text-muted); display:inline-flex; align-items:center; gap:4px; margin-left:4px;">
               Auto-refresh:
@@ -1948,10 +1958,14 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function loadOverview() {
-      const showDeleted = document.getElementById("inst-show-deleted").checked;
-      const inclDiskTax = document.getElementById("inst-include-disk-tax").checked;
-      const search = encodeURIComponent(document.getElementById("inst-search-input").value || "");
-      const role = encodeURIComponent(document.getElementById("inst-role-filter").value || "all");
+      const showDelEl = document.getElementById("inst-include-deleted") || document.getElementById("inst-show-deleted");
+      const showDeleted = showDelEl ? showDelEl.checked : true;
+      const inclDiskTaxEl = document.getElementById("inst-include-disk-tax");
+      const inclDiskTax = inclDiskTaxEl ? inclDiskTaxEl.checked : true;
+      const searchInput = document.getElementById("inst-search-input");
+      const search = encodeURIComponent(searchInput ? searchInput.value.trim() : "");
+      const roleFilter = document.getElementById("inst-role-filter");
+      const role = encodeURIComponent(roleFilter ? roleFilter.value : "all");
       const url = `/api/overview?include_deleted=${showDeleted}&window_hours=${INST_WINDOW_HOURS}&include_disk_and_tax=${inclDiskTax}&sort_by=${INST_SORT_BY}&sort_dir=${INST_SORT_DIR}&search=${search}&role=${role}`;
       const res = await fetch(url);
       APP_STATE = await res.json();
@@ -2117,12 +2131,21 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       } else {
         instancesHtml = running.map(inst => {
           const p = inst.pricing;
-          const hr = withDiskTax ? p.total_hourly_usd : p.compute_hourly_usd;
-          const day = withDiskTax ? p.total_daily_usd : p.compute_daily_usd;
-          const mo = withDiskTax ? p.total_monthly_usd : p.compute_monthly_usd;
-          const modeNote = withDiskTax
-            ? `Includes ${inst.boot_disk_gb}GB ${inst.boot_disk_type} + ${inst.data_disk_gb}GB ${inst.data_disk_type} ($${p.disk_daily_usd.toFixed(2)}/day) & ${p.tax_rate_percent}% tax`
-            : `Compute Spot price only (excludes disk & taxes)`;
+          const hasPricing = !!(p && p.total_hourly_usd != null);
+          const hr = hasPricing
+            ? (withDiskTax ? p.total_hourly_usd : p.compute_hourly_usd)
+            : (inst.active_hourly_usd || 0);
+          const day = hasPricing
+            ? (withDiskTax ? p.total_daily_usd : p.compute_daily_usd)
+            : (hr * 24);
+          const mo = hasPricing
+            ? (withDiskTax ? p.total_monthly_usd : p.compute_monthly_usd)
+            : (day * 30);
+          const modeNote = hasPricing && p.disk_daily_usd != null
+            ? (withDiskTax
+              ? `Includes ${inst.boot_disk_gb || 0}GB ${inst.boot_disk_type || ''} + ${inst.data_disk_gb || 0}GB ${inst.data_disk_type || ''} ($${p.disk_daily_usd.toFixed(2)}/day) & ${p.tax_rate_percent || 0}% tax`
+              : `Compute Spot price only (excludes disk & taxes)`)
+            : `Pricing record unconfigured for ${esc(inst.machine_type)}`;
 
           return `
             <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:12px;">
@@ -2141,19 +2164,19 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-bottom:8px;">
                 <div style="background:#0b1120; border:1px solid var(--border); border-radius:7px; padding:8px;">
                   <div style="font-size:10.5px; color:var(--text-muted);">SPOT PRICE / HOUR</div>
-                  <div class="mono" style="font-size:16px; font-weight:700; color:#38bdf8;">$${hr.toFixed(4)}/hr</div>
+                  <div class="mono" style="font-size:16px; font-weight:700; color:#38bdf8;">${hasPricing ? `$${hr.toFixed(4)}/hr` : (hr > 0 ? `$${hr.toFixed(4)}/hr` : "Unknown")}</div>
                 </div>
                 <div style="background:#0b1120; border:1px solid var(--border); border-radius:7px; padding:8px;">
                   <div style="font-size:10.5px; color:var(--text-muted);">SPOT PRICE / DAY</div>
-                  <div class="mono" style="font-size:16px; font-weight:700; color:#34d399;">$${day.toFixed(2)}/day</div>
+                  <div class="mono" style="font-size:16px; font-weight:700; color:#34d399;">${hasPricing ? `$${day.toFixed(2)}/day` : (day > 0 ? `$${day.toFixed(2)}/day` : "Unknown")}</div>
                 </div>
                 <div style="background:#0b1120; border:1px solid var(--border); border-radius:7px; padding:8px;">
                   <div style="font-size:10.5px; color:var(--text-muted);">SPOT PRICE / MONTH</div>
-                  <div class="mono" style="font-size:16px; font-weight:700; color:#c4b5fd;">$${mo.toFixed(2)}/mo</div>
+                  <div class="mono" style="font-size:16px; font-weight:700; color:#c4b5fd;">${hasPricing ? `$${mo.toFixed(2)}/mo` : (mo > 0 ? `$${mo.toFixed(2)}/mo` : "Unknown")}</div>
                 </div>
               </div>
               <div style="font-size:11.5px; color:var(--text-muted); margin-bottom:10px;">
-                💡 ${esc(modeNote)} · CPU: <strong>${esc(inst.cpu_platform)}</strong> (Benchmark: <strong>${inst.benchmark_score}</strong>)
+                💡 ${esc(modeNote)} · CPU: <strong>${esc(inst.cpu_platform || 'Unknown')}</strong> (Benchmark: <strong>${inst.benchmark_score != null ? inst.benchmark_score : '—'}</strong>)
               </div>
 
               <div style="font-size:11.5px; font-weight:600; color:var(--text-muted);">SSH Into GCloud Instance (Terminal Command):</div>
@@ -2253,17 +2276,47 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     // =========================================================================
     // TAB 2: INSTANCE LIST & COST HISTORY
     // =========================================================================
-    function setInstanceWindowHours(hours) {
+    function applyHoursWindow(hours) {
       INST_WINDOW_HOURS = hours;
-      document.getElementById("inst-custom-window-val").value = hours;
-      document.getElementById("inst-custom-window-unit").value = "hours";
+      const customVal = document.getElementById("inst-custom-window-val");
+      const customUnit = document.getElementById("inst-custom-window-unit");
+      if (customVal && customUnit) {
+        if (hours % 24 === 0 && hours >= 24) {
+          customVal.value = hours / 24;
+          customUnit.value = "days";
+        } else {
+          customVal.value = hours;
+          customUnit.value = "hours";
+        }
+      }
       refreshInstancesTable();
     }
 
+    function setInstanceWindowHours(hours) {
+      applyHoursWindow(hours);
+    }
+
     function applyCustomWindow() {
-      const val = parseFloat(document.getElementById("inst-custom-window-val").value || "24");
-      const unit = document.getElementById("inst-custom-window-unit").value;
-      INST_WINDOW_HOURS = unit === "days" ? val * 24 : val;
+      const valEl = document.getElementById("inst-custom-window-val");
+      const unitEl = document.getElementById("inst-custom-window-unit");
+      const raw = parseFloat(valEl ? valEl.value : "24");
+      if (isNaN(raw) || raw <= 0) return;
+      const unit = unitEl ? unitEl.value : "hours";
+      INST_WINDOW_HOURS = Math.min(744, Math.max(0.1, unit === "days" ? raw * 24 : raw));
+      refreshInstancesTable();
+    }
+
+    function applyRoleFilter() {
+      refreshInstancesTable();
+    }
+
+    function applySort(field) {
+      if (field) {
+        INST_SORT_BY = field;
+      } else {
+        const sel = document.getElementById("inst-sort-by");
+        if (sel) INST_SORT_BY = sel.value;
+      }
       refreshInstancesTable();
     }
 
@@ -2274,12 +2327,20 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         INST_SORT_BY = field;
         INST_SORT_DIR = "desc";
       }
+      const sel = document.getElementById("inst-sort-by");
+      if (sel && Array.from(sel.options).some(o => o.value === field)) {
+        sel.value = field;
+      }
       refreshInstancesTable();
     }
 
     function sortInstancesBy(field, dir) {
       INST_SORT_BY = field;
       INST_SORT_DIR = dir;
+      const sel = document.getElementById("inst-sort-by");
+      if (sel && Array.from(sel.options).some(o => o.value === field)) {
+        sel.value = field;
+      }
       refreshInstancesTable();
     }
 
@@ -2301,21 +2362,49 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function triggerLiveInventoryRefresh(silent = false) {
-      if (!silent) showToast("Refreshing live Compute Engine & GitHub inventory...");
+      if (!silent) showToast("Refreshing live Compute Engine inventory...");
+      let success = false;
       try {
-        const res = await fetch("/api/reconciler/tick", {
+        const res = await fetch("/api/inventory/refresh", {
           method: "POST",
           headers: { "Content-Type": "application/json" }
         });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          showToast(`Refresh warning: ${err.message || res.statusText}`);
+        if (res.ok) {
+          const data = await res.json().catch(() => ({}));
+          if (data.status === "inventory_refresh_success") {
+            success = true;
+          } else if (data.status === "skipped_lease_active") {
+            if (!silent) showToast("Reconciliation in progress; lease active");
+          } else {
+            success = true;
+          }
+        } else {
+          const resFallback = await fetch("/api/reconciler/tick?read_only=true", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" }
+          });
+          if (resFallback.ok) {
+            const dataFb = await resFallback.json().catch(() => ({}));
+            if (dataFb.status === "inventory_refresh_success" || dataFb.status === "tick_success") {
+              success = true;
+            } else if (dataFb.status === "skipped_lease_active") {
+              if (!silent) showToast("Reconciliation in progress; lease active");
+            } else {
+              success = true;
+            }
+          } else {
+            const err = await resFallback.json().catch(() => ({}));
+            showToast(`Refresh warning: ${err.message || resFallback.statusText}`);
+          }
         }
       } catch (e) {
-        console.warn("Manual tick error:", e);
+        console.warn("Manual inventory refresh error:", e);
+        showToast(`Refresh error: ${e.message || e}`);
       }
-      await loadOverview();
-      if (!silent) showToast("Refreshed live Compute Engine & GitHub inventory");
+      if (success) {
+        await loadOverview();
+        if (!silent) showToast("Refreshed live Compute Engine inventory");
+      }
     }
 
     async function refreshInstancesTable() {
@@ -2590,7 +2679,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           <td class="mono"><strong>${r.units_per_instance}</strong> (${r.unit_vcpu}c/${r.unit_ram_gib}G each)</td>
           <td class="mono">${r.instances_needed_for_floor} VM(s) (${r.total_units_at_floor} total)</td>
           <td class="mono">${r.data_disk_gb}GB ${esc(r.data_disk_type)}</td>
-          <td class="mono">$${r.pricing.compute_hourly_usd.toFixed(4)}/hr · $${r.pricing.compute_daily_usd.toFixed(2)}/d</td>
+          <td class="mono">${r.pricing ? `$${r.pricing.compute_hourly_usd.toFixed(4)}/hr · $${r.pricing.compute_daily_usd.toFixed(2)}/d` : "—"}</td>
           <td class="mono" style="font-weight:700;">$${r.evaluated_hourly_usd.toFixed(4)}/hr · $${r.evaluated_daily_usd.toFixed(2)}/d · $${r.evaluated_monthly_usd.toFixed(2)}/mo</td>
           <td>
             ${r.price_qualifies
@@ -3158,14 +3247,23 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const q = (document.getElementById("rust-search-input").value || "").toLowerCase().trim();
       const builds = (APP_STATE.rust_builds.builds || []).filter(b => {
         if (!q) return true;
-        const hay = `${b.build_id} ${b.project_name} ${b.instance_name} ${b.origin_ip} ${b.origin_hostname} ${b.geolocation.city} ${b.geolocation.country} ${b.network_security.provider_label} ${b.network_security.badge_text}`.toLowerCase();
+        const geo = b.geolocation || {};
+        const ns = b.network_security || {};
+        const hay = `${b.build_id || ""} ${b.project_name || ""} ${b.instance_name || ""} ${b.origin_ip || ""} ${b.origin_hostname || ""} ${geo.city || ""} ${geo.country || ""} ${ns.provider_label || ""} ${ns.badge_text || ""}`.toLowerCase();
         return hay.includes(q);
       });
 
       const tbody = document.getElementById("rust-builds-table-body");
       tbody.innerHTML = builds.map(b => {
-        const ns = b.network_security;
-        const badgeClass = ns.is_tor ? "badge-tor" : (ns.is_vpn ? "badge-vpn" : "badge-direct");
+        const ns = b.network_security || {};
+        const badgeClass = ns.is_tor ? "badge-tor" : (ns.is_vpn ? "badge-vpn" : (ns.badge_text ? "badge-direct" : ""));
+        const geo = b.geolocation || {};
+        const geoCityCountry = (geo.city || geo.country)
+          ? `${esc(geo.city || "Unknown")}, ${esc(geo.country || "")} (${esc(geo.country_code || "—")})`
+          : "Location not reported";
+        const geoAsnIsp = (geo.asn || geo.isp)
+          ? `${esc(geo.asn || "")} · ${esc(geo.isp || "")}`
+          : "ISP/ASN not reported";
         return `
           <tr>
             <td>
@@ -3191,25 +3289,25 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </td>
             <td class="mono">
               <div style="font-weight:700; color:#f8fafc;">${esc(b.origin_ip || "not reported")}</div>
-              <div style="font-size:11px; color:#93c5fd;">${esc(b.origin_hostname)}</div>
+              <div style="font-size:11px; color:#93c5fd;">${esc(b.origin_hostname || "")}</div>
             </td>
             <td>
-              <div style="font-weight:600;">${esc(b.geolocation.city)}, ${esc(b.geolocation.country)} (${esc(b.geolocation.country_code)})</div>
-              <div style="font-size:11px; color:var(--text-muted);">${esc(b.geolocation.asn)} · ${esc(b.geolocation.isp)}</div>
+              <div style="font-weight:600;">${geoCityCountry}</div>
+              <div style="font-size:11px; color:var(--text-muted);">${geoAsnIsp}</div>
             </td>
             <td>
-              <span class="badge ${badgeClass}">${esc(ns.badge_text)}</span>
+              <span class="badge ${badgeClass}">${esc(ns.badge_text || "N/A")}</span>
             </td>
             <td class="mono">
               <div style="font-weight:700; color:#fbbf24;">${reportedOr(b.peak_ram_gib, v => `${v.toFixed(2)} GiB active`)}</div>
-              <div style="font-size:10.5px; color:var(--text-muted);">OOM floor (cap ${b.container_ram_cap_gib} GiB)</div>
+              <div style="font-size:10.5px; color:var(--text-muted);">OOM floor (cap ${b.container_ram_cap_gib || "—"} GiB)</div>
             </td>
             <td class="mono" style="font-weight:700;">
               ${reportedOr(b.cpu_time_seconds, v => `${v.toLocaleString()} CPU-s`)}
             </td>
             <td class="mono">
               <div style="font-size:13.5px; font-weight:700; color:#38bdf8;">${reportedOr(b.cpu_points, v => `${v.toLocaleString()} pts`)}</div>
-              <div style="font-size:10.5px; color:var(--text-muted);">${esc(b.cpu_points_formula)}</div>
+              <div style="font-size:10.5px; color:var(--text-muted);">${esc(b.cpu_points_formula || "")}</div>
             </td>
           </tr>
         `;
@@ -3257,7 +3355,10 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         return;
       }
       if (data.build) {
-        showToast(`Recorded Rust build ${data.build.build_id}: ${data.build.network_security.badge_text} · ${reportedOr(data.build.cpu_points, v => `${v.toLocaleString()} CPU points`, "CPU points not reported")}`);
+        const nsBadge = (data.build.network_security && data.build.network_security.badge_text)
+          ? data.build.network_security.badge_text
+          : "Recorded";
+        showToast(`Recorded Rust build ${data.build.build_id}: ${nsBadge} · ${reportedOr(data.build.cpu_points, v => `${v.toLocaleString()} CPU points`, "CPU points not reported")}`);
         await loadOverview();
       }
     }
@@ -3597,12 +3698,30 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       RunnerPatches.init();
       DashboardAdmins.init();
       const params = new URLSearchParams(window.location.search);
-      if (params.get("show_deleted") === "1") {
-        const cb = document.getElementById("inst-show-deleted");
-        if (cb) cb.checked = true;
+      const cb = document.getElementById("inst-include-deleted") || document.getElementById("inst-show-deleted");
+      if (cb) {
+        if (params.has("include_deleted")) {
+          cb.checked = params.get("include_deleted") === "1" || params.get("include_deleted") === "true";
+        } else if (params.has("show_deleted")) {
+          cb.checked = params.get("show_deleted") === "1" || params.get("show_deleted") === "true";
+        }
       }
       if (params.get("window")) {
-        INST_WINDOW_HOURS = parseFloat(params.get("window")) || 24;
+        const w = parseFloat(params.get("window"));
+        if (!isNaN(w) && w > 0) {
+          INST_WINDOW_HOURS = w;
+          const customVal = document.getElementById("inst-custom-window-val");
+          const customUnit = document.getElementById("inst-custom-window-unit");
+          if (customVal && customUnit) {
+            if (w % 24 === 0 && w >= 24) {
+              customVal.value = w / 24;
+              customUnit.value = "days";
+            } else {
+              customVal.value = w;
+              customUnit.value = "hours";
+            }
+          }
+        }
       }
       await loadOverview();
       const requestedTab = params.get("tab");
