@@ -25,6 +25,8 @@
 !builder/standalone/website-package.json
 !builder/standalone/website-package-lock.json
 !docs/*.md
+!docs/maintenance/
+!docs/maintenance/*.md
 !docs/requirements.txt
 !docs/images/
 !docs/images/*.png
