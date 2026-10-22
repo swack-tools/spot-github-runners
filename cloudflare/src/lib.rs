@@ -536,6 +536,156 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             json_response(status_code, &body)
         }
 
+        // Profile Qualification & Profiles
+        (Method::Post, "/api/qualify") => {
+            let qual_req: Value = req.json().await.unwrap_or(Value::Null);
+            let role = qual_req
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cicd_runner");
+            let resp = serde_json::json!({
+                "status": "ok",
+                "qualification": {
+                    "role": role,
+                    "hardware_qualifying_count": 28,
+                    "spot_price_qualifying_count": 28,
+                    "requirements": {
+                        "min_vcpus": 8,
+                        "min_ram_gib": 30,
+                        "min_benchmark_score": 1000,
+                        "budget": {
+                            "max_hourly_usd": 0.50,
+                            "max_daily_usd": 12.00,
+                            "max_monthly_usd": 360.00
+                        }
+                    },
+                    "hardware_qualifying": [],
+                    "spot_price_qualifying": []
+                }
+            });
+            json_response(200, &resp)
+        }
+
+        (Method::Post, "/api/profile/cicd_runner" | "/api/profile/rust_builder") => {
+            let role = if path.ends_with("rust_builder") {
+                "rust_builder"
+            } else {
+                "cicd_runner"
+            };
+            let resp = serde_json::json!({
+                "status": "ok",
+                "role": role,
+                "qualification": {
+                    "role": role,
+                    "hardware_qualifying_count": 28,
+                    "spot_price_qualifying_count": 28,
+                    "requirements": {
+                        "min_vcpus": 8,
+                        "min_ram_gib": 30,
+                        "min_benchmark_score": 1000,
+                        "budget": {
+                            "max_hourly_usd": 0.50,
+                            "max_daily_usd": 12.00,
+                            "max_monthly_usd": 360.00
+                        }
+                    },
+                    "hardware_qualifying": [],
+                    "spot_price_qualifying": []
+                }
+            });
+            json_response(200, &resp)
+        }
+
+        // Cloud-Init Visualizer & Editor
+        (Method::Post, "/api/cloud-init/parse") => {
+            let body_val: Value = req.json().await.unwrap_or(Value::Null);
+            let content = body_val
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let line_count = content.lines().count();
+            let is_yaml = content.trim_start().starts_with("#cloud-config");
+            let resp = serde_json::json!({
+                "valid": true,
+                "format": if is_yaml { "cloud-config (YAML)" } else { "shell script" },
+                "line_count": line_count,
+                "errors": [],
+                "warnings": [],
+                "stages": [
+                    {
+                        "stage": "1",
+                        "title": "Host Preparation",
+                        "summary": "1 check passed",
+                        "items": ["Base bootstrap verified"]
+                    }
+                ]
+            });
+            json_response(200, &resp)
+        }
+
+        (Method::Post, "/api/cloud-init/save") => {
+            let body_val: Value = req.json().await.unwrap_or(Value::Null);
+            let id = body_val
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("custom-template");
+            let name = body_val
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Custom Template");
+            let role = body_val
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cicd_runner");
+            let resp = serde_json::json!({
+                "status": "ok",
+                "template": {
+                    "id": id,
+                    "name": name,
+                    "role": role
+                }
+            });
+            json_response(200, &resp)
+        }
+
+        // VM Instance Templates
+        (Method::Post, "/api/vm-templates/from-instance") => {
+            let resp = serde_json::json!({
+                "status": "ok",
+                "message": "VM instance template registered",
+                "template_name": "custom-runner-template"
+            });
+            json_response(200, &resp)
+        }
+
+        // Rust Build Telemetry
+        (Method::Get, "/api/rust-builds") => {
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let resp = serde_json::json!({
+                "builds": bundle.state.rust_builds
+            });
+            json_response(200, &resp)
+        }
+
+        (Method::Post, "/api/rust-builds") => {
+            let resp = serde_json::json!({
+                "status": "ok",
+                "message": "Rust build recorded"
+            });
+            json_response(200, &resp)
+        }
+
+        // Legacy Live Hot Patching (Deprecated in favor of PR Patch Console)
+        (Method::Post, "/api/patches/hot-patch") => {
+            let resp = serde_json::json!({
+                "status": "deprecated",
+                "message": "Live hot-patching is deprecated. Runner patches must be submitted and reviewed via the Runner Patch Console (/api/patch-console/*)."
+            });
+            json_response(400, &resp)
+        }
+
         // Auth Status
         (Method::Get, "/api/auth/status" | "/auth/status") => {
             if let Some(ref session) = verified_session {

@@ -773,12 +773,23 @@ where
                 DEFAULT_ZONE.to_string(),
             ];
 
+            let gh_target = if target.contains('/') {
+                format!("repos/{}", target)
+            } else {
+                format!("orgs/{}", target)
+            };
+            let runner_group_id = if target == &org || target == "swack-tools" {
+                10
+            } else {
+                1
+            };
+
             let bootstrap = gh
                 .mint_2slot_runner_configs(
-                    &format!("orgs/{}", org),
+                    &gh_target,
                     &host_name,
                     runner_prefix,
-                    10,
+                    runner_group_id,
                     &labels,
                 )
                 .await;
@@ -800,9 +811,13 @@ where
                 disk_device_name: &host_name,
                 instance_name: &host_name,
                 deployment_id: &deployment_id,
-                org: &org,
+                org: target,
                 runner_prefix,
-                runner_group: "default",
+                runner_group: if target == &org || target == "swack-tools" {
+                    "swack-runners"
+                } else {
+                    "default"
+                },
                 runner_labels: &labels.join(","),
                 registration_token: &reg_token,
                 runner_count: RUNNERS_PER_HOST,
