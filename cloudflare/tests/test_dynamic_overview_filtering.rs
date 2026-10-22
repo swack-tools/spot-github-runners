@@ -188,7 +188,9 @@ async fn test_overview_filter_include_deleted_and_zero_kv_writes() {
         window_hours: Some(24.0),
         ..Default::default()
     };
-    let (status, resp) = handle_api_overview(&kv, query_no_deleted, now).await.unwrap();
+    let (status, resp) = handle_api_overview(&kv, query_no_deleted, now)
+        .await
+        .unwrap();
     assert_eq!(status, 200);
 
     let iv = &resp["instances_view"];
@@ -206,7 +208,9 @@ async fn test_overview_filter_include_deleted_and_zero_kv_writes() {
         window_hours: Some(24.0),
         ..Default::default()
     };
-    let (status2, resp2) = handle_api_overview(&kv, query_with_deleted, now).await.unwrap();
+    let (status2, resp2) = handle_api_overview(&kv, query_with_deleted, now)
+        .await
+        .unwrap();
     assert_eq!(status2, 200);
     let iv2 = &resp2["instances_view"];
     assert_eq!(iv2["running_count"], 2);
@@ -326,8 +330,17 @@ async fn test_overview_filter_role_and_multi_field_search() {
         ..Default::default()
     };
     let (_, resp_s1) = handle_api_overview(&kv, q_search_asia, now).await.unwrap();
-    assert_eq!(resp_s1["instances_view"]["instances"].as_array().unwrap().len(), 1);
-    assert_eq!(resp_s1["instances_view"]["instances"][0]["name"], "builder-dedicated-asia");
+    assert_eq!(
+        resp_s1["instances_view"]["instances"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        resp_s1["instances_view"]["instances"][0]["name"],
+        "builder-dedicated-asia"
+    );
 
     // 4. Search filter by non-matching string
     let q_search_none = OverviewQuery {
@@ -335,7 +348,13 @@ async fn test_overview_filter_role_and_multi_field_search() {
         ..Default::default()
     };
     let (_, resp_s2) = handle_api_overview(&kv, q_search_none, now).await.unwrap();
-    assert_eq!(resp_s2["instances_view"]["instances"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        resp_s2["instances_view"]["instances"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -354,7 +373,9 @@ async fn test_overview_sorting_ascending_and_descending() {
         sort_dir: Some("asc".into()),
         ..Default::default()
     };
-    let (_, resp_asc) = handle_api_overview(&kv, q_sort_name_asc, now).await.unwrap();
+    let (_, resp_asc) = handle_api_overview(&kv, q_sort_name_asc, now)
+        .await
+        .unwrap();
     let inst_asc = resp_asc["instances_view"]["instances"].as_array().unwrap();
     assert_eq!(inst_asc[0]["name"], "builder-dedicated-asia");
     assert_eq!(inst_asc[1]["name"], "oxidex-runners-swack-tools-1001");
@@ -366,7 +387,9 @@ async fn test_overview_sorting_ascending_and_descending() {
         sort_dir: Some("desc".into()),
         ..Default::default()
     };
-    let (_, resp_desc) = handle_api_overview(&kv, q_sort_name_desc, now).await.unwrap();
+    let (_, resp_desc) = handle_api_overview(&kv, q_sort_name_desc, now)
+        .await
+        .unwrap();
     let inst_desc = resp_desc["instances_view"]["instances"].as_array().unwrap();
     assert_eq!(inst_desc[0]["name"], "oxidex-runners-swack-tools-old");
     assert_eq!(inst_desc[1]["name"], "oxidex-runners-swack-tools-1001");
@@ -514,7 +537,8 @@ async fn test_floor_keeper_target_collision_org_vs_repo() {
 
     let (mut bundle, _) = load_state(&kv, now).await.unwrap();
     // Configure both org and repo targets
-    bundle.state.controlled_targets = vec!["swack-tools".to_string(), "swack-tools/oxidex".to_string()];
+    bundle.state.controlled_targets =
+        vec!["swack-tools".to_string(), "swack-tools/oxidex".to_string()];
     save_state(&kv, &mut bundle, now).await.unwrap();
 
     // GCP currently only has an active VM for the repo target swack-tools/oxidex
@@ -564,9 +588,18 @@ async fn test_read_only_inventory_refresh_never_mutates_fleet() {
 
     let report = run_inventory_refresh(&kv, &gcp, now).await.unwrap();
     assert_eq!(report.status, "inventory_refresh_success");
-    assert!(report.launched_hosts.is_empty(), "Read-only inventory refresh must NEVER launch hosts");
-    assert!(report.cleaned_vms.is_empty(), "Read-only inventory refresh must NEVER delete VMs");
-    assert!(report.cleaned_runners.is_empty(), "Read-only inventory refresh must NEVER delete runners");
+    assert!(
+        report.launched_hosts.is_empty(),
+        "Read-only inventory refresh must NEVER launch hosts"
+    );
+    assert!(
+        report.cleaned_vms.is_empty(),
+        "Read-only inventory refresh must NEVER delete VMs"
+    );
+    assert!(
+        report.cleaned_runners.is_empty(),
+        "Read-only inventory refresh must NEVER delete runners"
+    );
 
     // State inventory freshness was updated
     let (fresh_bundle, _) = load_state(&kv, now).await.unwrap();
@@ -747,7 +780,10 @@ async fn test_refresh_fleet_inventory_fails_without_credentials() {
     // Verify existing state was preserved untouched
     let (fresh_bundle, _) = load_state(&kv, now).await.unwrap();
     assert_eq!(fresh_bundle.state.instances.len(), 1);
-    assert_eq!(fresh_bundle.state.instances[0].name, "oxidex-runners-c4d-seed");
+    assert_eq!(
+        fresh_bundle.state.instances[0].name,
+        "oxidex-runners-c4d-seed"
+    );
 }
 
 #[tokio::test]
@@ -795,7 +831,10 @@ async fn test_overview_filter_preserves_live_gce_provisioning_and_staging_states
     let instances = ov["instances_view"]["instances"].as_array().unwrap();
     // Live non-running states (STAGING, PROVISIONING) must remain visible when include_deleted = false
     assert_eq!(instances.len(), 2);
-    let names: Vec<&str> = instances.iter().map(|i| i["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = instances
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
     assert!(names.contains(&"oxidex-runners-c4d-staging"));
     assert!(names.contains(&"oxidex-runners-c4d-provisioning"));
     assert!(!names.contains(&"oxidex-runners-c4d-terminated"));
@@ -952,7 +991,10 @@ async fn test_overview_filter_excludes_unrelated_project_vms() {
     apply_dynamic_overview_filtering(&mut ov, &query, &live_inventory, now);
 
     let instances = ov["instances_view"]["instances"].as_array().unwrap();
-    let names: Vec<&str> = instances.iter().map(|i| i["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = instances
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
 
     // database-primary-prod and unrelated-bastion-host must NOT appear in instances
     assert!(!names.contains(&"database-primary-prod"));
@@ -1028,13 +1070,19 @@ async fn test_overview_filter_preserves_observed_hardware_or_unknown() {
 
     let instances = ov["instances_view"]["instances"].as_array().unwrap();
 
-    let builder_inst = instances.iter().find(|i| i["name"] == "builder-dedicated-asia").unwrap();
+    let builder_inst = instances
+        .iter()
+        .find(|i| i["name"] == "builder-dedicated-asia")
+        .unwrap();
     // Observed hardware from catalog
     assert_eq!(builder_inst["cpu_platform"], "Intel Emerald Rapids");
     assert_eq!(builder_inst["benchmark_score"], 4100);
     assert_eq!(builder_inst["data_disk_gb"], 100);
 
-    let unconfigured_inst = instances.iter().find(|i| i["name"] == "oxidex-runners-custom-hw").unwrap();
+    let unconfigured_inst = instances
+        .iter()
+        .find(|i| i["name"] == "oxidex-runners-custom-hw")
+        .unwrap();
     // Unobserved hardware must be explicitly Unknown/null, not fabricated Intel Cascade Lake
     assert_eq!(unconfigured_inst["cpu_platform"], "Unknown");
     assert!(unconfigured_inst["benchmark_score"].is_null());
@@ -1062,5 +1110,75 @@ async fn test_inventory_refresh_skips_when_reconciler_lease_active() {
     set_reconciler_lease(None);
 }
 
+#[tokio::test]
+async fn test_overview_filter_clears_deletion_markers_when_instance_is_live_again() {
+    let now = 1792000000;
+    let mut ov = serde_json::json!({
+        "instances_view": {
+            "instances": [
+                {
+                    "name": "oxidex-runners-restarted-vm",
+                    "status": "TERMINATED",
+                    "zone": "us-central1-a",
+                    "region": "us-central1",
+                    "machine_type": "c4d-standard-16",
+                    "started_epoch": (now - 7200) as f64,
+                    "deleted_epoch": (now - 3600) as f64,
+                    "deleted_at": "2026-10-22T18:00:00Z",
+                    "deletion_trigger": "preempted",
+                    "pricing": {
+                        "hourly_usd": 0.25,
+                        "total_hourly_usd": 0.28
+                    }
+                }
+            ]
+        }
+    });
 
+    let live_inventory = vec![InstanceRecord {
+        id: "restarted-1".to_string(),
+        name: "oxidex-runners-restarted-vm".to_string(),
+        zone: "us-central1-a".to_string(),
+        region: "us-central1".to_string(),
+        machine_type: "c4d-standard-16".to_string(),
+        status: "RUNNING".to_string(),
+        role: "cicd_runner".to_string(),
+        vcpu: 16,
+        ram_gib: 32,
+        runners_count: 2,
+        runners_count_known: false,
+        runner_limits_known: false,
+        created_at: None,
+        created_epoch: None,
+    }];
 
+    // Query with include_deleted = false
+    let query = OverviewQuery {
+        include_deleted: Some(false),
+        ..Default::default()
+    };
+    apply_dynamic_overview_filtering(&mut ov, &query, &live_inventory, now);
+
+    let instances = ov["instances_view"]["instances"].as_array().unwrap();
+    assert_eq!(
+        instances.len(),
+        1,
+        "Restarted instance must not be filtered out as deleted"
+    );
+
+    let restarted = &instances[0];
+    assert_eq!(restarted["name"], "oxidex-runners-restarted-vm");
+    assert_eq!(restarted["status"], "RUNNING");
+    assert!(
+        restarted["deleted_epoch"].is_null(),
+        "deleted_epoch must be cleared"
+    );
+    assert!(
+        restarted["deleted_at"].is_null(),
+        "deleted_at must be cleared"
+    );
+    assert!(
+        restarted["deletion_trigger"].is_null(),
+        "deletion_trigger must be cleared"
+    );
+}

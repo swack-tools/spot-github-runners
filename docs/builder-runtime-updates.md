@@ -58,14 +58,12 @@ UPLOADER_SHA=$(printf '%s' "$UPLOADER_CONFIG" | sha256sum | awk '{print $1}')
 BUILD_CONFIG='{"approved_image_id":null,"cpus":16,"image":"oxidex-remote-builder:1.99.0","memory_gib":28,"role":"builder"}'
 ADMISSION_CONFIG='{"builder_cpus":16,"builder_gib":28,"host_cpus":16,"role":"builder","runner_gib":0,"runner_names":[],"work_gib":28}'
 
-# Prepare builder asset writes script to stage binary payloads without exceeding command argument length limits
+# Prepare builder asset writes script to stage configuration and download host-agent without exceeding GCE's 256 KiB metadata limit
 cat << 'EOF' > /tmp/builder_assets.sh
 install -d -m 0755 /usr/local/bin /opt/oxidex-builder/image
-cat << 'ASSET_EOF' | base64 -d > /usr/local/bin/host-agent
-EOF
-base64 /usr/local/bin/host-agent >> /tmp/builder_assets.sh
-cat << 'EOF' >> /tmp/builder_assets.sh
-ASSET_EOF
+# Download native host-agent binary from artifact storage rather than embedding large binary in instance metadata
+curl -fsSL --retry 3 --retry-connrefused "https://storage.googleapis.com/${PROJECT}-artifacts/host-agent/host-agent" -o /usr/local/bin/host-agent || \
+  curl -fsSL --retry 3 --retry-connrefused "https://github.com/swack-tools/spot-github-runners/releases/latest/download/host-agent" -o /usr/local/bin/host-agent
 chmod 0755 /usr/local/bin/host-agent
 
 cat << 'ASSET_EOF' > /opt/oxidex-builder/image/Dockerfile

@@ -545,7 +545,11 @@ fn lookup_instance_pricing(
     }
 
     if let Some(qual) = qualifications.and_then(|v| v.as_object()) {
-        let role_key = if is_builder { "rust_builder" } else { "cicd_runner" };
+        let role_key = if is_builder {
+            "rust_builder"
+        } else {
+            "cicd_runner"
+        };
         if let Some(role_qual) = qual.get(role_key).and_then(|v| v.as_object()) {
             for list_key in &["spot_price_qualifying", "hardware_qualifying"] {
                 if let Some(list) = role_qual.get(*list_key).and_then(|v| v.as_array()) {
@@ -555,7 +559,8 @@ fn lookup_instance_pricing(
                                 || item.get("region").and_then(|v| v.as_str()) == Some(region))
                         {
                             if let Some(pricing) = item.get("pricing") {
-                                if pricing.is_object() && pricing.get("total_hourly_usd").is_some() {
+                                if pricing.is_object() && pricing.get("total_hourly_usd").is_some()
+                                {
                                     return Some(pricing.clone());
                                 }
                             }
@@ -573,7 +578,8 @@ fn lookup_instance_pricing(
                     for inst in insts {
                         if inst.get("machine_type").and_then(|v| v.as_str()) == Some(machine_type) {
                             if let Some(pricing) = inst.get("pricing") {
-                                if pricing.is_object() && pricing.get("total_hourly_usd").is_some() {
+                                if pricing.is_object() && pricing.get("total_hourly_usd").is_some()
+                                {
                                     return Some(pricing.clone());
                                 }
                             }
@@ -614,7 +620,10 @@ pub fn apply_dynamic_overview_filtering(
     if !ov_obj.contains_key("instances_view") || !ov_obj["instances_view"].is_object() {
         ov_obj.insert("instances_view".to_string(), serde_json::json!({}));
     }
-    let iv = ov_obj.get_mut("instances_view").and_then(|v| v.as_object_mut()).unwrap();
+    let iv = ov_obj
+        .get_mut("instances_view")
+        .and_then(|v| v.as_object_mut())
+        .unwrap();
 
     let mut base_instances: Vec<serde_json::Value> = iv
         .get("instances")
@@ -634,8 +643,19 @@ pub fn apply_dynamic_overview_filtering(
                 obj.insert("status".to_string(), serde_json::json!(rec.status));
                 obj.insert("zone".to_string(), serde_json::json!(rec.zone));
                 obj.insert("region".to_string(), serde_json::json!(rec.region));
-                obj.insert("machine_type".to_string(), serde_json::json!(rec.machine_type));
-                obj.insert("runners_count".to_string(), serde_json::json!(rec.runners_count));
+                obj.insert(
+                    "machine_type".to_string(),
+                    serde_json::json!(rec.machine_type),
+                );
+                obj.insert(
+                    "runners_count".to_string(),
+                    serde_json::json!(rec.runners_count),
+                );
+                if !rec.status.eq_ignore_ascii_case("TERMINATED") {
+                    obj.remove("deleted_epoch");
+                    obj.remove("deleted_at");
+                    obj.remove("deletion_trigger");
+                }
             }
         } else {
             let is_builder = rec.role == "rust_builder" || rec.name.starts_with("builder-");
@@ -674,7 +694,13 @@ pub fn apply_dynamic_overview_filtering(
                 .and_then(|v| v.as_f64())
                 .unwrap_or(compute_hourly);
 
-            let (observed_cpu, observed_benchmark, observed_disk_gb, observed_disk_type, observed_disk_category) = {
+            let (
+                observed_cpu,
+                observed_benchmark,
+                observed_disk_gb,
+                observed_disk_type,
+                observed_disk_category,
+            ) = {
                 let mut cpu = "Unknown".to_string();
                 let mut bench = serde_json::Value::Null;
                 let mut disk_gb = serde_json::Value::Null;
@@ -687,22 +713,49 @@ pub fn apply_dynamic_overview_filtering(
                     if let Some(c) = existing.get("cpu_platform").and_then(|v| v.as_str()) {
                         cpu = c.to_string();
                     }
-                    bench = existing.get("benchmark_score").cloned().unwrap_or(serde_json::Value::Null);
-                    disk_gb = existing.get("data_disk_gb").cloned().unwrap_or(serde_json::Value::Null);
-                    disk_type = existing.get("data_disk_type").cloned().unwrap_or(serde_json::Value::Null);
-                    disk_cat = existing.get("disk_category").cloned().unwrap_or(serde_json::Value::Null);
+                    bench = existing
+                        .get("benchmark_score")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    disk_gb = existing
+                        .get("data_disk_gb")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    disk_type = existing
+                        .get("data_disk_type")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    disk_cat = existing
+                        .get("disk_category")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                 } else if let Some(arr) = regions_val.as_ref().and_then(|r| r.as_array()) {
                     for reg in arr {
                         if let Some(types) = reg.get("qualified_types").and_then(|t| t.as_array()) {
                             for qt in types {
-                                if qt.get("machine_type").and_then(|m| m.as_str()) == Some(&rec.machine_type) {
-                                    if let Some(c) = qt.get("cpu_platform").and_then(|v| v.as_str()) {
+                                if qt.get("machine_type").and_then(|m| m.as_str())
+                                    == Some(&rec.machine_type)
+                                {
+                                    if let Some(c) = qt.get("cpu_platform").and_then(|v| v.as_str())
+                                    {
                                         cpu = c.to_string();
                                     }
-                                    bench = qt.get("benchmark_score").cloned().unwrap_or(serde_json::Value::Null);
-                                    disk_gb = qt.get("data_disk_gb").cloned().unwrap_or(serde_json::Value::Null);
-                                    disk_type = qt.get("data_disk_type").cloned().unwrap_or(serde_json::Value::Null);
-                                    disk_cat = qt.get("disk_category").cloned().unwrap_or(serde_json::Value::Null);
+                                    bench = qt
+                                        .get("benchmark_score")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    disk_gb = qt
+                                        .get("data_disk_gb")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    disk_type = qt
+                                        .get("data_disk_type")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    disk_cat = qt
+                                        .get("disk_category")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
                                     break;
                                 }
                             }
@@ -764,8 +817,14 @@ pub fn apply_dynamic_overview_filtering(
                         if let Some(obj) = inst.as_object_mut() {
                             obj.insert("status".to_string(), serde_json::json!("TERMINATED"));
                             if obj.get("deleted_epoch").map_or(true, |v| v.is_null()) {
-                                obj.insert("deleted_epoch".to_string(), serde_json::json!(now as f64));
-                                obj.insert("deleted_at".to_string(), serde_json::json!(chrono_iso(now)));
+                                obj.insert(
+                                    "deleted_epoch".to_string(),
+                                    serde_json::json!(now as f64),
+                                );
+                                obj.insert(
+                                    "deleted_at".to_string(),
+                                    serde_json::json!(chrono_iso(now)),
+                                );
                             }
                         }
                     }
@@ -783,7 +842,11 @@ pub fn apply_dynamic_overview_filtering(
     let include_disk_and_tax = query.include_disk_and_tax.unwrap_or(true);
     let role_filter = query.role.as_deref().unwrap_or("all").trim();
     let search_filter = query.search.as_deref().unwrap_or("").trim().to_lowercase();
-    let sort_by = query.sort_by.as_deref().unwrap_or("total_cost_in_window_usd").trim();
+    let sort_by = query
+        .sort_by
+        .as_deref()
+        .unwrap_or("total_cost_in_window_usd")
+        .trim();
     let sort_dir = query.sort_dir.as_deref().unwrap_or("desc").to_lowercase();
 
     let now_f64 = now as f64;
@@ -797,7 +860,10 @@ pub fn apply_dynamic_overview_filtering(
             continue;
         }
 
-        let status = inst.get("status").and_then(|v| v.as_str()).unwrap_or("RUNNING");
+        let status = inst
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("RUNNING");
         let is_terminated = status.eq_ignore_ascii_case("TERMINATED")
             || inst.get("deleted_epoch").and_then(|v| v.as_f64()).is_some();
         let is_running = !is_terminated;
@@ -806,8 +872,15 @@ pub fn apply_dynamic_overview_filtering(
             continue;
         }
 
-        let started_epoch = inst.get("started_epoch").and_then(|v| v.as_f64()).filter(|v| v.is_finite()).unwrap_or(0.0);
-        let deleted_epoch = inst.get("deleted_epoch").and_then(|v| v.as_f64()).filter(|v| v.is_finite());
+        let started_epoch = inst
+            .get("started_epoch")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let deleted_epoch = inst
+            .get("deleted_epoch")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite());
         let end_ts = deleted_epoch.unwrap_or(now_f64);
 
         if is_terminated && end_ts < window_start {
@@ -861,15 +934,28 @@ pub fn apply_dynamic_overview_filtering(
             .and_then(|v| v.as_f64())
             .unwrap_or(compute_daily_usd * 30.0);
 
-        let hourly_rate = if include_disk_and_tax { total_hourly_usd } else { compute_hourly_usd };
-        let daily_rate = if include_disk_and_tax { total_daily_usd } else { compute_daily_usd };
-        let monthly_rate = if include_disk_and_tax { total_monthly_usd } else { compute_monthly_usd };
+        let hourly_rate = if include_disk_and_tax {
+            total_hourly_usd
+        } else {
+            compute_hourly_usd
+        };
+        let daily_rate = if include_disk_and_tax {
+            total_daily_usd
+        } else {
+            compute_daily_usd
+        };
+        let monthly_rate = if include_disk_and_tax {
+            total_monthly_usd
+        } else {
+            compute_monthly_usd
+        };
 
         let active_hourly = if is_running { hourly_rate } else { 0.0 };
         let active_daily = if is_running { daily_rate } else { 0.0 };
         let active_monthly = if is_running { monthly_rate } else { 0.0 };
 
-        inst["active_hourly_usd"] = serde_json::json!(((active_hourly * 10000.0).round()) / 10000.0);
+        inst["active_hourly_usd"] =
+            serde_json::json!(((active_hourly * 10000.0).round()) / 10000.0);
         inst["active_daily_usd"] = serde_json::json!(((active_daily * 100.0).round()) / 100.0);
         inst["active_monthly_usd"] = serde_json::json!(((active_monthly * 100.0).round()) / 100.0);
 
@@ -913,40 +999,138 @@ pub fn apply_dynamic_overview_filtering(
 
     filtered.sort_by(|a, b| {
         let ord = match sort_by {
-            "name" => a.get("name").and_then(|v| v.as_str()).unwrap_or("").cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or("")),
-            "status" => a.get("status").and_then(|v| v.as_str()).unwrap_or("").cmp(b.get("status").and_then(|v| v.as_str()).unwrap_or("")),
-            "role" => a.get("role").and_then(|v| v.as_str()).unwrap_or("").cmp(b.get("role").and_then(|v| v.as_str()).unwrap_or("")),
-            "display_location" => a.get("display_location").and_then(|v| v.as_str()).unwrap_or("").cmp(b.get("display_location").and_then(|v| v.as_str()).unwrap_or("")),
-            "machine_type" => a.get("machine_type").and_then(|v| v.as_str()).unwrap_or("").cmp(b.get("machine_type").and_then(|v| v.as_str()).unwrap_or("")),
-            "benchmark_score" => a.get("benchmark_score").and_then(|v| v.as_u64()).unwrap_or(0).cmp(&b.get("benchmark_score").and_then(|v| v.as_u64()).unwrap_or(0)),
-            "runners_count" => a.get("runners_count").and_then(|v| v.as_u64()).unwrap_or(0).cmp(&b.get("runners_count").and_then(|v| v.as_u64()).unwrap_or(0)),
-            "runtime_hours" => a.get("runtime_hours").and_then(|v| v.as_f64()).unwrap_or(0.0).partial_cmp(&b.get("runtime_hours").and_then(|v| v.as_f64()).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal),
-            "active_hourly_usd" => a.get("active_hourly_usd").and_then(|v| v.as_f64()).unwrap_or(0.0).partial_cmp(&b.get("active_hourly_usd").and_then(|v| v.as_f64()).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal),
-            "started_epoch" => a.get("started_epoch").and_then(|v| v.as_f64()).unwrap_or(0.0).partial_cmp(&b.get("started_epoch").and_then(|v| v.as_f64()).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal),
-            "deletion_trigger" => a.get("deletion_trigger").and_then(|v| v.as_str()).unwrap_or("").cmp(b.get("deletion_trigger").and_then(|v| v.as_str()).unwrap_or("")),
-            _ => a.get("total_cost_in_window_usd").and_then(|v| v.as_f64()).unwrap_or(0.0).partial_cmp(&b.get("total_cost_in_window_usd").and_then(|v| v.as_f64()).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal),
+            "name" => a
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or("")),
+            "status" => a
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("status").and_then(|v| v.as_str()).unwrap_or("")),
+            "role" => a
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("role").and_then(|v| v.as_str()).unwrap_or("")),
+            "display_location" => a
+                .get("display_location")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(
+                    b.get("display_location")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                ),
+            "machine_type" => a
+                .get("machine_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("machine_type").and_then(|v| v.as_str()).unwrap_or("")),
+            "benchmark_score" => a
+                .get("benchmark_score")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .cmp(
+                    &b.get("benchmark_score")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                ),
+            "runners_count" => a
+                .get("runners_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .cmp(&b.get("runners_count").and_then(|v| v.as_u64()).unwrap_or(0)),
+            "runtime_hours" => a
+                .get("runtime_hours")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .partial_cmp(
+                    &b.get("runtime_hours")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                )
+                .unwrap_or(std::cmp::Ordering::Equal),
+            "active_hourly_usd" => a
+                .get("active_hourly_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .partial_cmp(
+                    &b.get("active_hourly_usd")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                )
+                .unwrap_or(std::cmp::Ordering::Equal),
+            "started_epoch" => a
+                .get("started_epoch")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .partial_cmp(
+                    &b.get("started_epoch")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                )
+                .unwrap_or(std::cmp::Ordering::Equal),
+            "deletion_trigger" => a
+                .get("deletion_trigger")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(
+                    b.get("deletion_trigger")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                ),
+            _ => a
+                .get("total_cost_in_window_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .partial_cmp(
+                    &b.get("total_cost_in_window_usd")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                )
+                .unwrap_or(std::cmp::Ordering::Equal),
         };
-        if sort_dir == "asc" { ord } else { ord.reverse() }
+        if sort_dir == "asc" {
+            ord
+        } else {
+            ord.reverse()
+        }
     });
 
     let running_count = filtered
         .iter()
         .filter(|i| {
             let status = i.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            !status.eq_ignore_ascii_case("TERMINATED") && i.get("deleted_epoch").map_or(true, |v| v.is_null())
+            !status.eq_ignore_ascii_case("TERMINATED")
+                && i.get("deleted_epoch").map_or(true, |v| v.is_null())
         })
         .count();
     let deleted_count = filtered.len().saturating_sub(running_count);
     let total_window_spend: f64 = filtered
         .iter()
-        .map(|i| i.get("total_cost_in_window_usd").and_then(|v| v.as_f64()).unwrap_or(0.0))
+        .map(|i| {
+            i.get("total_cost_in_window_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+        })
         .sum();
     let total_window_spend_usd = ((total_window_spend * 100.0).round()) / 100.0;
 
     iv.insert("instances".to_string(), serde_json::Value::Array(filtered));
-    iv.insert("running_count".to_string(), serde_json::json!(running_count));
-    iv.insert("deleted_count".to_string(), serde_json::json!(deleted_count));
-    iv.insert("total_window_spend_usd".to_string(), serde_json::json!(total_window_spend_usd));
+    iv.insert(
+        "running_count".to_string(),
+        serde_json::json!(running_count),
+    );
+    iv.insert(
+        "deleted_count".to_string(),
+        serde_json::json!(deleted_count),
+    );
+    iv.insert(
+        "total_window_spend_usd".to_string(),
+        serde_json::json!(total_window_spend_usd),
+    );
     iv.insert("window_hours".to_string(), serde_json::json!(window_hours));
     iv.insert("sort_by".to_string(), serde_json::json!(sort_by));
     iv.insert("sort_dir".to_string(), serde_json::json!(sort_dir));
@@ -956,7 +1140,8 @@ pub fn apply_dynamic_overview_filtering(
         .iter()
         .filter(|inst| {
             let status = inst.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            !status.eq_ignore_ascii_case("TERMINATED") && inst.get("deleted_epoch").map_or(true, |v| v.is_null())
+            !status.eq_ignore_ascii_case("TERMINATED")
+                && inst.get("deleted_epoch").map_or(true, |v| v.is_null())
         })
         .collect();
 
@@ -975,19 +1160,25 @@ pub fn apply_dynamic_overview_filtering(
         fs_total_vcpus += vcpu;
         fs_total_ram_gib += ram;
 
-        let active_hourly = inst.get("active_hourly_usd").and_then(|v| v.as_f64()).unwrap_or_else(|| {
-            inst.get("pricing")
-                .and_then(|p| p.get("total_hourly_usd"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0)
-        });
+        let active_hourly = inst
+            .get("active_hourly_usd")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(|| {
+                inst.get("pricing")
+                    .and_then(|p| p.get("total_hourly_usd"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0)
+            });
         fs_hourly_burn += active_hourly;
 
         if is_builder {
             fs_running_builder_vms += 1;
         } else {
             fs_running_runner_vms += 1;
-            let count = inst.get("runners_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let count = inst
+                .get("runners_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
             fs_running_runner_slots += count;
             if inst.get("runners_count_known") == Some(&serde_json::json!(false)) {
                 fs_unconfirmed_runner_hosts += 1;
@@ -1019,7 +1210,11 @@ pub fn apply_dynamic_overview_filtering(
     if let Some(regions_arr) = ov_obj.get_mut("regions").and_then(|v| v.as_array_mut()) {
         for reg in regions_arr.iter_mut() {
             if let Some(reg_obj) = reg.as_object_mut() {
-                let reg_id = reg_obj.get("region").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let reg_id = reg_obj
+                    .get("region")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let running_in_reg: Vec<serde_json::Value> = all_running
                     .iter()
                     .filter(|inst| {
@@ -1027,13 +1222,19 @@ pub fn apply_dynamic_overview_filtering(
                     })
                     .map(|v| (*v).clone())
                     .collect();
-                reg_obj.insert("running_instances".to_string(), serde_json::Value::Array(running_in_reg));
+                reg_obj.insert(
+                    "running_instances".to_string(),
+                    serde_json::Value::Array(running_in_reg),
+                );
             }
         }
     }
 
     if query.is_authenticated != Some(true) {
-        if let Some(rb) = ov_obj.get_mut("rust_builds").and_then(|v| v.as_object_mut()) {
+        if let Some(rb) = ov_obj
+            .get_mut("rust_builds")
+            .and_then(|v| v.as_object_mut())
+        {
             if let Some(builds) = rb.get_mut("builds").and_then(|v| v.as_array_mut()) {
                 for b in builds {
                     if let Some(obj) = b.as_object_mut() {
@@ -1147,7 +1348,12 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
         "dashboard_admins": bundle.state.dashboard_admins
     });
 
-    apply_dynamic_overview_filtering(&mut fallback_overview, &query, &bundle.state.instances_view, now);
+    apply_dynamic_overview_filtering(
+        &mut fallback_overview,
+        &query,
+        &bundle.state.instances_view,
+        now,
+    );
     Ok((200, fallback_overview))
 }
 

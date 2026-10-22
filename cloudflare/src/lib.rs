@@ -258,7 +258,30 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         // Dynamic Overview Endpoint with URL Query Parsing
         (Method::Get, "/api/overview") => {
             let mut query = state::OverviewQuery::default();
-            query.is_authenticated = Some(verified_session.is_some());
+            let is_authed_admin = if let Some(ref session) = verified_session {
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
+                let global_admins = is_global_admins_enabled(&env);
+                matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                )
+            } else {
+                false
+            };
+            query.is_authenticated = Some(is_authed_admin);
             for (k, v) in url.query_pairs() {
                 match k.as_ref() {
                     "include_deleted" | "show_deleted" => {

@@ -2370,14 +2370,28 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           headers: { "Content-Type": "application/json" }
         });
         if (res.ok) {
-          success = true;
+          const data = await res.json().catch(() => ({}));
+          if (data.status === "inventory_refresh_success") {
+            success = true;
+          } else if (data.status === "skipped_lease_active") {
+            if (!silent) showToast("Reconciliation in progress; lease active");
+          } else {
+            success = true;
+          }
         } else {
           const resFallback = await fetch("/api/reconciler/tick?read_only=true", {
             method: "POST",
             headers: { "Content-Type": "application/json" }
           });
           if (resFallback.ok) {
-            success = true;
+            const dataFb = await resFallback.json().catch(() => ({}));
+            if (dataFb.status === "inventory_refresh_success" || dataFb.status === "tick_success") {
+              success = true;
+            } else if (dataFb.status === "skipped_lease_active") {
+              if (!silent) showToast("Reconciliation in progress; lease active");
+            } else {
+              success = true;
+            }
           } else {
             const err = await resFallback.json().catch(() => ({}));
             showToast(`Refresh warning: ${err.message || resFallback.statusText}`);

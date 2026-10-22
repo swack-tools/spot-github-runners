@@ -59,14 +59,12 @@ UPLOADER_SHA=$(printf '%s' "$UPLOADER_CONFIG" | sha256sum | awk '{print $1}')
 BUILD_CONFIG='{"approved_image_id":null,"cpus":16,"image":"oxidex-remote-builder:1.99.0","memory_gib":28,"role":"builder"}'
 ADMISSION_CONFIG='{"builder_cpus":16,"builder_gib":28,"host_cpus":16,"role":"builder","runner_gib":0,"runner_names":[],"work_gib":28}'
 
-# Prepare builder asset writes script to stage binary payloads without exceeding command argument length limits
+# Prepare builder asset writes script to stage configuration and download host-agent without exceeding GCE's 256 KiB metadata limit
 cat << 'EOF' > /tmp/builder_assets.sh
 install -d -m 0755 /usr/local/bin /opt/oxidex-builder/image
-cat << 'ASSET_EOF' | base64 -d > /usr/local/bin/host-agent
-EOF
-base64 /usr/local/bin/host-agent >> /tmp/builder_assets.sh
-cat << 'EOF' >> /tmp/builder_assets.sh
-ASSET_EOF
+# Download native host-agent binary from artifact storage rather than embedding large binary in instance metadata
+curl -fsSL --retry 3 --retry-connrefused "https://storage.googleapis.com/${PROJECT}-artifacts/host-agent/host-agent" -o /usr/local/bin/host-agent || \
+  curl -fsSL --retry 3 --retry-connrefused "https://github.com/swack-tools/spot-github-runners/releases/latest/download/host-agent" -o /usr/local/bin/host-agent
 chmod 0755 /usr/local/bin/host-agent
 
 cat << 'ASSET_EOF' > /opt/oxidex-builder/image/Dockerfile
@@ -114,9 +112,12 @@ approved uploader mapping against its canonical SHA-256 before enabling SSH
 access, preventing silent identity replacement.
 
 The command executes **one `gcloud compute instances create` invocation**.
-It passes the complete embedded payload as `startup-script` metadata. The Debian
-13 GCE image runs this startup mechanism; a separate cloud-init agent is not
-required. `cloud-config.yaml` contains the equivalent payload for images with a
+It passes the rendered bootstrap script as `startup-script` metadata. Google
+documents that local instance metadata values are limited to 256 KiB; staging
+the compiled `host-agent` binary outside metadata via artifact storage keeps the
+script comfortably within this ceiling. For setups requiring entirely remote payloads,
+supply `startup-script-url` pointing to an external storage URL instead.
+`cloud-config.yaml` contains the equivalent payload for images with a
 cloud-init agent, but that alternative execution path has not been live-tested.
 
 Startup verifies fresh-host identity and the absence of existing runners/work,

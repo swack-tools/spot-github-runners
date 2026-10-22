@@ -582,7 +582,10 @@ where
     if let Some(ref mut ov) = fresh_bundle.state.overview {
         if let Some(obj) = ov.as_object_mut() {
             obj.insert("fleet_inventory".to_string(), fi.clone());
-            if let Some(iv) = obj.get_mut("instances_view").and_then(|v| v.as_object_mut()) {
+            if let Some(iv) = obj
+                .get_mut("instances_view")
+                .and_then(|v| v.as_object_mut())
+            {
                 iv.insert("fleet_inventory".to_string(), fi);
             }
         }
@@ -689,7 +692,9 @@ pub async fn refresh_fleet_inventory<K: KvStoreBackend>(
                     return run_inventory_refresh(kv, &gcp_client, now).await;
                 }
                 Err(e) => {
-                    return Err(ReconcilerError::Gcp(format!("Malformed GCP credentials: {e}")));
+                    return Err(ReconcilerError::Gcp(format!(
+                        "Malformed GCP credentials: {e}"
+                    )));
                 }
             }
         }
