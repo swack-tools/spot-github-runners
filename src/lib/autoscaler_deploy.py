@@ -16,7 +16,7 @@ every write updates with a generation precondition (see ``autoscaler_state_store
 
 This module creates or updates, in order:
 
-1. The APIs it needs, and a check that the state bucket exists (``control_watchdog_deploy.py`` creates it).
+1. The APIs it needs, and a check that the state bucket exists.
 2. Three service accounts: the job's runtime account, the scheduler's invoker account, and the runner host account
    that new hosts run as (Ops Agent metrics and logs only), so the job never acts as the default Compute Engine
    account.
@@ -38,18 +38,97 @@ import argparse
 import json
 import re
 import shlex
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
-from . import control_watchdog_deploy as wd
 from .autoscaler_job import ENV_DRY_RUN, ENV_GITHUB_TOKEN_FILE, ENV_SSH_KEY_FILE, GITHUB_SECRET_ROOT, \
     SSH_SECRET_ROOT, JobConfigError, autoscaler_argv
 from .autoscaler_state_store import ENV_STATE_URI
 from .target_config import DEFAULT_ORG, target_label_value
 
-DEFAULT_REGION = wd.DEFAULT_REGION
+DEFAULT_REGION = "us-central1"
+DEFAULT_PROJECT = "homelab-424523"
+DEFAULT_GITHUB_REPO = "swack-tools/spot-github-runners"
+FLOOR_STATE_PREFIX = "runner-floor"
+FLOOR_CONDITION_EXPRESSION = (
+    '(resource.type != "compute.googleapis.com/Instance" && resource.type != "compute.googleapis.com/Disk") || '
+    'resource.name.extract("/instances/{name}").startsWith("oxidex-runners-") || '
+    'resource.name.extract("/disks/{name}").startsWith("oxidex-runners-") || '
+    'resource.name.extract("/disks/{name}").startsWith("runner-data")'
+)
+NAME_ARG = "{name}"
+
+ROLE_ACT_AS = "roles/iam.serviceAccountUser"
+ROLE_SECRET = "roles/secretmanager.secretAccessor"
+ROLE_OBJECTS = "roles/storage.objectAdmin"
+ROLE_INVOKER = "roles/run.invoker"
+
+BASE_COMPUTE_ROLE = "roles/compute.instanceAdmin.v1"
+HOST_RESOURCES = ("instances", "disks")
+EXCLUDED_PERMISSIONS = ("compute.projects.setCommonInstanceMetadata", "compute.instances.osAdminLogin",
+                        "compute.instances.osLogin")
+
+_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
+_JOB_RE = re.compile(r"^[a-z][a-z0-9-]{0,47}[a-z0-9]$")
+_REGION_RE = re.compile(r"^[a-z]+-[a-z]+[0-9]$")
+_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
+_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
+_GH_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}$")
+
+
+class DeployError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Step:
+    title: str
+    run: tuple[tuple[str, ...], ...] = ()
+    check: tuple[str, ...] | None = None
+    create: tuple[tuple[str, ...], ...] = ()
+    update: tuple[tuple[str, ...], ...] = ()
+    require: tuple[tuple[tuple[str, ...], str], ...] = ()
+    files: Mapping[str, str] = field(default_factory=dict)
+    remove: tuple[tuple[str, ...], ...] = ()
+    prune: tuple[tuple[tuple[str, ...], tuple[str, ...], tuple[tuple[str, ...], ...]], ...] = ()
+    volume_prune: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+    remove_when: tuple[tuple[str, ...], str] | None = None
+    remove_pending: tuple[str, ...] | None = None
+    image_guard: bool = False
+
+
+Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
+
+
+def default_runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
+    timeout = 660 if list(argv) == ["sleep", "600"] else 600
+    return subprocess.run(list(argv), check=False, text=True, capture_output=True, timeout=timeout)
+
+
+def _c(*argv: str) -> tuple[str, ...]:
+    return tuple(argv)
+
+
+_PLACEHOLDER = "${PROJECT_NUMBER}"
+
+
+def _quote(arg: str) -> str:
+    if _PLACEHOLDER not in arg:
+        return shlex.quote(arg)
+    parts = (part.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+             for part in arg.split(_PLACEHOLDER))
+    return '"' + _PLACEHOLDER.join(parts) + '"'
+
+
+def _shell(argv: Sequence[str]) -> str:
+    return " ".join(_quote(arg) for arg in argv)
+
+
 # Every 5 minutes, the tiered policy's sampling interval (the autoscaler refuses any other interval in tiered mode).
 DEFAULT_SCHEDULE = "*/5 * * * *"
 DEFAULT_GITHUB_SECRET = "spot-floor-github-swack-tools"
@@ -70,17 +149,7 @@ ROLE_METRIC_WRITER = "roles/monitoring.metricWriter"
 ROLE_LOG_WRITER = "roles/logging.logWriter"
 HOSTS_CONDITION_TITLE = "spot-runner-autoscaler-hosts"
 SECRET_LABEL = "spot-runner-autoscaler"
-# The compute role is roles/compute.instanceAdmin.v1 without the permissions that reach past runner hosts. The IAM
-# condition can only narrow instances and disks; the project itself always passes it, and the base role's
-# compute.projects.setCommonInstanceMetadata would let gcloud compute ssh put the autoscaler's key (or anyone with
-# this account a startup script) into project metadata, which every VM in the project trusts. Without it gcloud
-# falls back to the runner host's own metadata. The base role is read and filtered by the watchdog deploy's
-# read_role_permissions and role_permissions, which its own custom role uses too.
-BASE_COMPUTE_ROLE = wd.BASE_COMPUTE_ROLE
 ROLE_ID = "spotRunnerHostAdmin"
-# Resource types the role may change; the IAM condition limits them to oxidex-runners-* and runner-data*.
-HOST_RESOURCES = wd.HOST_RESOURCES
-EXCLUDED_PERMISSIONS = wd.EXCLUDED_PERMISSIONS
 
 _MEMORY_RE = re.compile(r"^[1-9][0-9]*(Mi|Gi)$")
 _CPU_RE = re.compile(r"^[1-8]$")
@@ -101,7 +170,7 @@ class AutoscalerDeployConfig:
     schedule: str = DEFAULT_SCHEDULE
     image: str = ""
     project_number: str = ""
-    github_repo: str = wd.DEFAULT_GITHUB_REPO
+    github_repo: str = DEFAULT_GITHUB_REPO
     github_secret: str = DEFAULT_GITHUB_SECRET
     ssh_secret: str = DEFAULT_SSH_SECRET
     autoscaler_args: tuple[str, ...] = ()
@@ -123,7 +192,11 @@ class AutoscalerDeployConfig:
         return self.bucket or f"{self.project.replace(':', '-').replace('.', '-')}-spot-control-state"
 
     def email(self, account: str) -> str:
-        return wd.DeployConfig(project=self.project, control_vm_service_account="").email(account)
+        domain = self.project
+        if ":" in domain:
+            org, name = domain.split(":", 1)
+            domain = f"{name}.{org}"
+        return f"{account}@{domain}.iam.gserviceaccount.com"
 
     @property
     def runtime_email(self) -> str:
@@ -164,7 +237,7 @@ class AutoscalerDeployConfig:
     @property
     def floor_state_uri(self) -> str:
         # The same prefix the watchdog's runner floor keeper uses: both take one lease per target there.
-        return f"gs://{self.state_bucket}/{wd.FLOOR_STATE_PREFIX}"
+        return f"gs://{self.state_bucket}/{FLOOR_STATE_PREFIX}"
 
     @property
     def run_uri(self) -> str:
@@ -221,25 +294,25 @@ def validate(config: AutoscalerDeployConfig) -> list[str]:
     """Every problem that must stop the deploy before any command runs."""
     problems = []
     try:
-        wd.cv.project_control_paths(config.project, ".")
+        project_control_paths(config.project, ".")
     except ValueError as exc:
         problems.append(str(exc))
-    if not wd._REGION_RE.match(config.region):
+    if not _REGION_RE.match(config.region):
         problems.append(f"invalid region {config.region!r}")
-    if not wd._BUCKET_RE.match(config.state_bucket):
+    if not _BUCKET_RE.match(config.state_bucket):
         problems.append(f"invalid bucket name {config.state_bucket!r}")
     for account in (config.runtime_account, config.invoker_account, config.host_account):
-        if not wd._NAME_RE.match(account):
+        if not _NAME_RE.match(account):
             problems.append(f"service account name {account!r} must be 6-30 lower-case letters, digits or hyphens")
     for name in (config.job, config.scheduler_job, config.repository, config.image_name):
-        if not wd._JOB_RE.match(name):
+        if not _JOB_RE.match(name):
             problems.append(f"invalid resource name {name!r}")
     for secret in (config.github_secret, config.ssh_secret):
-        if not wd._SECRET_RE.match(secret):
+        if not _SECRET_RE.match(secret):
             problems.append(f"invalid secret name {secret!r}")
     if config.github_secret == config.ssh_secret:
         problems.append("the GitHub token and the SSH key need two different secrets")
-    if not wd._GH_REPO_RE.match(config.github_repo):
+    if not _GH_REPO_RE.match(config.github_repo):
         problems.append("--github-repo must be owner/repo")
     if config.schedule != DEFAULT_SCHEDULE:
         problems.append(f"the schedule must be {DEFAULT_SCHEDULE!r}: the tier policy counts samples 300-450 s apart")
@@ -286,8 +359,29 @@ def validate_args(config: AutoscalerDeployConfig) -> list[str]:
     return problems
 
 
-# The watchdog deploy's filter: every instance and disk permission, reads and uses only on the rest.
-role_permissions = wd.role_permissions
+def role_permissions(base: Sequence[str], support: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    keep = []
+    for permission in base:
+        if permission in EXCLUDED_PERMISSIONS or permission.endswith(".setIamPolicy"):
+            continue
+        service, _, rest = permission.partition(".")
+        resource, _, verb = rest.rpartition(".")
+        if service == "compute" and resource in HOST_RESOURCES:
+            pass
+        elif not verb.startswith(("get", "list") if service != "compute" else ("get", "list", "use")):
+            continue
+        if support is not None and support.get(permission, "NOT_SUPPORTED") == "NOT_SUPPORTED":
+            continue
+        keep.append(permission)
+    return tuple(sorted(set(keep)))
+
+
+def project_control_paths(project: str, directory: Path | str | None = None) -> tuple[Path, Path]:
+    if not isinstance(project, str) or not _PROJECT_ID_RE.match(project):
+        raise ValueError(f"invalid GCP project id for control state: {project!r}")
+    base = Path(directory or ".")
+    name = f"control-vm-{project.replace(':', '__')}"
+    return base / f"{name}.json", base / f"{name}.lock"
 
 
 def role_file(config: AutoscalerDeployConfig) -> str:
@@ -301,13 +395,32 @@ def role_file(config: AutoscalerDeployConfig) -> str:
                        "stage": "GA", "includedPermissions": permissions}, indent=2)
 
 
-def read_role_permissions(config: AutoscalerDeployConfig, runner: wd.Runner) -> tuple[str, ...]:
+def read_role_permissions(config: AutoscalerDeployConfig, runner: Runner) -> tuple[str, ...]:
     """Read the base role and the project's custom-role support levels; raises DeployError on failure."""
-    return wd.read_role_permissions(config.project, runner, APIS)
+    apis = APIS
+    if apis:
+        enabled = runner(["gcloud", "services", "enable", *apis, f"--project={config.project}"])
+        if enabled.returncode != 0:
+            raise DeployError(f"could not enable the APIs: {(enabled.stderr or '').strip()[:300]}")
+    described = runner(["gcloud", "iam", "roles", "describe", BASE_COMPUTE_ROLE, "--format=json"])
+    testable = runner(["gcloud", "iam", "list-testable-permissions",
+                       f"//cloudresourcemanager.googleapis.com/projects/{config.project}",
+                       "--format=json(name,customRolesSupportLevel)"])
+    try:
+        if described.returncode != 0 or testable.returncode != 0:
+            raise ValueError((described.stderr or testable.stderr or "").strip()[:300])
+        base = json.loads(described.stdout).get("includedPermissions") or []
+        support = {row["name"]: row.get("customRolesSupportLevel", "SUPPORTED") for row in json.loads(testable.stdout)}
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise DeployError(f"could not read {BASE_COMPUTE_ROLE}'s permissions: {exc}") from exc
+    permissions = role_permissions(base, support)
+    if not any(p == "compute.instances.create" for p in permissions):
+        raise DeployError(f"{BASE_COMPUTE_ROLE} returned no usable permissions")
+    return permissions
 
 
 def hosts_condition() -> dict[str, str]:
-    return {"expression": wd.FLOOR_CONDITION_EXPRESSION, "title": HOSTS_CONDITION_TITLE,
+    return {"expression": FLOOR_CONDITION_EXPRESSION, "title": HOSTS_CONDITION_TITLE,
             "description": "Runner hosts oxidex-runners-* and their runner-data disks"}
 
 
@@ -323,36 +436,36 @@ def iam_bindings(config: AutoscalerDeployConfig) -> list[tuple[str, str, str, st
          "hosts and their disks; list zones, machine types and CPU platforms"),
         (f"project {config.project}", runtime, ROLE_MONITORING_VIEWER,
          "read the runner hosts' Ops Agent memory and CPU metrics for the tier policy"),
-        (f"service account {config.host_email}", runtime, wd.ROLE_ACT_AS,
+        (f"service account {config.host_email}", runtime, ROLE_ACT_AS,
          "create runner hosts that run as that account (iam.serviceAccounts.actAs), and no other"),
-        (f"bucket gs://{config.state_bucket}", runtime, wd.ROLE_OBJECTS,
+        (f"bucket gs://{config.state_bucket}", runtime, ROLE_OBJECTS,
          "read and conditionally write the autoscaler state, its receipts, and the runner floor leases"),
-        (f"secret {config.github_secret}", runtime, wd.ROLE_SECRET,
+        (f"secret {config.github_secret}", runtime, ROLE_SECRET,
          f"read the GitHub token, mounted at {GITHUB_TOKEN_PATH}; no other secret"),
-        (f"secret {config.ssh_secret}", runtime, wd.ROLE_SECRET,
+        (f"secret {config.ssh_secret}", runtime, ROLE_SECRET,
          f"read the autoscaler's SSH private key, mounted at {SSH_KEY_PATH}; no other secret"),
         (f"project {config.project}", host, ROLE_METRIC_WRITER, "the hosts' Ops Agent writes metrics"),
         (f"project {config.project}", host, ROLE_LOG_WRITER, "the hosts' Ops Agent writes logs"),
-        (f"Cloud Run job {config.job}", f"serviceAccount:{config.invoker_email}", wd.ROLE_INVOKER,
+        (f"Cloud Run job {config.job}", f"serviceAccount:{config.invoker_email}", ROLE_INVOKER,
          "Cloud Scheduler starts executions of this one job (run.jobs.run); nobody else can"),
     ]
 
 
-def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
-    c = wd._c
+def build_steps(config: AutoscalerDeployConfig) -> list[Step]:
+    c = _c
     p = f"--project={config.project}"
     region = f"--region={config.region}"
     location = f"--location={config.region}"
     bucket = f"gs://{config.state_bucket}"
     runtime = f"serviceAccount:{config.runtime_email}"
     host = f"serviceAccount:{config.host_email}"
-    steps = [wd.Step("Enable the APIs", run=(c("gcloud", "services", "enable", *APIS, p),))]
-    steps.append(wd.Step(f"State bucket {bucket} exists (control_watchdog_deploy.py creates it)",
-                         run=(c("gcloud", "storage", "buckets", "describe", bucket, p, "--format=value(name)"),)))
+    steps = [Step("Enable the APIs", run=(c("gcloud", "services", "enable", *APIS, p),))]
+    steps.append(Step(f"State bucket {bucket} exists",
+                      run=(c("gcloud", "storage", "buckets", "describe", bucket, p, "--format=value(name)"),)))
     for account, display in ((config.runtime_account, "Runner autoscaler (Cloud Run job)"),
                              (config.invoker_account, "Runner autoscaler scheduler invoker"),
                              (config.host_account, "Runner hosts (Ops Agent metrics and logs only)")):
-        steps.append(wd.Step(
+        steps.append(Step(
             f"Service account {config.email(account)}",
             check=c("gcloud", "iam", "service-accounts", "describe", config.email(account), p, "--format=value(email)"),
             create=(c("gcloud", "iam", "service-accounts", "create", account, p, f"--display-name={display}"),)))
@@ -365,14 +478,14 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
                             f"create {config.ssh_secret} --data-file=<scratch>/key --replication-policy=automatic {p} "
                             "&& rm <scratch>/key <scratch>/key.pub"),
     }
-    steps.append(wd.Step(
+    steps.append(Step(
         "Secrets the job mounts (each needs an enabled version; this deploy never writes secret values)",
         require=tuple((c("gcloud", "secrets", "versions", "describe", "latest", f"--secret={secret}", p,
                          "--format=value(state)"),
                        f"secret {secret} ({what}) has no enabled version; create it: {how}")
                       for secret, (what, how) in sorted(hints.items()))))
     role_files = {"runner-host-role.json": role_file(config)}
-    steps.append(wd.Step(
+    steps.append(Step(
         f"Custom role {config.compute_role} (changes instances and disks only; no project metadata, OS Login, IAM)",
         files=role_files,
         check=c("gcloud", "iam", "roles", "describe", ROLE_ID, p, "--format=value(name)"),
@@ -384,18 +497,18 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
                     else ["--condition=None"])
     # The condition file is also needed to remove the conditional binding after a switch to --no-compute-condition.
     files = {"hosts-condition.json": json.dumps(hosts_condition(), indent=2)}
-    steps.append(wd.Step("Runtime and host service account IAM (narrowest resource for each role)", files=files, run=(
+    steps.append(Step("Runtime and host service account IAM (narrowest resource for each role)", files=files, run=(
         c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={runtime}",
           f"--role={config.compute_role}", *compute_args, "--format=none"),
         c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={runtime}",
           f"--role={ROLE_MONITORING_VIEWER}", "--condition=None", "--format=none"),
         c("gcloud", "iam", "service-accounts", "add-iam-policy-binding", config.host_email, p, f"--member={runtime}",
-          f"--role={wd.ROLE_ACT_AS}", "--format=none"),
+          f"--role={ROLE_ACT_AS}", "--format=none"),
         c("gcloud", "storage", "buckets", "add-iam-policy-binding", bucket, f"--member={runtime}",
-          f"--role={wd.ROLE_OBJECTS}", "--format=none"),
+          f"--role={ROLE_OBJECTS}", "--format=none"),
         *(c("gcloud", "secrets", "add-iam-policy-binding", secret, p, f"--member={runtime}",
-            f"--role={wd.ROLE_SECRET}", "--format=none") for secret in sorted({config.github_secret,
-                                                                                 config.ssh_secret})),
+            f"--role={ROLE_SECRET}", "--format=none") for secret in sorted({config.github_secret,
+                                                                             config.ssh_secret})),
         c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={host}",
           f"--role={ROLE_METRIC_WRITER}", "--condition=None", "--format=none"),
         c("gcloud", "projects", "add-iam-policy-binding", config.project, f"--member={host}",
@@ -408,33 +521,33 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
     # setting (add-iam-policy-binding never replaces it), and the accessor on labeled secrets no longer mounted.
     other = ["--condition=None"] if config.compute_condition else ["--condition-from-file=@FILE:hosts-condition.json"]
     keep = tuple(sorted({config.github_secret, config.ssh_secret}))
-    steps.append(wd.Step(
+    steps.append(Step(
         "Remove grants that are no longer configured (absent ones are skipped)", files=files,
         remove=(c("gcloud", "projects", "remove-iam-policy-binding", config.project, f"--member={runtime}",
                   f"--role={config.compute_role}", *other, "--format=none"),)))
     # Revoking a retired secret waits until the job mounts the new ones: an infrastructure-only deploy (no --image)
     # keeps every grant, so the deployed job can still read what it mounts.
-    secret_prune = wd.Step(
+    secret_prune = Step(
         "Revoke the job's access to secrets it no longer mounts (absent ones are skipped)",
         prune=((c("gcloud", "secrets", "list", p, f"--filter=labels.{SECRET_LABEL}=mounted",
                   "--format=value(name.basename())"), keep,
-                (c("gcloud", "secrets", "remove-iam-policy-binding", wd.NAME_ARG, p, f"--member={runtime}",
-                   f"--role={wd.ROLE_SECRET}", "--format=none"),
-                 c("gcloud", "secrets", "update", wd.NAME_ARG, p, f"--remove-labels={SECRET_LABEL}",
+                (c("gcloud", "secrets", "remove-iam-policy-binding", NAME_ARG, p, f"--member={runtime}",
+                   f"--role={ROLE_SECRET}", "--format=none"),
+                 c("gcloud", "secrets", "update", NAME_ARG, p, f"--remove-labels={SECRET_LABEL}",
                    "--format=none"))),))
     if not config.image:
         return steps
     env_arg = "--set-env-vars=^|^" + "|".join(f"{k}={v}" for k, v in sorted(config.job_env().items()))
     secrets_arg = (f"--set-secrets={GITHUB_TOKEN_PATH}={config.github_secret}:latest,"
                    f"{SSH_KEY_PATH}={config.ssh_secret}:latest")
-    steps.append(wd.Step(f"Cloud Run job {config.job} (one --once check per execution)", run=(
+    steps.append(Step(f"Cloud Run job {config.job} (one --once check per execution)", run=(
         c("gcloud", "run", "jobs", "deploy", config.job, p, region, f"--image={config.image}",
           f"--service-account={config.runtime_email}", "--tasks=1", "--parallelism=1", "--max-retries=0",
           f"--task-timeout={config.task_timeout}s", f"--cpu={config.cpu}", f"--memory={config.memory}",
           env_arg, secrets_arg, "--args=^|^" + "|".join(config.job_args()),
           "--labels=spot-role=runner-autoscaler", "--quiet"),
         c("gcloud", "run", "jobs", "add-iam-policy-binding", config.job, p, region,
-          f"--member=serviceAccount:{config.invoker_email}", f"--role={wd.ROLE_INVOKER}", "--format=none"),
+          f"--member=serviceAccount:{config.invoker_email}", f"--role={ROLE_INVOKER}", "--format=none"),
     )))
     steps.append(secret_prune)
     if config.skip_scheduler:
@@ -443,7 +556,7 @@ def build_steps(config: AutoscalerDeployConfig) -> list[wd.Step]:
                  "--http-method=POST", f"--oauth-service-account-email={config.invoker_email}",
                  "--oauth-token-scope=https://www.googleapis.com/auth/cloud-platform", "--attempt-deadline=60s",
                  "--max-retry-attempts=0")
-    steps.append(wd.Step(
+    steps.append(Step(
         f"Cloud Scheduler job {config.scheduler_job} ({config.schedule}, OAuth as {config.invoker_email})",
         check=c("gcloud", "scheduler", "jobs", "describe", config.scheduler_job, location, p, "--format=value(name)"),
         create=(c("gcloud", "scheduler", "jobs", "create", "http", config.scheduler_job, *scheduler,
@@ -469,18 +582,114 @@ def footer(config: AutoscalerDeployConfig) -> list[str]:
     return lines
 
 
+def render(config: AutoscalerDeployConfig, steps: Sequence[Step], *, title: str = "Runner autoscaler deploy (preview)",
+           footer: Sequence[str] | None = None) -> str:
+    """The dry-run script: every command, in order, as it would run. Nothing runs."""
+    lines = ["#!/usr/bin/env bash", f"# {title}: nothing below has run.", "set -euo pipefail"]
+    if not config.project_number:
+        lines.append(f"PROJECT_NUMBER=\"$(gcloud projects describe {shlex.quote(config.project)} "
+                     "--format='value(projectNumber)')\"")
+    for index, step in enumerate(steps, 1):
+        lines += ["", f"# {index}. {step.title}"]
+        for name, content in step.files.items():
+            lines.append(f"# @FILE:{name} is a temporary file holding:")
+            lines += [f"#   {line}" for line in content.splitlines()]
+        for command, hint in step.require:
+            lines.append(f"test \"$({_shell(command)})\" = ENABLED || {{ echo {shlex.quote(hint)} >&2; exit 1; }}")
+        if step.check:
+            lines.append(f"if {_shell(step.check)} >/dev/null 2>&1; then")
+            lines += [f"  {_shell(c)}" for c in step.update] or ["  :  # exists"]
+            lines.append("else")
+            lines += [f"  {_shell(c)}" for c in step.create]
+            lines.append("fi")
+        lines += [_shell(c) for c in step.run]
+        lines += [f"{_shell(c)} 2>/dev/null || echo 'already absent'" for c in step.remove]
+        for listing, keep, commands in step.prune:
+            lines.append(f"for name in $({_shell(listing)}); do")
+            lines.append(f"  case ' {' '.join(keep)} ' in *\" $name \"*) continue ;; esac")
+            lines += [f"  {_shell(c).replace(shlex.quote(NAME_ARG), '\"$name\"')} 2>/dev/null || echo 'already absent'"
+                      for c in commands]
+            lines.append("done")
+    if footer is not None:
+        lines += list(footer)
+    return "\n".join(lines) + "\n"
+
+
+def execute(config: AutoscalerDeployConfig, steps: Sequence[Step], runner: Runner = default_runner,
+            out: Callable[[str], None] = print) -> None:
+    """Run the steps. Raises DeployError at the first failure; everything before it stays in place (idempotent)."""
+    number = config.project_number
+    if not number:
+        result = runner(["gcloud", "projects", "describe", config.project, "--format=value(projectNumber)"])
+        number = (result.stdout or "").strip()
+        if result.returncode != 0 or not re.match(r"^[0-9]{6,20}$", number):
+            raise DeployError(f"could not read the project number: {(result.stderr or '').strip()[:300]}")
+    with tempfile.TemporaryDirectory(prefix="spot-autoscaler-deploy-") as tmp:
+        def materialize(argv: Sequence[str], files: Mapping[str, str]) -> list[str]:
+            resolved = []
+            for arg in argv:
+                for name, content in files.items():
+                    marker = f"@FILE:{name}"
+                    if marker in arg:
+                        path = Path(tmp) / name
+                        path.write_text(content, encoding="utf-8")
+                        arg = arg.replace(marker, str(path))
+                resolved.append(arg.replace("${PROJECT_NUMBER}", number))
+            return resolved
+
+        def run(argv: Sequence[str], files: Mapping[str, str], what: str) -> None:
+            command = materialize(argv, files)
+            out(f"+ {shlex.join(command)}")
+            result = runner(command)
+            if result.returncode != 0:
+                raise DeployError(f"{what} failed: {(result.stderr or '').strip()[:500]}")
+
+        def remove(argv: Sequence[str], files: Mapping[str, str], what: str) -> None:
+            command = materialize(argv, files)
+            out(f"+ {shlex.join(command)}")
+            result = runner(command)
+            if result.returncode != 0 and "not found" not in (result.stderr or "").lower():
+                raise DeployError(f"{what} failed: {(result.stderr or '').strip()[:500]}")
+
+        for index, step in enumerate(steps, 1):
+            out(f"# {index}. {step.title}")
+            for command, hint in step.require:
+                result = runner(materialize(command, step.files))
+                if result.returncode != 0 or (result.stdout or "").strip() != "ENABLED":
+                    raise DeployError(hint)
+            if step.check:
+                exists = runner(materialize(step.check, step.files)).returncode == 0
+                for command in (step.update if exists else step.create):
+                    run(command, step.files, step.title)
+                if exists and not step.update:
+                    out("  exists")
+            for command in step.run:
+                run(command, step.files, step.title)
+            for command in step.remove:
+                remove(command, step.files, step.title)
+            for listing, keep, commands in step.prune:
+                result = runner(materialize(listing, step.files))
+                if result.returncode != 0:
+                    raise DeployError(f"{step.title} failed: {(result.stderr or '').strip()[:500]}")
+                for name in sorted({line.strip() for line in (result.stdout or "").splitlines() if line.strip()}):
+                    if name in keep:
+                        continue
+                    for command in commands:
+                        remove(tuple(name if arg == NAME_ARG else arg for arg in command), step.files, step.title)
+
+
 def args_from_file(path: str) -> tuple[str, ...]:
     """Autoscaler flags from a file: shell words per line, ``#`` comments and blank lines ignored."""
     try:
         text = Path(path).expanduser().read_text(encoding="utf-8")
     except OSError as exc:
-        raise wd.DeployError(f"could not read --autoscaler-args-file {path}: {exc.strerror}") from exc
+        raise DeployError(f"could not read --autoscaler-args-file {path}: {exc.strerror}") from exc
     args: list[str] = []
     for number, line in enumerate(text.splitlines(), 1):
         try:
             args += shlex.split(line, comments=True)
         except ValueError as exc:
-            raise wd.DeployError(f"{path}:{number}: {exc}") from exc
+            raise DeployError(f"{path}:{number}: {exc}") from exc
     return tuple(args)
 
 
@@ -488,7 +697,7 @@ def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create or update the runner autoscaler Cloud Run job and its Cloud Scheduler trigger. Prints "
                     "the commands as a reviewable script unless --apply is given.")
-    parser.add_argument("--project", default=wd.cv.DEFAULT_PROJECT)
+    parser.add_argument("--project", default=DEFAULT_PROJECT)
     parser.add_argument("--region", default=DEFAULT_REGION, help="Region of the job, scheduler and image repository")
     parser.add_argument("--bucket", default="", help="State bucket (default: <project>-spot-control-state)")
     parser.add_argument("--image", default="",
@@ -504,7 +713,7 @@ def args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory", default="2Gi", help="Memory per execution (default: %(default)s)")
     parser.add_argument("--task-timeout", type=int, default=TASK_TIMEOUT_SECONDS,
                         help="Seconds before an execution is stopped (default: %(default)s)")
-    parser.add_argument("--github-repo", default=wd.DEFAULT_GITHUB_REPO)
+    parser.add_argument("--github-repo", default=DEFAULT_GITHUB_REPO)
     parser.add_argument("--project-number", default="", help="Skip the project-number lookup")
     parser.add_argument("--no-compute-condition", dest="compute_condition", action="store_false",
                         help="Grant the compute role without the oxidex-runners-* IAM condition")
@@ -514,7 +723,7 @@ def args_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None, *, runner: wd.Runner = wd.default_runner,
+def main(argv: Sequence[str] | None = None, *, runner: Runner = default_runner,
          env: Mapping[str, str] | None = None) -> int:
     import os
 
@@ -531,16 +740,16 @@ def main(argv: Sequence[str] | None = None, *, runner: wd.Runner = wd.default_ru
             env={key: str(env.get(key, "") or "") for key in PASSTHROUGH_ENV})
         problems = validate(config)
         if problems:
-            raise wd.DeployError("refusing to deploy:\n  - " + "\n  - ".join(problems))
+            raise DeployError("refusing to deploy:\n  - " + "\n  - ".join(problems))
         if args.apply:
             config = replace(config, role_permissions=read_role_permissions(config, runner))
         steps = build_steps(config)
         if not args.apply:
-            sys.stdout.write(wd.render(config, steps, title="Runner autoscaler deploy (preview)",
-                                       footer=footer(config)))
+            sys.stdout.write(render(config, steps, title="Runner autoscaler deploy (preview)",
+                                    footer=footer(config)))
             return 0
-        wd.execute(config, steps, runner)
-    except wd.DeployError as exc:
+        execute(config, steps, runner)
+    except DeployError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"Deployed. Job: {config.job} in {config.region}; state: {config.state_uri}.")

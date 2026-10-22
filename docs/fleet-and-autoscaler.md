@@ -201,8 +201,8 @@ without a workstation, use the [runner floor keeper](#runner-floor-keeper).
 
 The runner floor keeper, `src/runner_floor.py`, keeps at least one minimal Spot
 runner host for each target in `SPOT_RUNNER_FLOOR_TARGETS`. The
-[control VM watchdog](edge-dashboard.md#watchdog) runs one floor step after its
-control VM step on every tick, so the floor holds while no operator workstation
+[scheduled fleet reconciler](edge-dashboard.md#scheduled-fleet-reconciliation) maintains floor targets
+on every cron tick, so the floor holds while no operator workstation
 runs. The keeper only guarantees the floor. Scaling beyond it, drains,
 rotations, and lost-host cleanup stay with the autoscaler.
 
@@ -333,7 +333,7 @@ the autoscaler or an operator.
 
 Each target has its own floor state object and its own lease in the state
 bucket, next to the control VM state, with the same generation-checked writes and lease
-rules as the [control VM lease](edge-dashboard.md#shared-state-and-lease). The
+rules as the [scheduled fleet reconciliation lease](edge-dashboard.md#scheduled-fleet-reconciliation). The
 keeper takes a target's lease only for a step that acts, and skips the target
 while someone else holds it.
 

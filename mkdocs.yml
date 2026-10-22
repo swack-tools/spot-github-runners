@@ -65,7 +65,7 @@ nav:
       - Runner patches: runner-patches.md
   - Dashboard:
       - Dashboard: dashboard.md
-      - Edge hosting and control VM: edge-dashboard.md
+      - Serverless edge dashboard: edge-dashboard.md
   - Dedicated builders:
       - Set up a builder: dedicated-builders.md
       - Runtime updates: builder-runtime-updates.md

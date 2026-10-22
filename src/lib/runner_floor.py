@@ -1921,9 +1921,10 @@ class AutoscalerTargetLease:
 # Command-line interface
 # --------------------------------------------------------------------------------------------
 
-def args_parser() -> argparse.ArgumentParser:
-    from .control_vm import DEFAULT_PROJECT
+DEFAULT_PROJECT = "homelab-424523"
 
+
+def args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Keep at least one minimal Spot runner host per target in SPOT_RUNNER_FLOOR_TARGETS. Only "
                     "`tick --apply` and `replace-unmanaged --apply` change resources.")

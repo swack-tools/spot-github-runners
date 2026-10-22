@@ -332,4 +332,4 @@ metadata limits exposure but doesn't revoke it. Don't use a registration token a
   publish a label such as `spot-heavy32`.
 - Cloudflare Workers KV is eventually consistent. The dashboard's active-slot checks narrow the race between
   two writers, but the real exclusivity guarantee is the controller's fence. See
-  [Edge hosting and the control VM](edge-dashboard.md#snapshot-and-active-slot-checks).
+  [Edge state and quota conservation](edge-dashboard.md#edge-state-and-quota-conservation).

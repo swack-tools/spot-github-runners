@@ -42,6 +42,7 @@ import os
 import re
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -49,11 +50,125 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .control_vm import CONTROL_STATE_MOVED_KEY as MOVED_KEY
-from .control_vm import ENV_CONTROL_STATE_URI, STATE_KEY, ControlStateConflict, ProjectControlState, project_control_paths
 from .https_transport import HttpResponse, Transport, TransportError, https_request
 
 LOG = logging.getLogger("spot_runner_autoscaler.control_vm")
+
+ENV_CONTROL_STATE_DIR = "SPOT_CONTROL_STATE_DIR"
+ENV_CONTROL_STATE_URI = "SPOT_CONTROL_STATE_URI"
+CONTROL_STATE_MOVED_KEY = "control_vm_state_moved_to"
+MOVED_KEY = CONTROL_STATE_MOVED_KEY
+STATE_KEY = "control_vm"
+_PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}$")
+
+
+class ControlStateConflict(RuntimeError):
+    """A controller state file holds control VM state that differs from, and can't replace, the project state."""
+
+
+def default_control_state_dir(env: Mapping[str, str] | None = None) -> Path:
+    env = os.environ if env is None else env
+    configured = str(env.get(ENV_CONTROL_STATE_DIR, "") or "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".config" / "spot-runner-autoscaler"
+
+
+def project_control_paths(project: str, directory: Path | str | None = None) -> tuple[Path, Path]:
+    """(state file, lock file) of a project's control state lifecycle."""
+    if not isinstance(project, str) or not _PROJECT_ID_RE.match(project):
+        raise ValueError(f"invalid GCP project id for control state: {project!r}")
+    base = Path(directory).expanduser() if directory else default_control_state_dir()
+    name = f"control-vm-{project.replace(':', '__')}"
+    return base / f"{name}.json", base / f"{name}.lock"
+
+
+def _must_preserve(cstate: Any) -> bool:
+    return isinstance(cstate, dict) and bool(cstate.get("transition") or cstate.get("retained_disks"))
+
+
+class ProjectControlState:
+    guard: Callable[[], None] | None = None
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.state: dict[str, Any] = {}
+
+    def load(self) -> "ProjectControlState":
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            backups = sorted(self.path.parent.glob(f"{self.path.name}.migrated-*"))
+            if backups:
+                # A migrated file whose marker is gone is never empty state: the state lives elsewhere.
+                raise ControlStateConflict(f"control VM state {self.path} is missing but {backups[-1].name} shows it "
+                                           f"was migrated; set {ENV_CONTROL_STATE_URI}, or restore the file by hand")
+            data = {}
+        if isinstance(data, dict) and CONTROL_STATE_MOVED_KEY in data:
+            # Fail closed: this file was migrated, and acting on it would fork the state.
+            raise ControlStateConflict(f"control VM state {self.path} moved to {data.get(CONTROL_STATE_MOVED_KEY)}; "
+                                       f"set {ENV_CONTROL_STATE_URI}={data.get(CONTROL_STATE_MOVED_KEY)}")
+        if not isinstance(data, dict) or not isinstance(data.get(STATE_KEY, {}), dict):
+            # Never start over from defaults: an unreadable record could hide an in-progress transition.
+            raise ControlStateConflict(f"control VM state {self.path} is not a JSON object; repair it by hand")
+        self.state = data
+        return self
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=self.path.parent, delete=False, encoding="utf-8") as temp:
+            json.dump(self.state, temp)
+            temp.flush()
+            os.fsync(temp.fileno())
+        Path(temp.name).replace(self.path)
+
+    def adopt(self, controller_state: dict, source: Path | str, *, persist: bool) -> bool:
+        if STATE_KEY not in controller_state:
+            return False
+        legacy = controller_state[STATE_KEY]
+        current = self.state.get(STATE_KEY)
+        if legacy == current or not _must_preserve(legacy):
+            controller_state.pop(STATE_KEY)
+            return True
+        if _must_preserve(current):
+            raise ControlStateConflict(
+                f"{source} and {self.path} both hold an in-progress control VM transition or retained disks, and "
+                "they differ; resolve which one is current before this controller manages the control VM")
+        self.state[STATE_KEY] = copy.deepcopy(legacy)
+        if persist:
+            self.save()
+        controller_state.pop(STATE_KEY)
+        return True
+
+
+class ProjectControlLock:
+    def __init__(self, project: str, directory: Path | str | None = None) -> None:
+        self.state_path, self.lock_path = project_control_paths(project, directory)
+        self._handle: Any = None
+
+    def __enter__(self) -> ProjectControlState | None:
+        import fcntl
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.lock_path.open("a")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return None
+        self._handle = handle
+        try:
+            return ProjectControlState(self.state_path).load()
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+
+def control_state_uri(env: Mapping[str, str] | None = None) -> str:
+    env = os.environ if env is None else env
+    return str(env.get(ENV_CONTROL_STATE_URI, "") or "").strip()
 
 STATE_SCHEMA = "spot-control-vm-state-v1"
 LOCK_SCHEMA = "spot-control-vm-lock-v1"

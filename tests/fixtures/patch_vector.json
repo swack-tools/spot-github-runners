@@ -1,0 +1,219 @@
+{
+  "schema": "spot-runner-patch-vectors-v1",
+  "test_vectors_count": 6,
+  "vectors": [
+    {
+      "id": "v1_empty_manifest",
+      "description": "Minimal manifest with default schema",
+      "input_manifest": {
+        "schema": "spot-runner-patch-v1"
+      },
+      "raw_dict_sha256": "48a127dcdd4fb702470d547a4d2e825af8b6a1c16ea2ea7d062ca98e140edaf1",
+      "canonical_json": "{\"container\":{\"apt_packages\":[],\"dockerfile_run\":\"\",\"files\":[],\"mounts\":[],\"sysctl\":{}},\"hardware\":{\"arch\":\"x86_64\",\"extra_labels\":[],\"isa\":[],\"min_ram_gib\":null,\"min_vcpu\":null,\"qualify_command\":\"\"},\"host\":{\"apt_packages\":[],\"boot_mkdirs\":[],\"boot_script\":\"\",\"files\":[],\"sysctl\":{}},\"repository\":\"\",\"schema\":\"spot-runner-patch-v1\"}",
+      "patch_sha256": "dea5d163b5a1b1206d456003a5901e63638cb8150b70f649716ff4af0961e9ac"
+    },
+    {
+      "id": "v2_standard_e2e_manifest",
+      "description": "Standard E2E 16-vCPU/32-GiB manifest satisfying all hardware floor sizing",
+      "input_manifest": {
+        "schema": "spot-runner-patch-v1",
+        "repository": "swack-tools/oxidex",
+        "hardware": {
+          "arch": "x86_64",
+          "isa": [
+            "avx2"
+          ],
+          "extra_labels": [
+            "type-c4d-highcpu-16"
+          ],
+          "min_vcpu": 16,
+          "min_ram_gib": 32,
+          "runners_count": 2,
+          "runner_vcpu": 7,
+          "runner_ram_gib": 14,
+          "host_overhead_gib": 4,
+          "queued_jobs_threshold": 20,
+          "qualify_command": ""
+        },
+        "host": {
+          "apt_packages": [
+            "git",
+            "curl"
+          ],
+          "sysctl": {
+            "net.core.somaxconn": "4096"
+          },
+          "files": [],
+          "boot_mkdirs": [],
+          "boot_script": ""
+        },
+        "container": {
+          "apt_packages": [
+            "build-essential",
+            "pkg-config"
+          ],
+          "sysctl": {},
+          "mounts": [],
+          "files": [],
+          "dockerfile_run": ""
+        }
+      },
+      "raw_dict_sha256": "29b938a0dbaa6fb14936aa3e15ee631a8c9891b8ff2b49785e50e5681e27a13c",
+      "canonical_json": "{\"container\":{\"apt_packages\":[\"build-essential\",\"pkg-config\"],\"dockerfile_run\":\"\",\"files\":[],\"mounts\":[],\"sysctl\":{}},\"hardware\":{\"arch\":\"x86_64\",\"extra_labels\":[\"type-c4d-highcpu-16\"],\"host_overhead_gib\":4,\"isa\":[\"avx2\"],\"min_ram_gib\":32,\"min_vcpu\":16,\"qualify_command\":\"\",\"queued_jobs_threshold\":20,\"runner_ram_gib\":14,\"runner_vcpu\":7,\"runners_count\":2},\"host\":{\"apt_packages\":[\"git\",\"curl\"],\"boot_mkdirs\":[],\"boot_script\":\"\",\"files\":[],\"sysctl\":{\"net.core.somaxconn\":\"4096\"}},\"repository\":\"swack-tools/oxidex\",\"schema\":\"spot-runner-patch-v1\"}",
+      "patch_sha256": "29b938a0dbaa6fb14936aa3e15ee631a8c9891b8ff2b49785e50e5681e27a13c"
+    },
+    {
+      "id": "v3_nntmux_multisection_manifest",
+      "description": "Complex manifest with custom sysctls, multiline scripts, files, mounts, and qualify_command",
+      "input_manifest": {
+        "schema": "spot-runner-patch-v1",
+        "repository": "xbmc4lyfe/newznab-tmux",
+        "hardware": {
+          "arch": "x86_64",
+          "isa": [
+            "avx512-vbmi2"
+          ],
+          "extra_labels": [
+            "avx512-vbmi2",
+            "nntmux-simd"
+          ],
+          "min_vcpu": 16,
+          "min_ram_gib": 64,
+          "qualify_command": "grep -q avx512_vbmi2 /proc/cpuinfo\n"
+        },
+        "host": {
+          "apt_packages": [
+            "linux-perf"
+          ],
+          "sysctl": {
+            "net.core.rmem_max": 134217728,
+            "net.core.wmem_max": 134217728,
+            "vm.max_map_count": 262144
+          },
+          "boot_mkdirs": [
+            "/mnt/runner-data/nntmux-cache"
+          ],
+          "files": [
+            {
+              "path": "/etc/security/limits.d/99-nntmux.conf",
+              "mode": "0644",
+              "owner": "root:root",
+              "content": "* soft nofile 1048576\n* hard nofile 1048576\n"
+            }
+          ],
+          "boot_script": "chown 1001:1001 /mnt/runner-data/nntmux-cache\n"
+        },
+        "container": {
+          "apt_packages": [
+            "php-cli",
+            "php-ffi",
+            "composer"
+          ],
+          "sysctl": {
+            "net.ipv4.tcp_rmem": "4096 87380 67108864",
+            "net.ipv4.tcp_wmem": "4096 65536 67108864"
+          },
+          "mounts": [
+            {
+              "source": "/mnt/runner-data/nntmux-cache",
+              "target": "/work/.nntmux-cache",
+              "read_only": false
+            }
+          ],
+          "files": [
+            {
+              "path": "/etc/php-ffi-runner.ini",
+              "mode": "0644",
+              "content": "ffi.enable=true\nmemory_limit=1G\n"
+            }
+          ],
+          "dockerfile_run": "php -v && composer --version\n"
+        }
+      },
+      "raw_dict_sha256": "0c0a44a79d0365ef83c9d235581022fe875240f737cac80ce9ca7fd17134a1ce",
+      "canonical_json": "{\"container\":{\"apt_packages\":[\"php-cli\",\"php-ffi\",\"composer\"],\"dockerfile_run\":\"php -v && composer --version\\n\",\"files\":[{\"content\":\"ffi.enable=true\\nmemory_limit=1G\\n\",\"mode\":\"0644\",\"owner\":\"root:root\",\"path\":\"/etc/php-ffi-runner.ini\"}],\"mounts\":[{\"read_only\":false,\"source\":\"/mnt/runner-data/nntmux-cache\",\"target\":\"/work/.nntmux-cache\"}],\"sysctl\":{\"net.ipv4.tcp_rmem\":\"4096 87380 67108864\",\"net.ipv4.tcp_wmem\":\"4096 65536 67108864\"}},\"hardware\":{\"arch\":\"x86_64\",\"extra_labels\":[\"avx512-vbmi2\",\"nntmux-simd\"],\"isa\":[\"avx512-vbmi2\"],\"min_ram_gib\":64,\"min_vcpu\":16,\"qualify_command\":\"grep -q avx512_vbmi2 /proc/cpuinfo\\n\"},\"host\":{\"apt_packages\":[\"linux-perf\"],\"boot_mkdirs\":[\"/mnt/runner-data/nntmux-cache\"],\"boot_script\":\"chown 1001:1001 /mnt/runner-data/nntmux-cache\\n\",\"files\":[{\"content\":\"* soft nofile 1048576\\n* hard nofile 1048576\\n\",\"mode\":\"0644\",\"owner\":\"root:root\",\"path\":\"/etc/security/limits.d/99-nntmux.conf\"}],\"sysctl\":{\"net.core.rmem_max\":\"134217728\",\"net.core.wmem_max\":\"134217728\",\"vm.max_map_count\":\"262144\"}},\"repository\":\"xbmc4lyfe/newznab-tmux\",\"schema\":\"spot-runner-patch-v1\"}",
+      "patch_sha256": "759ecb98c3f8e53e9f882f37eb0bdf76ead66ee81a7a24af6d1f649e33dfd012"
+    },
+    {
+      "id": "v4_unicode_boot_script_manifest",
+      "description": "Manifest with non-ASCII unicode characters verifying ensure_ascii escaping parity",
+      "input_manifest": {
+        "schema": "spot-runner-patch-v1",
+        "repository": "swack-tools/oxidex",
+        "hardware": {
+          "arch": "x86_64",
+          "isa": [
+            "avx2"
+          ],
+          "extra_labels": [
+            "type-c4d-highcpu-16"
+          ],
+          "min_vcpu": 16,
+          "min_ram_gib": 32,
+          "runners_count": 2,
+          "runner_vcpu": 7,
+          "runner_ram_gib": 14,
+          "host_overhead_gib": 4,
+          "queued_jobs_threshold": 20,
+          "qualify_command": ""
+        },
+        "host": {
+          "apt_packages": [
+            "git",
+            "curl"
+          ],
+          "sysctl": {
+            "net.core.somaxconn": "4096"
+          },
+          "files": [],
+          "boot_mkdirs": [],
+          "boot_script": "echo '\u00fc\u00f1\u00ee\u00e7\u00f8d\u00e9 test'"
+        },
+        "container": {
+          "apt_packages": [
+            "build-essential",
+            "pkg-config"
+          ],
+          "sysctl": {},
+          "mounts": [],
+          "files": [],
+          "dockerfile_run": ""
+        }
+      },
+      "raw_dict_sha256": "969bc6a9aa397fa0698beb3aa0fd02d11bbfce7ca78f8d6f9bc4316642737730",
+      "canonical_json": "{\"container\":{\"apt_packages\":[\"build-essential\",\"pkg-config\"],\"dockerfile_run\":\"\",\"files\":[],\"mounts\":[],\"sysctl\":{}},\"hardware\":{\"arch\":\"x86_64\",\"extra_labels\":[\"type-c4d-highcpu-16\"],\"host_overhead_gib\":4,\"isa\":[\"avx2\"],\"min_ram_gib\":32,\"min_vcpu\":16,\"qualify_command\":\"\",\"queued_jobs_threshold\":20,\"runner_ram_gib\":14,\"runner_vcpu\":7,\"runners_count\":2},\"host\":{\"apt_packages\":[\"git\",\"curl\"],\"boot_mkdirs\":[],\"boot_script\":\"echo '\\u00fc\\u00f1\\u00ee\\u00e7\\u00f8d\\u00e9 test'\",\"files\":[],\"sysctl\":{\"net.core.somaxconn\":\"4096\"}},\"repository\":\"swack-tools/oxidex\",\"schema\":\"spot-runner-patch-v1\"}",
+      "patch_sha256": "969bc6a9aa397fa0698beb3aa0fd02d11bbfce7ca78f8d6f9bc4316642737730"
+    },
+    {
+      "id": "v5_sizing_fields_override_manifest",
+      "description": "Manifest explicitly specifying all 5 optional hardware sizing fields",
+      "input_manifest": {
+        "schema": "spot-runner-patch-v1",
+        "repository": "swack-tools/oxidex",
+        "hardware": {
+          "min_vcpu": 16,
+          "min_ram_gib": 32,
+          "runners_count": 2,
+          "runner_vcpu": 7,
+          "runner_ram_gib": 14,
+          "host_overhead_gib": 4,
+          "queued_jobs_threshold": 20
+        }
+      },
+      "raw_dict_sha256": "9c27e2d2a793973ca503739fce23ae8a0650ed7374a31a2881fd904b8bf78823",
+      "canonical_json": "{\"container\":{\"apt_packages\":[],\"dockerfile_run\":\"\",\"files\":[],\"mounts\":[],\"sysctl\":{}},\"hardware\":{\"arch\":\"x86_64\",\"extra_labels\":[],\"host_overhead_gib\":4,\"isa\":[],\"min_ram_gib\":32,\"min_vcpu\":16,\"qualify_command\":\"\",\"queued_jobs_threshold\":20,\"runner_ram_gib\":14,\"runner_vcpu\":7,\"runners_count\":2},\"host\":{\"apt_packages\":[],\"boot_mkdirs\":[],\"boot_script\":\"\",\"files\":[],\"sysctl\":{}},\"repository\":\"swack-tools/oxidex\",\"schema\":\"spot-runner-patch-v1\"}",
+      "patch_sha256": "4748905735fccb421c6f89c9fbd5d6aa390fcf58b49882cdd23e84d980fe61ef"
+    },
+    {
+      "id": "v6_additive_fields_omitted",
+      "description": "Additive fields (source_image, golden_image_family, source_instance_template) omitted, preserving 100% bit-for-bit parity",
+      "input_manifest": {
+        "schema": "spot-runner-patch-v1",
+        "repository": "swack-tools/oxidex"
+      },
+      "raw_dict_sha256": "02ec82f5781f2d84275cdff11acb62ec4df024d3a6029d2c41b1ce5fb3fc3f3e",
+      "canonical_json": "{\"container\":{\"apt_packages\":[],\"dockerfile_run\":\"\",\"files\":[],\"mounts\":[],\"sysctl\":{}},\"hardware\":{\"arch\":\"x86_64\",\"extra_labels\":[],\"isa\":[],\"min_ram_gib\":null,\"min_vcpu\":null,\"qualify_command\":\"\"},\"host\":{\"apt_packages\":[],\"boot_mkdirs\":[],\"boot_script\":\"\",\"files\":[],\"sysctl\":{}},\"repository\":\"swack-tools/oxidex\",\"schema\":\"spot-runner-patch-v1\"}",
+      "patch_sha256": "cec923ec70f57a7de0f7972a33c547041a4c9637880f420791743c4d37000275"
+    }
+  ]
+}

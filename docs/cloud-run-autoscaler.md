@@ -137,7 +137,7 @@ runs the loop all the time would cost about $47 a month for the same size.
 
 Prerequisites:
 
-- The [watchdog](edge-dashboard.md#watchdog) is deployed: its bucket, its Artifact Registry repository, its
+- The watchdog is deployed: its bucket, its Artifact Registry repository, its
   image publisher, and its runner floor lease prefix.
 - Owner access to the project.
 - The [image](#build-the-image) pushed by the image workflow.

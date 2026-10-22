@@ -157,10 +157,10 @@ that cause.
   that the replacement's state reached the old VM. Both keep a boot disk for you to recover from.
 - **`state_conflict`:** `/api/health` reports it when a KV write read back as another slot's snapshot. The
   dashboard stops accepting changes until KV shows this slot's write. See
-  [Snapshot and active slot checks](edge-dashboard.md#snapshot-and-active-slot-checks).
+  [Edge state and quota conservation](edge-dashboard.md#edge-state-and-quota-conservation).
 - **Unreadable dashboard state:** the dashboard renames the file to `state.json.corrupt-<UTC time>`, keeps
   `state.json.recovery-pending` until recovered state is on disk, and reports `state_unavailable`. See
-  [Unreadable state file](edge-dashboard.md#unreadable-state-file).
+  [Outages and recovery](edge-dashboard.md#outages-and-recovery).
 - **Conflicting control VM state:** when a controller's own state file and the project file hold different
   transitions or retained disks, the controller logs that it must `resolve which one is current` and
   doesn't manage the control VM. Decide which state is current before you continue.

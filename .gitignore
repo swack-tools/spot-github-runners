@@ -13,13 +13,20 @@
 !AGENTS.md
 !CLAUDE.md
 !README.md
+!PROJECT.md
+!TEST_INFRA.md
+!TEST_READY.md
 !builder/standalone/website-package.json
 !builder/standalone/website-package-lock.json
 !docs/*.md
 !docs/requirements.txt
-!cloudflare/*.js
-!cloudflare/*.mjs
+!cloudflare/Cargo.toml
+!cloudflare/Cargo.lock
 !cloudflare/wrangler.toml
+!cloudflare/src/**
+!cloudflare/tests/**
+!cloudflare/build/worker/shim.mjs
+!tools/edge_dashboard_probe.js
 !tests/fixtures/*.json
 
 # Secrets, generated files, and local-only artifacts
@@ -39,11 +46,13 @@ htmlcov/
 .firecrawl/
 /docs/superpowers/
 /site/
+cloudflare/target/
+cloudflare/.wrangler/
 
 # Python packaging and tooling artifacts
 *.egg
 *.egg-info/
-build/
+/build/
 dist/
 .eggs/
 .tox/

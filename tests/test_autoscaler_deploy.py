@@ -14,7 +14,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from lib import autoscaler_deploy as deploy
-from lib import control_watchdog_deploy as wd
 
 PROJECT = "homelab-424523"
 NUMBER = "330135650610"
@@ -83,8 +82,7 @@ class FakeGcloud:
 class ConfigTests(unittest.TestCase):
     def test_state_and_lease_share_the_watchdog_bucket_and_floor_prefix(self):
         c = config()
-        watchdog = wd.DeployConfig(project=PROJECT, control_vm_service_account="x")
-        self.assertEqual(c.floor_state_uri, watchdog.floor_state_uri)
+        self.assertEqual(c.floor_state_uri, f"gs://{c.state_bucket}/{deploy.FLOOR_STATE_PREFIX}")
         self.assertEqual(c.state_uri,
                          "gs://homelab-424523-spot-control-state/autoscaler/state-swack-tools-a7245ac03c.json")
         self.assertNotEqual(config(autoscaler_args=ARGS + ("--target", "swack-tools/oxidex")).state_uri, c.state_uri)
@@ -171,7 +169,7 @@ class RoleTests(unittest.TestCase):
         self.assertIn("--condition-from-file=@FILE:hosts-condition.json", binding)
         condition = json.loads(next(s for s in steps if "hosts-condition.json" in s.files)
                                .files["hosts-condition.json"])
-        self.assertEqual(condition["expression"], wd.FLOOR_CONDITION_EXPRESSION)
+        self.assertEqual(condition["expression"], deploy.FLOOR_CONDITION_EXPRESSION)
         # The predefined role, which can write project metadata, is never bound.
         self.assertFalse(any(f"--role={deploy.BASE_COMPUTE_ROLE}" in c for c in commands(steps)))
 
@@ -218,7 +216,7 @@ class StepsTests(unittest.TestCase):
             return runner(argv)
         out = io.StringIO()
         with redirect_stdout(out):
-            wd.execute(config(), deploy.build_steps(config()), listing, out=lambda line: None)
+            deploy.execute(config(), deploy.build_steps(config()), listing, out=lambda line: None)
         removed = [c for c in calls if c[:3] == ["gcloud", "secrets", "remove-iam-policy-binding"]]
         self.assertEqual([c[3] for c in removed], ["old-ssh-key"])
 

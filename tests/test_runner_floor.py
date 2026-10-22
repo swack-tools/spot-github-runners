@@ -852,13 +852,15 @@ class BudgetTests(unittest.TestCase):
             rf.Deadline(NOW + 5, wall=lambda: NOW).cap(600)
 
     def test_the_tick_fits_inside_the_lease(self):
-        from lib import control_watchdog_server as server
-        dead_by = server.TICK_TIMEOUT_SECONDS + server.TERM_GRACE_SECONDS + server.KILL_WAIT_SECONDS
+        tick_timeout_seconds = 840
+        term_grace_seconds = 10
+        kill_wait_seconds = 5
+        dead_by = tick_timeout_seconds + term_grace_seconds + kill_wait_seconds
         # A floor lease taken at any point in the tick can't be broken before the tick's process group is gone.
         self.assertLess(dead_by, gcs.LEASE_TTL_SECONDS + gcs.LEASE_STALE_GRACE_SECONDS)
-        self.assertGreater(server.TICK_TIMEOUT_SECONDS, rf.LAUNCH_MIN_SECONDS + rf.DEADLINE_MARGIN_SECONDS)
+        self.assertGreater(tick_timeout_seconds, rf.LAUNCH_MIN_SECONDS + rf.DEADLINE_MARGIN_SECONDS)
         # A launch's whole create-to-online window spans several ticks, never one.
-        self.assertGreater(rf.LAUNCH_DEADLINE_SECONDS, server.TICK_TIMEOUT_SECONDS)
+        self.assertGreater(rf.LAUNCH_DEADLINE_SECONDS, tick_timeout_seconds)
 
     def test_hard_deadline_kills_a_hung_child_and_nests(self):
         started = time.monotonic()
@@ -1583,9 +1585,7 @@ class OrphanedOperationTests(unittest.TestCase):
         self.assertEqual(rf.operation_deadline({"kind": "restart", "started_at": 100}),
                          100 + rf.RESTART_DEADLINE_SECONDS + rf.ORPHAN_GRACE_SECONDS)
         # A running keeper ends every operation well before that: the grace is several ticks.
-        from lib import control_watchdog_deploy as deploy
         self.assertGreaterEqual(rf.ORPHAN_GRACE_SECONDS, 5 * 180)
-        self.assertEqual(deploy.DEFAULT_SCHEDULE, "*/3 * * * *")
 
     def store_op(self, world, operation):
         store = world.store()

@@ -1015,10 +1015,6 @@ class PreviewFromRecordedPatchTests(unittest.TestCase):
         self.assertIsNone(pc.host_source_from_env("p", {}))
         self.assertIsNotNone(pc.host_source_from_env("p", {"DASHBOARD_FLEET_INVENTORY": "gce"}))
 
-    def test_control_vm_enables_the_gce_inventory(self):
-        script = (Path(__file__).resolve().parents[1] / "cloud-init" / "control-vm-startup.sh").read_text()
-        self.assertIn("printf 'DASHBOARD_FLEET_INVENTORY=gce\\n'", script)
-
 
 def unrecorded_item(name, **extra):
     """A GCE instance with neither the spot-target label nor any patch metadata (pre-recording fleet)."""
