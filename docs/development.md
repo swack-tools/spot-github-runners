@@ -160,3 +160,14 @@ gates pass. It does not authorize force-pushing, changing branch protections, or
    gh pr merge --repo swack-tools/spot-github-runners \
      --squash --delete-branch --match-head-commit "$REVIEWED_HEAD_SHA"
    ```
+
+## Keep documentation and visual assets up to date
+
+When a change modifies dashboard controls, API routes, `host-agent` subcommands, or architecture flows,
+update the corresponding documentation pages and regenerate any affected screenshots or SVG flowcharts:
+
+- Read [Documentation maintenance and custom prompts](maintenance/README.md) for the maintenance checklist and
+  the copy-pasteable AI agent prompt that audits prose against the Rust source tree.
+- Read [Recreate pictures, callouts, and flowcharts](maintenance/RECREATE_PICTURES.md) for the step-by-step
+  Playwright screenshot workflow, visual callout indicator rules, sanitization table, SVG flowchart list, and
+  the custom prompt for regenerating all visual assets.

@@ -84,4 +84,7 @@ nav:
       - Commands: commands.md
   - Operations and troubleshooting: operations.md
   - Security model: security.md
-  - Development: development.md
+  - Development:
+      - Development workflow: development.md
+      - Documentation maintenance: maintenance/README.md
+      - Recreate pictures and flowcharts: maintenance/RECREATE_PICTURES.md

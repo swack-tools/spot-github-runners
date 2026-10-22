@@ -39,12 +39,12 @@ check-crates:
 
 # Run Vale prose linter on documentation.
 check-vale:
-    vale README.md AGENTS.md CLAUDE.md docs/*.md
+    vale README.md AGENTS.md CLAUDE.md docs/*.md docs/maintenance/*.md
 
 # Synchronize Vale packages and verify documentation prose.
 vale:
     vale sync
-    vale README.md AGENTS.md CLAUDE.md docs/*.md
+    vale README.md AGENTS.md CLAUDE.md docs/*.md docs/maintenance/*.md
 
 # Format Rust source code across all crates.
 fmt:

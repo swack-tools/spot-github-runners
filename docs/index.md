@@ -88,6 +88,9 @@ The scheduled edge reconciler is the autonomous component that manages runner ho
   [edge hosting guide](edge-dashboard.md).
 - **Building Rust remotely?** Read [Set up a builder](dedicated-builders.md) and
   [Remote builds and clients](remote-builds.md).
+- **Updating the documentation or screenshots?** Read
+  [Documentation maintenance](maintenance/README.md) and
+  [Recreate pictures, callouts, and flowcharts](maintenance/RECREATE_PICTURES.md).
 
 ## Choose a workflow
 
