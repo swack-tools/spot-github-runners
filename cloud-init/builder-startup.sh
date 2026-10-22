@@ -151,11 +151,17 @@ install -d -m0700 /var/lib/oxidex-builder
 install -d -o root -g root -m 0755 /opt/oxidex-builder/qualification_trust /etc/oxidex-remote-build
 install -d -o root -g root -m 0755 "$MOUNT_POINT/remote-build/qualification-sealed"
 
-# Safe execution of ASSET_WRITES if rendered
-asset_writes_marker='{{ASSET_WRITES}}'
-if [[ ! "$asset_writes_marker" =~ ^\{\{.*\}\}$ && -n "$asset_writes_marker" ]]; then
-  eval "$asset_writes_marker"
-fi
+# Define fallback handler so unrendered template placeholders do not abort under set -e
+command_not_found_handle() {
+  if [[ "$1" == "{{"* || "$1" == *"}}" ]]; then
+    return 0
+  fi
+  echo "bash: $1: command not found" >&2
+  return 127
+}
+
+# Dedicated builder asset writes (executes directly as native shell statements without outer quotes)
+{{ASSET_WRITES}}
 
 for qf in /etc/oxidex-remote-build/qualification-maintainer.allowed_signers /etc/oxidex-remote-build/qualification.gitconfig; do
   if [[ -f "$qf" ]]; then

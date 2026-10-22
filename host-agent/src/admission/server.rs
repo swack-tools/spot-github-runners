@@ -73,20 +73,22 @@ pub fn calculate_runner_memory(
     owner: &str,
 ) -> f64 {
     let mut runner_mem = config.runner_gib;
-    let r_name = runner_name.unwrap_or("");
+    let r_name = runner_name.unwrap_or("").trim_start_matches('/');
     if let Some(ref hr) = config.heavy_runner {
-        if (!r_name.is_empty() && (r_name == hr.name || r_name.contains(&hr.name)))
-            || owner.contains(&hr.name)
+        let hr_target = hr.name.trim_start_matches('/');
+        if (!r_name.is_empty() && r_name == hr_target) || (r_name.is_empty() && owner == hr_target)
         {
             runner_mem = hr.memory_gib as f64;
         }
     }
     if let Some(ref hrs) = config.heavy_runners {
         for hr_name in hrs {
-            if (!r_name.is_empty() && (r_name == hr_name || r_name.contains(hr_name)))
-                || owner.contains(hr_name)
+            let hr_target = hr_name.trim_start_matches('/');
+            if (!r_name.is_empty() && r_name == hr_target)
+                || (r_name.is_empty() && owner == hr_target)
             {
                 runner_mem = 32.0;
+                break;
             }
         }
     }

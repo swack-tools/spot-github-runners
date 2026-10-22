@@ -179,11 +179,17 @@ async fn test_vm_templates_from_instance_success_and_persistence() {
     assert_eq!(resp["status"], "ok");
     assert_eq!(resp["template_name"], "C4D Spot Runner Golden Template");
     assert_eq!(resp["template"]["machine_type"], "c4d-highcpu-16");
+    assert_eq!(resp["template"]["cpu_platform"], "AMD Turin");
+    assert_eq!(resp["template"]["disk_category"], "pd_balanced");
+    assert_eq!(resp["template"]["boot_disk_type"], "pd-balanced");
     assert_eq!(resp["template"]["vcpu"], 16);
     assert_eq!(resp["template"]["ram_gib"], 32);
     assert_eq!(resp["template"]["runners_count"], 2);
     assert_eq!(resp["template"]["runner_vcpu"], 8);
     assert_eq!(resp["template"]["runner_ram_gib"], 16);
+    // UI expects data.vm_template
+    assert!(resp.get("vm_template").is_some());
+    assert_eq!(resp["vm_template"]["id"], resp["template"]["id"]);
 
     // Verify persistence in fresh state load
     invalidate_state_cache();

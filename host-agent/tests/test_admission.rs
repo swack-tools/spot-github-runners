@@ -368,6 +368,14 @@ fn test_calculate_runner_memory_heavy_policy_matching() {
     let mem2 = calculate_runner_memory(&config, Some("runner-2"), owner);
     assert_eq!(mem2, 32.0);
 
+    // Runner with prefix overlap (runner-20) -> strictly regular 14 GiB (not heavy)
+    let mem_overlap = calculate_runner_memory(&config, Some("runner-20"), owner);
+    assert_eq!(mem_overlap, 14.0);
+
+    // Docker inspected name with leading slash (/runner-2) -> 32 GiB
+    let mem_slash = calculate_runner_memory(&config, Some("/runner-2"), owner);
+    assert_eq!(mem_slash, 32.0);
+
     // Heavy runner via single heavy_runner policy (runner-heavy) -> 32 GiB
     let mem3 = calculate_runner_memory(&config, Some("runner-heavy"), owner);
     assert_eq!(mem3, 32.0);

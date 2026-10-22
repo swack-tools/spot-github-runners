@@ -675,6 +675,7 @@ where
 
     // Sum queued jobs backlog across controlled targets
     let mut queued_jobs = 0u32;
+    let mut backlog_known = true;
     for target in &controlled_targets {
         let (owner, repo) = if target.contains('/') {
             let mut parts = target.splitn(2, '/');
@@ -686,11 +687,11 @@ where
             Ok(count) => {
                 queued_jobs += count;
             }
-            Err(e) => {
-                return Err(ReconcilerError::Github(format!(
-                    "Failed to count queued jobs for {}/{}: {}",
-                    owner, repo, e
-                )));
+            Err(_) => {
+                // If counting queued jobs fails for a target (e.g. rate limit, 403, or outage),
+                // mark backlog as unknown so backlog scale-up is suppressed, but continue
+                // independent fleet maintenance (terminated VM cleanup, launch tracking, floor targets).
+                backlog_known = false;
             }
         }
     }
@@ -952,7 +953,10 @@ where
         .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
         .count();
 
-    if queued_jobs >= MIN_QUEUED_JOBS_THRESHOLD && current_live < (max_instances as usize) {
+    if backlog_known
+        && queued_jobs >= MIN_QUEUED_JOBS_THRESHOLD
+        && current_live < (max_instances as usize)
+    {
         let hex_suffix = generate_unique_suffix(now);
         let scale_host = format!("oxidex-runners-scale-{}-{}", now, hex_suffix);
         let deployment_id = format!("dep-scale-{}", now);
@@ -1058,25 +1062,62 @@ where
     let heartbeat_elapsed = now.saturating_sub(bundle.written_at) >= HEARTBEAT_INTERVAL_SECS;
 
     let snapshot_written = if has_mutations || heartbeat_elapsed {
-        // Sync instances_view with active instances
+        // Sync instances_view with active instances while preserving dedicated builders
+        let existing_by_name: std::collections::HashMap<String, InstanceRecord> = bundle
+            .state
+            .instances
+            .iter()
+            .map(|inst| (inst.name.clone(), inst.clone()))
+            .collect();
+
         bundle.state.instances_view = instances
             .iter()
             .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
-            .map(|i| InstanceRecord {
-                id: i.id.clone().unwrap_or_else(|| i.name.clone()),
-                name: i.name.clone(),
-                zone: i.zone.clone(),
-                region: i.zone.split('-').take(2).collect::<Vec<_>>().join("-"),
-                machine_type: i.machine_type.clone(),
-                status: i.status.clone(),
-                role: "cicd_runner".to_string(),
-                vcpu: MIN_HOST_VCPU,
-                ram_gib: MIN_HOST_RAM_GIB,
-                runners_count: RUNNERS_PER_HOST,
-                runners_count_known: true,
-                runner_limits_known: true,
+            .map(|i| {
+                if let Some(existing) = existing_by_name.get(&i.name) {
+                    if existing.role == "rust_builder" || i.name.starts_with("builder-") {
+                        let mut rec = existing.clone();
+                        rec.status = i.status.clone();
+                        rec.zone = i.zone.clone();
+                        rec.region = i.zone.split('-').take(2).collect::<Vec<_>>().join("-");
+                        rec.machine_type = i.machine_type.clone();
+                        return rec;
+                    }
+                }
+                let is_builder = i.name.starts_with("builder-");
+                InstanceRecord {
+                    id: i.id.clone().unwrap_or_else(|| i.name.clone()),
+                    name: i.name.clone(),
+                    zone: i.zone.clone(),
+                    region: i.zone.split('-').take(2).collect::<Vec<_>>().join("-"),
+                    machine_type: i.machine_type.clone(),
+                    status: i.status.clone(),
+                    role: if is_builder {
+                        "rust_builder".to_string()
+                    } else {
+                        "cicd_runner".to_string()
+                    },
+                    vcpu: if is_builder { 16 } else { MIN_HOST_VCPU },
+                    ram_gib: if is_builder { 32 } else { MIN_HOST_RAM_GIB },
+                    runners_count: if is_builder { 0 } else { RUNNERS_PER_HOST },
+                    runners_count_known: true,
+                    runner_limits_known: true,
+                }
             })
             .collect();
+
+        // Preserve any dedicated builders in bundle.state.instances not present in current runner query
+        for prev in bundle.state.instances.iter() {
+            if prev.role == "rust_builder"
+                && !bundle
+                    .state
+                    .instances_view
+                    .iter()
+                    .any(|v| v.name == prev.name)
+            {
+                bundle.state.instances_view.push(prev.clone());
+            }
+        }
         // Synchronize state.instances with live instances_view for unified action inventory
         bundle.state.instances = bundle.state.instances_view.clone();
 

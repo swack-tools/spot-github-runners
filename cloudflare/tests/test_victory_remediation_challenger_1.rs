@@ -435,8 +435,11 @@ async fn test_adversarial_vm_templates_from_instance_missing_and_persisted() {
     assert_eq!(resp["template"]["vcpu"], 16);
     assert_eq!(resp["template"]["ram_gib"], 32);
     assert_eq!(resp["template"]["benchmark_score"], 16 * 120);
-    assert_eq!(resp["template"]["runner_vcpu"], 8);
-    assert_eq!(resp["template"]["runner_ram_gib"], 16);
+    assert_eq!(resp["template"]["cpu_platform"], "AMD Turin");
+    assert_eq!(resp["template"]["boot_disk_type"], "pd-balanced");
+    assert_eq!(resp["template"]["disk_category"], "pd_balanced");
+    assert!(resp.get("vm_template").is_some());
+    assert_eq!(resp["vm_template"]["name"], "Derived C4D Golden Template");
 
     // Verify persistence in KV
     invalidate_state_cache();

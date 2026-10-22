@@ -904,6 +904,49 @@ pub struct SaveCloudInitRequest {
     pub assign_to_profile: bool,
 }
 
+pub(crate) fn generate_record_id(prefix: &str, now: u64) -> String {
+    let mut bytes = [0u8; 4];
+    let hex_entropy = if getrandom::getrandom(&mut bytes).is_ok() {
+        hex::encode(bytes)
+    } else {
+        format!("{:08x}", now as u32)
+    };
+    format!("{}-{}-{}", prefix, now, hex_entropy)
+}
+
+pub(crate) fn derive_hardware_profile(
+    machine_type: &str,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    let mt = machine_type.trim();
+    if mt.starts_with("c4d-") {
+        Some(("AMD Turin", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("n4d-") {
+        Some(("AMD Turin", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("c2d-") {
+        Some(("AMD Milan", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("n2d-") {
+        Some(("AMD Milan", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("n4-") {
+        Some(("Intel Emerald Rapids", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("c4-") {
+        Some((
+            "Intel Emerald Rapids",
+            "hyperdisk_balanced",
+            "hyperdisk-balanced",
+        ))
+    } else if mt.starts_with("c3-") {
+        Some((
+            "Intel Sapphire Rapids",
+            "hyperdisk_balanced",
+            "hyperdisk-balanced",
+        ))
+    } else if mt.starts_with("n2-") {
+        Some(("Intel Ice Lake", "pd_balanced", "pd-balanced"))
+    } else {
+        None
+    }
+}
+
 pub async fn handle_post_cloud_init_save<K: KvStoreBackend>(
     kv: &K,
     req: SaveCloudInitRequest,
@@ -934,7 +977,7 @@ pub async fn handle_post_cloud_init_save<K: KvStoreBackend>(
     let requested_id = req.id.as_deref().unwrap_or("").trim();
 
     let template_id = if is_save_as || requested_id.is_empty() {
-        format!("{}-custom-{}", req.role.replace('_', "-"), now)
+        generate_record_id(&format!("{}-custom", req.role.replace('_', "-")), now)
     } else {
         requested_id.to_string()
     };
@@ -1019,7 +1062,15 @@ pub async fn handle_post_vm_templates_from_instance<K: KvStoreBackend>(
             ))
         })?;
 
-    let tpl_id = format!("vmtpl-{}", now);
+    let (cpu_platform, disk_cat, disk_type) = derive_hardware_profile(&inst.machine_type)
+        .ok_or_else(|| {
+            StateError::Validation(format!(
+                "Cannot derive hardware profile for unknown machine type '{}'",
+                inst.machine_type
+            ))
+        })?;
+
+    let tpl_id = generate_record_id("vmtpl", now);
     let runner_vcpu = if inst.runners_count > 0 {
         inst.vcpu / inst.runners_count
     } else {
@@ -1038,12 +1089,12 @@ pub async fn handle_post_vm_templates_from_instance<K: KvStoreBackend>(
         machine_type: inst.machine_type.clone(),
         vcpu: inst.vcpu,
         ram_gib: inst.ram_gib,
-        cpu_platform: "Intel Sapphire Rapids".to_string(),
+        cpu_platform: cpu_platform.to_string(),
         benchmark_score: inst.vcpu * 120,
-        disk_category: "hyperdisk_balanced".to_string(),
-        boot_disk_type: "hyperdisk-balanced".to_string(),
+        disk_category: disk_cat.to_string(),
+        boot_disk_type: disk_type.to_string(),
         boot_disk_gb: 30,
-        data_disk_type: "hyperdisk-balanced".to_string(),
+        data_disk_type: disk_type.to_string(),
         data_disk_gb: if inst.role == "rust_builder" {
             375
         } else {
@@ -1070,7 +1121,8 @@ pub async fn handle_post_vm_templates_from_instance<K: KvStoreBackend>(
             "status": "ok",
             "message": "VM instance template registered",
             "template_name": template_name,
-            "template": new_template
+            "template": new_template,
+            "vm_template": new_template
         }),
     ))
 }
@@ -1110,7 +1162,7 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
 
     let (mut bundle, _) = load_state(kv, now).await?;
 
-    let build_id = format!("build-{}", now);
+    let build_id = generate_record_id("build", now);
     let iso_now = chrono_iso(now);
 
     let compile_sec = req.compile_duration_seconds.unwrap_or(0.0);
