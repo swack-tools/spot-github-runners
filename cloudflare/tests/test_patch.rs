@@ -3,17 +3,16 @@
 
 use serde_json::Value;
 use spot_dashboard_edge::patch::{
-    classify_patch_diff, classify_rollout, classify_rollout_values,
-    compute_canonical_patch_sha256, merge_patches, parse_manifest_text,
-    validate_patch_manifest,
-    HardwarePatch, RunnerPatch,
+    classify_patch_diff, classify_rollout, classify_rollout_values, compute_canonical_patch_sha256,
+    merge_patches, parse_manifest_text, validate_patch_manifest, HardwarePatch, RunnerPatch,
     FORBIDDEN_MOUNTS, PERMITTED_MACHINE_TYPES,
 };
 
 #[test]
 fn test_patch_vector_fixture_exact_parity() {
     let fixture_str = include_str!("../../tests/fixtures/patch_vector.json");
-    let fixture: Value = serde_json::from_str(fixture_str).expect("Valid patch_vector.json fixture");
+    let fixture: Value =
+        serde_json::from_str(fixture_str).expect("Valid patch_vector.json fixture");
     let vectors = fixture["vectors"].as_array().expect("vectors array");
 
     assert_eq!(vectors.len(), 6, "Must test exactly 6 canonical vectors");
@@ -65,10 +64,17 @@ fn test_exclusion_of_source_commit_and_source_branch() {
     with_commit["source_branch"] = serde_json::json!("refs/heads/feature-patch-branch");
 
     let p = serde_json::from_value::<RunnerPatch>(with_commit.clone()).unwrap();
-    assert_eq!(p.patch_sha256(), base_sha, "source_commit/branch must be stripped from hash");
+    assert_eq!(
+        p.patch_sha256(),
+        base_sha,
+        "source_commit/branch must be stripped from hash"
+    );
 
     let digest_from_val = compute_canonical_patch_sha256(&with_commit).unwrap();
-    assert_eq!(digest_from_val, base_sha, "Raw canonical hash must also strip source_commit/branch");
+    assert_eq!(
+        digest_from_val, base_sha,
+        "Raw canonical hash must also strip source_commit/branch"
+    );
 }
 
 #[test]
@@ -87,11 +93,26 @@ fn test_hardware_optional_null_stripping_and_preservation() {
 
     let p = serde_json::from_value::<RunnerPatch>(m.clone()).unwrap();
     let canonical = p.to_canonical_json();
-    assert!(!canonical.contains("runners_count"), "runners_count must be stripped when null");
-    assert!(!canonical.contains("runner_vcpu"), "runner_vcpu must be stripped when null");
-    assert!(!canonical.contains("runner_ram_gib"), "runner_ram_gib must be stripped when null");
-    assert!(!canonical.contains("host_overhead_gib"), "host_overhead_gib must be stripped when null");
-    assert!(!canonical.contains("queued_jobs_threshold"), "queued_jobs_threshold must be stripped when null");
+    assert!(
+        !canonical.contains("runners_count"),
+        "runners_count must be stripped when null"
+    );
+    assert!(
+        !canonical.contains("runner_vcpu"),
+        "runner_vcpu must be stripped when null"
+    );
+    assert!(
+        !canonical.contains("runner_ram_gib"),
+        "runner_ram_gib must be stripped when null"
+    );
+    assert!(
+        !canonical.contains("host_overhead_gib"),
+        "host_overhead_gib must be stripped when null"
+    );
+    assert!(
+        !canonical.contains("queued_jobs_threshold"),
+        "queued_jobs_threshold must be stripped when null"
+    );
 
     // 2. min_vcpu: null and min_ram_gib: null are PRESERVED
     let mut m2 = base_valid.clone();
@@ -99,8 +120,14 @@ fn test_hardware_optional_null_stripping_and_preservation() {
     m2["hardware"]["min_ram_gib"] = Value::Null;
     let p2 = serde_json::from_value::<RunnerPatch>(m2).unwrap();
     let canonical2 = p2.to_canonical_json();
-    assert!(canonical2.contains("\"min_vcpu\":null"), "min_vcpu: null must be preserved in canonical JSON");
-    assert!(canonical2.contains("\"min_ram_gib\":null"), "min_ram_gib: null must be preserved in canonical JSON");
+    assert!(
+        canonical2.contains("\"min_vcpu\":null"),
+        "min_vcpu: null must be preserved in canonical JSON"
+    );
+    assert!(
+        canonical2.contains("\"min_ram_gib\":null"),
+        "min_ram_gib: null must be preserved in canonical JSON"
+    );
 }
 
 #[test]
@@ -124,17 +151,22 @@ fn test_fast_boot_golden_image_and_instance_template_omission_parity() {
     let p_none = serde_json::from_value::<RunnerPatch>(m_explicit_none.clone()).unwrap();
     assert_eq!(p_none.patch_sha256(), expected_v6_sha);
     let expected_v6_raw_sha = v6["raw_dict_sha256"].as_str().unwrap();
-    assert_eq!(compute_canonical_patch_sha256(&m_explicit_none).unwrap(), expected_v6_raw_sha);
+    assert_eq!(
+        compute_canonical_patch_sha256(&m_explicit_none).unwrap(),
+        expected_v6_raw_sha
+    );
 
     // Setting source_image changes hash deterministically
     let mut m_img = v6_manifest.clone();
-    m_img["source_image"] = serde_json::json!("projects/homelab-424523/global/images/runner-golden-20261021");
+    m_img["source_image"] =
+        serde_json::json!("projects/homelab-424523/global/images/runner-golden-20261021");
     let p_img = serde_json::from_value::<RunnerPatch>(m_img).unwrap();
     assert_ne!(p_img.patch_sha256(), expected_v6_sha);
 
     // Setting source_instance_template changes hash deterministically
     let mut m_tpl = v6_manifest.clone();
-    m_tpl["source_instance_template"] = serde_json::json!("projects/homelab-424523/global/instanceTemplates/runner-template-1");
+    m_tpl["source_instance_template"] =
+        serde_json::json!("projects/homelab-424523/global/instanceTemplates/runner-template-1");
     let p_tpl = serde_json::from_value::<RunnerPatch>(m_tpl).unwrap();
     assert_ne!(p_tpl.patch_sha256(), expected_v6_sha);
 }
@@ -156,7 +188,9 @@ fn test_hardware_floor_sizing_validation_matrix() {
     let mut m_vcpu_15 = base_valid.clone();
     m_vcpu_15["hardware"]["min_vcpu"] = serde_json::json!(15);
     let errs = validate_patch_manifest(&m_vcpu_15).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("min_vcpu_below_floor: 15 < 16")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("min_vcpu_below_floor: 15 < 16")));
 
     // 3. RAM Floor (32 passes, 31 fails)
     let mut m_ram_32 = base_valid.clone();
@@ -166,7 +200,9 @@ fn test_hardware_floor_sizing_validation_matrix() {
     let mut m_ram_31 = base_valid.clone();
     m_ram_31["hardware"]["min_ram_gib"] = serde_json::json!(31);
     let errs = validate_patch_manifest(&m_ram_31).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("min_ram_gib_below_floor: 31 < 32")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("min_ram_gib_below_floor: 31 < 32")));
 
     // 4. Runner Count (2 passes, 1 and 3 fail)
     let mut m_rc_2 = base_valid.clone();
@@ -176,12 +212,16 @@ fn test_hardware_floor_sizing_validation_matrix() {
     let mut m_rc_1 = base_valid.clone();
     m_rc_1["hardware"]["runners_count"] = serde_json::json!(1);
     let errs = validate_patch_manifest(&m_rc_1).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("runners_count_must_be_2: got 1")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("runners_count_must_be_2: got 1")));
 
     let mut m_rc_3 = base_valid.clone();
     m_rc_3["hardware"]["runners_count"] = serde_json::json!(3);
     let errs = validate_patch_manifest(&m_rc_3).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("runners_count_must_be_2: got 3")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("runners_count_must_be_2: got 3")));
 
     // 5. Runner vCPU (7 passes, 6 and 8 fail)
     let mut m_rv_7 = base_valid.clone();
@@ -191,12 +231,16 @@ fn test_hardware_floor_sizing_validation_matrix() {
     let mut m_rv_6 = base_valid.clone();
     m_rv_6["hardware"]["runner_vcpu"] = serde_json::json!(6);
     let errs = validate_patch_manifest(&m_rv_6).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("runner_vcpu_must_be_7: got 6")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("runner_vcpu_must_be_7: got 6")));
 
     let mut m_rv_8 = base_valid.clone();
     m_rv_8["hardware"]["runner_vcpu"] = serde_json::json!(8);
     let errs = validate_patch_manifest(&m_rv_8).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("runner_vcpu_must_be_7: got 8")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("runner_vcpu_must_be_7: got 8")));
 
     // 6. Runner RAM (14 passes, 12 and 16 fail)
     let mut m_rr_14 = base_valid.clone();
@@ -206,7 +250,9 @@ fn test_hardware_floor_sizing_validation_matrix() {
     let mut m_rr_12 = base_valid.clone();
     m_rr_12["hardware"]["runner_ram_gib"] = serde_json::json!(12);
     let errs = validate_patch_manifest(&m_rr_12).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("runner_ram_gib_must_be_14: got 12")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("runner_ram_gib_must_be_14: got 12")));
 
     // 7. Host Overhead (4 passes, 5 fails)
     let mut m_ho_4 = base_valid.clone();
@@ -216,7 +262,9 @@ fn test_hardware_floor_sizing_validation_matrix() {
     let mut m_ho_5 = base_valid.clone();
     m_ho_5["hardware"]["host_overhead_gib"] = serde_json::json!(5);
     let errs = validate_patch_manifest(&m_ho_5).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("host_overhead_gib_must_be_4: got 5")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("host_overhead_gib_must_be_4: got 5")));
 
     // 8. Queue Threshold (20 passes, 19 fails)
     let mut m_qj_20 = base_valid.clone();
@@ -226,7 +274,9 @@ fn test_hardware_floor_sizing_validation_matrix() {
     let mut m_qj_19 = base_valid.clone();
     m_qj_19["hardware"]["queued_jobs_threshold"] = serde_json::json!(19);
     let errs = validate_patch_manifest(&m_qj_19).unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("queued_jobs_threshold_below_floor: 19 < 20")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("queued_jobs_threshold_below_floor: 19 < 20")));
 
     // 9. Multi-Error Reporting: reports both min_vcpu and min_ram_gib
     let mut m_multi = base_valid.clone();
@@ -248,7 +298,11 @@ fn test_permitted_machine_types_allowlist() {
     for permitted in PERMITTED_MACHINE_TYPES {
         let mut m = base_valid.clone();
         m["hardware"]["extra_labels"] = serde_json::json!([format!("type-{}", permitted)]);
-        assert!(validate_patch_manifest(&m).is_ok(), "Shape {} must be permitted", permitted);
+        assert!(
+            validate_patch_manifest(&m).is_ok(),
+            "Shape {} must be permitted",
+            permitted
+        );
     }
 
     // Disallowed shapes
@@ -267,7 +321,8 @@ fn test_permitted_machine_types_allowlist() {
         let errs = validate_patch_manifest(&m).unwrap_err();
         assert!(
             errs.iter().any(|e| e.contains("unpermitted_machine_type")),
-            "Disallowed shape '{}' must be rejected", bad_shape
+            "Disallowed shape '{}' must be rejected",
+            bad_shape
         );
     }
 }
@@ -287,7 +342,8 @@ fn test_forbidden_mount_sources_rejected() {
         let errs1 = validate_patch_manifest(&m1).unwrap_err();
         assert!(
             errs1.iter().any(|e| e.contains("forbidden_mount_source")),
-            "Exact forbidden mount '{}' must be rejected", forbidden
+            "Exact forbidden mount '{}' must be rejected",
+            forbidden
         );
 
         // Subpath match
@@ -298,7 +354,8 @@ fn test_forbidden_mount_sources_rejected() {
         let errs2 = validate_patch_manifest(&m2).unwrap_err();
         assert!(
             errs2.iter().any(|e| e.contains("forbidden_mount_source")),
-            "Forbidden mount subpath '{}/subpath' must be rejected", forbidden
+            "Forbidden mount subpath '{}/subpath' must be rejected",
+            forbidden
         );
     }
 
@@ -358,11 +415,17 @@ fn test_multi_repo_manifest_merging() {
     assert!(merged.host.apt_packages.contains(&"curl".to_string()));
     assert!(merged.host.apt_packages.contains(&"ripgrep".to_string()));
 
-    assert!(merged.container.apt_packages.contains(&"build-essential".to_string()));
+    assert!(merged
+        .container
+        .apt_packages
+        .contains(&"build-essential".to_string()));
     assert!(merged.container.apt_packages.contains(&"cmake".to_string()));
 
     // Boot scripts concatenated
-    assert_eq!(merged.host.boot_script, "echo 'default boot'\necho 'repo boot'");
+    assert_eq!(
+        merged.host.boot_script,
+        "echo 'default boot'\necho 'repo boot'"
+    );
 }
 
 #[test]
@@ -384,24 +447,33 @@ fn test_rollout_diff_classification_exhaustive() {
     // 3. Container dockerfile_run change -> recreate_containers
     let mut tgt_docker = cur.clone();
     tgt_docker.container.dockerfile_run = "RUN echo update".to_string();
-    assert_eq!(classify_patch_diff(&cur, &tgt_docker), "recreate_containers");
+    assert_eq!(
+        classify_patch_diff(&cur, &tgt_docker),
+        "recreate_containers"
+    );
     let c = classify_rollout(Some(&cur), &tgt_docker);
     assert_eq!(c.action, "recreate_containers");
 
     // 4. Container mounts change -> recreate_containers
     let mut tgt_mount = cur.clone();
-    tgt_mount.container.mounts.push(spot_dashboard_edge::patch::PatchMountSpec {
-        source: "/mnt/runner-data/cache".to_string(),
-        target: "/cache".to_string(),
-        read_only: false,
-    });
+    tgt_mount
+        .container
+        .mounts
+        .push(spot_dashboard_edge::patch::PatchMountSpec {
+            source: "/mnt/runner-data/cache".to_string(),
+            target: "/cache".to_string(),
+            read_only: false,
+        });
     assert_eq!(classify_patch_diff(&cur, &tgt_mount), "recreate_containers");
     let c = classify_rollout(Some(&cur), &tgt_mount);
     assert_eq!(c.action, "recreate_containers");
 
     // 5. Hardware extra_labels change -> replace_vm
     let mut tgt_hw = cur.clone();
-    tgt_hw.hardware.extra_labels.push("type-n4-highcpu-16".to_string());
+    tgt_hw
+        .hardware
+        .extra_labels
+        .push("type-n4-highcpu-16".to_string());
     assert_eq!(classify_patch_diff(&cur, &tgt_hw), "replace_vm");
     let c = classify_rollout(Some(&cur), &tgt_hw);
     assert_eq!(c.action, "replace_vm");
@@ -459,5 +531,8 @@ container:
     assert_eq!(parsed.hardware.min_ram_gib, Some(32));
     assert_eq!(parsed.hardware.runners_count, Some(2));
     assert_eq!(parsed.host.apt_packages, vec!["git", "curl"]);
-    assert_eq!(parsed.host.sysctl.get("net.core.somaxconn"), Some(&"4096".to_string()));
+    assert_eq!(
+        parsed.host.sysctl.get("net.core.somaxconn"),
+        Some(&"4096".to_string())
+    );
 }

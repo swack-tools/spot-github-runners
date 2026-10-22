@@ -22,11 +22,11 @@
 //! 4. Multi-repo manifest merging (`defaults.yaml` + `repos/<owner>/<repo>.yaml`).
 //! 5. Rollout classification (`noop`, `hot_patch`, `recreate_containers`, `replace_vm`).
 
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 pub const SCHEMA_VERSION: &str = "spot-runner-patch-v1";
 
@@ -102,7 +102,11 @@ where
                     Value::String(s) => s,
                     Value::Number(n) => n.to_string(),
                     Value::Bool(b) => b.to_string(),
-                    _ => return Err(serde::de::Error::custom("sysctl value must be string or number")),
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "sysctl value must be string or number",
+                        ))
+                    }
                 };
                 map.insert(key, s);
             }
@@ -363,7 +367,11 @@ pub fn canonicalize_manifest_value(val: &Value) -> Value {
     root.remove("source_commit");
     root.remove("source_branch");
 
-    for opt_root in &["source_image", "golden_image_family", "source_instance_template"] {
+    for opt_root in &[
+        "source_image",
+        "golden_image_family",
+        "source_instance_template",
+    ] {
         if let Some(v) = root.get(*opt_root) {
             if v.is_null() {
                 root.remove(*opt_root);
@@ -464,7 +472,10 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
     match root.get("schema") {
         Some(Value::String(s)) if s == SCHEMA_VERSION => {}
         Some(Value::String(s)) => {
-            errors.push(format!("invalid_schema: expected {}, got {}", SCHEMA_VERSION, s));
+            errors.push(format!(
+                "invalid_schema: expected {}, got {}",
+                SCHEMA_VERSION, s
+            ));
         }
         _ => {
             errors.push(format!("invalid_schema: expected {}", SCHEMA_VERSION));
@@ -488,7 +499,10 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
             if let Some(v) = hw.get("min_ram_gib") {
                 if let Some(n) = v.as_u64() {
                     if n < MIN_HOST_RAM_GIB as u64 {
-                        errors.push(format!("min_ram_gib_below_floor: {} < {}", n, MIN_HOST_RAM_GIB));
+                        errors.push(format!(
+                            "min_ram_gib_below_floor: {} < {}",
+                            n, MIN_HOST_RAM_GIB
+                        ));
                     }
                 } else if !v.is_null() {
                     errors.push("hardware.min_ram_gib must be a positive integer".to_string());
@@ -531,17 +545,24 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
                         errors.push(format!("host_overhead_gib_must_be_4: got {}", n));
                     }
                 } else if !v.is_null() {
-                    errors.push("hardware.host_overhead_gib must be a non-negative integer".to_string());
+                    errors.push(
+                        "hardware.host_overhead_gib must be a non-negative integer".to_string(),
+                    );
                 }
             }
 
             if let Some(v) = hw.get("queued_jobs_threshold") {
                 if let Some(n) = v.as_u64() {
                     if n < MIN_QUEUED_JOBS_THRESHOLD as u64 {
-                        errors.push(format!("queued_jobs_threshold_below_floor: {} < {}", n, MIN_QUEUED_JOBS_THRESHOLD));
+                        errors.push(format!(
+                            "queued_jobs_threshold_below_floor: {} < {}",
+                            n, MIN_QUEUED_JOBS_THRESHOLD
+                        ));
                     }
                 } else if !v.is_null() {
-                    errors.push("hardware.queued_jobs_threshold must be a positive integer".to_string());
+                    errors.push(
+                        "hardware.queued_jobs_threshold must be a positive integer".to_string(),
+                    );
                 }
             }
 
@@ -622,11 +643,26 @@ pub fn merge_patches(defaults: &RunnerPatch, override_patch: &RunnerPatch) -> Ru
         } else {
             override_patch.repository.clone()
         },
-        source_commit: override_patch.source_commit.clone().or_else(|| defaults.source_commit.clone()),
-        source_branch: override_patch.source_branch.clone().or_else(|| defaults.source_branch.clone()),
-        source_image: override_patch.source_image.clone().or_else(|| defaults.source_image.clone()),
-        golden_image_family: override_patch.golden_image_family.clone().or_else(|| defaults.golden_image_family.clone()),
-        source_instance_template: override_patch.source_instance_template.clone().or_else(|| defaults.source_instance_template.clone()),
+        source_commit: override_patch
+            .source_commit
+            .clone()
+            .or_else(|| defaults.source_commit.clone()),
+        source_branch: override_patch
+            .source_branch
+            .clone()
+            .or_else(|| defaults.source_branch.clone()),
+        source_image: override_patch
+            .source_image
+            .clone()
+            .or_else(|| defaults.source_image.clone()),
+        golden_image_family: override_patch
+            .golden_image_family
+            .clone()
+            .or_else(|| defaults.golden_image_family.clone()),
+        source_instance_template: override_patch
+            .source_instance_template
+            .clone()
+            .or_else(|| defaults.source_instance_template.clone()),
         hardware: HardwarePatch {
             arch: if override_patch.hardware.arch.is_empty() {
                 defaults.hardware.arch.clone()
@@ -651,21 +687,54 @@ pub fn merge_patches(defaults: &RunnerPatch, override_patch: &RunnerPatch) -> Ru
                 }
                 list
             },
-            min_vcpu: override_patch.hardware.min_vcpu.or(defaults.hardware.min_vcpu),
-            min_ram_gib: override_patch.hardware.min_ram_gib.or(defaults.hardware.min_ram_gib),
-            runners_count: override_patch.hardware.runners_count.or(defaults.hardware.runners_count),
-            runner_vcpu: override_patch.hardware.runner_vcpu.or(defaults.hardware.runner_vcpu),
-            runner_ram_gib: override_patch.hardware.runner_ram_gib.or(defaults.hardware.runner_ram_gib),
-            host_overhead_gib: override_patch.hardware.host_overhead_gib.or(defaults.hardware.host_overhead_gib),
-            queued_jobs_threshold: override_patch.hardware.queued_jobs_threshold.or(defaults.hardware.queued_jobs_threshold),
+            min_vcpu: override_patch
+                .hardware
+                .min_vcpu
+                .or(defaults.hardware.min_vcpu),
+            min_ram_gib: override_patch
+                .hardware
+                .min_ram_gib
+                .or(defaults.hardware.min_ram_gib),
+            runners_count: override_patch
+                .hardware
+                .runners_count
+                .or(defaults.hardware.runners_count),
+            runner_vcpu: override_patch
+                .hardware
+                .runner_vcpu
+                .or(defaults.hardware.runner_vcpu),
+            runner_ram_gib: override_patch
+                .hardware
+                .runner_ram_gib
+                .or(defaults.hardware.runner_ram_gib),
+            host_overhead_gib: override_patch
+                .hardware
+                .host_overhead_gib
+                .or(defaults.hardware.host_overhead_gib),
+            queued_jobs_threshold: override_patch
+                .hardware
+                .queued_jobs_threshold
+                .or(defaults.hardware.queued_jobs_threshold),
             qualify_command: if override_patch.hardware.qualify_command.is_empty() {
                 defaults.hardware.qualify_command.clone()
             } else {
                 override_patch.hardware.qualify_command.clone()
             },
-            source_image: override_patch.hardware.source_image.clone().or_else(|| defaults.hardware.source_image.clone()),
-            golden_image_family: override_patch.hardware.golden_image_family.clone().or_else(|| defaults.hardware.golden_image_family.clone()),
-            source_instance_template: override_patch.hardware.source_instance_template.clone().or_else(|| defaults.hardware.source_instance_template.clone()),
+            source_image: override_patch
+                .hardware
+                .source_image
+                .clone()
+                .or_else(|| defaults.hardware.source_image.clone()),
+            golden_image_family: override_patch
+                .hardware
+                .golden_image_family
+                .clone()
+                .or_else(|| defaults.hardware.golden_image_family.clone()),
+            source_instance_template: override_patch
+                .hardware
+                .source_instance_template
+                .clone()
+                .or_else(|| defaults.hardware.source_instance_template.clone()),
         },
         host: HostPatch {
             apt_packages: {
@@ -784,7 +853,10 @@ pub fn classify_patch_diff(current: &RunnerPatch, target: &RunnerPatch) -> &'sta
 }
 
 /// Classify rollout returning structured `RolloutClassification`.
-pub fn classify_rollout(current: Option<&RunnerPatch>, target: &RunnerPatch) -> RolloutClassification {
+pub fn classify_rollout(
+    current: Option<&RunnerPatch>,
+    target: &RunnerPatch,
+) -> RolloutClassification {
     let current_sha = current.map(|c| c.patch_sha256()).unwrap_or_default();
     let target_sha = target.patch_sha256();
 
@@ -838,7 +910,9 @@ pub fn classify_rollout(current: Option<&RunnerPatch>, target: &RunnerPatch) -> 
 
 /// Classify rollout from serde_json Values directly (used by HTTP routes).
 pub fn classify_rollout_values(current: Option<&Value>, target: &Value) -> RolloutClassification {
-    let cur_empty = current.map(|c| c.as_object().map(|m| m.is_empty()).unwrap_or(true)).unwrap_or(true);
+    let cur_empty = current
+        .map(|c| c.as_object().map(|m| m.is_empty()).unwrap_or(true))
+        .unwrap_or(true);
     let tgt_empty = target.as_object().map(|m| m.is_empty()).unwrap_or(true);
 
     if cur_empty && tgt_empty {
@@ -848,7 +922,9 @@ pub fn classify_rollout_values(current: Option<&Value>, target: &Value) -> Rollo
         };
     }
 
-    let current_sha = current.and_then(|c| compute_canonical_patch_sha256(c).ok()).unwrap_or_default();
+    let current_sha = current
+        .and_then(|c| compute_canonical_patch_sha256(c).ok())
+        .unwrap_or_default();
     let target_sha = compute_canonical_patch_sha256(target).unwrap_or_default();
 
     if !current_sha.is_empty() && current_sha == target_sha {
@@ -862,12 +938,20 @@ pub fn classify_rollout_values(current: Option<&Value>, target: &Value) -> Rollo
     let cur_obj = current.and_then(|c| c.as_object());
     let tgt_obj = target.as_object();
 
-    let cur_hw = cur_obj.and_then(|o| o.get("hardware")).unwrap_or(&empty_obj);
-    let tgt_hw = tgt_obj.and_then(|o| o.get("hardware")).unwrap_or(&empty_obj);
+    let cur_hw = cur_obj
+        .and_then(|o| o.get("hardware"))
+        .unwrap_or(&empty_obj);
+    let tgt_hw = tgt_obj
+        .and_then(|o| o.get("hardware"))
+        .unwrap_or(&empty_obj);
     let cur_host = cur_obj.and_then(|o| o.get("host")).unwrap_or(&empty_obj);
     let tgt_host = tgt_obj.and_then(|o| o.get("host")).unwrap_or(&empty_obj);
-    let cur_cnt = cur_obj.and_then(|o| o.get("container")).unwrap_or(&empty_obj);
-    let tgt_cnt = tgt_obj.and_then(|o| o.get("container")).unwrap_or(&empty_obj);
+    let cur_cnt = cur_obj
+        .and_then(|o| o.get("container"))
+        .unwrap_or(&empty_obj);
+    let tgt_cnt = tgt_obj
+        .and_then(|o| o.get("container"))
+        .unwrap_or(&empty_obj);
 
     if cur_hw != tgt_hw
         || cur_host.get("boot_script") != tgt_host.get("boot_script")
@@ -1028,7 +1112,10 @@ pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
                     } else {
                         items.push(Value::Null);
                     }
-                } else if after_dash.contains(':') && !after_dash.starts_with('"') && !after_dash.starts_with('\'') {
+                } else if after_dash.contains(':')
+                    && !after_dash.starts_with('"')
+                    && !after_dash.starts_with('\'')
+                {
                     let mut parts = after_dash.splitn(2, ':');
                     let k = parts.next().unwrap().trim().to_string();
                     let v_str = parts.next().unwrap().trim();

@@ -8,16 +8,16 @@ Cargo downloads while using separate target directories.
 
 The image installs Rust 1.99.0 (full compiler commit
 `b940084d7eb6a299eb4bfeb8e34901bc051e7ac4`), rustfmt, clippy, Zig 0.15.2,
-cargo-zigbuild 0.23.4, cbindgen 0.29.2, Just, nextest, Python, uv, Perl, rsync,
+cargo-zigbuild 0.23.4, cbindgen 0.29.2, Just, nextest, Perl, rsync,
 LLVM, and native build dependencies. App builds run as UID/GID 1001 and
 receive no Docker socket. SSH lands on the host; the uploader can sudo only the
-fixed `/usr/local/bin/oxidex-remote-build` launcher.
+fixed `/usr/local/bin/oxidex-remote-build` launcher (`host-agent host-launcher`).
 
 The website tool additions pin Node 24.21.0 and Playwright 1.63.0, including
 Chromium revision 1243. The package lock verifies npm archives; the official
 Node archive has a fixed SHA-256. Browser downloads and Linux libraries are
 installed during image construction. Browser files live at the root-owned
-`/opt/playwright-browsers` path, which UID 1001 can read but not write,, selected by `PLAYWRIGHT_BROWSERS_PATH`.
+`/opt/playwright-browsers` path, which UID 1001 can read but not write, selected by `PLAYWRIGHT_BROWSERS_PATH`.
 The tool probe checks the browser executable and shared libraries as UID 1001.
 The website audit must separately prove an actual browser launch and rendering. These source additions need a reviewed image build and actual
 tool proof before an existing host is upgraded; they do not establish that
@@ -45,22 +45,29 @@ Explicit settings still pass through the same strict policy checks.
 }
 ```
 
-Render locally with the approved mapping file:
+Configure the launch command with the approved uploader mapping and startup script:
 
 ```bash
-python3 src/render_builder_startup.py --config /private/builder-config.json \
-  --uploader-mapping /private/approved-uploader.json \
-  --output-directory /private/builder-payload
-bash /private/builder-payload/launch-command.sh
+sed -e 's/{{INSTANCE_NAME}}/builder-your-unique-name/g' \
+    -e 's/{{PROJECT}}/your-project/g' \
+    -e 's/{{ZONE}}/asia-east2-a/g' \
+    -e 's/{{DISK_DEVICE_NAME}}/builder-your-unique-name-data/g' \
+    cloud-init/builder-startup.sh > /private/builder-startup.sh
+
+gcloud compute instances create "builder-your-unique-name" \
+  --project="your-project" \
+  --zone="asia-east2-a" \
+  --machine-type="n4-highcpu-16" \
+  --provisioning-model="SPOT" \
+  --instance-termination-action="STOP" \
+  --metadata-from-file="startup-script=/private/builder-startup.sh"
 ```
 
-The deployment identity defaults to `instance_name` in the configuration. Use
-`--deployment-id` only when you need a distinct identity in the startup receipt.
-Existing configurations can continue embedding `authorized_uploader` and its
-canonical `authorized_uploader_sha256` instead. The renderer refuses a mapping
-file combined with either embedded field, so it cannot silently replace an identity.
+The deployment identity defaults to the instance name. Startup verifies the
+approved uploader mapping against its canonical SHA-256 before enabling SSH
+access, preventing silent identity replacement.
 
-The second command executes **one `gcloud compute instances create` invocation**.
+The command executes **one `gcloud compute instances create` invocation**.
 It passes the complete embedded payload as `startup-script` metadata. The Debian
 13 GCE image runs this startup mechanism; a separate cloud-init agent is not
 required. `cloud-config.yaml` contains the equivalent payload for images with a
@@ -100,13 +107,12 @@ The standalone image includes:
 Some auxiliary tool installs resolve versions during the image build. Use the actual tool receipt and the
 immutable image ID rather than assuming that every dependency has a fixed version.
 
-The older shared-host image in `builder/Dockerfile` still pins Rust 1.97.1. Ordinary runner images don't
-establish the standalone builder's toolchain, because workflows select their Rust version separately.
-Provisioning a new standalone builder doesn't upgrade existing runner containers.
+The standalone builder toolchain is established during image construction; workflows select their Rust version separately.
+Provisioning a new standalone builder does not upgrade existing runner containers.
 
 ## Configure the build client
 
-The renderer also writes `cargo-remote-env.toml` with the project, instance name,
+Define `cargo-remote-env.toml` entries with the project, instance name,
 zone, and uploader username. Merge those entries into the existing `[env]` table
 in OxiDex's `.cargo/config.toml`; do not replace unrelated settings.
 

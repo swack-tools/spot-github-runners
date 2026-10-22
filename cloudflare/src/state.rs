@@ -7,10 +7,10 @@
 //! 4. Fast sub-15ms REST API handlers (`/api/health`, `/api/overview`, `/api/scaling`, `/api/admins`).
 //! 5. Instance action safety gates returning plan previews with LIFECYCLE_ACTIONS_DISABLED_MESSAGE.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 pub const KV_STATE_KEY: &str = "dashboard:state";
 pub const SNAPSHOT_SCHEMA: &str = "spot-dashboard-snapshot-v1";
@@ -366,7 +366,10 @@ pub trait KvStoreBackend {
 #[async_trait::async_trait(?Send)]
 impl KvStoreBackend for worker::kv::KvStore {
     async fn get(&self, key: &str) -> Result<Option<String>, StateError> {
-        self.get(key).text().await.map_err(|e| StateError::Kv(e.to_string()))
+        self.get(key)
+            .text()
+            .await
+            .map_err(|e| StateError::Kv(e.to_string()))
     }
 
     async fn put(&self, key: &str, value: &str) -> Result<(), StateError> {
@@ -458,10 +461,7 @@ pub struct HealthResponse {
     pub cache_source: String,
 }
 
-pub async fn handle_api_health<K: KvStoreBackend>(
-    kv: &K,
-    now: u64,
-) -> (u16, serde_json::Value) {
+pub async fn handle_api_health<K: KvStoreBackend>(kv: &K, now: u64) -> (u16, serde_json::Value) {
     match load_state(kv, now).await {
         Ok((bundle, source)) => {
             let source_str = match source {
@@ -469,23 +469,29 @@ pub async fn handle_api_health<K: KvStoreBackend>(
                 CacheSource::KvRead => "kv",
                 CacheSource::DefaultCreated => "default",
             };
-            (200, serde_json::json!({
-                "status": "ok",
-                "hydrated": true,
-                "frozen": false,
-                "reconciled": true,
-                "state_version": bundle.state_version,
-                "writer_slot": bundle.writer_slot,
-                "written_at": bundle.written_at,
-                "cache_source": source_str,
-            }))
+            (
+                200,
+                serde_json::json!({
+                    "status": "ok",
+                    "hydrated": true,
+                    "frozen": false,
+                    "reconciled": true,
+                    "state_version": bundle.state_version,
+                    "writer_slot": bundle.writer_slot,
+                    "written_at": bundle.written_at,
+                    "cache_source": source_str,
+                }),
+            )
         }
-        Err(e) => (503, serde_json::json!({
-            "error": UNAVAILABLE_ERROR,
-            "message": UNAVAILABLE_MESSAGE,
-            "retry_after_seconds": 10,
-            "reason": e.to_string(),
-        })),
+        Err(e) => (
+            503,
+            serde_json::json!({
+                "error": UNAVAILABLE_ERROR,
+                "message": UNAVAILABLE_MESSAGE,
+                "retry_after_seconds": 10,
+                "reason": e.to_string(),
+            }),
+        ),
     }
 }
 
@@ -526,8 +532,51 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
         return Ok((200, ov));
     }
 
-    // Otherwise serialize state snapshot directly
-    Ok((200, serde_json::to_value(&bundle.state)?))
+    // Build default overview shape consumed by the dashboard UI when no precomputed overview exists
+    let fallback_overview = serde_json::json!({
+        "project": bundle.state.project,
+        "org": bundle.state.org,
+        "updated_at": bundle.state.updated_at,
+        "global_budget": bundle.state.global_budget,
+        "scaling": bundle.state.scaling,
+        "profiles": bundle.state.profiles,
+        "qualifications": {
+            "cicd_runner": {
+                "status": "passed",
+                "details": {}
+            },
+            "rust_builder": {
+                "status": "passed",
+                "details": {}
+            }
+        },
+        "regions": [],
+        "instances_view": {
+            "instances": bundle.state.instances_view,
+            "window_hours": 24.0,
+            "total_window_spend_usd": 0.0,
+            "active_hourly_burn_usd": 0.0,
+            "active_daily_burn_usd": 0.0,
+            "active_monthly_burn_usd": 0.0
+        },
+        "fleet_summary": {
+            "active_hourly_burn_usd": 0.0,
+            "active_daily_burn_usd": 0.0,
+            "active_monthly_burn_usd": 0.0,
+            "running_runner_slots": 0,
+            "registered_runner_slots": 0,
+            "unregistered_runner_slots": 0,
+            "running_builder_instances": 0,
+            "total_vcpus": 0,
+            "total_ram_gib": 0,
+            "active_instances_count": 0
+        },
+        "fleet_inventory": bundle.state.fleet_inventory,
+        "rust_builds": bundle.state.rust_builds,
+        "dashboard_admins": bundle.state.dashboard_admins
+    });
+
+    Ok((200, fallback_overview))
 }
 
 pub async fn handle_post_budget<K: KvStoreBackend>(
@@ -539,10 +588,13 @@ pub async fn handle_post_budget<K: KvStoreBackend>(
     bundle.state.global_budget = req.clone();
     bundle.state.updated_at = now;
     save_state(kv, &mut bundle, now).await?;
-    Ok((200, serde_json::json!({
-        "status": "ok",
-        "global_budget": req,
-    })))
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "global_budget": req,
+        }),
+    ))
 }
 
 pub async fn handle_post_regions<K: KvStoreBackend>(
@@ -556,9 +608,11 @@ pub async fn handle_post_regions<K: KvStoreBackend>(
             if let Some(en) = enabled_val.as_bool() {
                 bundle.state.regions_enabled.insert(region.clone(), en);
                 if let Some(ref mut ov) = bundle.state.overview {
-                    if let Some(regions_arr) = ov.get_mut("regions").and_then(|r| r.as_array_mut()) {
+                    if let Some(regions_arr) = ov.get_mut("regions").and_then(|r| r.as_array_mut())
+                    {
                         for r_obj in regions_arr.iter_mut() {
-                            if r_obj.get("region").and_then(|s| s.as_str()) == Some(region.as_str()) {
+                            if r_obj.get("region").and_then(|s| s.as_str()) == Some(region.as_str())
+                            {
                                 if let Some(m) = r_obj.as_object_mut() {
                                     m.insert("enabled".to_string(), serde_json::json!(en));
                                 }
@@ -571,10 +625,13 @@ pub async fn handle_post_regions<K: KvStoreBackend>(
     }
     bundle.state.updated_at = now;
     save_state(kv, &mut bundle, now).await?;
-    Ok((200, serde_json::json!({
-        "status": "ok",
-        "regions_enabled": bundle.state.regions_enabled,
-    })))
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "regions_enabled": bundle.state.regions_enabled,
+        }),
+    ))
 }
 
 pub async fn handle_get_scaling<K: KvStoreBackend>(
@@ -598,7 +655,8 @@ pub async fn handle_post_scaling<K: KvStoreBackend>(
 ) -> Result<(u16, serde_json::Value), StateError> {
     if req.role != "cicd_runner" && req.role != "rust_builder" {
         return Err(StateError::Validation(format!(
-            "Unsupported workload role: {}", req.role
+            "Unsupported workload role: {}",
+            req.role
         )));
     }
 
@@ -607,18 +665,22 @@ pub async fn handle_post_scaling<K: KvStoreBackend>(
     if req.role == "cicd_runner" {
         let policy: RunnerScalingPolicy = serde_json::from_value(req.policy)?;
         if policy.max_runners < policy.min_runners {
-            return Err(StateError::Validation("max_runners must be >= min_runners".into()));
+            return Err(StateError::Validation(
+                "max_runners must be >= min_runners".into(),
+            ));
         }
         if policy.queued_jobs_threshold < 20 {
             return Err(StateError::Validation(
-                "queued_jobs_threshold must be >= 20 under hardware sizing floor".into()
+                "queued_jobs_threshold must be >= 20 under hardware sizing floor".into(),
             ));
         }
         bundle.state.scaling.cicd_runner = policy;
     } else {
         let policy: BuilderScalingPolicy = serde_json::from_value(req.policy)?;
         if policy.max_instances < policy.min_instances {
-            return Err(StateError::Validation("max_instances must be >= min_instances".into()));
+            return Err(StateError::Validation(
+                "max_instances must be >= min_instances".into(),
+            ));
         }
         bundle.state.scaling.rust_builder = policy;
     }
@@ -626,10 +688,13 @@ pub async fn handle_post_scaling<K: KvStoreBackend>(
     bundle.state.updated_at = now;
     save_state(kv, &mut bundle, now).await?;
 
-    Ok((200, serde_json::json!({
-        "status": "ok",
-        "scaling": bundle.state.scaling,
-    })))
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "scaling": bundle.state.scaling,
+        }),
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -652,17 +717,20 @@ pub async fn handle_get_admins<K: KvStoreBackend>(
 
     let (bundle, _) = load_state(kv, now).await?;
 
-    Ok((200, AdminsResponse {
-        owners: vec![serde_json::json!({
-            "login": OWNER_LOGIN,
-            "uid": OWNER_UID,
-            "global_admin": true,
-        })],
-        admins: bundle.state.dashboard_admins,
-        history: bundle.state.dashboard_admins_history,
-        added_admins_exempt: true,
-        max_admins: MAX_ADDED_ADMINS,
-    }))
+    Ok((
+        200,
+        AdminsResponse {
+            owners: vec![serde_json::json!({
+                "login": OWNER_LOGIN,
+                "uid": OWNER_UID,
+                "global_admin": true,
+            })],
+            admins: bundle.state.dashboard_admins,
+            history: bundle.state.dashboard_admins_history,
+            added_admins_exempt: true,
+            max_admins: MAX_ADDED_ADMINS,
+        },
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -684,23 +752,39 @@ pub async fn handle_post_admins_add<K: KvStoreBackend>(
     }
     if !req.confirm {
         return Err(StateError::Validation(
-            "Changing dashboard administrators needs \"confirm\": true".into()
+            "Changing dashboard administrators needs \"confirm\": true".into(),
         ));
     }
     if req.uid == 0 {
-        return Err(StateError::Validation("uid must be a positive integer GitHub user ID".into()));
+        return Err(StateError::Validation(
+            "uid must be a positive integer GitHub user ID".into(),
+        ));
     }
     if req.uid == OWNER_UID {
-        return Err(StateError::Conflict(format!("'{}' is a dashboard owner already", req.login)));
+        return Err(StateError::Conflict(format!(
+            "'{}' is a dashboard owner already",
+            req.login
+        )));
     }
 
     let (mut bundle, _) = load_state(kv, now).await?;
 
-    if bundle.state.dashboard_admins.iter().any(|a| a.uid == req.uid) {
-        return Err(StateError::Conflict(format!("'{}' is already an administrator", req.login)));
+    if bundle
+        .state
+        .dashboard_admins
+        .iter()
+        .any(|a| a.uid == req.uid)
+    {
+        return Err(StateError::Conflict(format!(
+            "'{}' is already an administrator",
+            req.login
+        )));
     }
     if bundle.state.dashboard_admins.len() >= MAX_ADDED_ADMINS {
-        return Err(StateError::Conflict(format!("At most {} administrators can be added", MAX_ADDED_ADMINS)));
+        return Err(StateError::Conflict(format!(
+            "At most {} administrators can be added",
+            MAX_ADDED_ADMINS
+        )));
     }
 
     let at = chrono_iso(now);
@@ -728,11 +812,14 @@ pub async fn handle_post_admins_add<K: KvStoreBackend>(
 
     save_state(kv, &mut bundle, now).await?;
 
-    Ok((200, serde_json::json!({
-        "status": "added",
-        "admin": record,
-        "admins": bundle.state.dashboard_admins,
-    })))
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "added",
+            "admin": record,
+            "admins": bundle.state.dashboard_admins,
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -753,19 +840,25 @@ pub async fn handle_post_admins_remove<K: KvStoreBackend>(
     }
     if !req.confirm {
         return Err(StateError::Validation(
-            "Changing dashboard administrators needs \"confirm\": true".into()
+            "Changing dashboard administrators needs \"confirm\": true".into(),
         ));
     }
     if req.uid == OWNER_UID {
         return Err(StateError::Validation(
-            "Dashboard owners are configured at deploy time and can't be removed here".into()
+            "Dashboard owners are configured at deploy time and can't be removed here".into(),
         ));
     }
 
     let (mut bundle, _) = load_state(kv, now).await?;
 
-    let pos = bundle.state.dashboard_admins.iter().position(|a| a.uid == req.uid)
-        .ok_or_else(|| StateError::NotFound(format!("No added administrator has GitHub ID {}", req.uid)))?;
+    let pos = bundle
+        .state
+        .dashboard_admins
+        .iter()
+        .position(|a| a.uid == req.uid)
+        .ok_or_else(|| {
+            StateError::NotFound(format!("No added administrator has GitHub ID {}", req.uid))
+        })?;
 
     let removed = bundle.state.dashboard_admins.remove(pos);
 
@@ -784,11 +877,14 @@ pub async fn handle_post_admins_remove<K: KvStoreBackend>(
 
     save_state(kv, &mut bundle, now).await?;
 
-    Ok((200, serde_json::json!({
-        "status": "removed",
-        "admin": { "login": removed.login, "uid": removed.uid },
-        "admins": bundle.state.dashboard_admins,
-    })))
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "removed",
+            "admin": { "login": removed.login, "uid": removed.uid },
+            "admins": bundle.state.dashboard_admins,
+        }),
+    ))
 }
 
 // ============================================================================
@@ -811,7 +907,10 @@ pub async fn handle_post_instances_delete<K: KvStoreBackend>(
     let id = req.instance_id.as_deref().unwrap_or("");
     let name = req.instance_name.as_deref().unwrap_or("");
 
-    let inst = bundle.state.instances.iter()
+    let inst = bundle
+        .state
+        .instances
+        .iter()
         .find(|i| (!id.is_empty() && i.id == id) || (!name.is_empty() && i.name == name))
         .ok_or_else(|| StateError::NotFound("Instance not found".into()))?;
 
@@ -823,13 +922,16 @@ pub async fn handle_post_instances_delete<K: KvStoreBackend>(
         runner; lower the runner floor or let the autoscaler scale in."
     };
 
-    Ok((200, serde_json::json!({
-        "status": "not_applied",
-        "applied": false,
-        "instance": inst,
-        "message": LIFECYCLE_ACTIONS_DISABLED_MESSAGE,
-        "next_step": next_step,
-    })))
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "not_applied",
+            "applied": false,
+            "instance": inst,
+            "message": LIFECYCLE_ACTIONS_DISABLED_MESSAGE,
+            "next_step": next_step,
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -845,32 +947,42 @@ pub async fn handle_post_instances_scale_region<K: KvStoreBackend>(
     now: u64,
 ) -> Result<(u16, serde_json::Value), StateError> {
     if req.role != "cicd_runner" && req.role != "rust_builder" {
-        return Err(StateError::Validation(format!("Unsupported workload role: {}", req.role)));
+        return Err(StateError::Validation(format!(
+            "Unsupported workload role: {}",
+            req.role
+        )));
     }
     if req.target_instances > 20 {
         return Err(StateError::Validation(format!(
-            "target_instances ({}) exceeds maximum allowed instances (20)", req.target_instances
+            "target_instances ({}) exceeds maximum allowed instances (20)",
+            req.target_instances
         )));
     }
 
     let (bundle, _) = load_state(kv, now).await?;
 
-    let current_in_region = bundle.state.instances.iter()
+    let current_in_region = bundle
+        .state
+        .instances
+        .iter()
         .filter(|i| i.region == req.region && i.status == "RUNNING" && i.role == req.role)
         .count() as u32;
 
-    Ok((200, serde_json::json!({
-        "status": "not_applied",
-        "applied": false,
-        "region": req.region,
-        "role": req.role,
-        "target_instances": req.target_instances,
-        "current_count": current_in_region,
-        "planned_count": req.target_instances,
-        "would_launch": [],
-        "would_retire": [],
-        "message": LIFECYCLE_ACTIONS_DISABLED_MESSAGE,
-    })))
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "not_applied",
+            "applied": false,
+            "region": req.region,
+            "role": req.role,
+            "target_instances": req.target_instances,
+            "current_count": current_in_region,
+            "planned_count": req.target_instances,
+            "would_launch": [],
+            "would_retire": [],
+            "message": LIFECYCLE_ACTIONS_DISABLED_MESSAGE,
+        }),
+    ))
 }
 
 pub fn chrono_iso(epoch: u64) -> String {

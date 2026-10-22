@@ -1,7 +1,7 @@
+use spot_dashboard_edge::state::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use spot_dashboard_edge::state::*;
 
 pub struct MockKvStore {
     pub data: Mutex<HashMap<String, String>>,
@@ -42,14 +42,18 @@ async fn test_cached_overview_zero_kv_writes_and_cache_hit() {
     let now = 1792000000;
 
     // First GET: Cache miss, loads from KV (or creates default)
-    let (status, _) = handle_api_overview(&kv, OverviewQuery::default(), now).await.unwrap();
+    let (status, _) = handle_api_overview(&kv, OverviewQuery::default(), now)
+        .await
+        .unwrap();
     assert_eq!(status, 200);
     assert_eq!(kv.get_count.load(Ordering::SeqCst), 1);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 0); // 0 KV writes!
 
     // Subsequent 10 GETs within 60s: All hit in-isolate memory cache
     for offset in 1..=10 {
-        let (status, _) = handle_api_overview(&kv, OverviewQuery::default(), now + offset).await.unwrap();
+        let (status, _) = handle_api_overview(&kv, OverviewQuery::default(), now + offset)
+            .await
+            .unwrap();
         assert_eq!(status, 200);
     }
 
@@ -65,11 +69,15 @@ async fn test_cache_ttl_expiration_triggers_single_kv_read() {
     let now = 1792000000;
 
     // Initial fetch
-    handle_api_overview(&kv, OverviewQuery::default(), now).await.unwrap();
+    handle_api_overview(&kv, OverviewQuery::default(), now)
+        .await
+        .unwrap();
     assert_eq!(kv.get_count.load(Ordering::SeqCst), 1);
 
     // Advance simulated clock past 60s TTL
-    handle_api_overview(&kv, OverviewQuery::default(), now + 65).await.unwrap();
+    handle_api_overview(&kv, OverviewQuery::default(), now + 65)
+        .await
+        .unwrap();
     assert_eq!(kv.get_count.load(Ordering::SeqCst), 2);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 0);
 }
@@ -120,8 +128,12 @@ async fn test_scaling_update_performs_single_write_and_enforces_floor() {
             "shared_global_budget": false
         }),
     };
-    let err = handle_post_scaling(&kv, invalid_req, now + 1).await.unwrap_err();
-    assert!(err.to_string().contains("queued_jobs_threshold must be >= 20"));
+    let err = handle_post_scaling(&kv, invalid_req, now + 1)
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("queued_jobs_threshold must be >= 20"));
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 1); // 0 extra writes on validation failure
 
     // 2. Set queued_jobs_threshold >= 20 -> succeeds with exactly 1 write
@@ -201,7 +213,9 @@ async fn test_instance_actions_safety_gate_returns_plan_with_zero_kv_writes() {
         instance_id: Some("inst-1".into()),
         instance_name: None,
     };
-    let (status, del_resp) = handle_post_instances_delete(&kv, del_req, now + 5).await.unwrap();
+    let (status, del_resp) = handle_post_instances_delete(&kv, del_req, now + 5)
+        .await
+        .unwrap();
     assert_eq!(status, 200);
     assert_eq!(del_resp["applied"], false);
     assert_eq!(del_resp["status"], "not_applied");
@@ -213,7 +227,9 @@ async fn test_instance_actions_safety_gate_returns_plan_with_zero_kv_writes() {
         target_instances: 2,
         role: "cicd_runner".into(),
     };
-    let (status, scale_resp) = handle_post_instances_scale_region(&kv, scale_req, now + 6).await.unwrap();
+    let (status, scale_resp) = handle_post_instances_scale_region(&kv, scale_req, now + 6)
+        .await
+        .unwrap();
     assert_eq!(status, 200);
     assert_eq!(scale_resp["applied"], false);
     assert_eq!(scale_resp["status"], "not_applied");
@@ -232,7 +248,10 @@ async fn test_gcp_oauth_token_caching_zero_kv_operations() {
     set_cached_gcp_token(now, "mock_token_abc123".into());
 
     // Token valid within 55 minutes
-    assert_eq!(get_cached_gcp_token(now + 1800), Some("mock_token_abc123".into()));
+    assert_eq!(
+        get_cached_gcp_token(now + 1800),
+        Some("mock_token_abc123".into())
+    );
 
     // Token expires after 55 minutes (3300s)
     assert_eq!(get_cached_gcp_token(now + 3301), None);
@@ -245,6 +264,7 @@ async fn test_overview_snapshot_serialization_parity() {
     assert_eq!(bundle.writer_slot, WRITER_SLOT_EDGE);
 
     let serialized = serde_json::to_string(&bundle).expect("Serialize bundle");
-    let deserialized: DashboardBundle = serde_json::from_str(&serialized).expect("Deserialize bundle");
+    let deserialized: DashboardBundle =
+        serde_json::from_str(&serialized).expect("Deserialize bundle");
     assert_eq!(bundle, deserialized);
 }

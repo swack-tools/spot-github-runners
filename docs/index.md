@@ -2,48 +2,39 @@
 
 This repository provisions and operates persistent GitHub Actions runners and dedicated Rust build VMs on GCP (Google's cloud platform) Spot instances. It mainly serves `swack-tools/oxidex`. It also includes a web dashboard hosted at the edge and a set of persistent local ARM64 Docker runners.
 
-This site describes the source on `main`. Merging source doesn't update a running controller, container, or VM.
+This site describes the source on `main`. Merging source does not update a running controller, container, or VM.
 Inspect the deployed configuration and the actual tool versions before you route work to a host.
 
 ## What the repository contains
 
 | Component | What it does |
 | --- | --- |
-| Runner fleet | Spot VMs named `oxidex-runners-*` run Docker containers that register as GitHub Actions listeners. A controller sizes, replaces, and drains them. |
-| Autoscaler | A controller on an operator workstation that keeps a runner floor, scales by tier, rotates hosts when prices move, recovers lost hosts, and re-runs eligible interrupted jobs. |
+| Runner fleet | Spot VMs named `oxidex-runners-*` run Docker containers that register as GitHub Actions listeners. The edge reconciler provisions, replaces, and drains them. |
+| Edge reconciler | A Cloudflare Worker cron trigger running every 5 minutes that maintains a runner floor, scales up on queued backlog (>=20 jobs), cleans terminated VMs, and syncs KV state. |
 | Dedicated builders | `builder-*` VMs that register no GitHub runner. They run Rust builds in one resource-limited, unprivileged container with persistent caches. |
-| Dashboard | A web UI for fleet telemetry, runner patches, and administrators. It runs on a small control VM behind a Cloudflare Worker. |
+| Dashboard | A web UI for fleet telemetry, runner patches, and administrators. It runs as a compiled WebAssembly Worker at Cloudflare's edge backed by Workers KV. |
 | Local runners | Two persistent ARM64 Docker runners that run on a local host, outside the GCP fleet. |
-| Price tools | Commands that read Spot prices, from the official Billing Catalog or Compute Engine price lookups, and the machine inventory. |
+| Host agent | A native pure-Rust multi-call binary managing memory lease admission, descriptor-safe cleanup, and Docker security boundaries. |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    browser["Browser"] --> worker["Cloudflare Worker<br/>(Workers KV state)"]
-    worker -->|"tunnel + Access"| control["Control VM<br/>dashboard + cloudflared"]
+    browser["Browser"] --> worker["Cloudflare Worker<br/>(Wasm + SPOT_KV)"]
+    worker -->|"Compute Engine API"| gcp["GCP Spot Instances"]
+    worker <-->|"GitHub API (JIT, runners, PRs)"| github["GitHub"]
 
-    ctl["Autoscaler<br/>(operator workstation)"] -->|"Compute API, identity-checked SSH"| hosts
-    ctl -->|"freeze, snapshot, import"| control
-    ctl <-->|"runners, jobs, runner groups"| github["GitHub"]
-
-    subgraph gcp["GCP project"]
-        control
-        hosts["Runner hosts<br/>oxidex-runners-*"]
-        builders["Dedicated builders<br/>builder-*"]
+    subgraph gcp["GCP Project"]
+        hosts["Runner hosts<br/>oxidex-runners-*<br/>(host-agent)"]
+        builders["Dedicated builders<br/>builder-*<br/>(host-agent)"]
     end
 
     hosts <-->|"listeners"| github
-    control -->|"OAuth, config repository"| github
-    ops["Operator"] -->|"rendered launch command"| builders
+    ops["Operator"] -->|"direct SSH / Just"| builders
     local["Local ARM64 runners"] <-->|"listeners"| github
 ```
 
-The autoscaler is the long-running component that changes runner hosts. It reads GitHub and GCP state, keeps its own
-persisted operation state, and changes one host at a time. The control VM watchdog changes only the dashboard's control
-VMs, and a dashboard run with `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud` can hot-patch runner hosts. The dashboard doesn't run on runner hosts, and the control
-VM dashboard has no `gcloud` or SSH path to them. A dashboard that an operator runs with
-`DASHBOARD_HOT_PATCH_EXECUTOR=gcloud` can reach them over `gcloud compute ssh`. See the [security model](security.md).
+The scheduled edge reconciler is the autonomous component that manages runner hosts. It queries GitHub Actions and Compute Engine APIs, maintains fleet state in `SPOT_KV`, and enforces rate-limited diff-gating to conserve KV write quotas (<50 writes/day). On runner hosts, the native `host-agent` manages memory leases and descriptor-safe cleanup. Dedicated builders run Rust builds in isolated containers managed by `host-agent docker-admission`. See the [security model](security.md).
 
 ## Where to start
 
@@ -60,22 +51,20 @@ VM dashboard has no `gcloud` or SSH path to them. A dashboard that an operator r
 
 | Goal | Entry point | Creates or changes resources? |
 | --- | --- | --- |
-| List Spot compute prices by minimum CPU, RAM, and daily cap | `tools/spot_prices.py` | No |
-| Find candidate Spot offers with deployment constraints | `src/spot_finder.py` | No |
-| Inspect runners and VMs | `src/runner_fleet.py` | No |
-| Preview or provision runner hosts and strict heavy pools | `src/spot_runner_manager.py` | Only with `--apply`, or `--patch-live` (which changes a running host without a preview) |
-| Plan or manage runner capacity | `src/spot_runner_autoscaler.py` | Yes, except a tiered `--dry-run` without `--install-launch-agent` |
-| Render a dedicated builder launch | `src/render_builder_startup.py` | Writes local files. The generated launch command creates a VM. |
-| Build on an explicitly selected legacy host | `src/remote_rust_build.py` | Transfers source and starts a remote build |
-| Install Cargo client commands | `src/install_remote_commands.py` | Writes local executable shims |
-| Run the web dashboard | `src/web_dashboard.py` | Updates the local dashboard state file. With `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` set, `POST /api/patches/save` creates a branch, commits, and opens a pull request on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts. |
-| Inspect, plan, or manage the control VM that hosts the dashboard | `src/control_vm.py` | Only with `--apply`; `render-startup` writes a local file |
-| Update an occupied dedicated builder in place | `src/lib/builder_runtime_update.py` | Only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed` |
+| Test host agent crate | `cargo test --manifest-path host-agent/Cargo.toml` | No |
+| Test Cloudflare Worker edge crate | `cargo test --manifest-path cloudflare/Cargo.toml` | No |
+| Build release Wasm Worker bundle | `cd cloudflare && worker-build --release` | Writes local build artifacts |
+| Run all repository tests | `just test` | No |
+| Check formatting, crates, and Vale | `just check` | No |
+| Probe edge dashboard health | `just probe-edge` | No |
+| Clean workspace targets and target directories | `host-agent clean-target <path>` | Cleans local build target directory |
+| Manage host memory leases | `host-agent host-admission <subcommand>` | Updates `/var/lib/gha-admission/leases.json` |
+| Save runner patch manifest | `POST /api/patch-console/save` | Creates Git branch and pull request |
 
 See the [command reference](commands.md) for every flag.
 
-## Registered listeners aren't capacity
+## Registered listeners are not capacity
 
-Twenty registered runners don't mean that twenty jobs can each use 32 GiB at once. Admission reserves memory
+Twenty registered runners do not mean that twenty jobs can each use 32 GiB at once. Admission reserves memory
 before a job starts. The physical host also needs space for its operating system, services, and idle listeners.
 Keep the distinction between registered listeners and active jobs in mind whenever you read a runner count.

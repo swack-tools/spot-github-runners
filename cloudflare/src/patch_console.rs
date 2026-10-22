@@ -6,15 +6,15 @@
 //! - Controlled targets: `swack-tools`, `xbmc4lyfe/newznab-tmux`, `xbmc4lyfe/rustnzb`, `xbmc4lyfe/nntp-proxy`
 //! - GitHub Git Data & Pull Request API workflow with abstract transport for offline test mockability.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::patch::{
     classify_rollout_values, compute_canonical_patch_sha256, validate_patch_manifest,
-    CONTROLLED_TARGETS, RolloutClassification,
+    RolloutClassification, CONTROLLED_TARGETS,
 };
 
 pub const CONFIG_REPO: &str = "swack-tools/spot-runners-config";
@@ -74,8 +74,12 @@ impl GitHubTransport for WorkerGitHubTransport {
             req_init.with_method(m);
 
             let req_headers = Headers::new();
-            req_headers.set("User-Agent", "spot-dashboard-edge/1.0").map_err(|e| e.to_string())?;
-            req_headers.set("Accept", "application/vnd.github.v3+json").map_err(|e| e.to_string())?;
+            req_headers
+                .set("User-Agent", "spot-dashboard-edge/1.0")
+                .map_err(|e| e.to_string())?;
+            req_headers
+                .set("Accept", "application/vnd.github.v3+json")
+                .map_err(|e| e.to_string())?;
 
             for (k, v) in headers {
                 req_headers.set(k, v).map_err(|e| e.to_string())?;
@@ -87,7 +91,10 @@ impl GitHubTransport for WorkerGitHubTransport {
             }
 
             let req = Request::new_with_init(&url, &req_init).map_err(|e| e.to_string())?;
-            let mut resp = Fetch::Request(req).send().await.map_err(|e| e.to_string())?;
+            let mut resp = Fetch::Request(req)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             let status = resp.status_code();
             let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
             Ok((status, bytes))
@@ -120,8 +127,10 @@ impl MockGitHubTransport {
         let mut files = HashMap::new();
         let mut head_files = HashMap::new();
 
-        let defaults_json = serde_json::to_string(&make_valid_manifest_json("swack-tools")).unwrap();
-        let oxidex_json = serde_json::to_string(&make_valid_manifest_json("swack-tools/oxidex")).unwrap();
+        let defaults_json =
+            serde_json::to_string(&make_valid_manifest_json("swack-tools")).unwrap();
+        let oxidex_json =
+            serde_json::to_string(&make_valid_manifest_json("swack-tools/oxidex")).unwrap();
 
         head_files.insert(DEFAULTS_PATH.to_string(), defaults_json);
         head_files.insert("repos/swack-tools/oxidex.yaml".to_string(), oxidex_json);
@@ -147,7 +156,10 @@ impl GitHubTransport for MockGitHubTransport {
         body: Option<&[u8]>,
     ) -> Result<(u16, Vec<u8>), String> {
         let payload: Option<Value> = body.and_then(|b| serde_json::from_slice(b).ok());
-        self.calls.lock().unwrap().push((method.to_string(), path.to_string(), payload.clone()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method.to_string(), path.to_string(), payload.clone()));
 
         let prefix = format!("repos/{}", CONFIG_REPO);
 
@@ -175,7 +187,13 @@ impl GitHubTransport for MockGitHubTransport {
                 .next()
                 .unwrap();
             let files = self.files.lock().unwrap();
-            let head_sha = self.branches.lock().unwrap().get(&self.default_branch).cloned().unwrap_or_else(|| "a".repeat(40));
+            let head_sha = self
+                .branches
+                .lock()
+                .unwrap()
+                .get(&self.default_branch)
+                .cloned()
+                .unwrap_or_else(|| "a".repeat(40));
 
             if let Some(content) = files.get(&head_sha).and_then(|f| f.get(file_path)) {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
@@ -213,7 +231,10 @@ impl GitHubTransport for MockGitHubTransport {
                 return Err("Direct commit to main is forbidden".to_string());
             }
             let new_sha = "c".repeat(40);
-            self.branches.lock().unwrap().insert(branch.to_string(), new_sha.clone());
+            self.branches
+                .lock()
+                .unwrap()
+                .insert(branch.to_string(), new_sha.clone());
             let res = json!({"commit": {"sha": new_sha}});
             return Ok((200, serde_json::to_vec(&res).unwrap()));
         }
@@ -302,10 +323,16 @@ pub fn make_valid_manifest_json(repo: &str) -> Value {
 
 /// Maps a path (`defaults.yaml` or `repos/<owner>/<repo>.yaml`) or target name to a controlled target.
 pub fn resolve_target_from_repo_or_path(repo_or_path: &str) -> String {
-    if repo_or_path == DEFAULTS_PATH || repo_or_path == "repos/swack-tools/oxidex.yaml" || repo_or_path == "swack-tools/oxidex" {
+    if repo_or_path == DEFAULTS_PATH
+        || repo_or_path == "repos/swack-tools/oxidex.yaml"
+        || repo_or_path == "swack-tools/oxidex"
+    {
         return "swack-tools".to_string();
     }
-    if let Some(rest) = repo_or_path.strip_prefix("repos/").and_then(|s| s.strip_suffix(".yaml")) {
+    if let Some(rest) = repo_or_path
+        .strip_prefix("repos/")
+        .and_then(|s| s.strip_suffix(".yaml"))
+    {
         return rest.to_string();
     }
     repo_or_path.to_string()
@@ -385,14 +412,19 @@ pub async fn handle_manifest(
     if !token.is_empty() {
         let auth_hdr = format!("Bearer {}", token);
         let path = format!("repos/{}/contents/{}", CONFIG_REPO, manifest_path);
-        if let Ok((200, body)) = transport.request("GET", &path, &[("Authorization", &auth_hdr)], None).await {
+        if let Ok((200, body)) = transport
+            .request("GET", &path, &[("Authorization", &auth_hdr)], None)
+            .await
+        {
             if let Ok(gh_resp) = serde_json::from_slice::<Value>(&body) {
                 if let Some(sha_str) = gh_resp.get("sha").and_then(|s| s.as_str()) {
                     blob_sha = sha_str.to_string();
                 }
                 if let Some(content_b64) = gh_resp.get("content").and_then(|s| s.as_str()) {
                     let cleaned_b64 = content_b64.replace(['\n', '\r', ' '], "");
-                    if let Ok(raw_bytes) = base64::engine::general_purpose::STANDARD.decode(cleaned_b64) {
+                    if let Ok(raw_bytes) =
+                        base64::engine::general_purpose::STANDARD.decode(cleaned_b64)
+                    {
                         if let Ok(text) = String::from_utf8(raw_bytes) {
                             if let Ok(parsed) = crate::patch::parse_manifest_to_value(&text) {
                                 manifest_val = parsed;
@@ -405,9 +437,16 @@ pub async fn handle_manifest(
 
         // Fetch default branch HEAD for base_sha
         let head_path = format!("repos/{}/git/ref/heads/{}", CONFIG_REPO, DEFAULT_BRANCH);
-        if let Ok((200, head_body)) = transport.request("GET", &head_path, &[("Authorization", &auth_hdr)], None).await {
+        if let Ok((200, head_body)) = transport
+            .request("GET", &head_path, &[("Authorization", &auth_hdr)], None)
+            .await
+        {
             if let Ok(head_val) = serde_json::from_slice::<Value>(&head_body) {
-                if let Some(sha_str) = head_val.get("object").and_then(|o| o.get("sha")).and_then(|s| s.as_str()) {
+                if let Some(sha_str) = head_val
+                    .get("object")
+                    .and_then(|o| o.get("sha"))
+                    .and_then(|s| s.as_str())
+                {
                     base_sha = sha_str.to_string();
                 }
             }
@@ -498,7 +537,11 @@ pub async fn handle_save(
         None
     };
 
-    let manifest = match body.get("manifest").filter(|m| !m.is_null()).or(parsed_from_content.as_ref()) {
+    let manifest = match body
+        .get("manifest")
+        .filter(|m| !m.is_null())
+        .or(parsed_from_content.as_ref())
+    {
         Some(m) => m,
         None => {
             return (
@@ -568,9 +611,16 @@ pub async fn handle_save(
         // 1. Get base commit SHA
         let head_path = format!("{}/git/ref/heads/{}", prefix, DEFAULT_BRANCH);
         let mut base_sha = "a".repeat(40);
-        if let Ok((200, head_body)) = transport.request("GET", &head_path, &[("Authorization", &auth_hdr)], None).await {
+        if let Ok((200, head_body)) = transport
+            .request("GET", &head_path, &[("Authorization", &auth_hdr)], None)
+            .await
+        {
             if let Ok(head_val) = serde_json::from_slice::<Value>(&head_body) {
-                if let Some(s) = head_val.get("object").and_then(|o| o.get("sha")).and_then(|s| s.as_str()) {
+                if let Some(s) = head_val
+                    .get("object")
+                    .and_then(|o| o.get("sha"))
+                    .and_then(|s| s.as_str())
+                {
                     base_sha = s.to_string();
                 }
             }
@@ -582,23 +632,33 @@ pub async fn handle_save(
             "sha": base_sha,
         });
         let ref_bytes = serde_json::to_vec(&ref_payload).unwrap();
-        let _ = transport.request("POST", &format!("{}/git/refs", prefix), &[("Authorization", &auth_hdr)], Some(&ref_bytes)).await;
+        let _ = transport
+            .request(
+                "POST",
+                &format!("{}/git/refs", prefix),
+                &[("Authorization", &auth_hdr)],
+                Some(&ref_bytes),
+            )
+            .await;
 
         // 3. Put file commit
         let canonical_str = crate::patch::to_canonical_json_str(manifest);
-        let encoded_content = base64::engine::general_purpose::STANDARD.encode(canonical_str.as_bytes());
+        let encoded_content =
+            base64::engine::general_purpose::STANDARD.encode(canonical_str.as_bytes());
         let file_payload = json!({
             "message": format!("Update {} runner patch from Spot Dashboard", repo),
             "content": encoded_content,
             "branch": branch,
         });
         let file_bytes = serde_json::to_vec(&file_payload).unwrap();
-        let put_res = transport.request(
-            "PUT",
-            &format!("{}/contents/{}", prefix, manifest_path),
-            &[("Authorization", &auth_hdr)],
-            Some(&file_bytes),
-        ).await;
+        let put_res = transport
+            .request(
+                "PUT",
+                &format!("{}/contents/{}", prefix, manifest_path),
+                &[("Authorization", &auth_hdr)],
+                Some(&file_bytes),
+            )
+            .await;
 
         match put_res {
             Ok((200 | 201, _)) => {
@@ -610,7 +670,15 @@ pub async fn handle_save(
                     "body": format!("Runner patch update for `{}` from Spot Dashboard.\n\nDigest: `{}`", repo, digest),
                 });
                 let pr_bytes = serde_json::to_vec(&pr_payload).unwrap();
-                if let Ok((201, pr_body)) = transport.request("POST", &format!("{}/pulls", prefix), &[("Authorization", &auth_hdr)], Some(&pr_bytes)).await {
+                if let Ok((201, pr_body)) = transport
+                    .request(
+                        "POST",
+                        &format!("{}/pulls", prefix),
+                        &[("Authorization", &auth_hdr)],
+                        Some(&pr_bytes),
+                    )
+                    .await
+                {
                     if let Ok(pr_resp) = serde_json::from_slice::<Value>(&pr_body) {
                         if let Some(url_str) = pr_resp.get("html_url").and_then(|u| u.as_str()) {
                             pr_url = url_str.to_string();
@@ -623,7 +691,14 @@ pub async fn handle_save(
             }
             _ => {
                 // Rollback branch on commit failure
-                let _ = transport.request("DELETE", &format!("{}/git/refs/heads/{}", prefix, branch), &[("Authorization", &auth_hdr)], None).await;
+                let _ = transport
+                    .request(
+                        "DELETE",
+                        &format!("{}/git/refs/heads/{}", prefix, branch),
+                        &[("Authorization", &auth_hdr)],
+                        None,
+                    )
+                    .await;
                 return (
                     502,
                     json!({
@@ -667,12 +742,16 @@ pub fn handle_preview(body: &Value) -> (u16, Value) {
     } else {
         None
     };
-    let target = body.get("manifest").or(parsed_target.as_ref()).unwrap_or(&Value::Null);
+    let target = body
+        .get("manifest")
+        .or(parsed_target.as_ref())
+        .unwrap_or(&Value::Null);
     let classification: RolloutClassification = classify_rollout_values(current, target);
     let mut val = json!(classification);
     if let Some(obj) = val.as_object_mut() {
         obj.entry("hosts".to_string()).or_insert_with(|| json!([]));
-        obj.entry("hot_patch_allowed".to_string()).or_insert_with(|| json!(false));
+        obj.entry("hot_patch_allowed".to_string())
+            .or_insert_with(|| json!(false));
         obj.entry("executor".to_string()).or_insert_with(|| {
             json!({
                 "available": false,

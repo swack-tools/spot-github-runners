@@ -1,10 +1,10 @@
-use spot_dashboard_edge::state::*;
 use spot_dashboard_edge::auth::*;
+use spot_dashboard_edge::state::*;
 use spot_dashboard_edge::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 struct TestKv {
     data: Mutex<HashMap<String, String>>,
@@ -166,7 +166,11 @@ async fn test_scaling_adversarial_validation_zero_kv_writes() {
         };
         let res = handle_post_scaling(&kv, req, now).await;
         assert!(res.is_err(), "Expected invalid config to fail");
-        assert_eq!(kv.put_count.load(Ordering::SeqCst), 1, "Must perform 0 writes on failure");
+        assert_eq!(
+            kv.put_count.load(Ordering::SeqCst),
+            1,
+            "Must perform 0 writes on failure"
+        );
     }
 }
 
@@ -199,7 +203,11 @@ fn test_safe_return_path_open_redirect_adversarial() {
     let safe_paths = vec!["/dashboard", "/overview", "/settings", "/runners"];
     for safe in safe_paths {
         let sanitized = safe_return_path(safe);
-        assert_eq!(sanitized, safe, "Safe path '{}' was incorrectly modified", safe);
+        assert_eq!(
+            sanitized, safe,
+            "Safe path '{}' was incorrectly modified",
+            safe
+        );
     }
 }
 
@@ -244,7 +252,11 @@ fn test_cookie_fuzzing_resilience() {
         let parsed = parse_cookies(hdr);
         // Ensure parser never panics
         if let Some(val) = parsed.get("__Host-spot_session") {
-            assert!(!val.is_empty() || hdr.contains("__Host-spot_session=\"\"") || hdr.contains("__Host-spot_session="));
+            assert!(
+                !val.is_empty()
+                    || hdr.contains("__Host-spot_session=\"\"")
+                    || hdr.contains("__Host-spot_session=")
+            );
         }
     }
 }

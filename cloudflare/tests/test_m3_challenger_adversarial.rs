@@ -9,9 +9,7 @@ use spot_dashboard_edge::gcp::{GceInsertInstanceRequest, GceMetadata, GceOperati
 use spot_dashboard_edge::github::RunnerBootstrapConfig;
 use spot_dashboard_edge::patch::CONTROLLED_TARGETS;
 use spot_dashboard_edge::reconciler::*;
-use spot_dashboard_edge::state::{
-    invalidate_state_cache, KvStoreBackend, StateError,
-};
+use spot_dashboard_edge::state::{invalidate_state_cache, KvStoreBackend, StateError};
 
 // ============================================================================
 // Adversarial Test Doubles
@@ -59,7 +57,11 @@ pub struct AdversarialGcpReconciler {
 
 #[async_trait::async_trait(?Send)]
 impl GcpReconcilerClient for AdversarialGcpReconciler {
-    async fn list_instances(&self, _project: &str, _now: u64) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
+    async fn list_instances(
+        &self,
+        _project: &str,
+        _now: u64,
+    ) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
         Ok(self.instances.lock().unwrap().clone())
     }
 
@@ -81,8 +83,17 @@ impl GcpReconcilerClient for AdversarialGcpReconciler {
         })
     }
 
-    async fn delete_instance(&self, _project: &str, _zone: &str, instance: &str, _now: u64) -> Result<GceOperation, ReconcilerError> {
-        self.deleted_instances.lock().unwrap().push(instance.to_string());
+    async fn delete_instance(
+        &self,
+        _project: &str,
+        _zone: &str,
+        instance: &str,
+        _now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
+        self.deleted_instances
+            .lock()
+            .unwrap()
+            .push(instance.to_string());
         Ok(GceOperation {
             id: Some("op-delete".into()),
             name: Some("op-delete".into()),
@@ -92,8 +103,18 @@ impl GcpReconcilerClient for AdversarialGcpReconciler {
         })
     }
 
-    async fn scrub_startup_script(&self, _project: &str, _zone: &str, instance: &str, _current_metadata: &GceMetadata, _now: u64) -> Result<GceOperation, ReconcilerError> {
-        self.scrubbed_instances.lock().unwrap().push(instance.to_string());
+    async fn scrub_startup_script(
+        &self,
+        _project: &str,
+        _zone: &str,
+        instance: &str,
+        _current_metadata: &GceMetadata,
+        _now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
+        self.scrubbed_instances
+            .lock()
+            .unwrap()
+            .push(instance.to_string());
         Ok(GceOperation {
             id: Some("op-scrub".into()),
             name: Some("op-scrub".into()),
@@ -113,11 +134,18 @@ pub struct AdversarialGitHubReconciler {
 
 #[async_trait::async_trait(?Send)]
 impl GitHubReconcilerClient for AdversarialGitHubReconciler {
-    async fn list_runners(&self, _target_api_path: &str) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
+    async fn list_runners(
+        &self,
+        _target_api_path: &str,
+    ) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
         Ok(self.runners.lock().unwrap().clone())
     }
 
-    async fn delete_runner(&self, _target_api_path: &str, runner_id: u64) -> Result<(), ReconcilerError> {
+    async fn delete_runner(
+        &self,
+        _target_api_path: &str,
+        runner_id: u64,
+    ) -> Result<(), ReconcilerError> {
         self.deleted_runners.lock().unwrap().push(runner_id);
         Ok(())
     }
@@ -168,7 +196,9 @@ fn populate_all_floor_hosts(gcp: &AdversarialGcpReconciler) {
 
 #[tokio::test]
 async fn test_adversarial_diff_gating_500_ticks_zero_kv_writes() {
-    let _guard = ADVERSARIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ADVERSARIAL_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     invalidate_state_cache();
     reset_reconciler_state();
 
@@ -190,14 +220,22 @@ async fn test_adversarial_diff_gating_500_ticks_zero_kv_writes() {
         now += 2;
         let rep = run_reconciliation(&kv, &gcp, &gh, now).await.unwrap();
         assert_eq!(rep.tick, tick_idx);
-        assert!(!rep.snapshot_written, "Tick {} wrote snapshot despite 0 fleet changes!", tick_idx);
+        assert!(
+            !rep.snapshot_written,
+            "Tick {} wrote snapshot despite 0 fleet changes!",
+            tick_idx
+        );
         assert_eq!(rep.launched_hosts.len(), 0);
         assert_eq!(rep.cleaned_vms.len(), 0);
         assert_eq!(rep.cleaned_runners.len(), 0);
     }
 
     // Assert strictly zero additional KV writes across all 500 unchanged ticks
-    assert_eq!(kv.put_count.load(Ordering::SeqCst), 1, "Expected strictly 1 KV write for all 501 ticks");
+    assert_eq!(
+        kv.put_count.load(Ordering::SeqCst),
+        1,
+        "Expected strictly 1 KV write for all 501 ticks"
+    );
 }
 
 // ============================================================================
@@ -206,7 +244,9 @@ async fn test_adversarial_diff_gating_500_ticks_zero_kv_writes() {
 
 #[tokio::test]
 async fn test_adversarial_coarse_heartbeat_boundaries_and_clock_skew() {
-    let _guard = ADVERSARIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ADVERSARIAL_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     invalidate_state_cache();
     reset_reconciler_state();
 
@@ -224,28 +264,50 @@ async fn test_adversarial_coarse_heartbeat_boundaries_and_clock_skew() {
 
     // Clock skew test: timestamp moving backward (e.g. system clock adjust)
     // T = base_now - 500s -> must NOT crash or trigger false write
-    let rep_skew = run_reconciliation(&kv, &gcp, &gh, base_now.saturating_sub(500)).await.unwrap();
+    let rep_skew = run_reconciliation(&kv, &gcp, &gh, base_now.saturating_sub(500))
+        .await
+        .unwrap();
     assert!(!rep_skew.snapshot_written);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 1);
 
     // Exact boundary test at 1799s (1 second before 30m heartbeat)
-    let rep_1799 = run_reconciliation(&kv, &gcp, &gh, base_now + 1799).await.unwrap();
-    assert!(!rep_1799.snapshot_written, "At 1799s heartbeat should not have fired yet");
+    let rep_1799 = run_reconciliation(&kv, &gcp, &gh, base_now + 1799)
+        .await
+        .unwrap();
+    assert!(
+        !rep_1799.snapshot_written,
+        "At 1799s heartbeat should not have fired yet"
+    );
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 1);
 
     // Exact boundary test at 1800s (exactly 30m heartbeat) -> MUST write snapshot
-    let rep_1800 = run_reconciliation(&kv, &gcp, &gh, base_now + 1800).await.unwrap();
-    assert!(rep_1800.snapshot_written, "At 1800s heartbeat MUST trigger snapshot write");
+    let rep_1800 = run_reconciliation(&kv, &gcp, &gh, base_now + 1800)
+        .await
+        .unwrap();
+    assert!(
+        rep_1800.snapshot_written,
+        "At 1800s heartbeat MUST trigger snapshot write"
+    );
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 2);
 
     // Immediately subsequent tick at 1801s (only 1s elapsed since new written_at) -> 0 writes
-    let rep_1801 = run_reconciliation(&kv, &gcp, &gh, base_now + 1801).await.unwrap();
-    assert!(!rep_1801.snapshot_written, "Heartbeat just fired, 1801s should not write");
+    let rep_1801 = run_reconciliation(&kv, &gcp, &gh, base_now + 1801)
+        .await
+        .unwrap();
+    assert!(
+        !rep_1801.snapshot_written,
+        "Heartbeat just fired, 1801s should not write"
+    );
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 2);
 
     // Second heartbeat at 1800 + 1800 = 3600s
-    let rep_3600 = run_reconciliation(&kv, &gcp, &gh, base_now + 3600).await.unwrap();
-    assert!(rep_3600.snapshot_written, "Second heartbeat at 3600s MUST trigger snapshot write");
+    let rep_3600 = run_reconciliation(&kv, &gcp, &gh, base_now + 3600)
+        .await
+        .unwrap();
+    assert!(
+        rep_3600.snapshot_written,
+        "Second heartbeat at 3600s MUST trigger snapshot write"
+    );
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 3);
 }
 
@@ -255,7 +317,9 @@ async fn test_adversarial_coarse_heartbeat_boundaries_and_clock_skew() {
 
 #[tokio::test]
 async fn test_adversarial_scaling_threshold_boundaries_and_capacity_cap() {
-    let _guard = ADVERSARIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ADVERSARIAL_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     invalidate_state_cache();
     reset_reconciler_state();
 
@@ -270,7 +334,12 @@ async fn test_adversarial_scaling_threshold_boundaries_and_capacity_cap() {
     for queued in [0, 1, 10, 18, 19] {
         *gh.queued_jobs.lock().unwrap() = queued;
         let rep = run_reconciliation(&kv, &gcp, &gh, now).await.unwrap();
-        assert_eq!(rep.launched_hosts.len(), 0, "Queued jobs {} should NOT scale up", queued);
+        assert_eq!(
+            rep.launched_hosts.len(),
+            0,
+            "Queued jobs {} should NOT scale up",
+            queued
+        );
     }
 
     // Exact threshold check: 20 queued jobs -> MUST scale up exactly 1 host
@@ -307,8 +376,16 @@ async fn test_adversarial_scaling_threshold_boundaries_and_capacity_cap() {
     // Even with 100 queued jobs, current_live (12) >= max_instances (12) -> MUST NOT exceed capacity!
     *gh.queued_jobs.lock().unwrap() = 100;
     let rep_saturated = run_reconciliation(&kv, &gcp, &gh, now).await.unwrap();
-    let scale_hosts: Vec<_> = rep_saturated.launched_hosts.iter().filter(|h| h.contains("scale")).collect();
-    assert_eq!(scale_hosts.len(), 0, "Must not scale up beyond max instance capacity");
+    let scale_hosts: Vec<_> = rep_saturated
+        .launched_hosts
+        .iter()
+        .filter(|h| h.contains("scale"))
+        .collect();
+    assert_eq!(
+        scale_hosts.len(),
+        0,
+        "Must not scale up beyond max instance capacity"
+    );
 }
 
 // ============================================================================
@@ -317,7 +394,9 @@ async fn test_adversarial_scaling_threshold_boundaries_and_capacity_cap() {
 
 #[tokio::test]
 async fn test_adversarial_floor_keeper_exact_specs_and_inflight_dedup() {
-    let _guard = ADVERSARIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ADVERSARIAL_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     invalidate_state_cache();
     reset_reconciler_state();
 
@@ -329,28 +408,50 @@ async fn test_adversarial_floor_keeper_exact_specs_and_inflight_dedup() {
     // 0 hosts in GCE: Floor keeper must launch exactly 1 host per controlled target (4 targets)
     let rep = run_reconciliation(&kv, &gcp, &gh, now).await.unwrap();
     assert_eq!(rep.launched_hosts.len(), CONTROLLED_TARGETS.len());
-    assert_eq!(gcp.inserted_instances.lock().unwrap().len(), CONTROLLED_TARGETS.len());
+    assert_eq!(
+        gcp.inserted_instances.lock().unwrap().len(),
+        CONTROLLED_TARGETS.len()
+    );
 
     // Validate hardware floor and configuration invariants for every launched host
     for req in gcp.inserted_instances.lock().unwrap().iter() {
-        assert_eq!(req.machine_type, format!("zones/{}/machineTypes/{}", DEFAULT_ZONE, DEFAULT_MACHINE_TYPE));
+        assert_eq!(
+            req.machine_type,
+            format!(
+                "zones/{}/machineTypes/{}",
+                DEFAULT_ZONE, DEFAULT_MACHINE_TYPE
+            )
+        );
         assert_eq!(req.scheduling.provisioning_model, "SPOT");
         assert_eq!(req.scheduling.instance_termination_action, "DELETE");
         assert_eq!(req.metadata.get("spot-runner-count"), Some("2"));
-        assert_eq!(req.metadata.get("runner_1_jitconfig"), Some("jit-slot-1-token"));
-        assert_eq!(req.metadata.get("runner_2_jitconfig"), Some("jit-slot-2-token"));
+        assert_eq!(
+            req.metadata.get("runner_1_jitconfig"),
+            Some("jit-slot-1-token")
+        );
+        assert_eq!(
+            req.metadata.get("runner_2_jitconfig"),
+            Some("jit-slot-2-token")
+        );
         let startup = req.metadata.get("startup-script").unwrap();
         assert!(
             startup.starts_with("#!/usr/bin/env bash") || startup.starts_with("#!/bin/bash"),
             "Startup script has invalid shebang: {}",
             &startup[..50]
         );
-        assert!(!startup.contains("{{"), "Startup script contains unexpanded template tokens!");
+        assert!(
+            !startup.contains("{{"),
+            "Startup script contains unexpanded template tokens!"
+        );
     }
 
     // Next tick: In-flight launches exist in ACTIVE_LAUNCHES -> Floor keeper MUST NOT duplicate!
     let rep_inflight = run_reconciliation(&kv, &gcp, &gh, now + 10).await.unwrap();
-    assert_eq!(rep_inflight.launched_hosts.len(), 0, "In-flight launches must prevent duplicate provisioning");
+    assert_eq!(
+        rep_inflight.launched_hosts.len(),
+        0,
+        "In-flight launches must prevent duplicate provisioning"
+    );
 }
 
 // ============================================================================
@@ -359,7 +460,9 @@ async fn test_adversarial_floor_keeper_exact_specs_and_inflight_dedup() {
 
 #[tokio::test]
 async fn test_adversarial_preempted_vm_status_matrix() {
-    let _guard = ADVERSARIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ADVERSARIAL_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     invalidate_state_cache();
     reset_reconciler_state();
 
@@ -406,7 +509,11 @@ async fn test_adversarial_preempted_vm_status_matrix() {
     // Verify non-terminated instances were NOT touched
     for (name, _, should_delete) in &statuses {
         if !should_delete {
-            assert!(!deleted.contains(&name.to_string()), "Instance {} should NOT be deleted", name);
+            assert!(
+                !deleted.contains(&name.to_string()),
+                "Instance {} should NOT be deleted",
+                name
+            );
         }
     }
 }
@@ -417,7 +524,9 @@ async fn test_adversarial_preempted_vm_status_matrix() {
 
 #[tokio::test]
 async fn test_adversarial_stale_runner_cleanup_matrix() {
-    let _guard = ADVERSARIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ADVERSARIAL_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     invalidate_state_cache();
     reset_reconciler_state();
 
@@ -447,15 +556,60 @@ async fn test_adversarial_stale_runner_cleanup_matrix() {
     // 8. Offline & Idle NO live VM (status: "OFFLINE") -> DELETED!
     // 9. Offline & Idle NO live VM (status: "Offline") -> DELETED!
     gh.runners.lock().unwrap().extend(vec![
-        SimpleGitHubRunner { id: 101, name: "oxidex-runners-swack-live-r1".into(), status: "online".into(), busy: false },
-        SimpleGitHubRunner { id: 102, name: "oxidex-runners-swack-live-r2".into(), status: "online".into(), busy: true },
-        SimpleGitHubRunner { id: 103, name: "oxidex-runners-swack-ghost-r1".into(), status: "online".into(), busy: false },
-        SimpleGitHubRunner { id: 104, name: "oxidex-runners-swack-live-r3".into(), status: "offline".into(), busy: true },
-        SimpleGitHubRunner { id: 105, name: "oxidex-runners-swack-ghost-r2".into(), status: "offline".into(), busy: true },
-        SimpleGitHubRunner { id: 106, name: "oxidex-runners-swack-live-r4".into(), status: "offline".into(), busy: false },
-        SimpleGitHubRunner { id: 201, name: "oxidex-runners-dead-host-1".into(), status: "offline".into(), busy: false },
-        SimpleGitHubRunner { id: 202, name: "oxidex-runners-dead-host-2".into(), status: "OFFLINE".into(), busy: false },
-        SimpleGitHubRunner { id: 203, name: "oxidex-runners-dead-host-3".into(), status: "Offline".into(), busy: false },
+        SimpleGitHubRunner {
+            id: 101,
+            name: "oxidex-runners-swack-live-r1".into(),
+            status: "online".into(),
+            busy: false,
+        },
+        SimpleGitHubRunner {
+            id: 102,
+            name: "oxidex-runners-swack-live-r2".into(),
+            status: "online".into(),
+            busy: true,
+        },
+        SimpleGitHubRunner {
+            id: 103,
+            name: "oxidex-runners-swack-ghost-r1".into(),
+            status: "online".into(),
+            busy: false,
+        },
+        SimpleGitHubRunner {
+            id: 104,
+            name: "oxidex-runners-swack-live-r3".into(),
+            status: "offline".into(),
+            busy: true,
+        },
+        SimpleGitHubRunner {
+            id: 105,
+            name: "oxidex-runners-swack-ghost-r2".into(),
+            status: "offline".into(),
+            busy: true,
+        },
+        SimpleGitHubRunner {
+            id: 106,
+            name: "oxidex-runners-swack-live-r4".into(),
+            status: "offline".into(),
+            busy: false,
+        },
+        SimpleGitHubRunner {
+            id: 201,
+            name: "oxidex-runners-dead-host-1".into(),
+            status: "offline".into(),
+            busy: false,
+        },
+        SimpleGitHubRunner {
+            id: 202,
+            name: "oxidex-runners-dead-host-2".into(),
+            status: "OFFLINE".into(),
+            busy: false,
+        },
+        SimpleGitHubRunner {
+            id: 203,
+            name: "oxidex-runners-dead-host-3".into(),
+            status: "Offline".into(),
+            busy: false,
+        },
     ]);
 
     let now = 1700000000;
@@ -469,7 +623,11 @@ async fn test_adversarial_stale_runner_cleanup_matrix() {
 
     // Protected runners must not be in deleted list
     for protected_id in [101, 102, 103, 104, 105, 106] {
-        assert!(!deleted_ids.contains(&protected_id), "Runner {} was incorrectly deleted", protected_id);
+        assert!(
+            !deleted_ids.contains(&protected_id),
+            "Runner {} was incorrectly deleted",
+            protected_id
+        );
     }
 }
 
@@ -479,7 +637,9 @@ async fn test_adversarial_stale_runner_cleanup_matrix() {
 
 #[tokio::test]
 async fn test_adversarial_concurrency_lease_skips_and_recovery() {
-    let _guard = ADVERSARIAL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ADVERSARIAL_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     invalidate_state_cache();
     reset_reconciler_state();
 

@@ -18,9 +18,7 @@ use spot_dashboard_edge::patch::{
     ContainerPatch, HostPatch, PatchFileSpec, PatchMountSpec, RunnerPatch,
 };
 use spot_dashboard_edge::patch_console::GitHubTransport;
-use spot_dashboard_edge::state::{
-    invalidate_gcp_token_cache, GCP_TOKEN_CACHE_TTL_SECS,
-};
+use spot_dashboard_edge::state::{invalidate_gcp_token_cache, GCP_TOKEN_CACHE_TTL_SECS};
 
 const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCjk/Wqnq5sogxX\n\
@@ -169,7 +167,11 @@ async fn test_zero_kv_operations_during_token_exchange_and_caching() {
 
     // Number of network calls should only be around 1000 * 30 / 3300 = ~9 or 10
     let calls = transport.calls.lock().unwrap().len();
-    assert!(calls >= 9 && calls <= 11, "Expected ~10 network refreshes, got {}", calls);
+    assert!(
+        calls >= 9 && calls <= 11,
+        "Expected ~10 network refreshes, got {}",
+        calls
+    );
 
     // Direct unit check on state getters/setters: strictly zero KV store invocations
     // GCP_TOKEN_CACHE operates purely inside thread_local! RefCell, bypassing KvStoreBackend entirely.
@@ -222,7 +224,10 @@ async fn test_source_instance_template_query_param_and_body_construction() {
     assert_eq!(req.disks[0].r#type.as_deref(), Some("PERSISTENT"));
     assert_eq!(req.disks[0].interface.as_deref(), Some("NVME"));
     let init_params = req.disks[0].initialize_params.as_ref().unwrap();
-    assert_eq!(init_params.disk_name, "oxidex-runners-us-central1-a-tpl-boot");
+    assert_eq!(
+        init_params.disk_name,
+        "oxidex-runners-us-central1-a-tpl-boot"
+    );
     assert_eq!(init_params.disk_size_gb, "40");
     assert_eq!(
         init_params.disk_type,
@@ -231,10 +236,7 @@ async fn test_source_instance_template_query_param_and_body_construction() {
 
     // GVNIC interface for hyperdisk-balanced
     assert_eq!(req.network_interfaces.len(), 1);
-    assert_eq!(
-        req.network_interfaces[0].nic_type.as_deref(),
-        Some("GVNIC")
-    );
+    assert_eq!(req.network_interfaces[0].nic_type.as_deref(), Some("GVNIC"));
 
     // Metadata items
     assert_eq!(req.metadata.get("runner_1_jitconfig"), Some("jit_slot_1"));
@@ -248,12 +250,7 @@ async fn test_source_instance_template_query_param_and_body_construction() {
 
     // Test 1: Short template name
     client
-        .insert_instance(
-            "us-central1-a",
-            &req,
-            Some("c4d-spot-template-v2"),
-            now,
-        )
+        .insert_instance("us-central1-a", &req, Some("c4d-spot-template-v2"), now)
         .await
         .unwrap();
 
@@ -261,11 +258,15 @@ async fn test_source_instance_template_query_param_and_body_construction() {
     let call1 = calls.last().unwrap();
     assert_eq!(call1.0, "POST");
     assert!(
-        call1.1.contains("/zones/us-central1-a/instances?sourceInstanceTemplate="),
+        call1
+            .1
+            .contains("/zones/us-central1-a/instances?sourceInstanceTemplate="),
         "URL must include sourceInstanceTemplate query param"
     );
     assert!(
-        call1.1.contains("projects%2Fhomelab-424523%2Fglobal%2FinstanceTemplates%2Fc4d-spot-template-v2"),
+        call1.1.contains(
+            "projects%2Fhomelab-424523%2Fglobal%2FinstanceTemplates%2Fc4d-spot-template-v2"
+        ),
         "Template short name must be expanded to full projects path and percent-encoded"
     );
 
@@ -284,7 +285,9 @@ async fn test_source_instance_template_query_param_and_body_construction() {
     let calls = transport.calls.lock().unwrap();
     let call2 = calls.last().unwrap();
     assert!(
-        call2.1.contains("projects%2Fexternal-proj%2Fglobal%2FinstanceTemplates%2Fcustom-tpl"),
+        call2
+            .1
+            .contains("projects%2Fexternal-proj%2Fglobal%2FinstanceTemplates%2Fcustom-tpl"),
         "Full template path starting with projects/ must be preserved verbatim"
     );
 
@@ -487,10 +490,11 @@ impl GitHubTransport for ConfigurableGitHubMockTransport {
         _headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<(u16, Vec<u8>), String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((method.to_string(), path.to_string(), body.map(|b| b.to_vec())));
+        self.calls.lock().unwrap().push((
+            method.to_string(),
+            path.to_string(),
+            body.map(|b| b.to_vec()),
+        ));
 
         // Check for simulated network failure
         {
@@ -503,7 +507,10 @@ impl GitHubTransport for ConfigurableGitHubMockTransport {
         // Check custom responses
         {
             let resps = self.responses.lock().unwrap();
-            let mut matches: Vec<_> = resps.iter().filter(|(pat, _)| path.contains(*pat)).collect();
+            let mut matches: Vec<_> = resps
+                .iter()
+                .filter(|(pat, _)| path.contains(*pat))
+                .collect();
             matches.sort_by_key(|(pat, _)| std::cmp::Reverse(pat.len()));
             if let Some((_, (status, resp_bytes))) = matches.first() {
                 return Ok((*status, resp_bytes.clone()));
@@ -539,7 +546,11 @@ impl GitHubTransport for ConfigurableGitHubMockTransport {
 
 #[tokio::test]
 async fn test_jitconfig_fallback_matrix() {
-    let labels = vec!["self-hosted".to_string(), "Linux".to_string(), "spot".to_string()];
+    let labels = vec![
+        "self-hosted".to_string(),
+        "Linux".to_string(),
+        "spot".to_string(),
+    ];
 
     // Case 1: Slot 1 HTTP 404 (Not Found / JIT disabled on organization)
     {
@@ -560,7 +571,9 @@ async fn test_jitconfig_fallback_matrix() {
             RunnerBootstrapConfig::RegistrationToken { token } => {
                 assert_eq!(token, "default-fallback-reg-token-xyz");
             }
-            RunnerBootstrapConfig::JitConfig { .. } => panic!("404 must fallback to registration token"),
+            RunnerBootstrapConfig::JitConfig { .. } => {
+                panic!("404 must fallback to registration token")
+            }
         }
         let calls = transport.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -587,7 +600,9 @@ async fn test_jitconfig_fallback_matrix() {
             RunnerBootstrapConfig::RegistrationToken { token } => {
                 assert_eq!(token, "default-fallback-reg-token-xyz");
             }
-            RunnerBootstrapConfig::JitConfig { .. } => panic!("403 must fallback to registration token"),
+            RunnerBootstrapConfig::JitConfig { .. } => {
+                panic!("403 must fallback to registration token")
+            }
         }
     }
 
@@ -610,7 +625,9 @@ async fn test_jitconfig_fallback_matrix() {
             RunnerBootstrapConfig::RegistrationToken { token } => {
                 assert_eq!(token, "default-fallback-reg-token-xyz");
             }
-            RunnerBootstrapConfig::JitConfig { .. } => panic!("500 must fallback to registration token"),
+            RunnerBootstrapConfig::JitConfig { .. } => {
+                panic!("500 must fallback to registration token")
+            }
         }
     }
 
@@ -658,7 +675,8 @@ async fn test_jitconfig_fallback_matrix() {
                     // Slot 2 fails with 500
                     return Ok((
                         500,
-                        serde_json::to_vec(&serde_json::json!({"message": "Slot 2 failed"})).unwrap(),
+                        serde_json::to_vec(&serde_json::json!({"message": "Slot 2 failed"}))
+                            .unwrap(),
                     ));
                 }
                 self.inner.request(method, path, headers, body).await
@@ -770,7 +788,10 @@ fn test_startup_script_rendering_31_placeholders_and_adversarial_params() {
 
     let mut sysctl = BTreeMap::new();
     sysctl.insert("fs.file-max".to_string(), "2097152".to_string());
-    sysctl.insert("net.ipv4.ip_local_port_range".to_string(), "1024 65535".to_string());
+    sysctl.insert(
+        "net.ipv4.ip_local_port_range".to_string(),
+        "1024 65535".to_string(),
+    );
 
     patch.host = HostPatch {
         apt_packages: vec!["build-essential".to_string(), "zlib1g-dev".to_string()],

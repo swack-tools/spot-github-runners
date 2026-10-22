@@ -7,9 +7,7 @@ use std::sync::{Arc, Mutex};
 use spot_dashboard_edge::gcp::{GceInsertInstanceRequest, GceMetadata, GceOperation};
 use spot_dashboard_edge::github::RunnerBootstrapConfig;
 use spot_dashboard_edge::reconciler::*;
-use spot_dashboard_edge::state::{
-    invalidate_state_cache, KvStoreBackend, StateError,
-};
+use spot_dashboard_edge::state::{invalidate_state_cache, KvStoreBackend, StateError};
 
 // ============================================================================
 // Mock Test Doubles
@@ -57,7 +55,11 @@ pub struct MockGcpReconciler {
 
 #[async_trait::async_trait(?Send)]
 impl GcpReconcilerClient for MockGcpReconciler {
-    async fn list_instances(&self, _project: &str, _now: u64) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
+    async fn list_instances(
+        &self,
+        _project: &str,
+        _now: u64,
+    ) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
         Ok(self.instances.lock().unwrap().clone())
     }
 
@@ -79,8 +81,17 @@ impl GcpReconcilerClient for MockGcpReconciler {
         })
     }
 
-    async fn delete_instance(&self, _project: &str, _zone: &str, instance: &str, _now: u64) -> Result<GceOperation, ReconcilerError> {
-        self.deleted_instances.lock().unwrap().push(instance.to_string());
+    async fn delete_instance(
+        &self,
+        _project: &str,
+        _zone: &str,
+        instance: &str,
+        _now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
+        self.deleted_instances
+            .lock()
+            .unwrap()
+            .push(instance.to_string());
         Ok(GceOperation {
             id: Some("op-delete-1".into()),
             name: Some("op-delete-1".into()),
@@ -90,8 +101,18 @@ impl GcpReconcilerClient for MockGcpReconciler {
         })
     }
 
-    async fn scrub_startup_script(&self, _project: &str, _zone: &str, instance: &str, _current_metadata: &GceMetadata, _now: u64) -> Result<GceOperation, ReconcilerError> {
-        self.scrubbed_instances.lock().unwrap().push(instance.to_string());
+    async fn scrub_startup_script(
+        &self,
+        _project: &str,
+        _zone: &str,
+        instance: &str,
+        _current_metadata: &GceMetadata,
+        _now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
+        self.scrubbed_instances
+            .lock()
+            .unwrap()
+            .push(instance.to_string());
         Ok(GceOperation {
             id: Some("op-scrub-1".into()),
             name: Some("op-scrub-1".into()),
@@ -111,11 +132,18 @@ pub struct MockGitHubReconciler {
 
 #[async_trait::async_trait(?Send)]
 impl GitHubReconcilerClient for MockGitHubReconciler {
-    async fn list_runners(&self, _target_api_path: &str) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
+    async fn list_runners(
+        &self,
+        _target_api_path: &str,
+    ) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
         Ok(self.runners.lock().unwrap().clone())
     }
 
-    async fn delete_runner(&self, _target_api_path: &str, runner_id: u64) -> Result<(), ReconcilerError> {
+    async fn delete_runner(
+        &self,
+        _target_api_path: &str,
+        runner_id: u64,
+    ) -> Result<(), ReconcilerError> {
         self.deleted_runners.lock().unwrap().push(runner_id);
         Ok(())
     }
@@ -175,8 +203,14 @@ async fn test_floor_creation_zero_hosts_launches_one_per_target() {
         assert_eq!(inserted.scheduling.instance_termination_action, "DELETE");
         // Verify metadata has 2-slot JIT configs and runner count = 2
         assert_eq!(inserted.metadata.get("spot-runner-count"), Some("2"));
-        assert_eq!(inserted.metadata.get("runner_1_jitconfig"), Some("jit1-token-xyz"));
-        assert_eq!(inserted.metadata.get("runner_2_jitconfig"), Some("jit2-token-xyz"));
+        assert_eq!(
+            inserted.metadata.get("runner_1_jitconfig"),
+            Some("jit1-token-xyz")
+        );
+        assert_eq!(
+            inserted.metadata.get("runner_2_jitconfig"),
+            Some("jit2-token-xyz")
+        );
     }
 }
 
@@ -191,7 +225,12 @@ async fn test_strict_zero_kv_writes_on_unchanged_ticks() {
     let gh = MockGitHubReconciler::default();
 
     // Populate healthy running hosts for each target
-    for target in ["swack-tools", "xbmc4lyfe-newznab-tmux", "xbmc4lyfe-rustnzb", "xbmc4lyfe-nntp-proxy"] {
+    for target in [
+        "swack-tools",
+        "xbmc4lyfe-newznab-tmux",
+        "xbmc4lyfe-rustnzb",
+        "xbmc4lyfe-nntp-proxy",
+    ] {
         gcp.instances.lock().unwrap().push(SimpleGceInstance {
             id: Some(format!("vm-{}", target)),
             name: format!("oxidex-runners-{}-healthy", target),
@@ -217,7 +256,11 @@ async fn test_strict_zero_kv_writes_on_unchanged_ticks() {
         now += 10; // advance by 10s each tick (< 1800s heartbeat)
         let report = run_reconciliation(&kv, &gcp, &gh, now).await.unwrap();
         assert_eq!(report.tick, i);
-        assert!(!report.snapshot_written, "Tick {} should not write snapshot when unchanged", i);
+        assert!(
+            !report.snapshot_written,
+            "Tick {} should not write snapshot when unchanged",
+            i
+        );
         assert_eq!(report.launched_hosts.len(), 0);
         assert_eq!(report.cleaned_vms.len(), 0);
         assert_eq!(report.cleaned_runners.len(), 0);
@@ -238,7 +281,12 @@ async fn test_coarse_heartbeat_triggers_single_kv_write() {
     let gh = MockGitHubReconciler::default();
 
     // Populate healthy running hosts
-    for target in ["swack-tools", "xbmc4lyfe-newznab-tmux", "xbmc4lyfe-rustnzb", "xbmc4lyfe-nntp-proxy"] {
+    for target in [
+        "swack-tools",
+        "xbmc4lyfe-newznab-tmux",
+        "xbmc4lyfe-rustnzb",
+        "xbmc4lyfe-nntp-proxy",
+    ] {
         gcp.instances.lock().unwrap().push(SimpleGceInstance {
             id: Some(format!("vm-{}", target)),
             name: format!("oxidex-runners-{}-healthy", target),
@@ -256,12 +304,16 @@ async fn test_coarse_heartbeat_triggers_single_kv_write() {
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 1);
 
     // Tick 2 at now + 1799s (< 1800s heartbeat): 0 writes
-    let report2 = run_reconciliation(&kv, &gcp, &gh, now + 1799).await.unwrap();
+    let report2 = run_reconciliation(&kv, &gcp, &gh, now + 1799)
+        .await
+        .unwrap();
     assert!(!report2.snapshot_written);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 1);
 
     // Tick 3 at now + 1801s (>= 1800s heartbeat): exactly 1 write
-    let report3 = run_reconciliation(&kv, &gcp, &gh, now + 1801).await.unwrap();
+    let report3 = run_reconciliation(&kv, &gcp, &gh, now + 1801)
+        .await
+        .unwrap();
     assert!(report3.snapshot_written);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 2);
 }
@@ -277,7 +329,12 @@ async fn test_scale_up_at_exact_20_queued_jobs() {
     let gh = MockGitHubReconciler::default();
 
     // Floor hosts are present
-    for target in ["swack-tools", "xbmc4lyfe-newznab-tmux", "xbmc4lyfe-rustnzb", "xbmc4lyfe-nntp-proxy"] {
+    for target in [
+        "swack-tools",
+        "xbmc4lyfe-newznab-tmux",
+        "xbmc4lyfe-rustnzb",
+        "xbmc4lyfe-nntp-proxy",
+    ] {
         gcp.instances.lock().unwrap().push(SimpleGceInstance {
             id: Some(format!("vm-{}", target)),
             name: format!("oxidex-runners-{}-healthy", target),
@@ -310,7 +367,12 @@ async fn test_no_scale_up_at_19_queued_jobs() {
     let gh = MockGitHubReconciler::default();
 
     // Floor hosts are present
-    for target in ["swack-tools", "xbmc4lyfe-newznab-tmux", "xbmc4lyfe-rustnzb", "xbmc4lyfe-nntp-proxy"] {
+    for target in [
+        "swack-tools",
+        "xbmc4lyfe-newznab-tmux",
+        "xbmc4lyfe-rustnzb",
+        "xbmc4lyfe-nntp-proxy",
+    ] {
         gcp.instances.lock().unwrap().push(SimpleGceInstance {
             id: Some(format!("vm-{}", target)),
             name: format!("oxidex-runners-{}-healthy", target),
@@ -341,7 +403,12 @@ async fn test_scale_up_at_21_queued_jobs() {
     let gcp = MockGcpReconciler::default();
     let gh = MockGitHubReconciler::default();
 
-    for target in ["swack-tools", "xbmc4lyfe-newznab-tmux", "xbmc4lyfe-rustnzb", "xbmc4lyfe-nntp-proxy"] {
+    for target in [
+        "swack-tools",
+        "xbmc4lyfe-newznab-tmux",
+        "xbmc4lyfe-rustnzb",
+        "xbmc4lyfe-nntp-proxy",
+    ] {
         gcp.instances.lock().unwrap().push(SimpleGceInstance {
             id: Some(format!("vm-{}", target)),
             name: format!("oxidex-runners-{}-healthy", target),
@@ -417,7 +484,10 @@ async fn test_cleanup_terminated_preempted_vms() {
 
     // Only TERMINATED instance is deleted; STAGING, STOPPING, RUNNING are protected
     assert_eq!(report.cleaned_vms, vec!["oxidex-runners-preempted"]);
-    assert_eq!(gcp.deleted_instances.lock().unwrap().clone(), vec!["oxidex-runners-preempted"]);
+    assert_eq!(
+        gcp.deleted_instances.lock().unwrap().clone(),
+        vec!["oxidex-runners-preempted"]
+    );
 }
 
 #[tokio::test]

@@ -1,10 +1,16 @@
-# Allow project source, deployment assets, documentation, and the environment example.
+# Allow project source, deployment assets, documentation, and configuration files.
 *
 !*/
-!*.py
+!*.rs
 !*.sh
 !*.yaml
 !*.yml
+!*.toml
+!*.lock
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!justfile
 !Dockerfile
 !Dockerfile.*
 !.env.example
@@ -20,6 +26,7 @@
 !builder/standalone/website-package-lock.json
 !docs/*.md
 !docs/requirements.txt
+!host-agent/**
 !cloudflare/Cargo.toml
 !cloudflare/Cargo.lock
 !cloudflare/wrangler.toml
@@ -32,35 +39,21 @@
 # Secrets, generated files, and local-only artifacts
 .env
 .DS_Store
-__pycache__/
-*.py[cod]
-*.pyo
-.venv/
-venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
 *.log
 .firecrawl/
 /docs/superpowers/
 /site/
+
+# Rust build artifacts and target directories
+target/
+**/target/
+host-agent/target/
 cloudflare/target/
 cloudflare/.wrangler/
-
-# Python packaging and tooling artifacts
-*.egg
-*.egg-info/
-/build/
-dist/
-.eggs/
-.tox/
-.nox/
-.pytype/
-.dmypy.json
-dmypy.json
-pip-wheel-metadata/
+.wrangler/
+*.rs.bk
+*.pdb
+Cargo.lock.bak
 
 # Documentation lint configuration; downloaded styles stay local.
 !.vale.ini

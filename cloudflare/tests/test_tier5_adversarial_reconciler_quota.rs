@@ -1,24 +1,22 @@
 //! Tier 5 Adversarial Coverage Hardening Test Suite
 //! Comprehensive white-box verification for GCP, GitHub, Reconciler, KV Quota, and Resource Budget Gates.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use rsa::pkcs8::DecodePrivateKey;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
+use rsa::pkcs8::DecodePrivateKey;
 use rsa::sha2::Sha256;
 use rsa::signature::Verifier;
 use rsa::RsaPrivateKey;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use spot_dashboard_edge::gcp::*;
 use spot_dashboard_edge::github::*;
 use spot_dashboard_edge::patch::CONTROLLED_TARGETS;
 use spot_dashboard_edge::reconciler::*;
-use spot_dashboard_edge::state::{
-    invalidate_state_cache, KvStoreBackend, StateError,
-};
+use spot_dashboard_edge::state::{invalidate_state_cache, KvStoreBackend, StateError};
 
 // ============================================================================
 // Test Private Key & Helpers
@@ -111,7 +109,11 @@ pub struct Tier5MockGcpReconciler {
 
 #[async_trait::async_trait(?Send)]
 impl GcpReconcilerClient for Tier5MockGcpReconciler {
-    async fn list_instances(&self, _project: &str, _now: u64) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
+    async fn list_instances(
+        &self,
+        _project: &str,
+        _now: u64,
+    ) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
         Ok(self.instances.lock().unwrap().clone())
     }
 
@@ -133,8 +135,17 @@ impl GcpReconcilerClient for Tier5MockGcpReconciler {
         })
     }
 
-    async fn delete_instance(&self, _project: &str, _zone: &str, instance: &str, _now: u64) -> Result<GceOperation, ReconcilerError> {
-        self.deleted_instances.lock().unwrap().push(instance.to_string());
+    async fn delete_instance(
+        &self,
+        _project: &str,
+        _zone: &str,
+        instance: &str,
+        _now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
+        self.deleted_instances
+            .lock()
+            .unwrap()
+            .push(instance.to_string());
         Ok(GceOperation {
             id: Some("op-delete".into()),
             name: Some("op-delete".into()),
@@ -144,8 +155,18 @@ impl GcpReconcilerClient for Tier5MockGcpReconciler {
         })
     }
 
-    async fn scrub_startup_script(&self, _project: &str, _zone: &str, instance: &str, _current_metadata: &GceMetadata, _now: u64) -> Result<GceOperation, ReconcilerError> {
-        self.scrubbed_instances.lock().unwrap().push(instance.to_string());
+    async fn scrub_startup_script(
+        &self,
+        _project: &str,
+        _zone: &str,
+        instance: &str,
+        _current_metadata: &GceMetadata,
+        _now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
+        self.scrubbed_instances
+            .lock()
+            .unwrap()
+            .push(instance.to_string());
         Ok(GceOperation {
             id: Some("op-scrub".into()),
             name: Some("op-scrub".into()),
@@ -167,11 +188,18 @@ pub struct Tier5MockGitHubReconciler {
 
 #[async_trait::async_trait(?Send)]
 impl GitHubReconcilerClient for Tier5MockGitHubReconciler {
-    async fn list_runners(&self, _target_api_path: &str) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
+    async fn list_runners(
+        &self,
+        _target_api_path: &str,
+    ) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
         Ok(self.runners.lock().unwrap().clone())
     }
 
-    async fn delete_runner(&self, _target_api_path: &str, runner_id: u64) -> Result<(), ReconcilerError> {
+    async fn delete_runner(
+        &self,
+        _target_api_path: &str,
+        runner_id: u64,
+    ) -> Result<(), ReconcilerError> {
         self.deleted_runners.lock().unwrap().push(runner_id);
         Ok(())
     }
@@ -234,23 +262,32 @@ fn test_tier5_adversarial_gcp_rs256_jwt_claims_and_signature_verification() {
 
     let assertion = mint_rs256_assertion(&creds, now).expect("mint assertion");
     let parts: Vec<&str> = assertion.split('.').collect();
-    assert_eq!(parts.len(), 3, "JWT must consist of header.payload.signature");
+    assert_eq!(
+        parts.len(),
+        3,
+        "JWT must consist of header.payload.signature"
+    );
 
     // 1. Header Verification
     let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).expect("decode header");
-    let header_val: serde_json::Value = serde_json::from_slice(&header_bytes).expect("parse header JSON");
+    let header_val: serde_json::Value =
+        serde_json::from_slice(&header_bytes).expect("parse header JSON");
     assert_eq!(header_val["alg"], "RS256");
     assert_eq!(header_val["typ"], "JWT");
 
     // 2. Claims Verification
     let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).expect("decode payload");
-    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes).expect("parse claims JSON");
+    let claims: serde_json::Value =
+        serde_json::from_slice(&payload_bytes).expect("parse claims JSON");
     assert_eq!(claims["iss"], creds.client_email);
     assert_eq!(claims["scope"], GCP_OAUTH_SCOPE);
     assert_eq!(claims["aud"], creds.token_uri);
     assert_eq!(claims["iat"], now);
     assert_eq!(claims["exp"], now + 3600);
-    assert_eq!(claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(), 3600);
+    assert_eq!(
+        claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(),
+        3600
+    );
 
     // 3. Cryptographic Verification using RSA Public Key
     let priv_key = RsaPrivateKey::from_pkcs8_pem(&creds.private_key).expect("parse private key");
@@ -269,7 +306,9 @@ fn test_tier5_adversarial_gcp_rs256_jwt_claims_and_signature_verification() {
     // 4. Adversarial Tamper Resistance: Mutate payload
     let tampered_signing_input = format!("{}.{}", parts[0], "eyJpc3MiOiJoYWNrZXIifQ");
     assert!(
-        verifying_key.verify(tampered_signing_input.as_bytes(), &sig).is_err(),
+        verifying_key
+            .verify(tampered_signing_input.as_bytes(), &sig)
+            .is_err(),
         "Tampered payload must cause signature verification failure"
     );
 
@@ -278,7 +317,9 @@ fn test_tier5_adversarial_gcp_rs256_jwt_claims_and_signature_verification() {
     corrupted_sig_bytes[10] ^= 0xFF;
     if let Ok(corrupted_sig) = Signature::try_from(corrupted_sig_bytes.as_slice()) {
         assert!(
-            verifying_key.verify(signing_input.as_bytes(), &corrupted_sig).is_err(),
+            verifying_key
+                .verify(signing_input.as_bytes(), &corrupted_sig)
+                .is_err(),
             "Corrupted signature must be rejected"
         );
     }
@@ -299,12 +340,16 @@ async fn test_tier5_adversarial_gcp_oauth_token_caching_boundaries_zero_kv() {
     let t0 = 2500000000u64;
 
     // Cache miss at T0 -> calls token endpoint
-    let token1 = get_cached_or_fresh_gcp_token(&transport, &creds, t0).await.expect("token 1");
+    let token1 = get_cached_or_fresh_gcp_token(&transport, &creds, t0)
+        .await
+        .expect("token 1");
     assert_eq!(token1, "ya29.mock-token-xyz");
     assert_eq!(transport.calls.lock().unwrap().len(), 1);
 
     // Boundary 1: T0 + 3240s (54 minutes, exactly within 55m TTL) -> must hit memory cache
-    let token2 = get_cached_or_fresh_gcp_token(&transport, &creds, t0 + 3240).await.expect("token 2");
+    let token2 = get_cached_or_fresh_gcp_token(&transport, &creds, t0 + 3240)
+        .await
+        .expect("token 2");
     assert_eq!(token2, token1);
     assert_eq!(
         transport.calls.lock().unwrap().len(),
@@ -313,12 +358,16 @@ async fn test_tier5_adversarial_gcp_oauth_token_caching_boundaries_zero_kv() {
     );
 
     // Boundary 2: T0 + 3299s (54m 59s, 1s before expiration) -> still cached
-    let token3 = get_cached_or_fresh_gcp_token(&transport, &creds, t0 + 3299).await.expect("token 3");
+    let token3 = get_cached_or_fresh_gcp_token(&transport, &creds, t0 + 3299)
+        .await
+        .expect("token 3");
     assert_eq!(token3, token1);
     assert_eq!(transport.calls.lock().unwrap().len(), 1);
 
     // Boundary 3: T0 + 3300s (exactly 55 minutes, TTL elapsed) -> cache expired, triggers fresh exchange
-    let token4 = get_cached_or_fresh_gcp_token(&transport, &creds, t0 + 3300).await.expect("token 4");
+    let token4 = get_cached_or_fresh_gcp_token(&transport, &creds, t0 + 3300)
+        .await
+        .expect("token 4");
     assert_eq!(token4, "ya29.mock-token-xyz");
     assert_eq!(
         transport.calls.lock().unwrap().len(),
@@ -328,7 +377,9 @@ async fn test_tier5_adversarial_gcp_oauth_token_caching_boundaries_zero_kv() {
 
     // Stress test: 100 rapid calls at T0 + 3310 -> all hit memory cache, strictly 2 calls total
     for _ in 0..100 {
-        let tok = get_cached_or_fresh_gcp_token(&transport, &creds, t0 + 3310).await.expect("stress token");
+        let tok = get_cached_or_fresh_gcp_token(&transport, &creds, t0 + 3310)
+            .await
+            .expect("stress token");
         assert_eq!(tok, "ya29.mock-token-xyz");
     }
     assert_eq!(transport.calls.lock().unwrap().len(), 2);
@@ -359,28 +410,67 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
     };
 
     // Case 1: sourceInstanceTemplate is None -> clean URL without query parameter
-    client.insert_instance("us-central1-a", &base_req, None, now).await.expect("insert none");
-    let call1 = transport.calls.lock().unwrap().iter().rfind(|(m, u, _)| m == "POST" && u.contains("/instances")).cloned().expect("call 1");
+    client
+        .insert_instance("us-central1-a", &base_req, None, now)
+        .await
+        .expect("insert none");
+    let call1 = transport
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rfind(|(m, u, _)| m == "POST" && u.contains("/instances"))
+        .cloned()
+        .expect("call 1");
     assert_eq!(
         call1.1,
         "https://compute.googleapis.com/compute/v1/projects/homelab-424523/zones/us-central1-a/instances"
     );
 
     // Case 2: sourceInstanceTemplate is short name -> query parameter correctly appended and encoded
-    client.insert_instance("us-central1-a", &base_req, Some("spot-runner-template-v1"), now).await.expect("insert template");
-    let call2 = transport.calls.lock().unwrap().iter().rfind(|(m, u, _)| m == "POST" && u.contains("/instances")).cloned().expect("call 2");
+    client
+        .insert_instance(
+            "us-central1-a",
+            &base_req,
+            Some("spot-runner-template-v1"),
+            now,
+        )
+        .await
+        .expect("insert template");
+    let call2 = transport
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rfind(|(m, u, _)| m == "POST" && u.contains("/instances"))
+        .cloned()
+        .expect("call 2");
     assert!(call2.1.contains("?sourceInstanceTemplate="));
-    assert!(call2.1.contains("projects%2Fhomelab-424523%2Fglobal%2FinstanceTemplates%2Fspot-runner-template-v1"));
+    assert!(call2.1.contains(
+        "projects%2Fhomelab-424523%2Fglobal%2FinstanceTemplates%2Fspot-runner-template-v1"
+    ));
 
     // Case 3: sourceInstanceTemplate is full path -> query parameter preserves full path
-    client.insert_instance(
-        "us-central1-a",
-        &base_req,
-        Some("projects/external-project/global/instanceTemplates/golden-v2"),
-        now,
-    ).await.expect("insert full path");
-    let call3 = transport.calls.lock().unwrap().iter().rfind(|(m, u, _)| m == "POST" && u.contains("/instances")).cloned().expect("call 3");
-    assert!(call3.1.contains("projects%2Fexternal-project%2Fglobal%2FinstanceTemplates%2Fgolden-v2"));
+    client
+        .insert_instance(
+            "us-central1-a",
+            &base_req,
+            Some("projects/external-project/global/instanceTemplates/golden-v2"),
+            now,
+        )
+        .await
+        .expect("insert full path");
+    let call3 = transport
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rfind(|(m, u, _)| m == "POST" && u.contains("/instances"))
+        .cloned()
+        .expect("call 3");
+    assert!(call3
+        .1
+        .contains("projects%2Fexternal-project%2Fglobal%2FinstanceTemplates%2Fgolden-v2"));
 
     // Case 4: Golden Image Precedence Matrix in build_spot_runner_vm_request
     // Precedence: source_image > golden_image_family > DEBIAN_13_IMAGE_FAMILY
@@ -400,8 +490,17 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         boot_disk_type: Some("pd-balanced"),
     };
     let req_both = build_spot_runner_vm_request("homelab-424523", &cfg_both).unwrap();
-    let img_both = req_both.disks[0].initialize_params.as_ref().unwrap().source_image.as_ref().unwrap();
-    assert_eq!(img_both, "projects/homelab-424523/global/images/golden-custom-image-2026", "source_image must take precedence over family");
+    let img_both = req_both.disks[0]
+        .initialize_params
+        .as_ref()
+        .unwrap()
+        .source_image
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        img_both, "projects/homelab-424523/global/images/golden-custom-image-2026",
+        "source_image must take precedence over family"
+    );
 
     let cfg_family_only = RunnerVmConfig {
         source_image: None,
@@ -409,8 +508,17 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         ..cfg_both
     };
     let req_family = build_spot_runner_vm_request("homelab-424523", &cfg_family_only).unwrap();
-    let img_family = req_family.disks[0].initialize_params.as_ref().unwrap().source_image.as_ref().unwrap();
-    assert_eq!(img_family, "projects/homelab-424523/global/images/family/golden-family-2026");
+    let img_family = req_family.disks[0]
+        .initialize_params
+        .as_ref()
+        .unwrap()
+        .source_image
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        img_family,
+        "projects/homelab-424523/global/images/family/golden-family-2026"
+    );
 
     let cfg_neither = RunnerVmConfig {
         source_image: None,
@@ -418,7 +526,13 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         ..cfg_both
     };
     let req_debian = build_spot_runner_vm_request("homelab-424523", &cfg_neither).unwrap();
-    let img_debian = req_debian.disks[0].initialize_params.as_ref().unwrap().source_image.as_ref().unwrap();
+    let img_debian = req_debian.disks[0]
+        .initialize_params
+        .as_ref()
+        .unwrap()
+        .source_image
+        .as_ref()
+        .unwrap();
     assert_eq!(img_debian, DEBIAN_13_IMAGE_FAMILY);
 
     // Case 5: Machine Type Sizing Floor Enforcement
@@ -445,8 +559,18 @@ async fn test_tier5_adversarial_gcp_delete_disk_all_and_orphan_disk_filtering() 
     let now = 1700000000u64;
 
     // 1. Verify deleteDisk=ALL query parameter
-    client.delete_instance("us-central1-a", "oxidex-runners-homelab-1", now).await.expect("delete instance");
-    let delete_call = transport.calls.lock().unwrap().iter().find(|(m, _, _)| m == "DELETE").cloned().expect("delete call");
+    client
+        .delete_instance("us-central1-a", "oxidex-runners-homelab-1", now)
+        .await
+        .expect("delete instance");
+    let delete_call = transport
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(m, _, _)| m == "DELETE")
+        .cloned()
+        .expect("delete call");
     assert_eq!(
         delete_call.1,
         "https://compute.googleapis.com/compute/v1/projects/homelab-424523/zones/us-central1-a/instances/oxidex-runners-homelab-1?deleteDisk=ALL"
@@ -522,7 +646,10 @@ async fn test_tier5_adversarial_gcp_delete_disk_all_and_orphan_disk_filtering() 
         serde_json::to_vec(&envelope_json).unwrap(),
     );
 
-    let orphans = client.list_orphan_runner_disks(now).await.expect("list orphan disks");
+    let orphans = client
+        .list_orphan_runner_disks(now)
+        .await
+        .expect("list orphan disks");
     assert_eq!(orphans.len(), 3);
     assert_eq!(orphans[0].name, "oxidex-runners-swack-tools-orphan");
     assert_eq!(orphans[1].name, "spot-runners-rustnzb-orphan");
@@ -549,17 +676,30 @@ impl spot_dashboard_edge::patch_console::GitHubTransport for MockGitHubAdversari
         _headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<(u16, Vec<u8>), String> {
-        self.calls.lock().unwrap().push((method.to_string(), path.to_string()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method.to_string(), path.to_string()));
 
         if path.contains("generate-jitconfig") {
-            let body_str = body.map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+            let body_str = body
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
             let is_slot1 = body_str.contains("-1\"");
-            let status = if is_slot1 { self.jit_slot1_status } else { self.jit_slot2_status };
+            let status = if is_slot1 {
+                self.jit_slot1_status
+            } else {
+                self.jit_slot2_status
+            };
 
             if status == 201 {
                 let dummy_runner = GitHubRunner {
                     id: if is_slot1 { 101 } else { 102 },
-                    name: if is_slot1 { "runner-1".into() } else { "runner-2".into() },
+                    name: if is_slot1 {
+                        "runner-1".into()
+                    } else {
+                        "runner-2".into()
+                    },
                     os: Some("linux".into()),
                     status: "online".into(),
                     busy: false,
@@ -567,11 +707,18 @@ impl spot_dashboard_edge::patch_console::GitHubTransport for MockGitHubAdversari
                 };
                 let resp = GenerateJitConfigResponse {
                     runner: dummy_runner,
-                    encoded_jit_config: if is_slot1 { "encoded-jit-config-slot-1".into() } else { "encoded-jit-config-slot-2".into() },
+                    encoded_jit_config: if is_slot1 {
+                        "encoded-jit-config-slot-1".into()
+                    } else {
+                        "encoded-jit-config-slot-2".into()
+                    },
                 };
                 return Ok((201, serde_json::to_vec(&resp).unwrap()));
             } else {
-                return Ok((status, format!("{{\"message\": \"Error status {}\"}}", status).into_bytes()));
+                return Ok((
+                    status,
+                    format!("{{\"message\": \"Error status {}\"}}", status).into_bytes(),
+                ));
             }
         }
 
@@ -591,7 +738,11 @@ impl spot_dashboard_edge::patch_console::GitHubTransport for MockGitHubAdversari
 async fn test_tier5_adversarial_github_2slot_jitconfig_uniqueness_and_error_fallbacks() {
     let _guard = TIER5_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
-    let labels = vec!["self-hosted".to_string(), "Linux".to_string(), "X64".to_string()];
+    let labels = vec![
+        "self-hosted".to_string(),
+        "Linux".to_string(),
+        "X64".to_string(),
+    ];
 
     // Case 1: Happy path -> both slots succeed (201), unique JIT configs generated
     {
@@ -602,13 +753,22 @@ async fn test_tier5_adversarial_github_2slot_jitconfig_uniqueness_and_error_fall
             calls: Mutex::new(Vec::new()),
         });
         let client = GitHubActionsClient::new("fake-token".into(), transport.clone());
-        let res = client.mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels).await.unwrap();
+        let res = client
+            .mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels)
+            .await
+            .unwrap();
 
         match res {
-            RunnerBootstrapConfig::JitConfig { runner_1_jitconfig, runner_2_jitconfig } => {
+            RunnerBootstrapConfig::JitConfig {
+                runner_1_jitconfig,
+                runner_2_jitconfig,
+            } => {
                 assert_eq!(runner_1_jitconfig, "encoded-jit-config-slot-1");
                 assert_eq!(runner_2_jitconfig, "encoded-jit-config-slot-2");
-                assert_ne!(runner_1_jitconfig, runner_2_jitconfig, "Slots 1 and 2 must have distinct JIT configs");
+                assert_ne!(
+                    runner_1_jitconfig, runner_2_jitconfig,
+                    "Slots 1 and 2 must have distinct JIT configs"
+                );
             }
             _ => panic!("Expected JitConfig for 201/201"),
         }
@@ -623,8 +783,16 @@ async fn test_tier5_adversarial_github_2slot_jitconfig_uniqueness_and_error_fall
             calls: Mutex::new(Vec::new()),
         });
         let client = GitHubActionsClient::new("fake-token".into(), transport.clone());
-        let res = client.mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels).await.unwrap();
-        assert_eq!(res, RunnerBootstrapConfig::RegistrationToken { token: "fallback-on-404".into() });
+        let res = client
+            .mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels)
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            RunnerBootstrapConfig::RegistrationToken {
+                token: "fallback-on-404".into()
+            }
+        );
     }
 
     // Case 3: Slot 1 fails with 403 (insufficient permissions) -> falls back to registration-token
@@ -636,8 +804,16 @@ async fn test_tier5_adversarial_github_2slot_jitconfig_uniqueness_and_error_fall
             calls: Mutex::new(Vec::new()),
         });
         let client = GitHubActionsClient::new("fake-token".into(), transport.clone());
-        let res = client.mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels).await.unwrap();
-        assert_eq!(res, RunnerBootstrapConfig::RegistrationToken { token: "fallback-on-403".into() });
+        let res = client
+            .mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels)
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            RunnerBootstrapConfig::RegistrationToken {
+                token: "fallback-on-403".into()
+            }
+        );
     }
 
     // Case 4: Slot 1 fails with 500 (GitHub internal error) -> falls back to registration-token
@@ -649,8 +825,16 @@ async fn test_tier5_adversarial_github_2slot_jitconfig_uniqueness_and_error_fall
             calls: Mutex::new(Vec::new()),
         });
         let client = GitHubActionsClient::new("fake-token".into(), transport.clone());
-        let res = client.mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels).await.unwrap();
-        assert_eq!(res, RunnerBootstrapConfig::RegistrationToken { token: "fallback-on-500".into() });
+        let res = client
+            .mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels)
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            RunnerBootstrapConfig::RegistrationToken {
+                token: "fallback-on-500".into()
+            }
+        );
     }
 
     // Case 5: Slot 1 succeeds (201) but Slot 2 fails (500) -> falls back to registration-token
@@ -662,8 +846,16 @@ async fn test_tier5_adversarial_github_2slot_jitconfig_uniqueness_and_error_fall
             calls: Mutex::new(Vec::new()),
         });
         let client = GitHubActionsClient::new("fake-token".into(), transport.clone());
-        let res = client.mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels).await.unwrap();
-        assert_eq!(res, RunnerBootstrapConfig::RegistrationToken { token: "fallback-on-slot2-fail".into() });
+        let res = client
+            .mint_2slot_runner_configs("orgs/swack-tools", "vm-alpha", "oxidex", 10, &labels)
+            .await
+            .unwrap();
+        assert_eq!(
+            res,
+            RunnerBootstrapConfig::RegistrationToken {
+                token: "fallback-on-slot2-fail".into()
+            }
+        );
     }
 }
 
@@ -693,27 +885,57 @@ async fn test_tier5_adversarial_github_delete_runner_404_idempotency_matrix() {
     let _guard = TIER5_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     // HTTP 204 No Content -> Ok
-    let client_204 = GitHubActionsClient::new("tok".into(), Arc::new(MockDeregisterTransport { return_status: 204 }));
-    assert!(client_204.delete_runner("orgs/swack-tools", 1001).await.is_ok());
+    let client_204 = GitHubActionsClient::new(
+        "tok".into(),
+        Arc::new(MockDeregisterTransport { return_status: 204 }),
+    );
+    assert!(client_204
+        .delete_runner("orgs/swack-tools", 1001)
+        .await
+        .is_ok());
 
     // HTTP 404 Not Found (already deleted) -> Ok (idempotent!)
-    let client_404 = GitHubActionsClient::new("tok".into(), Arc::new(MockDeregisterTransport { return_status: 404 }));
+    let client_404 = GitHubActionsClient::new(
+        "tok".into(),
+        Arc::new(MockDeregisterTransport { return_status: 404 }),
+    );
     assert!(
-        client_404.delete_runner("orgs/swack-tools", 1002).await.is_ok(),
+        client_404
+            .delete_runner("orgs/swack-tools", 1002)
+            .await
+            .is_ok(),
         "HTTP 404 on runner delete must be treated as successful/idempotent"
     );
 
     // HTTP 401 Unauthorized -> Err
-    let client_401 = GitHubActionsClient::new("tok".into(), Arc::new(MockDeregisterTransport { return_status: 401 }));
-    assert!(client_401.delete_runner("orgs/swack-tools", 1003).await.is_err());
+    let client_401 = GitHubActionsClient::new(
+        "tok".into(),
+        Arc::new(MockDeregisterTransport { return_status: 401 }),
+    );
+    assert!(client_401
+        .delete_runner("orgs/swack-tools", 1003)
+        .await
+        .is_err());
 
     // HTTP 403 Forbidden -> Err
-    let client_403 = GitHubActionsClient::new("tok".into(), Arc::new(MockDeregisterTransport { return_status: 403 }));
-    assert!(client_403.delete_runner("orgs/swack-tools", 1004).await.is_err());
+    let client_403 = GitHubActionsClient::new(
+        "tok".into(),
+        Arc::new(MockDeregisterTransport { return_status: 403 }),
+    );
+    assert!(client_403
+        .delete_runner("orgs/swack-tools", 1004)
+        .await
+        .is_err());
 
     // HTTP 500 Internal Error -> Err
-    let client_500 = GitHubActionsClient::new("tok".into(), Arc::new(MockDeregisterTransport { return_status: 500 }));
-    assert!(client_500.delete_runner("orgs/swack-tools", 1005).await.is_err());
+    let client_500 = GitHubActionsClient::new(
+        "tok".into(),
+        Arc::new(MockDeregisterTransport { return_status: 500 }),
+    );
+    assert!(client_500
+        .delete_runner("orgs/swack-tools", 1005)
+        .await
+        .is_err());
 }
 
 // ============================================================================
@@ -790,10 +1012,16 @@ async fn test_tier5_adversarial_github_queued_backlog_mixed_workflow_states() {
     });
 
     let client = GitHubActionsClient::new("token".into(), transport);
-    let count = client.count_queued_jobs_for_repo("swack-tools", "oxidex").await.unwrap();
+    let count = client
+        .count_queued_jobs_for_repo("swack-tools", "oxidex")
+        .await
+        .unwrap();
 
     // 2 from run 1 (queued, waiting) + 2 from run 2 (pending, requested) = 4 queued jobs
-    assert_eq!(count, 4, "Expected exactly 4 queued jobs from mixed workflow states");
+    assert_eq!(
+        count, 4,
+        "Expected exactly 4 queued jobs from mixed workflow states"
+    );
 }
 
 // ============================================================================
@@ -830,9 +1058,24 @@ fn test_tier5_adversarial_fleet_fingerprint_permutation_invariance_and_sensitivi
         disks: vec![],
     };
 
-    let runner_1 = SimpleGitHubRunner { id: 10, name: "runner-1".into(), status: "online".into(), busy: false };
-    let runner_2 = SimpleGitHubRunner { id: 20, name: "runner-2".into(), status: "online".into(), busy: true };
-    let runner_3 = SimpleGitHubRunner { id: 30, name: "runner-3".into(), status: "offline".into(), busy: false };
+    let runner_1 = SimpleGitHubRunner {
+        id: 10,
+        name: "runner-1".into(),
+        status: "online".into(),
+        busy: false,
+    };
+    let runner_2 = SimpleGitHubRunner {
+        id: 20,
+        name: "runner-2".into(),
+        status: "online".into(),
+        busy: true,
+    };
+    let runner_3 = SimpleGitHubRunner {
+        id: 30,
+        name: "runner-3".into(),
+        status: "offline".into(),
+        busy: false,
+    };
 
     let launch_1 = LaunchOperation {
         target: "swack-tools".into(),
@@ -879,23 +1122,51 @@ fn test_tier5_adversarial_fleet_fingerprint_permutation_invariance_and_sensitivi
         &[launch_1.clone(), launch_2.clone()],
     );
 
-    assert_eq!(fp1, fp2, "Fingerprint must be strictly identical regardless of instance/runner/launch ordering");
-    assert_eq!(fp2, fp3, "Fingerprint must be strictly identical regardless of instance/runner/launch ordering");
+    assert_eq!(
+        fp1, fp2,
+        "Fingerprint must be strictly identical regardless of instance/runner/launch ordering"
+    );
+    assert_eq!(
+        fp2, fp3,
+        "Fingerprint must be strictly identical regardless of instance/runner/launch ordering"
+    );
 
     // 2. Sensitivity Checks
     // Mutate runner busy state
-    let runner_1_busy = SimpleGitHubRunner { busy: true, ..runner_1.clone() };
-    let fp_mut_runner = compute_fleet_fingerprint(&[inst_a.clone(), inst_b.clone()], &[runner_1_busy], 15, &[]);
-    assert_ne!(fp1, fp_mut_runner, "Toggling runner busy must change fingerprint");
+    let runner_1_busy = SimpleGitHubRunner {
+        busy: true,
+        ..runner_1.clone()
+    };
+    let fp_mut_runner =
+        compute_fleet_fingerprint(&[inst_a.clone(), inst_b.clone()], &[runner_1_busy], 15, &[]);
+    assert_ne!(
+        fp1, fp_mut_runner,
+        "Toggling runner busy must change fingerprint"
+    );
 
     // Mutate VM status
-    let inst_a_term = SimpleGceInstance { status: "TERMINATED".into(), ..inst_a.clone() };
-    let fp_mut_vm = compute_fleet_fingerprint(&[inst_a_term, inst_b.clone()], &[runner_1.clone()], 15, &[]);
-    assert_ne!(fp1, fp_mut_vm, "Changing instance status must change fingerprint");
+    let inst_a_term = SimpleGceInstance {
+        status: "TERMINATED".into(),
+        ..inst_a.clone()
+    };
+    let fp_mut_vm =
+        compute_fleet_fingerprint(&[inst_a_term, inst_b.clone()], &[runner_1.clone()], 15, &[]);
+    assert_ne!(
+        fp1, fp_mut_vm,
+        "Changing instance status must change fingerprint"
+    );
 
     // Mutate queued jobs count
-    let fp_mut_queue = compute_fleet_fingerprint(&[inst_a.clone(), inst_b.clone()], &[runner_1.clone()], 16, &[]);
-    assert_ne!(fp1, fp_mut_queue, "Changing queued jobs count must change fingerprint");
+    let fp_mut_queue = compute_fleet_fingerprint(
+        &[inst_a.clone(), inst_b.clone()],
+        &[runner_1.clone()],
+        16,
+        &[],
+    );
+    assert_ne!(
+        fp1, fp_mut_queue,
+        "Changing queued jobs count must change fingerprint"
+    );
 }
 
 // ============================================================================
@@ -917,7 +1188,9 @@ async fn test_tier5_adversarial_reconciler_zero_kv_writes_unchanged_ticks() {
     let mut now = 1700000000u64;
 
     // Initial tick: writes state snapshot (1 KV put)
-    let rep1 = run_reconciliation(&kv, &gcp, &gh, now).await.expect("tick 1");
+    let rep1 = run_reconciliation(&kv, &gcp, &gh, now)
+        .await
+        .expect("tick 1");
     assert!(rep1.snapshot_written);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 1);
 
@@ -926,7 +1199,11 @@ async fn test_tier5_adversarial_reconciler_zero_kv_writes_unchanged_ticks() {
         now += 3;
         let rep = run_reconciliation(&kv, &gcp, &gh, now).await.expect("tick");
         assert_eq!(rep.tick, tick_idx);
-        assert!(!rep.snapshot_written, "Tick {} wrote snapshot despite 0 fleet changes!", tick_idx);
+        assert!(
+            !rep.snapshot_written,
+            "Tick {} wrote snapshot despite 0 fleet changes!",
+            tick_idx
+        );
         assert_eq!(rep.launched_hosts.len(), 0);
         assert_eq!(rep.cleaned_vms.len(), 0);
         assert_eq!(rep.cleaned_runners.len(), 0);
@@ -964,27 +1241,43 @@ async fn test_tier5_adversarial_reconciler_coarse_heartbeat_boundary() {
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 1);
 
     // T0 + 1799s (1 second before 30m heartbeat) -> NO write
-    let rep_1799 = run_reconciliation(&kv, &gcp, &gh, t0 + 1799).await.expect("1799s");
-    assert!(!rep_1799.snapshot_written, "At 1799s heartbeat must not fire");
+    let rep_1799 = run_reconciliation(&kv, &gcp, &gh, t0 + 1799)
+        .await
+        .expect("1799s");
+    assert!(
+        !rep_1799.snapshot_written,
+        "At 1799s heartbeat must not fire"
+    );
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 1);
 
     // T0 + 1800s (exactly 30m heartbeat) -> single KV write
-    let rep_1800 = run_reconciliation(&kv, &gcp, &gh, t0 + 1800).await.expect("1800s");
-    assert!(rep_1800.snapshot_written, "At 1800s heartbeat MUST fire single snapshot write");
+    let rep_1800 = run_reconciliation(&kv, &gcp, &gh, t0 + 1800)
+        .await
+        .expect("1800s");
+    assert!(
+        rep_1800.snapshot_written,
+        "At 1800s heartbeat MUST fire single snapshot write"
+    );
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 2);
 
     // T0 + 1801s (1s after heartbeat) -> NO write
-    let rep_1801 = run_reconciliation(&kv, &gcp, &gh, t0 + 1801).await.expect("1801s");
+    let rep_1801 = run_reconciliation(&kv, &gcp, &gh, t0 + 1801)
+        .await
+        .expect("1801s");
     assert!(!rep_1801.snapshot_written);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 2);
 
     // T0 + 3599s -> NO write
-    let rep_3599 = run_reconciliation(&kv, &gcp, &gh, t0 + 3599).await.expect("3599s");
+    let rep_3599 = run_reconciliation(&kv, &gcp, &gh, t0 + 3599)
+        .await
+        .expect("3599s");
     assert!(!rep_3599.snapshot_written);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 2);
 
     // T0 + 3600s (second 30m heartbeat) -> single KV write
-    let rep_3600 = run_reconciliation(&kv, &gcp, &gh, t0 + 3600).await.expect("3600s");
+    let rep_3600 = run_reconciliation(&kv, &gcp, &gh, t0 + 3600)
+        .await
+        .expect("3600s");
     assert!(rep_3600.snapshot_written);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 3);
 }
@@ -1013,7 +1306,9 @@ async fn test_tier5_adversarial_reconciler_scale_up_exact_boundaries_19_vs_20() 
 
     // Boundary Test 1: Exactly 19 queued jobs -> NO scale-up
     *gh.queued_jobs.lock().unwrap() = 19;
-    let rep_19 = run_reconciliation(&kv, &gcp, &gh, t0 + 10).await.expect("19 jobs");
+    let rep_19 = run_reconciliation(&kv, &gcp, &gh, t0 + 10)
+        .await
+        .expect("19 jobs");
     assert_eq!(
         rep_19.launched_hosts.len(),
         0,
@@ -1023,7 +1318,9 @@ async fn test_tier5_adversarial_reconciler_scale_up_exact_boundaries_19_vs_20() 
 
     // Boundary Test 2: Exactly 20 queued jobs -> Scale-up 1 host!
     *gh.queued_jobs.lock().unwrap() = 20;
-    let rep_20 = run_reconciliation(&kv, &gcp, &gh, t0 + 20).await.expect("20 jobs");
+    let rep_20 = run_reconciliation(&kv, &gcp, &gh, t0 + 20)
+        .await
+        .expect("20 jobs");
     assert_eq!(
         rep_20.launched_hosts.len(),
         1,
@@ -1059,7 +1356,9 @@ async fn test_tier5_adversarial_reconciler_concurrency_lease_skipping() {
     set_reconciler_lease(Some(t0 + 240));
 
     // Overlapping tick at T0 + 10s -> MUST skip execution
-    let rep_skip = run_reconciliation(&kv, &gcp, &gh, t0 + 10).await.expect("skip");
+    let rep_skip = run_reconciliation(&kv, &gcp, &gh, t0 + 10)
+        .await
+        .expect("skip");
     assert_eq!(rep_skip.status, "skipped_lease_active");
     assert!(!rep_skip.snapshot_written);
     assert_eq!(rep_skip.launched_hosts.len(), 0);
@@ -1068,12 +1367,16 @@ async fn test_tier5_adversarial_reconciler_concurrency_lease_skipping() {
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 0);
 
     // Overlapping tick at T0 + 239s -> still skips
-    let rep_skip_239 = run_reconciliation(&kv, &gcp, &gh, t0 + 239).await.expect("skip 239");
+    let rep_skip_239 = run_reconciliation(&kv, &gcp, &gh, t0 + 239)
+        .await
+        .expect("skip 239");
     assert_eq!(rep_skip_239.status, "skipped_lease_active");
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 0);
 
     // Tick at T0 + 240s (lease expired) -> proceeds normally!
-    let rep_proc = run_reconciliation(&kv, &gcp, &gh, t0 + 240).await.expect("proceed");
+    let rep_proc = run_reconciliation(&kv, &gcp, &gh, t0 + 240)
+        .await
+        .expect("proceed");
     assert_eq!(rep_proc.status, "reconciled");
     assert!(rep_proc.snapshot_written);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 1);
@@ -1107,7 +1410,9 @@ async fn test_tier5_adversarial_reconciler_preempted_vm_cleanup() {
     });
 
     let t0 = 1700000000u64;
-    let rep = run_reconciliation(&kv, &gcp, &gh, t0).await.expect("reconcile");
+    let rep = run_reconciliation(&kv, &gcp, &gh, t0)
+        .await
+        .expect("reconcile");
 
     // Preempted VM must be cleaned
     assert!(
@@ -1115,10 +1420,16 @@ async fn test_tier5_adversarial_reconciler_preempted_vm_cleanup() {
         "Preempted TERMINATED VM must be cleaned up"
     );
     assert!(
-        gcp.deleted_instances.lock().unwrap().contains(&term_vm_name.to_string()),
+        gcp.deleted_instances
+            .lock()
+            .unwrap()
+            .contains(&term_vm_name.to_string()),
         "GCP delete_instance must be invoked on the TERMINATED VM"
     );
-    assert!(rep.snapshot_written, "VM deletion mutation must trigger snapshot update");
+    assert!(
+        rep.snapshot_written,
+        "VM deletion mutation must trigger snapshot update"
+    );
 }
 
 // ============================================================================
@@ -1173,13 +1484,18 @@ async fn test_tier5_adversarial_reconciler_stale_runner_cleanup_matrix() {
     ]);
 
     let t0 = 1700000000u64;
-    let rep = run_reconciliation(&kv, &gcp, &gh, t0).await.expect("reconcile");
+    let rep = run_reconciliation(&kv, &gcp, &gh, t0)
+        .await
+        .expect("reconcile");
 
     // Only Runner 2 should be cleaned
     assert_eq!(rep.cleaned_runners.len(), 1);
     assert_eq!(rep.cleaned_runners[0], "oxidex-runners-deleted-vm-2");
     assert_eq!(gh.deleted_runners.lock().unwrap().as_slice(), &[102]);
-    assert!(rep.snapshot_written, "Runner deregistration must trigger snapshot update");
+    assert!(
+        rep.snapshot_written,
+        "Runner deregistration must trigger snapshot update"
+    );
 }
 
 // ============================================================================
@@ -1190,9 +1506,13 @@ async fn test_tier5_adversarial_reconciler_stale_runner_cleanup_matrix() {
 fn test_tier5_adversarial_resource_budget_gate_size_limits() {
     let wasm_path = std::path::Path::new("build/index_bg.wasm");
     if !wasm_path.exists() {
-        let alt_path = std::path::Path::new("target/wasm32-unknown-unknown/release/spot_dashboard_edge.wasm");
+        let alt_path =
+            std::path::Path::new("target/wasm32-unknown-unknown/release/spot_dashboard_edge.wasm");
         if !alt_path.exists() {
-            eprintln!("Wasm artifact not found at {:?} or {:?}; skipping size gate check in unit run", wasm_path, alt_path);
+            eprintln!(
+                "Wasm artifact not found at {:?} or {:?}; skipping size gate check in unit run",
+                wasm_path, alt_path
+            );
             return;
         }
     }

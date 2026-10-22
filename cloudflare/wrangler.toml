@@ -31,7 +31,7 @@ command = "worker-build --release"
 # Optional bulk sign-out cut-off timestamp (epoch seconds)
 SESSION_NOT_BEFORE = ""
 # GCP project and GitHub Org identifiers used when serving default dashboard header
-GCP_PROJECT = "homelab-424523"
+GCP_PROJECT = "your-gcp-project-id"
 GITHUB_ORG = "swack-tools"
 
 [triggers]

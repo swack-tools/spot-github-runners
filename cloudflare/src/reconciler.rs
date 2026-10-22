@@ -14,17 +14,15 @@
 //!    - Coarse heartbeat (>= 30-60 min) periodic update.
 //!    - Steady-state budget < 50 writes/day.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::gcp::{GceAttachedDisk, GceInsertInstanceRequest, GceMetadata, GceOperation};
 use crate::github::RunnerBootstrapConfig;
 use crate::patch::CONTROLLED_TARGETS;
-use crate::state::{
-    load_state, save_state, InstanceRecord, KvStoreBackend, StateError,
-};
+use crate::state::{load_state, save_state, InstanceRecord, KvStoreBackend, StateError};
 
 pub const DEFAULT_MACHINE_TYPE: &str = "c4d-highcpu-16";
 pub const DEFAULT_ZONE: &str = "us-central1-a";
@@ -37,7 +35,7 @@ pub const MIN_QUEUED_JOBS_THRESHOLD: u32 = 20;
 pub const MAX_DAILY_USD_CAP: f64 = 1.50;
 pub const RECONCILER_LEASE_TTL_SECS: u64 = 240;
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 1800; // 30 minutes
-pub const LAUNCH_TIMEOUT_SECS: u64 = 900;       // 15 minutes
+pub const LAUNCH_TIMEOUT_SECS: u64 = 900; // 15 minutes
 
 // ============================================================================
 // Data Types & State Machine Models
@@ -117,7 +115,11 @@ pub struct SimpleGitHubRunner {
 
 #[async_trait::async_trait(?Send)]
 pub trait GcpReconcilerClient {
-    async fn list_instances(&self, project: &str, now: u64) -> Result<Vec<SimpleGceInstance>, ReconcilerError>;
+    async fn list_instances(
+        &self,
+        project: &str,
+        now: u64,
+    ) -> Result<Vec<SimpleGceInstance>, ReconcilerError>;
     async fn insert_instance(
         &self,
         project: &str,
@@ -126,14 +128,34 @@ pub trait GcpReconcilerClient {
         source_instance_template: Option<&str>,
         now: u64,
     ) -> Result<GceOperation, ReconcilerError>;
-    async fn delete_instance(&self, project: &str, zone: &str, instance: &str, now: u64) -> Result<GceOperation, ReconcilerError>;
-    async fn scrub_startup_script(&self, project: &str, zone: &str, instance: &str, current_metadata: &GceMetadata, now: u64) -> Result<GceOperation, ReconcilerError>;
+    async fn delete_instance(
+        &self,
+        project: &str,
+        zone: &str,
+        instance: &str,
+        now: u64,
+    ) -> Result<GceOperation, ReconcilerError>;
+    async fn scrub_startup_script(
+        &self,
+        project: &str,
+        zone: &str,
+        instance: &str,
+        current_metadata: &GceMetadata,
+        now: u64,
+    ) -> Result<GceOperation, ReconcilerError>;
 }
 
 #[async_trait::async_trait(?Send)]
 pub trait GitHubReconcilerClient {
-    async fn list_runners(&self, target_api_path: &str) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError>;
-    async fn delete_runner(&self, target_api_path: &str, runner_id: u64) -> Result<(), ReconcilerError>;
+    async fn list_runners(
+        &self,
+        target_api_path: &str,
+    ) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError>;
+    async fn delete_runner(
+        &self,
+        target_api_path: &str,
+        runner_id: u64,
+    ) -> Result<(), ReconcilerError>;
     async fn mint_2slot_runner_configs(
         &self,
         target_api_path: &str,
@@ -151,17 +173,27 @@ pub trait GitHubReconcilerClient {
 
 #[async_trait::async_trait(?Send)]
 impl<T: crate::gcp::GcpHttpTransport> GcpReconcilerClient for crate::gcp::GceComputeClient<T> {
-    async fn list_instances(&self, _project: &str, now: u64) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
-        let list = self.list_instances(now).await.map_err(|e| ReconcilerError::Gcp(e.to_string()))?;
-        Ok(list.into_iter().map(|i| SimpleGceInstance {
-            id: i.id,
-            name: i.name,
-            zone: i.zone,
-            machine_type: i.machine_type,
-            status: i.status,
-            metadata: i.metadata,
-            disks: i.disks,
-        }).collect())
+    async fn list_instances(
+        &self,
+        _project: &str,
+        now: u64,
+    ) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
+        let list = self
+            .list_instances(now)
+            .await
+            .map_err(|e| ReconcilerError::Gcp(e.to_string()))?;
+        Ok(list
+            .into_iter()
+            .map(|i| SimpleGceInstance {
+                id: i.id,
+                name: i.name,
+                zone: i.zone,
+                machine_type: i.machine_type,
+                status: i.status,
+                metadata: i.metadata,
+                disks: i.disks,
+            })
+            .collect())
     }
 
     async fn insert_instance(
@@ -177,13 +209,26 @@ impl<T: crate::gcp::GcpHttpTransport> GcpReconcilerClient for crate::gcp::GceCom
             .map_err(|e| ReconcilerError::Gcp(e.to_string()))
     }
 
-    async fn delete_instance(&self, _project: &str, zone: &str, instance: &str, now: u64) -> Result<GceOperation, ReconcilerError> {
+    async fn delete_instance(
+        &self,
+        _project: &str,
+        zone: &str,
+        instance: &str,
+        now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
         self.delete_instance(zone, instance, now)
             .await
             .map_err(|e| ReconcilerError::Gcp(e.to_string()))
     }
 
-    async fn scrub_startup_script(&self, _project: &str, zone: &str, instance: &str, current_metadata: &GceMetadata, now: u64) -> Result<GceOperation, ReconcilerError> {
+    async fn scrub_startup_script(
+        &self,
+        _project: &str,
+        zone: &str,
+        instance: &str,
+        current_metadata: &GceMetadata,
+        now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
         self.scrub_startup_script(zone, instance, current_metadata, now)
             .await
             .map_err(|e| ReconcilerError::Gcp(e.to_string()))
@@ -192,18 +237,33 @@ impl<T: crate::gcp::GcpHttpTransport> GcpReconcilerClient for crate::gcp::GceCom
 
 #[async_trait::async_trait(?Send)]
 impl GitHubReconcilerClient for crate::github::GitHubActionsClient {
-    async fn list_runners(&self, target_api_path: &str) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
-        let list = self.list_runners(target_api_path).await.map_err(|e| ReconcilerError::Github(e.to_string()))?;
-        Ok(list.into_iter().map(|r| SimpleGitHubRunner {
-            id: r.id,
-            name: r.name,
-            status: r.status,
-            busy: r.busy,
-        }).collect())
+    async fn list_runners(
+        &self,
+        target_api_path: &str,
+    ) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
+        let list = self
+            .list_runners(target_api_path)
+            .await
+            .map_err(|e| ReconcilerError::Github(e.to_string()))?;
+        Ok(list
+            .into_iter()
+            .map(|r| SimpleGitHubRunner {
+                id: r.id,
+                name: r.name,
+                status: r.status,
+                busy: r.busy,
+            })
+            .collect())
     }
 
-    async fn delete_runner(&self, target_api_path: &str, runner_id: u64) -> Result<(), ReconcilerError> {
-        self.delete_runner(target_api_path, runner_id).await.map_err(|e| ReconcilerError::Github(e.to_string()))
+    async fn delete_runner(
+        &self,
+        target_api_path: &str,
+        runner_id: u64,
+    ) -> Result<(), ReconcilerError> {
+        self.delete_runner(target_api_path, runner_id)
+            .await
+            .map_err(|e| ReconcilerError::Github(e.to_string()))
     }
 
     async fn mint_2slot_runner_configs(
@@ -214,13 +274,21 @@ impl GitHubReconcilerClient for crate::github::GitHubActionsClient {
         runner_group_id: u32,
         labels: &[String],
     ) -> Result<RunnerBootstrapConfig, ReconcilerError> {
-        self.mint_2slot_runner_configs(target_api_path, vm_name, runner_prefix, runner_group_id, labels)
-            .await
-            .map_err(|e| ReconcilerError::Github(e.to_string()))
+        self.mint_2slot_runner_configs(
+            target_api_path,
+            vm_name,
+            runner_prefix,
+            runner_group_id,
+            labels,
+        )
+        .await
+        .map_err(|e| ReconcilerError::Github(e.to_string()))
     }
 
     async fn count_queued_jobs(&self, owner: &str, repo: &str) -> Result<u32, ReconcilerError> {
-        self.count_queued_jobs_for_repo(owner, repo).await.map_err(|e| ReconcilerError::Github(e.to_string()))
+        self.count_queued_jobs_for_repo(owner, repo)
+            .await
+            .map_err(|e| ReconcilerError::Github(e.to_string()))
     }
 }
 
@@ -295,7 +363,11 @@ pub struct SimulatedFleetProvider;
 
 #[async_trait::async_trait(?Send)]
 impl GcpReconcilerClient for SimulatedFleetProvider {
-    async fn list_instances(&self, _project: &str, _now: u64) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
+    async fn list_instances(
+        &self,
+        _project: &str,
+        _now: u64,
+    ) -> Result<Vec<SimpleGceInstance>, ReconcilerError> {
         Ok(SIMULATED_INSTANCES.lock().unwrap().clone())
     }
 
@@ -326,7 +398,13 @@ impl GcpReconcilerClient for SimulatedFleetProvider {
         })
     }
 
-    async fn delete_instance(&self, _project: &str, _zone: &str, instance: &str, _now: u64) -> Result<GceOperation, ReconcilerError> {
+    async fn delete_instance(
+        &self,
+        _project: &str,
+        _zone: &str,
+        instance: &str,
+        _now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
         let mut list = SIMULATED_INSTANCES.lock().unwrap();
         list.retain(|i| i.name != instance);
         Ok(GceOperation {
@@ -338,7 +416,14 @@ impl GcpReconcilerClient for SimulatedFleetProvider {
         })
     }
 
-    async fn scrub_startup_script(&self, _project: &str, _zone: &str, instance: &str, current_metadata: &GceMetadata, _now: u64) -> Result<GceOperation, ReconcilerError> {
+    async fn scrub_startup_script(
+        &self,
+        _project: &str,
+        _zone: &str,
+        instance: &str,
+        current_metadata: &GceMetadata,
+        _now: u64,
+    ) -> Result<GceOperation, ReconcilerError> {
         let mut list = SIMULATED_INSTANCES.lock().unwrap();
         if let Some(inst) = list.iter_mut().find(|i| i.name == instance) {
             let mut new_meta = current_metadata.clone();
@@ -357,11 +442,18 @@ impl GcpReconcilerClient for SimulatedFleetProvider {
 
 #[async_trait::async_trait(?Send)]
 impl GitHubReconcilerClient for SimulatedFleetProvider {
-    async fn list_runners(&self, _target_api_path: &str) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
+    async fn list_runners(
+        &self,
+        _target_api_path: &str,
+    ) -> Result<Vec<SimpleGitHubRunner>, ReconcilerError> {
         Ok(SIMULATED_RUNNERS.lock().unwrap().clone())
     }
 
-    async fn delete_runner(&self, _target_api_path: &str, runner_id: u64) -> Result<(), ReconcilerError> {
+    async fn delete_runner(
+        &self,
+        _target_api_path: &str,
+        runner_id: u64,
+    ) -> Result<(), ReconcilerError> {
         let mut list = SIMULATED_RUNNERS.lock().unwrap();
         list.retain(|r| r.id != runner_id);
         Ok(())
@@ -395,8 +487,15 @@ pub async fn reconcile_worker_fleet<K: KvStoreBackend>(
     if let (Some(sa_key), Some(gh_tok)) = (env_gcp_sa_key, env_gh_token) {
         if !sa_key.trim().is_empty() && !gh_tok.trim().is_empty() {
             if let Ok(creds) = serde_json::from_str::<crate::gcp::GcpCredentials>(sa_key) {
-                let project = creds.project_id.clone().unwrap_or_else(|| "homelab-424523".to_string());
-                let gcp_client = crate::gcp::GceComputeClient::new(creds, project, crate::gcp::WorkerGcpTransport);
+                let project = creds
+                    .project_id
+                    .clone()
+                    .unwrap_or_else(|| "homelab-424523".to_string());
+                let gcp_client = crate::gcp::GceComputeClient::new(
+                    creds,
+                    project,
+                    crate::gcp::WorkerGcpTransport,
+                );
                 let gh_client = crate::github::GitHubActionsClient::new(
                     gh_tok.to_string(),
                     std::sync::Arc::new(crate::patch_console::WorkerGitHubTransport),
@@ -515,7 +614,10 @@ where
 
     // 2. Query Current GCP & GitHub Fleet State
     let instances = gcp.list_instances(&project, now).await.unwrap_or_default();
-    let runners = gh.list_runners(&format!("orgs/{}", org)).await.unwrap_or_default();
+    let runners = gh
+        .list_runners(&format!("orgs/{}", org))
+        .await
+        .unwrap_or_default();
 
     // Sum queued jobs backlog across controlled targets
     let mut queued_jobs = 0u32;
@@ -547,7 +649,9 @@ where
     // 4. Preempted VM Cleanup (TERMINATED GCE instances)
     for inst in &instances {
         if inst.status.eq_ignore_ascii_case("TERMINATED") {
-            let _ = gcp.delete_instance(&project, &inst.zone, &inst.name, now).await;
+            let _ = gcp
+                .delete_instance(&project, &inst.zone, &inst.name, now)
+                .await;
             cleaned_vms.push(inst.name.clone());
         }
     }
@@ -595,14 +699,24 @@ where
                 }
                 LaunchPhase::Booting => {
                     let all_online = op.expected_runners.iter().all(|expected| {
-                        runners.iter().any(|r| r.name == *expected && r.status.eq_ignore_ascii_case("online"))
+                        runners
+                            .iter()
+                            .any(|r| r.name == *expected && r.status.eq_ignore_ascii_case("online"))
                     });
 
                     if all_online && !op.expected_runners.is_empty() {
                         op.phase = LaunchPhase::Done;
                         // Scrub startup-script once VM is online
                         if let Some(inst) = instances.iter().find(|i| i.name == op.host_name) {
-                            let _ = gcp.scrub_startup_script(&project, &op.zone, &op.host_name, &inst.metadata, now).await;
+                            let _ = gcp
+                                .scrub_startup_script(
+                                    &project,
+                                    &op.zone,
+                                    &op.host_name,
+                                    &inst.metadata,
+                                    now,
+                                )
+                                .await;
                         }
                     } else if let Some(inst) = instances.iter().find(|i| i.name == op.host_name) {
                         if inst.status.eq_ignore_ascii_case("TERMINATED") {
@@ -621,18 +735,28 @@ where
 
     // 8. Floor Target Keeper (Ensure >= 1 Host Per Target)
     let controlled_targets = if bundle.state.controlled_targets.is_empty() {
-        CONTROLLED_TARGETS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        CONTROLLED_TARGETS
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
     } else {
         bundle.state.controlled_targets.clone()
     };
 
     for target in &controlled_targets {
         let target_slug = target.replace('/', "-").to_lowercase();
-        let active_count = instances.iter().filter(|i| {
-            !i.status.eq_ignore_ascii_case("TERMINATED") && i.name.contains(&target_slug)
-        }).count();
+        let active_count = instances
+            .iter()
+            .filter(|i| {
+                !i.status.eq_ignore_ascii_case("TERMINATED") && i.name.contains(&target_slug)
+            })
+            .count();
 
-        let in_flight = ACTIVE_LAUNCHES.lock().unwrap().iter().any(|l| l.target == *target);
+        let in_flight = ACTIVE_LAUNCHES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.target == *target);
 
         if active_count == 0 && !in_flight {
             let host_name = format!("oxidex-runners-{}-{}", target_slug, &now.to_string()[..6]);
@@ -649,21 +773,37 @@ where
                 DEFAULT_ZONE.to_string(),
             ];
 
-            let bootstrap = gh.mint_2slot_runner_configs(
-                &format!("orgs/{}", org),
-                &host_name,
-                runner_prefix,
-                10,
-                &labels,
-            ).await;
+            let gh_target = if target.contains('/') {
+                format!("repos/{}", target)
+            } else {
+                format!("orgs/{}", target)
+            };
+            let runner_group_id = if target == &org || target == "swack-tools" {
+                10
+            } else {
+                1
+            };
+
+            let bootstrap = gh
+                .mint_2slot_runner_configs(
+                    &gh_target,
+                    &host_name,
+                    runner_prefix,
+                    runner_group_id,
+                    &labels,
+                )
+                .await;
 
             let (reg_token, jit1, jit2) = match bootstrap {
-                Ok(RunnerBootstrapConfig::JitConfig { runner_1_jitconfig, runner_2_jitconfig }) => {
-                    ("".to_string(), Some(runner_1_jitconfig), Some(runner_2_jitconfig))
-                }
-                Ok(RunnerBootstrapConfig::RegistrationToken { token }) => {
-                    (token, None, None)
-                }
+                Ok(RunnerBootstrapConfig::JitConfig {
+                    runner_1_jitconfig,
+                    runner_2_jitconfig,
+                }) => (
+                    "".to_string(),
+                    Some(runner_1_jitconfig),
+                    Some(runner_2_jitconfig),
+                ),
+                Ok(RunnerBootstrapConfig::RegistrationToken { token }) => (token, None, None),
                 Err(_) => ("".to_string(), None, None),
             };
 
@@ -671,9 +811,13 @@ where
                 disk_device_name: &host_name,
                 instance_name: &host_name,
                 deployment_id: &deployment_id,
-                org: &org,
+                org: target,
                 runner_prefix,
-                runner_group: "default",
+                runner_group: if target == &org || target == "swack-tools" {
+                    "swack-runners"
+                } else {
+                    "default"
+                },
                 runner_labels: &labels.join(","),
                 registration_token: &reg_token,
                 runner_count: RUNNERS_PER_HOST,
@@ -684,8 +828,19 @@ where
                 resource_monitoring: false,
             };
 
-            let rendered_script = crate::github::render_startup_script(&startup_params, None)
-                .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
+            let manifest_val = crate::patch_console::make_valid_manifest_json(target);
+            let patch_sha = crate::patch::compute_canonical_patch_sha256(&manifest_val)
+                .unwrap_or_else(|_| {
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+                });
+            let patch_json_str =
+                serde_json::to_string(&manifest_val).unwrap_or_else(|_| "{}".to_string());
+            let runner_patch =
+                serde_json::from_value::<crate::patch::RunnerPatch>(manifest_val.clone()).ok();
+
+            let rendered_script =
+                crate::github::render_startup_script(&startup_params, runner_patch.as_ref())
+                    .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
 
             let vm_cfg = crate::gcp::RunnerVmConfig {
                 instance_name: &host_name,
@@ -694,8 +849,8 @@ where
                 target,
                 runner_prefix,
                 startup_script: &rendered_script,
-                patch_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-                patch_json: "{}",
+                patch_sha256: &patch_sha,
+                patch_json: &patch_json_str,
                 runner_1_jitconfig: jit1.as_deref(),
                 runner_2_jitconfig: jit2.as_deref(),
                 source_image: None,
@@ -704,7 +859,9 @@ where
             };
 
             if let Ok(req) = crate::gcp::build_spot_runner_vm_request(&project, &vm_cfg) {
-                let _ = gcp.insert_instance(&project, DEFAULT_ZONE, &req, None, now).await;
+                let _ = gcp
+                    .insert_instance(&project, DEFAULT_ZONE, &req, None, now)
+                    .await;
                 launched_hosts.push(host_name.clone());
 
                 ACTIVE_LAUNCHES.lock().unwrap().push(LaunchOperation {
@@ -727,7 +884,10 @@ where
 
     // 9. Backlog Scale-Up Policy (Triggered ONLY when queued_jobs >= 20)
     let max_instances = (bundle.state.scaling.cicd_runner.max_runners / RUNNERS_PER_HOST).max(1);
-    let current_live = instances.iter().filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED")).count();
+    let current_live = instances
+        .iter()
+        .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
+        .count();
 
     if queued_jobs >= MIN_QUEUED_JOBS_THRESHOLD && current_live < (max_instances as usize) {
         let scale_host = format!("oxidex-runners-scale-{}", &now.to_string()[..6]);
@@ -742,18 +902,25 @@ where
             DEFAULT_ZONE.to_string(),
         ];
 
-        let bootstrap = gh.mint_2slot_runner_configs(
-            &format!("orgs/{}", org),
-            &scale_host,
-            runner_prefix,
-            10,
-            &labels,
-        ).await;
+        let bootstrap = gh
+            .mint_2slot_runner_configs(
+                &format!("orgs/{}", org),
+                &scale_host,
+                runner_prefix,
+                10,
+                &labels,
+            )
+            .await;
 
         let (reg_token, jit1, jit2) = match bootstrap {
-            Ok(RunnerBootstrapConfig::JitConfig { runner_1_jitconfig, runner_2_jitconfig }) => {
-                ("".to_string(), Some(runner_1_jitconfig), Some(runner_2_jitconfig))
-            }
+            Ok(RunnerBootstrapConfig::JitConfig {
+                runner_1_jitconfig,
+                runner_2_jitconfig,
+            }) => (
+                "".to_string(),
+                Some(runner_1_jitconfig),
+                Some(runner_2_jitconfig),
+            ),
             Ok(RunnerBootstrapConfig::RegistrationToken { token }) => (token, None, None),
             Err(_) => ("".to_string(), None, None),
         };
@@ -775,8 +942,19 @@ where
             resource_monitoring: false,
         };
 
-        let rendered_script = crate::github::render_startup_script(&startup_params, None)
-            .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
+        let manifest_val = crate::patch_console::make_valid_manifest_json("swack-tools");
+        let patch_sha =
+            crate::patch::compute_canonical_patch_sha256(&manifest_val).unwrap_or_else(|_| {
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+            });
+        let patch_json_str =
+            serde_json::to_string(&manifest_val).unwrap_or_else(|_| "{}".to_string());
+        let runner_patch =
+            serde_json::from_value::<crate::patch::RunnerPatch>(manifest_val.clone()).ok();
+
+        let rendered_script =
+            crate::github::render_startup_script(&startup_params, runner_patch.as_ref())
+                .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
 
         let vm_cfg = crate::gcp::RunnerVmConfig {
             instance_name: &scale_host,
@@ -785,8 +963,8 @@ where
             target: "swack-tools",
             runner_prefix,
             startup_script: &rendered_script,
-            patch_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-            patch_json: "{}",
+            patch_sha256: &patch_sha,
+            patch_json: &patch_json_str,
             runner_1_jitconfig: jit1.as_deref(),
             runner_2_jitconfig: jit2.as_deref(),
             source_image: None,
@@ -795,14 +973,17 @@ where
         };
 
         if let Ok(req) = crate::gcp::build_spot_runner_vm_request(&project, &vm_cfg) {
-            let _ = gcp.insert_instance(&project, DEFAULT_ZONE, &req, None, now).await;
+            let _ = gcp
+                .insert_instance(&project, DEFAULT_ZONE, &req, None, now)
+                .await;
             launched_hosts.push(scale_host);
         }
     }
 
     // 10. Strict Diff Gating & KV Quota Conservation
     let active_launches = ACTIVE_LAUNCHES.lock().unwrap().clone();
-    let current_fingerprint = compute_fleet_fingerprint(&instances, &runners, queued_jobs, &active_launches);
+    let current_fingerprint =
+        compute_fleet_fingerprint(&instances, &runners, queued_jobs, &active_launches);
     let mut last_fp_guard = LAST_FLEET_FINGERPRINT.lock().unwrap();
 
     let has_mutations = !cleaned_vms.is_empty()

@@ -6,8 +6,7 @@ use serde_json::json;
 use spot_dashboard_edge::patch::{compute_canonical_patch_sha256, CONTROLLED_TARGETS};
 use spot_dashboard_edge::patch_console::{
     handle_bootstrap, handle_manifest, handle_preview, handle_save, handle_validate,
-    make_valid_manifest_json, GitHubTransport, MockGitHubTransport,
-    CONFIG_REPO,
+    make_valid_manifest_json, GitHubTransport, MockGitHubTransport, CONFIG_REPO,
 };
 
 #[test]
@@ -16,10 +15,16 @@ fn test_patch_console_bootstrap() {
     assert_eq!(status, 200);
     assert_eq!(body["repository"], CONFIG_REPO);
 
-    let targets = body["controlled_targets"].as_array().expect("array of targets");
+    let targets = body["controlled_targets"]
+        .as_array()
+        .expect("array of targets");
     assert_eq!(targets.len(), 4);
     for t in CONTROLLED_TARGETS {
-        assert!(targets.iter().any(|v| v.as_str() == Some(*t)), "Target {} must be in bootstrap", t);
+        assert!(
+            targets.iter().any(|v| v.as_str() == Some(*t)),
+            "Target {} must be in bootstrap",
+            t
+        );
     }
 }
 
@@ -29,7 +34,11 @@ async fn test_patch_console_manifest_loading_controlled_targets() {
 
     for target in CONTROLLED_TARGETS {
         let (status, body) = handle_manifest(target, &mock, "mock_token").await;
-        assert_eq!(status, 200, "Manifest load for {} should return 200", target);
+        assert_eq!(
+            status, 200,
+            "Manifest load for {} should return 200",
+            target
+        );
         assert_eq!(body["repository"], *target);
         assert!(body["manifest"].is_object());
 
@@ -65,7 +74,11 @@ async fn test_patch_console_manifest_loading_unauthorized_and_path_traversal() {
 
     for bad_repo in attacks {
         let (status, body) = handle_manifest(bad_repo, &mock, "mock_token").await;
-        assert_eq!(status, 400, "Target '{}' must be rejected with 400", bad_repo);
+        assert_eq!(
+            status, 400,
+            "Target '{}' must be rejected with 400",
+            bad_repo
+        );
         assert_eq!(body["error"], "unsupported_or_missing_repository");
     }
 }
@@ -87,7 +100,9 @@ fn test_patch_console_validate_api() {
     assert_eq!(status, 400);
     assert_eq!(body["valid"], false);
     let errs = body["errors"].as_array().unwrap();
-    assert!(errs.iter().any(|e| e.as_str().unwrap().contains("min_vcpu_below_floor")));
+    assert!(errs
+        .iter()
+        .any(|e| e.as_str().unwrap().contains("min_vcpu_below_floor")));
 
     // 3. Permitted machine type violation
     let mut bad_type = valid.clone();
@@ -95,15 +110,20 @@ fn test_patch_console_validate_api() {
     let (status, body) = handle_validate(&bad_type);
     assert_eq!(status, 400);
     let errs = body["errors"].as_array().unwrap();
-    assert!(errs.iter().any(|e| e.as_str().unwrap().contains("unpermitted_machine_type")));
+    assert!(errs
+        .iter()
+        .any(|e| e.as_str().unwrap().contains("unpermitted_machine_type")));
 
     // 4. Forbidden mount violation
     let mut bad_mount = valid.clone();
-    bad_mount["container"]["mounts"] = json!([{"source": "/var/run/docker.sock", "target": "/var/run/docker.sock"}]);
+    bad_mount["container"]["mounts"] =
+        json!([{"source": "/var/run/docker.sock", "target": "/var/run/docker.sock"}]);
     let (status, body) = handle_validate(&bad_mount);
     assert_eq!(status, 400);
     let errs = body["errors"].as_array().unwrap();
-    assert!(errs.iter().any(|e| e.as_str().unwrap().contains("forbidden_mount_source")));
+    assert!(errs
+        .iter()
+        .any(|e| e.as_str().unwrap().contains("forbidden_mount_source")));
 }
 
 #[tokio::test]
@@ -126,10 +146,18 @@ async fn test_patch_console_save_pr_happy_path() {
     assert!(pr_url.contains(&format!("https://github.com/{}/pull/", CONFIG_REPO)));
 
     let calls = mock.calls.lock().unwrap();
-    assert!(calls.iter().any(|(m, p, _)| m == "GET" && p.contains("/git/ref/heads/main")));
-    assert!(calls.iter().any(|(m, p, _)| m == "POST" && p.contains("/git/refs")));
-    assert!(calls.iter().any(|(m, p, _)| m == "PUT" && p.contains("/contents/defaults.yaml")));
-    assert!(calls.iter().any(|(m, p, _)| m == "POST" && p.contains("/pulls")));
+    assert!(calls
+        .iter()
+        .any(|(m, p, _)| m == "GET" && p.contains("/git/ref/heads/main")));
+    assert!(calls
+        .iter()
+        .any(|(m, p, _)| m == "POST" && p.contains("/git/refs")));
+    assert!(calls
+        .iter()
+        .any(|(m, p, _)| m == "PUT" && p.contains("/contents/defaults.yaml")));
+    assert!(calls
+        .iter()
+        .any(|(m, p, _)| m == "POST" && p.contains("/pulls")));
 }
 
 #[tokio::test]
@@ -146,7 +174,9 @@ async fn test_patch_console_save_pr_multi_repo_targets() {
     assert!(branch.starts_with("spot-dashboard/xbmc4lyfe-rustnzb-"));
 
     let calls = mock.calls.lock().unwrap();
-    assert!(calls.iter().any(|(m, p, _)| m == "PUT" && p.contains("/contents/repos/xbmc4lyfe/rustnzb.yaml")));
+    assert!(calls
+        .iter()
+        .any(|(m, p, _)| m == "PUT" && p.contains("/contents/repos/xbmc4lyfe/rustnzb.yaml")));
 }
 
 #[tokio::test]
@@ -213,7 +243,9 @@ async fn test_patch_console_save_commit_failure_and_rollback() {
 
     // Verify rollback DELETE was attempted
     let calls = failing_transport.mock.calls.lock().unwrap();
-    assert!(calls.iter().any(|(m, p, _)| m == "DELETE" && p.contains("/git/refs/heads/")));
+    assert!(calls
+        .iter()
+        .any(|(m, p, _)| m == "DELETE" && p.contains("/git/refs/heads/")));
 }
 
 #[test]
@@ -227,7 +259,10 @@ fn test_patch_console_preview() {
     assert_eq!(body["action"], "noop");
 
     // 2. Add apt package -> hot_patch
-    tgt["container"]["apt_packages"].as_array_mut().unwrap().push(json!("wget"));
+    tgt["container"]["apt_packages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("wget"));
     let (status, body) = handle_preview(&json!({"current_manifest": cur, "manifest": tgt}));
     assert_eq!(status, 200);
     assert_eq!(body["action"], "hot_patch");

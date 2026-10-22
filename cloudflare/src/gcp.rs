@@ -19,25 +19,25 @@
 //!    - `disks.delete` for orphan disk cleanup.
 //! 3. Decoupled `GcpHttpTransport` trait supporting native unit testing and `worker::Fetch`.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use rsa::pkcs8::DecodePrivateKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
+use rsa::pkcs8::DecodePrivateKey;
 use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 pub const COMPUTE_API_BASE: &str = "https://compute.googleapis.com/compute/v1";
 pub const GCP_OAUTH_SCOPE: &str =
     "https://www.googleapis.com/auth/compute https://www.googleapis.com/auth/cloud-platform";
 pub const TOKEN_CACHE_TTL_SECS: u64 = 3300; // 55 minutes
-pub const JWT_EXPIRY_SECS: u64 = 3600;       // 1 hour
+pub const JWT_EXPIRY_SECS: u64 = 3600; // 1 hour
 pub const DEFAULT_BOOT_DISK_SIZE_GB: u64 = 40;
 pub const DEBIAN_13_IMAGE_FAMILY: &str = "projects/debian-cloud/global/images/family/debian-13";
 pub const DEBIAN_13_ARM64_IMAGE_FAMILY: &str =
@@ -103,13 +103,21 @@ pub struct GceMetadata {
 
 impl GceMetadata {
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.items.iter().find(|i| i.key == key).map(|i| i.value.as_str())
+        self.items
+            .iter()
+            .find(|i| i.key == key)
+            .map(|i| i.value.as_str())
     }
 
     pub fn without_key(&self, key: &str) -> Self {
         Self {
             fingerprint: self.fingerprint.clone(),
-            items: self.items.iter().filter(|i| i.key != key).cloned().collect(),
+            items: self
+                .items
+                .iter()
+                .filter(|i| i.key != key)
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -134,11 +142,19 @@ pub struct GceAttachedDisk {
     pub boot: bool,
     #[serde(default = "default_auto_delete", alias = "auto_delete")]
     pub auto_delete: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "device_name")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "device_name"
+    )]
     pub device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "disk_size_gb")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "disk_size_gb"
+    )]
     pub disk_size_gb: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
@@ -146,7 +162,11 @@ pub struct GceAttachedDisk {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "initialize_params")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "initialize_params"
+    )]
     pub initialize_params: Option<GceDiskInitializeParams>,
 }
 
@@ -246,7 +266,10 @@ impl GceInstance {
     }
 
     pub fn machine_type_short(&self) -> &str {
-        self.machine_type.rsplit('/').next().unwrap_or(&self.machine_type)
+        self.machine_type
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.machine_type)
     }
 }
 
@@ -385,7 +408,12 @@ impl GcpHttpTransport for WorkerGcpTransport {
                 "POST" => Method::Post,
                 "DELETE" => Method::Delete,
                 "PUT" => Method::Put,
-                _ => return Err(GcpError::Transport(format!("Unsupported method: {}", method_str))),
+                _ => {
+                    return Err(GcpError::Transport(format!(
+                        "Unsupported method: {}",
+                        method_str
+                    )))
+                }
             };
 
             let mut init = RequestInit::new();
@@ -393,7 +421,9 @@ impl GcpHttpTransport for WorkerGcpTransport {
 
             let headers = Headers::new();
             for (k, v) in headers_slice {
-                headers.set(k, v).map_err(|e| GcpError::Transport(e.to_string()))?;
+                headers
+                    .set(k, v)
+                    .map_err(|e| GcpError::Transport(e.to_string()))?;
             }
             init.with_headers(headers);
 
@@ -403,11 +433,15 @@ impl GcpHttpTransport for WorkerGcpTransport {
 
             let req = Request::new_with_init(url, &init)
                 .map_err(|e| GcpError::Transport(e.to_string()))?;
-            let mut resp = Fetch::Request(req).send().await
+            let mut resp = Fetch::Request(req)
+                .send()
+                .await
                 .map_err(|e| GcpError::Transport(e.to_string()))?;
 
             let status = resp.status_code();
-            let bytes = resp.bytes().await
+            let bytes = resp
+                .bytes()
+                .await
                 .map_err(|e| GcpError::Transport(e.to_string()))?;
 
             Ok((status, bytes))
@@ -416,7 +450,9 @@ impl GcpHttpTransport for WorkerGcpTransport {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = (method_str, url, headers_slice, body);
-            Err(GcpError::Transport("Native test environment requires MockGcpHttpTransport".to_string()))
+            Err(GcpError::Transport(
+                "Native test environment requires MockGcpHttpTransport".to_string(),
+            ))
         }
     }
 }
@@ -439,7 +475,10 @@ impl MockGcpHttpTransport {
     }
 
     pub fn set_response(&self, url_pattern: &str, status: u16, body: Vec<u8>) {
-        self.responses.lock().unwrap().insert(url_pattern.to_string(), (status, body));
+        self.responses
+            .lock()
+            .unwrap()
+            .insert(url_pattern.to_string(), (status, body));
     }
 
     pub fn set_json_response<S: Serialize>(&self, url_pattern: &str, status: u16, data: &S) {
@@ -457,7 +496,10 @@ impl GcpHttpTransport for MockGcpHttpTransport {
         _headers: &[(&str, &str)],
         body: Option<Vec<u8>>,
     ) -> Result<(u16, Vec<u8>), GcpError> {
-        self.calls.lock().unwrap().push((method.to_string(), url.to_string(), body.clone()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method.to_string(), url.to_string(), body.clone()));
 
         // Check registered responses (longer pattern matches first)
         {
@@ -471,7 +513,10 @@ impl GcpHttpTransport for MockGcpHttpTransport {
 
         // Automatic mock handler for token endpoint
         if url.contains("/oauth2.googleapis.com/token") || url.contains("token") {
-            let tok = self.default_token.as_deref().unwrap_or("ya29.mock-token-xyz");
+            let tok = self
+                .default_token
+                .as_deref()
+                .unwrap_or("ya29.mock-token-xyz");
             let resp = serde_json::json!({
                 "access_token": tok,
                 "expires_in": 3600,
@@ -496,7 +541,10 @@ impl GcpHttpTransport for MockGcpHttpTransport {
 
 pub fn mint_rs256_assertion(creds: &GcpCredentials, now: u64) -> Result<String, GcpError> {
     // 1. Prepare Header and Claims
-    let header = GcpJwtHeader { alg: "RS256", typ: "JWT" };
+    let header = GcpJwtHeader {
+        alg: "RS256",
+        typ: "JWT",
+    };
     let claims = GcpJwtClaims {
         iss: &creds.client_email,
         scope: GCP_OAUTH_SCOPE,
@@ -546,7 +594,12 @@ pub async fn exchange_jwt_for_access_token<T: GcpHttpTransport>(
     ];
 
     let (status, resp_bytes) = transport
-        .request("POST", &creds.token_uri, &headers, Some(form_body.into_bytes()))
+        .request(
+            "POST",
+            &creds.token_uri,
+            &headers,
+            Some(form_body.into_bytes()),
+        )
         .await?;
 
     if status != 200 {
@@ -590,7 +643,11 @@ pub struct GceComputeClient<T: GcpHttpTransport> {
 
 impl<T: GcpHttpTransport> GceComputeClient<T> {
     pub fn new(credentials: GcpCredentials, project: String, transport: T) -> Self {
-        Self { credentials, project, transport }
+        Self {
+            credentials,
+            project,
+            transport,
+        }
     }
 
     async fn auth_headers(&self, now: u64) -> Result<Vec<(&'static str, String)>, GcpError> {
@@ -618,9 +675,13 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
             }
 
             let headers = self.auth_headers(now).await?;
-            let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let header_refs: Vec<(&str, &str)> =
+                headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-            let (status, bytes) = self.transport.request("GET", &url, &header_refs, None).await?;
+            let (status, bytes) = self
+                .transport
+                .request("GET", &url, &header_refs, None)
+                .await?;
             if status != 200 {
                 return Err(GcpError::Api(
                     status,
@@ -629,7 +690,8 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
                 ));
             }
 
-            let page: GceAggregatedListEnvelope<GceInstancesScopedList> = serde_json::from_slice(&bytes)?;
+            let page: GceAggregatedListEnvelope<GceInstancesScopedList> =
+                serde_json::from_slice(&bytes)?;
             for scoped in page.items.into_values() {
                 instances.extend(scoped.instances);
             }
@@ -659,9 +721,13 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
             }
 
             let headers = self.auth_headers(now).await?;
-            let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let header_refs: Vec<(&str, &str)> =
+                headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-            let (status, bytes) = self.transport.request("GET", &url, &header_refs, None).await?;
+            let (status, bytes) = self
+                .transport
+                .request("GET", &url, &header_refs, None)
+                .await?;
             if status != 200 {
                 return Err(GcpError::Api(
                     status,
@@ -670,7 +736,8 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
                 ));
             }
 
-            let page: GceAggregatedListEnvelope<GceDisksScopedList> = serde_json::from_slice(&bytes)?;
+            let page: GceAggregatedListEnvelope<GceDisksScopedList> =
+                serde_json::from_slice(&bytes)?;
             for scoped in page.items.into_values() {
                 disks.extend(scoped.disks);
             }
@@ -707,26 +774,35 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
         source_instance_template: Option<&str>,
         now: u64,
     ) -> Result<GceOperation, GcpError> {
-        let mut url = format!("{}/projects/{}/zones/{}/instances", COMPUTE_API_BASE, self.project, zone);
+        let mut url = format!(
+            "{}/projects/{}/zones/{}/instances",
+            COMPUTE_API_BASE, self.project, zone
+        );
         if let Some(template) = source_instance_template {
             let template_url = if template.starts_with("projects/") {
                 template.to_string()
             } else {
-                format!("projects/{}/global/instanceTemplates/{}", self.project, template)
+                format!(
+                    "projects/{}/global/instanceTemplates/{}",
+                    self.project, template
+                )
             };
             url.push_str("?sourceInstanceTemplate=");
             url.push_str(
-                &percent_encoding::utf8_percent_encode(&template_url, QUERY_VALUE)
-                    .to_string(),
+                &percent_encoding::utf8_percent_encode(&template_url, QUERY_VALUE).to_string(),
             );
         }
 
         let body = serde_json::to_vec(req)?;
         let mut headers = self.auth_headers(now).await?;
         headers.push(("Content-Type", "application/json".to_string()));
-        let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let header_refs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        let (status, bytes) = self.transport.request("POST", &url, &header_refs, Some(body)).await?;
+        let (status, bytes) = self
+            .transport
+            .request("POST", &url, &header_refs, Some(body))
+            .await?;
         if status != 200 {
             return Err(GcpError::Api(
                 status,
@@ -740,16 +816,25 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
     }
 
     /// Delete an instance with deleteDisk=ALL.
-    pub async fn delete_instance(&self, zone: &str, instance: &str, now: u64) -> Result<GceOperation, GcpError> {
+    pub async fn delete_instance(
+        &self,
+        zone: &str,
+        instance: &str,
+        now: u64,
+    ) -> Result<GceOperation, GcpError> {
         let url = format!(
             "{}/projects/{}/zones/{}/instances/{}?deleteDisk=ALL",
             COMPUTE_API_BASE, self.project, zone, instance
         );
 
         let headers = self.auth_headers(now).await?;
-        let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let header_refs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        let (status, bytes) = self.transport.request("DELETE", &url, &header_refs, None).await?;
+        let (status, bytes) = self
+            .transport
+            .request("DELETE", &url, &header_refs, None)
+            .await?;
         if status != 200 {
             return Err(GcpError::Api(
                 status,
@@ -780,9 +865,13 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
 
         let mut headers = self.auth_headers(now).await?;
         headers.push(("Content-Type", "application/json".to_string()));
-        let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let header_refs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        let (status, bytes) = self.transport.request("POST", &url, &header_refs, Some(body)).await?;
+        let (status, bytes) = self
+            .transport
+            .request("POST", &url, &header_refs, Some(body))
+            .await?;
         if status != 200 {
             return Err(GcpError::Api(
                 status,
@@ -796,13 +885,25 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
     }
 
     /// Delete an unattached orphan disk.
-    pub async fn delete_disk(&self, zone: &str, disk: &str, now: u64) -> Result<GceOperation, GcpError> {
-        let url = format!("{}/projects/{}/zones/{}/disks/{}", COMPUTE_API_BASE, self.project, zone, disk);
+    pub async fn delete_disk(
+        &self,
+        zone: &str,
+        disk: &str,
+        now: u64,
+    ) -> Result<GceOperation, GcpError> {
+        let url = format!(
+            "{}/projects/{}/zones/{}/disks/{}",
+            COMPUTE_API_BASE, self.project, zone, disk
+        );
 
         let headers = self.auth_headers(now).await?;
-        let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let header_refs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        let (status, bytes) = self.transport.request("DELETE", &url, &header_refs, None).await?;
+        let (status, bytes) = self
+            .transport
+            .request("DELETE", &url, &header_refs, None)
+            .await?;
         if status != 200 {
             return Err(GcpError::Api(
                 status,
@@ -844,7 +945,8 @@ pub fn build_spot_runner_vm_request(
     if !crate::patch::PERMITTED_MACHINE_TYPES.contains(&cfg.machine_type) {
         return Err(GcpError::Validation(format!(
             "Machine type '{}' is not in permitted list: {:?}",
-            cfg.machine_type, crate::patch::PERMITTED_MACHINE_TYPES
+            cfg.machine_type,
+            crate::patch::PERMITTED_MACHINE_TYPES
         )));
     }
 
@@ -887,24 +989,54 @@ pub fn build_spot_runner_vm_request(
     };
 
     let mut metadata_items = vec![
-        GceMetadataItem { key: "startup-script".into(), value: cfg.startup_script.into() },
-        GceMetadataItem { key: "spot-target".into(), value: cfg.target.into() },
-        GceMetadataItem { key: "spot-runner-prefix".into(), value: cfg.runner_prefix.into() },
-        GceMetadataItem { key: "spot-runner-count".into(), value: "2".into() },
-        GceMetadataItem { key: "spot-runner-patch-target".into(), value: cfg.target.into() },
-        GceMetadataItem { key: "spot-runner-patch-sha256".into(), value: cfg.patch_sha256.into() },
-        GceMetadataItem { key: "spot-runner-patch".into(), value: cfg.patch_json.into() },
+        GceMetadataItem {
+            key: "startup-script".into(),
+            value: cfg.startup_script.into(),
+        },
+        GceMetadataItem {
+            key: "spot-target".into(),
+            value: cfg.target.into(),
+        },
+        GceMetadataItem {
+            key: "spot-runner-prefix".into(),
+            value: cfg.runner_prefix.into(),
+        },
+        GceMetadataItem {
+            key: "spot-runner-count".into(),
+            value: "2".into(),
+        },
+        GceMetadataItem {
+            key: "spot-runner-patch-target".into(),
+            value: cfg.target.into(),
+        },
+        GceMetadataItem {
+            key: "spot-runner-patch-sha256".into(),
+            value: cfg.patch_sha256.into(),
+        },
+        GceMetadataItem {
+            key: "spot-runner-patch".into(),
+            value: cfg.patch_json.into(),
+        },
     ];
 
     if let Some(jit1) = cfg.runner_1_jitconfig {
-        metadata_items.push(GceMetadataItem { key: "runner_1_jitconfig".into(), value: jit1.into() });
+        metadata_items.push(GceMetadataItem {
+            key: "runner_1_jitconfig".into(),
+            value: jit1.into(),
+        });
     }
     if let Some(jit2) = cfg.runner_2_jitconfig {
-        metadata_items.push(GceMetadataItem { key: "runner_2_jitconfig".into(), value: jit2.into() });
+        metadata_items.push(GceMetadataItem {
+            key: "runner_2_jitconfig".into(),
+            value: jit2.into(),
+        });
     }
 
     let mut labels = BTreeMap::new();
-    labels.insert("spot-target".into(), cfg.target.replace('/', "-").to_lowercase());
+    labels.insert(
+        "spot-target".into(),
+        cfg.target.replace('/', "-").to_lowercase(),
+    );
     labels.insert("spot-role".into(), "cicd_runner".into());
 
     let nic_type = if boot_disk_type == "hyperdisk-balanced" {
@@ -928,7 +1060,10 @@ pub fn build_spot_runner_vm_request(
         scheduling: GceScheduling::default(),
         disks: vec![boot_disk],
         network_interfaces: vec![network],
-        metadata: GceMetadata { fingerprint: None, items: metadata_items },
+        metadata: GceMetadata {
+            fingerprint: None,
+            items: metadata_items,
+        },
         labels,
     })
 }

@@ -46,7 +46,8 @@ fn test_exact_session_fixture_vector() {
     let control_secret = secret;
     let control_key = derive_purpose_key(control_secret, "control");
     let control_token = fixture["control"]["token"].as_str().unwrap();
-    let verified_control = verify_token_signature(&control_key, control_token).expect("Control token valid");
+    let verified_control =
+        verify_token_signature(&control_key, control_token).expect("Control token valid");
     assert_eq!(verified_control["op"], "freeze");
     assert_eq!(verified_control["slot"], "a");
 }

@@ -14,19 +14,19 @@
 //! - Section 4: Patch console controlled targets, path traversal attempts, multi-repo
 //!   manifest merging, idempotent branch/PR handling, and commit failure branch rollback.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use spot_dashboard_edge::auth::*;
 use spot_dashboard_edge::patch::*;
 use spot_dashboard_edge::patch_console::*;
-use spot_dashboard_edge::state::*;
 use spot_dashboard_edge::state::MAX_ADDED_ADMINS;
+use spot_dashboard_edge::state::*;
 
 const TEST_SECRET: &[u8] = b"tier5-adversarial-test-secret-key-32bytes-auth-patch-suite!";
 
@@ -64,14 +64,22 @@ impl Tier5MockKvStore {
 
     pub fn with_raw(key: &str, val: &str) -> Self {
         let store = Self::new();
-        store.data.lock().unwrap().insert(key.to_string(), val.to_string());
+        store
+            .data
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), val.to_string());
         store
     }
 
     pub fn with_bundle(bundle: DashboardBundle) -> Self {
         let store = Self::new();
         let raw = serde_json::to_string(&bundle).expect("Serialize initial bundle");
-        store.data.lock().unwrap().insert(KV_STATE_KEY.to_string(), raw);
+        store
+            .data
+            .lock()
+            .unwrap()
+            .insert(KV_STATE_KEY.to_string(), raw);
         store
     }
 }
@@ -334,8 +342,14 @@ fn test_tier5_auth_session_revocation_cutoff_boundaries() {
     assert_eq!(parse_session_not_before(None), Some(0));
     assert_eq!(parse_session_not_before(Some("")), Some(0));
     assert_eq!(parse_session_not_before(Some("   ")), Some(0));
-    assert_eq!(parse_session_not_before(Some("1792000000")), Some(1792000000));
-    assert_eq!(parse_session_not_before(Some("  1792000000  ")), Some(1792000000));
+    assert_eq!(
+        parse_session_not_before(Some("1792000000")),
+        Some(1792000000)
+    );
+    assert_eq!(
+        parse_session_not_before(Some("  1792000000  ")),
+        Some(1792000000)
+    );
 
     // Malformed non-numeric inputs fail closed (return None)
     assert_eq!(parse_session_not_before(Some("abc")), None);
@@ -448,12 +462,21 @@ fn test_tier5_auth_pkce_and_oauth_state_boundaries() {
     assert!(verify_oauth_state(TEST_SECRET, &state, &other_state, now).is_err());
 
     // Expired state token must be rejected
-    assert!(verify_oauth_state(TEST_SECRET, &state, &state, now + DEFAULT_STATE_TTL_SECONDS + 1).is_err());
+    assert!(verify_oauth_state(
+        TEST_SECRET,
+        &state,
+        &state,
+        now + DEFAULT_STATE_TTL_SECONDS + 1
+    )
+    .is_err());
 
     // Nonce replay prevention: mark_state_nonce_used must return true once, then false
     let nonce = "unique-test-nonce-12345";
     assert!(mark_state_nonce_used(nonce));
-    assert!(!mark_state_nonce_used(nonce), "Replayed nonce must be rejected");
+    assert!(
+        !mark_state_nonce_used(nonce),
+        "Replayed nonce must be rejected"
+    );
 }
 
 #[test]
@@ -466,7 +489,10 @@ fn test_tier5_auth_device_flow_rapid_polling_and_intervals() {
     // Rapid poll before next_poll_at (now + 1 < now + 5) must trigger SlowDown
     match poll_device_flow(&handle, now + 1) {
         DevicePollResult::SlowDown { interval } => {
-            assert_eq!(interval, 10, "First slow down must increment interval to 10s");
+            assert_eq!(
+                interval, 10,
+                "First slow down must increment interval to 10s"
+            );
         }
         other => panic!("Expected SlowDown, got {other:?}"),
     }
@@ -474,27 +500,42 @@ fn test_tier5_auth_device_flow_rapid_polling_and_intervals() {
     // Second rapid poll before next interval must increment again
     match poll_device_flow(&handle, now + 2) {
         DevicePollResult::SlowDown { interval } => {
-            assert_eq!(interval, 15, "Second slow down must increment interval to 15s");
+            assert_eq!(
+                interval, 15,
+                "Second slow down must increment interval to 15s"
+            );
         }
         other => panic!("Expected SlowDown, got {other:?}"),
     }
 
     // Polling after expiration
-    assert_eq!(poll_device_flow(&handle, now + 901), DevicePollResult::Expired);
+    assert_eq!(
+        poll_device_flow(&handle, now + 901),
+        DevicePollResult::Expired
+    );
 
     // Invalid / unknown code or handle
-    assert_eq!(poll_device_flow("unknown_code", now), DevicePollResult::Invalid);
+    assert_eq!(
+        poll_device_flow("unknown_code", now),
+        DevicePollResult::Invalid
+    );
 
     // Empty or oversized handle (>512 chars)
     assert_eq!(poll_device_flow("", now), DevicePollResult::Invalid);
     let giant_handle = "a".repeat(513);
-    assert_eq!(poll_device_flow(&giant_handle, now), DevicePollResult::Invalid);
+    assert_eq!(
+        poll_device_flow(&giant_handle, now),
+        DevicePollResult::Invalid
+    );
 
     // Authorization flow
     let (_, handle2) = start_device_flow(TEST_SECRET, now + 1000).unwrap();
     assert!(authorize_device(&handle2, "swackhamer", 619624));
     match poll_device_flow(&handle2, now + 1001) {
-        DevicePollResult::Authorized { user_login, user_id } => {
+        DevicePollResult::Authorized {
+            user_login,
+            user_id,
+        } => {
             assert_eq!(user_login, "swackhamer");
             assert_eq!(user_id, 619624);
         }
@@ -506,24 +547,41 @@ fn test_tier5_auth_device_flow_rapid_polling_and_intervals() {
 fn test_tier5_auth_authorization_and_session_checks() {
     // 1. is_owner checks
     assert!(is_owner("swackhamer", 619624));
-    assert!(is_owner("SWACKHAMER", 619624), "Owner login check must be case-insensitive");
-    assert!(!is_owner("swackhamer", 619625), "Wrong UID must not be owner");
-    assert!(!is_owner("attacker", 619624), "Wrong login must not be owner");
+    assert!(
+        is_owner("SWACKHAMER", 619624),
+        "Owner login check must be case-insensitive"
+    );
+    assert!(
+        !is_owner("swackhamer", 619625),
+        "Wrong UID must not be owner"
+    );
+    assert!(
+        !is_owner("attacker", 619624),
+        "Wrong login must not be owner"
+    );
 
     // 2. may_sign_in checks
     let added_admins = vec![111111, 222222];
     assert!(may_sign_in("swackhamer", 619624, &added_admins));
     assert!(may_sign_in("added_user", 111111, &added_admins));
     assert!(!may_sign_in("unauthorized", 333333, &added_admins));
-    assert!(!may_sign_in("zero_uid", 0, &[0]), "UID 0 must never be allowed");
+    assert!(
+        !may_sign_in("zero_uid", 0, &[0]),
+        "UID 0 must never be allowed"
+    );
 
     // 3. check_session target validation
     let mut session = make_valid_session();
-    let controlled_targets = vec!["swack-tools/oxidex".to_string(), "xbmc4lyfe/rustnzb".to_string()];
+    let controlled_targets = vec![
+        "swack-tools/oxidex".to_string(),
+        "xbmc4lyfe/rustnzb".to_string(),
+    ];
 
     // Session missing xbmc4lyfe/rustnzb
     match check_session(&session, &controlled_targets, &[], false) {
-        SessionCheckStatus::Forbidden { missing_targets, .. } => {
+        SessionCheckStatus::Forbidden {
+            missing_targets, ..
+        } => {
             assert_eq!(missing_targets, vec!["xbmc4lyfe/rustnzb".to_string()]);
         }
         other => panic!("Expected Forbidden, got {other:?}"),
@@ -531,12 +589,18 @@ fn test_tier5_auth_authorization_and_session_checks() {
 
     // Session with all targets verified (case-insensitive check)
     session.tgt.push("XBMC4LYFE/RUSTNZB".to_string());
-    assert_eq!(check_session(&session, &controlled_targets, &[], false), SessionCheckStatus::Ok);
+    assert_eq!(
+        check_session(&session, &controlled_targets, &[], false),
+        SessionCheckStatus::Ok
+    );
 
     // Global admin flag bypasses target verification
     let mut minimal_session = make_valid_session();
     minimal_session.tgt.clear();
-    assert_eq!(check_session(&minimal_session, &controlled_targets, &[], true), SessionCheckStatus::Ok);
+    assert_eq!(
+        check_session(&minimal_session, &controlled_targets, &[], true),
+        SessionCheckStatus::Ok
+    );
 }
 
 // ============================================================================
@@ -596,7 +660,10 @@ async fn test_tier5_state_isolate_memory_cache_invalidation_and_writes() {
     set_cached_gcp_token(start_time, "oauth-token-xyz".to_string());
 
     // Hit at 3299s
-    assert_eq!(get_cached_gcp_token(start_time + 3299).as_deref(), Some("oauth-token-xyz"));
+    assert_eq!(
+        get_cached_gcp_token(start_time + 3299).as_deref(),
+        Some("oauth-token-xyz")
+    );
 
     // Miss at 3300s
     assert!(get_cached_gcp_token(start_time + 3300).is_none());
@@ -658,7 +725,9 @@ async fn test_tier5_state_zero_kv_writes_on_all_get_endpoints_and_safety_gates()
 
     // 2. GET /api/overview -> 0 KV writes
     for i in 0..100 {
-        let (status, _) = handle_api_overview(&kv, OverviewQuery::default(), now + (i % 50)).await.unwrap();
+        let (status, _) = handle_api_overview(&kv, OverviewQuery::default(), now + (i % 50))
+            .await
+            .unwrap();
         assert_eq!(status, 200);
     }
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 0);
@@ -672,7 +741,9 @@ async fn test_tier5_state_zero_kv_writes_on_all_get_endpoints_and_safety_gates()
 
     // 4. GET /api/admins -> 0 KV writes
     for i in 0..50 {
-        let (status, _) = handle_get_admins(&kv, OWNER_UID, now + (i % 50)).await.unwrap();
+        let (status, _) = handle_get_admins(&kv, OWNER_UID, now + (i % 50))
+            .await
+            .unwrap();
         assert_eq!(status, 200);
     }
     assert_eq!(kv.put_count.load(Ordering::SeqCst), 0);
@@ -692,7 +763,9 @@ async fn test_tier5_state_zero_kv_writes_on_all_get_endpoints_and_safety_gates()
         target_instances: 5,
         role: "cicd_runner".to_string(),
     };
-    let (scale_status, scale_body) = handle_post_instances_scale_region(&kv, scale_req, now).await.unwrap();
+    let (scale_status, scale_body) = handle_post_instances_scale_region(&kv, scale_req, now)
+        .await
+        .unwrap();
     assert_eq!(scale_status, 200);
     assert_eq!(scale_body["status"], "not_applied");
     assert_eq!(scale_body["applied"], false);
@@ -722,7 +795,8 @@ async fn test_tier5_state_admin_management_adversarial_boundaries() {
         uid: 100001,
         confirm: false,
     };
-    let err_unconfirmed = handle_post_admins_add(&kv, unconfirmed_req, OWNER_LOGIN, OWNER_UID, now).await;
+    let err_unconfirmed =
+        handle_post_admins_add(&kv, unconfirmed_req, OWNER_LOGIN, OWNER_UID, now).await;
     assert!(matches!(err_unconfirmed, Err(StateError::Validation(_))));
 
     // 3. uid == 0 rejected with Validation
@@ -740,7 +814,8 @@ async fn test_tier5_state_admin_management_adversarial_boundaries() {
         uid: OWNER_UID,
         confirm: true,
     };
-    let err_owner_add = handle_post_admins_add(&kv, owner_add_req, OWNER_LOGIN, OWNER_UID, now).await;
+    let err_owner_add =
+        handle_post_admins_add(&kv, owner_add_req, OWNER_LOGIN, OWNER_UID, now).await;
     assert!(matches!(err_owner_add, Err(StateError::Conflict(_))));
 
     // 5. Removing owner rejected with Validation
@@ -748,7 +823,8 @@ async fn test_tier5_state_admin_management_adversarial_boundaries() {
         uid: OWNER_UID,
         confirm: true,
     };
-    let err_owner_rem = handle_post_admins_remove(&kv, owner_rem_req, OWNER_LOGIN, OWNER_UID, now).await;
+    let err_owner_rem =
+        handle_post_admins_remove(&kv, owner_rem_req, OWNER_LOGIN, OWNER_UID, now).await;
     assert!(matches!(err_owner_rem, Err(StateError::Validation(_))));
 
     // 6. Removing non-existent admin rejected with NotFound
@@ -756,7 +832,8 @@ async fn test_tier5_state_admin_management_adversarial_boundaries() {
         uid: 888888,
         confirm: true,
     };
-    let err_rem_nonexistent = handle_post_admins_remove(&kv, rem_nonexistent, OWNER_LOGIN, OWNER_UID, now).await;
+    let err_rem_nonexistent =
+        handle_post_admins_remove(&kv, rem_nonexistent, OWNER_LOGIN, OWNER_UID, now).await;
     assert!(matches!(err_rem_nonexistent, Err(StateError::NotFound(_))));
 
     // 7. Max 50 added admins boundary:
@@ -767,7 +844,9 @@ async fn test_tier5_state_admin_management_adversarial_boundaries() {
             uid: 200000 + i as u64,
             confirm: true,
         };
-        let (status, _) = handle_post_admins_add(&kv, req, OWNER_LOGIN, OWNER_UID, now + i as u64).await.unwrap();
+        let (status, _) = handle_post_admins_add(&kv, req, OWNER_LOGIN, OWNER_UID, now + i as u64)
+            .await
+            .unwrap();
         assert_eq!(status, 200);
     }
 
@@ -834,9 +913,21 @@ fn test_tier5_patch_canonical_hashing_under_adversarial_json_formatting() {
 
     // 2. Unicode and Python ensure_ascii=True character escaping
     let unicode_tests = [
-        ("emoji", "🦀 rocket 🚀", r#""\ud83e\udd80 rocket \ud83d\ude80""#),
-        ("control_chars", "\x00\x08\x0c\n\r\t\x1f", r#""\u0000\b\f\n\r\t\u001f""#),
-        ("quotes_slashes", r#"path\to"quote""#, r#""path\\to\"quote\"""#),
+        (
+            "emoji",
+            "🦀 rocket 🚀",
+            r#""\ud83e\udd80 rocket \ud83d\ude80""#,
+        ),
+        (
+            "control_chars",
+            "\x00\x08\x0c\n\r\t\x1f",
+            r#""\u0000\b\f\n\r\t\u001f""#,
+        ),
+        (
+            "quotes_slashes",
+            r#"path\to"quote""#,
+            r#""path\\to\"quote\"""#,
+        ),
     ];
     for (label, input, expected_escaped) in unicode_tests {
         let val = Value::String(input.to_string());
@@ -858,12 +949,32 @@ fn test_tier5_patch_canonical_hashing_under_adversarial_json_formatting() {
 
     let canonical = canonicalize_manifest_value(&manifest_with_nulls);
     let hw = canonical.get("hardware").unwrap().as_object().unwrap();
-    assert_eq!(hw.get("min_vcpu"), Some(&Value::Null), "min_vcpu: null must be preserved");
-    assert_eq!(hw.get("min_ram_gib"), Some(&Value::Null), "min_ram_gib: null must be preserved");
-    assert!(hw.get("runners_count").is_none(), "optional runners_count: null must be stripped");
-    assert!(hw.get("runner_vcpu").is_none(), "optional runner_vcpu: null must be stripped");
-    assert!(canonical.get("source_commit").is_none(), "source_commit must be stripped");
-    assert!(canonical.get("source_branch").is_none(), "source_branch must be stripped");
+    assert_eq!(
+        hw.get("min_vcpu"),
+        Some(&Value::Null),
+        "min_vcpu: null must be preserved"
+    );
+    assert_eq!(
+        hw.get("min_ram_gib"),
+        Some(&Value::Null),
+        "min_ram_gib: null must be preserved"
+    );
+    assert!(
+        hw.get("runners_count").is_none(),
+        "optional runners_count: null must be stripped"
+    );
+    assert!(
+        hw.get("runner_vcpu").is_none(),
+        "optional runner_vcpu: null must be stripped"
+    );
+    assert!(
+        canonical.get("source_commit").is_none(),
+        "source_commit must be stripped"
+    );
+    assert!(
+        canonical.get("source_branch").is_none(),
+        "source_branch must be stripped"
+    );
 }
 
 #[test]
@@ -888,7 +999,8 @@ fn test_tier5_patch_golden_image_and_instance_template_omission_parity() {
 
     // Manifest with concrete golden image values produces different, deterministic hash
     let mut golden_manifest = base_manifest.clone();
-    golden_manifest["source_instance_template"] = json!("projects/homelab-424523/global/instanceTemplates/runner-tmpl-v1");
+    golden_manifest["source_instance_template"] =
+        json!("projects/homelab-424523/global/instanceTemplates/runner-tmpl-v1");
     golden_manifest["golden_image_family"] = json!("oxidex-runner-golden");
 
     let golden_sha = compute_canonical_patch_sha256(&golden_manifest).unwrap();
@@ -971,7 +1083,13 @@ fn test_tier5_patch_permitted_machine_types_and_forbidden_mounts() {
     }
 
     // Unpermitted machine types
-    let unpermitted = ["e2-standard-4", "n2-standard-16", "c3-highcpu-16", "custom-16-32768", ""];
+    let unpermitted = [
+        "e2-standard-4",
+        "n2-standard-16",
+        "c3-highcpu-16",
+        "custom-16-32768",
+        "",
+    ];
     for unp in unpermitted {
         let mut m = valid.clone();
         m["hardware"]["extra_labels"] = json!([format!("type-{unp}")]);
@@ -1012,7 +1130,11 @@ fn test_tier5_patch_permitted_machine_types_and_forbidden_mounts() {
     }
 
     // Permitted mounts
-    let permitted_mounts = ["/opt/runner/cache", "/mnt/disks/build-cache", "/var/cache/builds"];
+    let permitted_mounts = [
+        "/opt/runner/cache",
+        "/mnt/disks/build-cache",
+        "/var/cache/builds",
+    ];
     for pm in permitted_mounts {
         let mut m = valid.clone();
         m["container"]["mounts"] = json!([{
@@ -1063,7 +1185,10 @@ async fn test_tier5_patch_console_target_validation_and_path_traversal() {
             }
         });
         let (status, body) = handle_save(&save_payload, &mock, "mock_token").await;
-        assert_eq!(status, 400, "Attack payload '{bad}' on save must return 400");
+        assert_eq!(
+            status, 400,
+            "Attack payload '{bad}' on save must return 400"
+        );
         assert_eq!(body["error"], "unsupported_repository");
     }
 }
@@ -1072,16 +1197,29 @@ async fn test_tier5_patch_console_target_validation_and_path_traversal() {
 fn test_tier5_patch_console_multi_repo_manifest_merging() {
     let mut defaults = RunnerPatch::default();
     defaults.repository = "swack-tools".to_string();
-    defaults.hardware.extra_labels = vec!["type-c4d-highcpu-16".to_string(), "shared-label".to_string()];
+    defaults.hardware.extra_labels = vec![
+        "type-c4d-highcpu-16".to_string(),
+        "shared-label".to_string(),
+    ];
     defaults.hardware.isa = vec!["avx2".to_string()];
-    defaults.host.sysctl.insert("net.core.somaxconn".to_string(), "4096".to_string());
-    defaults.host.sysctl.insert("fs.file-max".to_string(), "100000".to_string());
+    defaults
+        .host
+        .sysctl
+        .insert("net.core.somaxconn".to_string(), "4096".to_string());
+    defaults
+        .host
+        .sysctl
+        .insert("fs.file-max".to_string(), "100000".to_string());
 
     let mut repo_override = RunnerPatch::default();
     repo_override.repository = "xbmc4lyfe/rustnzb".to_string();
-    repo_override.hardware.extra_labels = vec!["shared-label".to_string(), "repo-unique-label".to_string()];
+    repo_override.hardware.extra_labels =
+        vec!["shared-label".to_string(), "repo-unique-label".to_string()];
     repo_override.hardware.isa = vec!["avx2".to_string(), "bmi2".to_string()];
-    repo_override.host.sysctl.insert("net.core.somaxconn".to_string(), "8192".to_string()); // Overrides default
+    repo_override
+        .host
+        .sysctl
+        .insert("net.core.somaxconn".to_string(), "8192".to_string()); // Overrides default
     repo_override.golden_image_family = Some("rustnzb-golden".to_string());
 
     let merged = merge_patches(&defaults, &repo_override);
@@ -1099,11 +1237,17 @@ fn test_tier5_patch_console_multi_repo_manifest_merging() {
     assert_eq!(merged.hardware.isa, vec!["avx2", "bmi2"]);
 
     // Sysctl merged: net.core.somaxconn overridden to 8192, fs.file-max preserved as 100000
-    assert_eq!(merged.host.sysctl.get("net.core.somaxconn").unwrap(), "8192");
+    assert_eq!(
+        merged.host.sysctl.get("net.core.somaxconn").unwrap(),
+        "8192"
+    );
     assert_eq!(merged.host.sysctl.get("fs.file-max").unwrap(), "100000");
 
     // Golden image family from override
-    assert_eq!(merged.golden_image_family.as_deref(), Some("rustnzb-golden"));
+    assert_eq!(
+        merged.golden_image_family.as_deref(),
+        Some("rustnzb-golden")
+    );
 }
 
 #[tokio::test]
@@ -1142,7 +1286,10 @@ impl GitHubTransport for FailOnPutGitHubTransport {
     ) -> Result<(u16, Vec<u8>), String> {
         if method == "PUT" {
             // Simulate commit failure (500 Internal Server Error)
-            return Ok((500, b"{\"message\": \"Internal Server Error on Commit\"}".to_vec()));
+            return Ok((
+                500,
+                b"{\"message\": \"Internal Server Error on Commit\"}".to_vec(),
+            ));
         }
         if method == "DELETE" {
             *self.delete_called.lock().unwrap() = true;

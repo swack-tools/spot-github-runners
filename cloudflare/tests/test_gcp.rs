@@ -47,7 +47,10 @@ fn test_gcp_credentials_parsing() {
         "project_id": "test-project"
     });
     let creds: GcpCredentials = serde_json::from_value(json_data).unwrap();
-    assert_eq!(creds.client_email, "runner-sa@test-project.iam.gserviceaccount.com");
+    assert_eq!(
+        creds.client_email,
+        "runner-sa@test-project.iam.gserviceaccount.com"
+    );
     assert_eq!(creds.token_uri, DEFAULT_TOKEN_URI);
     assert_eq!(creds.project_id.as_deref(), Some("test-project"));
 }
@@ -67,19 +70,26 @@ fn test_deterministic_rs256_assertion_generation() {
     assert_eq!(parts.len(), 3);
 
     // Verify header
-    let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+    let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .unwrap();
     let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
     assert_eq!(header["alg"], "RS256");
     assert_eq!(header["typ"], "JWT");
 
     // Verify claims
-    let claims_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+    let claims_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .unwrap();
     let claims: serde_json::Value = serde_json::from_slice(&claims_bytes).unwrap();
     assert_eq!(claims["iss"], creds.client_email);
     assert_eq!(claims["aud"], creds.token_uri);
     assert_eq!(claims["iat"], now);
     assert_eq!(claims["exp"], now + JWT_EXPIRY_SECS);
-    assert!(claims["scope"].as_str().unwrap().contains("https://www.googleapis.com/auth/compute"));
+    assert!(claims["scope"]
+        .as_str()
+        .unwrap()
+        .contains("https://www.googleapis.com/auth/compute"));
 }
 
 #[tokio::test]
@@ -90,12 +100,16 @@ async fn test_token_exchange_and_zero_kv_operations() {
     let now = 1700000000;
 
     // First call: cache miss, exchanges assertion for access token
-    let token1 = get_cached_or_fresh_gcp_token(&transport, &creds, now).await.unwrap();
+    let token1 = get_cached_or_fresh_gcp_token(&transport, &creds, now)
+        .await
+        .unwrap();
     assert_eq!(token1, "ya29.mock-token-xyz");
     assert_eq!(transport.calls.lock().unwrap().len(), 1);
 
     // Second call 10 seconds later: cache hit in Wasm isolate memory (0 network calls, 0 KV ops)
-    let token2 = get_cached_or_fresh_gcp_token(&transport, &creds, now + 10).await.unwrap();
+    let token2 = get_cached_or_fresh_gcp_token(&transport, &creds, now + 10)
+        .await
+        .unwrap();
     assert_eq!(token2, token1);
     assert_eq!(transport.calls.lock().unwrap().len(), 1); // No new network call!
 }
@@ -107,23 +121,34 @@ async fn test_cache_expiration_at_55_minutes() {
     let transport = MockGcpHttpTransport::new();
     let now = 1700000000;
 
-    let token1 = get_cached_or_fresh_gcp_token(&transport, &creds, now).await.unwrap();
+    let token1 = get_cached_or_fresh_gcp_token(&transport, &creds, now)
+        .await
+        .unwrap();
     assert_eq!(token1, "ya29.mock-token-xyz");
 
     // Advance by 3299 seconds (< 3300s TTL) -> Still cached
-    let token2 = get_cached_or_fresh_gcp_token(&transport, &creds, now + 3299).await.unwrap();
+    let token2 = get_cached_or_fresh_gcp_token(&transport, &creds, now + 3299)
+        .await
+        .unwrap();
     assert_eq!(token2, token1);
     assert_eq!(transport.calls.lock().unwrap().len(), 1);
 
     // Advance by 3301 seconds (>= 3300s TTL) -> Cache expired, new network call
-    let token3 = get_cached_or_fresh_gcp_token(&transport, &creds, now + 3301).await.unwrap();
+    let token3 = get_cached_or_fresh_gcp_token(&transport, &creds, now + 3301)
+        .await
+        .unwrap();
     assert_eq!(token3, token1);
     assert_eq!(transport.calls.lock().unwrap().len(), 2);
 }
 
 #[test]
 fn test_spot_runner_vm_request_builder_permitted_machine_types() {
-    let permitted = ["c4d-highcpu-16", "n4d-highcpu-16", "n4-highcpu-16", "c2d-highcpu-16"];
+    let permitted = [
+        "c4d-highcpu-16",
+        "n4d-highcpu-16",
+        "n4-highcpu-16",
+        "c2d-highcpu-16",
+    ];
     for mt in permitted {
         let cfg = RunnerVmConfig {
             instance_name: "test-vm-1",
@@ -142,7 +167,10 @@ fn test_spot_runner_vm_request_builder_permitted_machine_types() {
         };
         let req = build_spot_runner_vm_request("test-proj", &cfg).unwrap();
         assert_eq!(req.name, "test-vm-1");
-        assert_eq!(req.machine_type, format!("zones/us-central1-a/machineTypes/{}", mt));
+        assert_eq!(
+            req.machine_type,
+            format!("zones/us-central1-a/machineTypes/{}", mt)
+        );
         assert_eq!(req.scheduling.provisioning_model, "SPOT");
         assert_eq!(req.scheduling.instance_termination_action, "DELETE");
 
@@ -153,7 +181,12 @@ fn test_spot_runner_vm_request_builder_permitted_machine_types() {
     }
 
     // Shapes under 16 vCPU or not in permitted list must be rejected
-    let invalid_shapes = ["n2-standard-4", "e2-medium", "c4d-highcpu-8", "custom-8-32768"];
+    let invalid_shapes = [
+        "n2-standard-4",
+        "e2-medium",
+        "c4d-highcpu-8",
+        "custom-8-32768",
+    ];
     for invalid in invalid_shapes {
         let cfg = RunnerVmConfig {
             instance_name: "test-vm-invalid",
@@ -200,7 +233,12 @@ fn test_golden_boot_disk_resolution() {
     };
     let req1 = build_spot_runner_vm_request("my-proj", &cfg1).unwrap();
     assert_eq!(
-        req1.disks[0].initialize_params.as_ref().unwrap().source_image.as_deref(),
+        req1.disks[0]
+            .initialize_params
+            .as_ref()
+            .unwrap()
+            .source_image
+            .as_deref(),
         Some("projects/my-proj/global/images/my-custom-image-v1")
     );
 
@@ -222,7 +260,12 @@ fn test_golden_boot_disk_resolution() {
     };
     let req2 = build_spot_runner_vm_request("my-proj", &cfg2).unwrap();
     assert_eq!(
-        req2.disks[0].initialize_params.as_ref().unwrap().source_image.as_deref(),
+        req2.disks[0]
+            .initialize_params
+            .as_ref()
+            .unwrap()
+            .source_image
+            .as_deref(),
         Some("projects/my-proj/global/images/family/debian-13-fastboot")
     );
 
@@ -244,7 +287,12 @@ fn test_golden_boot_disk_resolution() {
     };
     let req3 = build_spot_runner_vm_request("my-proj", &cfg3).unwrap();
     assert_eq!(
-        req3.disks[0].initialize_params.as_ref().unwrap().source_image.as_deref(),
+        req3.disks[0]
+            .initialize_params
+            .as_ref()
+            .unwrap()
+            .source_image
+            .as_deref(),
         Some(DEBIAN_13_IMAGE_FAMILY)
     );
 }
@@ -274,13 +322,20 @@ async fn test_instances_insert_with_source_instance_template() {
     let req = build_spot_runner_vm_request("homelab-424523", &cfg).unwrap();
 
     // 1. Insert with sourceInstanceTemplate
-    client.insert_instance("us-central1-a", &req, Some("c4d-template-v1"), now).await.unwrap();
+    client
+        .insert_instance("us-central1-a", &req, Some("c4d-template-v1"), now)
+        .await
+        .unwrap();
 
     let calls = transport.calls.lock().unwrap();
     let last_call = calls.last().unwrap();
     assert_eq!(last_call.0, "POST");
-    assert!(last_call.1.contains("/zones/us-central1-a/instances?sourceInstanceTemplate="));
-    assert!(last_call.1.contains("projects%2Fhomelab-424523%2Fglobal%2FinstanceTemplates%2Fc4d-template-v1"));
+    assert!(last_call
+        .1
+        .contains("/zones/us-central1-a/instances?sourceInstanceTemplate="));
+    assert!(last_call
+        .1
+        .contains("projects%2Fhomelab-424523%2Fglobal%2FinstanceTemplates%2Fc4d-template-v1"));
 }
 
 #[tokio::test]
@@ -290,12 +345,17 @@ async fn test_instances_delete_includes_delete_disk_all() {
     let client = GceComputeClient::new(creds, "homelab-424523".to_string(), transport.clone());
     let now = 1700000000;
 
-    client.delete_instance("us-central1-a", "oxidex-runners-us-central1-a-old", now).await.unwrap();
+    client
+        .delete_instance("us-central1-a", "oxidex-runners-us-central1-a-old", now)
+        .await
+        .unwrap();
 
     let calls = transport.calls.lock().unwrap();
     let last_call = calls.last().unwrap();
     assert_eq!(last_call.0, "DELETE");
-    assert!(last_call.1.ends_with("/zones/us-central1-a/instances/oxidex-runners-us-central1-a-old?deleteDisk=ALL"));
+    assert!(last_call.1.ends_with(
+        "/zones/us-central1-a/instances/oxidex-runners-us-central1-a-old?deleteDisk=ALL"
+    ));
 }
 
 #[tokio::test]
@@ -308,18 +368,37 @@ async fn test_instances_scrub_startup_script() {
     let metadata = GceMetadata {
         fingerprint: Some("fingerprint-xyz123".to_string()),
         items: vec![
-            GceMetadataItem { key: "startup-script".to_string(), value: "sensitive-token-12345".to_string() },
-            GceMetadataItem { key: "spot-target".to_string(), value: "swack-tools".to_string() },
-            GceMetadataItem { key: "runner_1_jitconfig".to_string(), value: "jit-base64".to_string() },
+            GceMetadataItem {
+                key: "startup-script".to_string(),
+                value: "sensitive-token-12345".to_string(),
+            },
+            GceMetadataItem {
+                key: "spot-target".to_string(),
+                value: "swack-tools".to_string(),
+            },
+            GceMetadataItem {
+                key: "runner_1_jitconfig".to_string(),
+                value: "jit-base64".to_string(),
+            },
         ],
     };
 
-    client.scrub_startup_script("us-central1-a", "oxidex-runners-us-central1-a-1", &metadata, now).await.unwrap();
+    client
+        .scrub_startup_script(
+            "us-central1-a",
+            "oxidex-runners-us-central1-a-1",
+            &metadata,
+            now,
+        )
+        .await
+        .unwrap();
 
     let calls = transport.calls.lock().unwrap();
     let last_call = calls.last().unwrap();
     assert_eq!(last_call.0, "POST");
-    assert!(last_call.1.ends_with("/zones/us-central1-a/instances/oxidex-runners-us-central1-a-1/setMetadata"));
+    assert!(last_call
+        .1
+        .ends_with("/zones/us-central1-a/instances/oxidex-runners-us-central1-a-1/setMetadata"));
 
     let body_bytes = last_call.2.as_ref().unwrap();
     let scrubbed: GceMetadata = serde_json::from_slice(body_bytes).unwrap();

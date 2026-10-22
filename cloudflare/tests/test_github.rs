@@ -1,10 +1,12 @@
 //! Test Suite for GitHub Actions REST API Client & Startup Script Rendering.
 
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 use spot_dashboard_edge::github::*;
+use spot_dashboard_edge::patch::{
+    ContainerPatch, HostPatch, PatchFileSpec, PatchMountSpec, RunnerPatch,
+};
 use spot_dashboard_edge::patch_console::GitHubTransport;
-use spot_dashboard_edge::patch::{RunnerPatch, HostPatch, ContainerPatch, PatchMountSpec, PatchFileSpec};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Custom mock transport to simulate specific status codes for JIT and registration endpoints.
 #[derive(Clone, Default)]
@@ -20,7 +22,10 @@ impl CustomMockGitHubTransport {
 
     fn set_response(&self, path_substring: &str, status: u16, body: serde_json::Value) {
         let bytes = serde_json::to_vec(&body).unwrap();
-        self.responses.lock().unwrap().insert(path_substring.to_string(), (status, bytes));
+        self.responses
+            .lock()
+            .unwrap()
+            .insert(path_substring.to_string(), (status, bytes));
     }
 }
 
@@ -33,10 +38,17 @@ impl GitHubTransport for CustomMockGitHubTransport {
         _headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<(u16, Vec<u8>), String> {
-        self.calls.lock().unwrap().push((method.to_string(), path.to_string(), body.map(|b| b.to_vec())));
+        self.calls.lock().unwrap().push((
+            method.to_string(),
+            path.to_string(),
+            body.map(|b| b.to_vec()),
+        ));
 
         let resps = self.responses.lock().unwrap();
-        let mut matches: Vec<_> = resps.iter().filter(|(pat, _)| path.contains(*pat)).collect();
+        let mut matches: Vec<_> = resps
+            .iter()
+            .filter(|(pat, _)| path.contains(*pat))
+            .collect();
         matches.sort_by_key(|(pat, _)| std::cmp::Reverse(pat.len()));
 
         if let Some((_, (status, resp_bytes))) = matches.first() {
@@ -73,30 +85,45 @@ impl GitHubTransport for CustomMockGitHubTransport {
 #[tokio::test]
 async fn test_2_slot_jitconfig_generation() {
     let transport = Arc::new(CustomMockGitHubTransport::new());
-    transport.set_response("generate-jitconfig", 201, serde_json::json!({
-        "runner": {
-            "id": 101,
-            "name": "runner-slot",
-            "status": "offline",
-            "busy": false,
-            "labels": []
-        },
-        "encoded_jit_config": "base64_jit_slot_payload"
-    }));
+    transport.set_response(
+        "generate-jitconfig",
+        201,
+        serde_json::json!({
+            "runner": {
+                "id": 101,
+                "name": "runner-slot",
+                "status": "offline",
+                "busy": false,
+                "labels": []
+            },
+            "encoded_jit_config": "base64_jit_slot_payload"
+        }),
+    );
 
     let client = GitHubActionsClient::new("fake_pat_token".to_string(), transport.clone());
-    let labels = vec!["self-hosted".to_string(), "Linux".to_string(), "X64".to_string(), "spot".to_string()];
+    let labels = vec![
+        "self-hosted".to_string(),
+        "Linux".to_string(),
+        "X64".to_string(),
+        "spot".to_string(),
+    ];
 
-    let result = client.mint_2slot_runner_configs(
-        "orgs/swack-tools",
-        "oxidex-runners-us-central1-a-test",
-        "swack",
-        10,
-        &labels,
-    ).await.unwrap();
+    let result = client
+        .mint_2slot_runner_configs(
+            "orgs/swack-tools",
+            "oxidex-runners-us-central1-a-test",
+            "swack",
+            10,
+            &labels,
+        )
+        .await
+        .unwrap();
 
     match result {
-        RunnerBootstrapConfig::JitConfig { runner_1_jitconfig, runner_2_jitconfig } => {
+        RunnerBootstrapConfig::JitConfig {
+            runner_1_jitconfig,
+            runner_2_jitconfig,
+        } => {
             assert_eq!(runner_1_jitconfig, "base64_jit_slot_payload");
             assert_eq!(runner_2_jitconfig, "base64_jit_slot_payload");
         }
@@ -118,25 +145,36 @@ async fn test_2_slot_jitconfig_generation() {
 async fn test_jitconfig_failure_falls_back_to_registration_token() {
     let transport = Arc::new(CustomMockGitHubTransport::new());
     // Simulate 404 Not Found (e.g. endpoint not supported on repo or organization)
-    transport.set_response("generate-jitconfig", 404, serde_json::json!({
-        "message": "Not Found",
-        "documentation_url": "https://docs.github.com/rest"
-    }));
-    transport.set_response("registration-token", 201, serde_json::json!({
-        "token": "fallback-registration-token-abc",
-        "expires_at": "2026-10-22T02:00:00Z"
-    }));
+    transport.set_response(
+        "generate-jitconfig",
+        404,
+        serde_json::json!({
+            "message": "Not Found",
+            "documentation_url": "https://docs.github.com/rest"
+        }),
+    );
+    transport.set_response(
+        "registration-token",
+        201,
+        serde_json::json!({
+            "token": "fallback-registration-token-abc",
+            "expires_at": "2026-10-22T02:00:00Z"
+        }),
+    );
 
     let client = GitHubActionsClient::new("fake_pat_token".to_string(), transport.clone());
     let labels = vec!["self-hosted".to_string()];
 
-    let result = client.mint_2slot_runner_configs(
-        "repos/xbmc4lyfe/newznab-tmux",
-        "oxidex-runners-us-central1-a-fallback",
-        "xbmc",
-        1,
-        &labels,
-    ).await.unwrap();
+    let result = client
+        .mint_2slot_runner_configs(
+            "repos/xbmc4lyfe/newznab-tmux",
+            "oxidex-runners-us-central1-a-fallback",
+            "xbmc",
+            1,
+            &labels,
+        )
+        .await
+        .unwrap();
 
     match result {
         RunnerBootstrapConfig::RegistrationToken { token } => {
@@ -218,8 +256,16 @@ async fn test_list_runners_pagination_and_deduplication() {
 async fn test_delete_runner_safe_handling() {
     let transport = Arc::new(CustomMockGitHubTransport::new());
     transport.set_response("actions/runners/101", 204, serde_json::json!({}));
-    transport.set_response("actions/runners/102", 404, serde_json::json!({"message": "Not Found"}));
-    transport.set_response("actions/runners/103", 500, serde_json::json!({"message": "Server Error"}));
+    transport.set_response(
+        "actions/runners/102",
+        404,
+        serde_json::json!({"message": "Not Found"}),
+    );
+    transport.set_response(
+        "actions/runners/103",
+        500,
+        serde_json::json!({"message": "Server Error"}),
+    );
 
     let client = GitHubActionsClient::new("fake_token".to_string(), transport);
 
@@ -230,7 +276,10 @@ async fn test_delete_runner_safe_handling() {
     assert!(client.delete_runner("orgs/swack-tools", 102).await.is_ok());
 
     // 500 Server Error -> Err
-    let err = client.delete_runner("orgs/swack-tools", 103).await.unwrap_err();
+    let err = client
+        .delete_runner("orgs/swack-tools", 103)
+        .await
+        .unwrap_err();
     match err {
         GitHubError::Api { status, .. } => assert_eq!(status, 500),
         _ => panic!("Expected Api error"),
@@ -273,7 +322,10 @@ async fn test_count_queued_jobs_backlog() {
     transport.set_response("runs/1002/jobs", 200, jobs_1002);
 
     let client = GitHubActionsClient::new("fake_token".to_string(), transport);
-    let queued = client.count_queued_jobs_for_repo("swack-tools", "oxidex").await.unwrap();
+    let queued = client
+        .count_queued_jobs_for_repo("swack-tools", "oxidex")
+        .await
+        .unwrap();
 
     // 2 (run 1001: queued + waiting) + 1 (run 1002: pending) = 3
     assert_eq!(queued, 3);
@@ -301,10 +353,17 @@ fn test_render_startup_script_31_placeholders() {
     let script = render_startup_script(&params, None).unwrap();
 
     // Invariant: 0 unexpanded placeholder tokens
-    assert!(!script.contains("{{"), "Found unexpanded placeholder in script");
+    assert!(
+        !script.contains("{{"),
+        "Found unexpanded placeholder in script"
+    );
 
     // Invariant: strict size budget under 256 KiB
-    assert!(script.len() < 256 * 1024, "Script length {} exceeds 256 KiB", script.len());
+    assert!(
+        script.len() < 256 * 1024,
+        "Script length {} exceeds 256 KiB",
+        script.len()
+    );
 
     // Invariant: concrete substitutions
     assert!(script.contains("DEVICE=\"/dev/disk/by-id/google-oxidex-runners-us-central1-a-test\""));
