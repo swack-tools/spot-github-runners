@@ -5,7 +5,7 @@ A runner patch is a declarative customization of the runner hosts and runner con
 This page covers the manifest, how the tools classify a change, the receipts that prove a patch, GitHub label sync, and the operator procedures. For the dashboard console that edits manifests, see [Dashboard](dashboard.md) and [Runner patches in the edge dashboard reference](edge-dashboard.md#runner-patches).
 
 !!! warning "Operator procedures change live resources"
-    The commands on this page create, patch, or replace Compute Engine virtual machines (VMs) and relabel GitHub runners. A request to edit code or documentation doesn't authorize any of them. Run each one only when you intend the live change, and complete the preview step first.
+    The commands on this page create, patch, or replace Compute Engine virtual machines (VMs) and relabel GitHub runners. A request to edit code or documentation does not authorize any of them. Run each one only when you intend the live change, and complete the preview step first.
 
 ## Where manifests live
 
@@ -24,14 +24,14 @@ The `--patch-file PATH` option loads one local file instead. It skips `defaults.
 
 ### Supported formats
 
-The loader accepts JSON (text that starts with `{`), TOML, and a restricted YAML subset. A parser in the Python standard library reads the YAML subset, so no third-party package affects the result. The subset supports nested mappings, lists, `|` and `|-` block scalars, flow lists such as `[a, b]`, flow mappings, quoted strings, and comments. Anchors aren't supported. A `>` folded scalar isn't supported either, and it parses without an error as the literal text `>`, so use `|` or `|-` for multi-line text.
+The pure-Rust loader (`cloudflare/src/patch.rs`) parses JSON and YAML manifests. The parser supports nested mappings, lists, block scalars, flow lists such as `[a, b]`, flow mappings, quoted strings, and comments. Anchors are not supported. A `>` folded scalar is not supported either, so use `|` or `|-` for multi-line text.
 
 ## Manifest schema
 
 All keys are optional except where noted. A missing `schema` defaults to `spot-runner-patch-v1`, and any other value is an error.
 
 !!! note "Unknown keys"
-    The dashboard rejects unknown top-level keys and unknown keys inside a section, so a typo shows up as a field error. The loader that `spot_runner_manager.py` uses ignores unknown keys silently. Validate a manifest in the dashboard before you rely on it.
+    The Runner Patch Console strictly rejects unknown top-level keys and unknown keys inside a section, so a typo shows up as a field error. Validate a manifest in the dashboard before you merge it.
 
 ### Top-level keys
 
@@ -245,69 +245,57 @@ Before a live patch changes anything, it checks everything that label sync needs
 
 ## Apply a patch
 
-Commit the manifest to the configuration repository first. In the dashboard, you save a manifest as a pull request, and you review and merge it like any other change. The tools read the default branch, so an unmerged manifest has no effect.
+To apply a patch, commit the manifest to the configuration repository (`swack-tools/spot-runners-config`). Operators author, validate, and preview manifests in the Runner Patch Console on the edge dashboard or through its REST APIs. Saving a manifest opens a pull request on the configuration repository. After review and merge into the default branch (`main`), the autonomous Cloudflare Worker fleet reconciler (`cloudflare/src/reconciler.rs`) provisions replacement Spot instances or rotates running hosts according to the merged manifest.
 
-### Provision with a patch
+### Validate and preview with the patch console
 
-Add `--patch-repo OWNER/REPO` (or `--patch-file`) to `src/spot_runner_manager.py`. Without `--apply`, the manager resolves and validates the patch, checks the `--cpu` and `--ram` values against `hardware.min_vcpu` and `hardware.min_ram_gib`, checks price and capacity, logs the plan, and creates nothing. Run that preview first:
+Before applying any change, validate the manifest syntax and preview its classification against the running fleet. You can perform these checks in the dashboard Web UI or by calling the edge endpoints:
 
-```bash
-PYTHONPATH=src python3 -B src/spot_runner_manager.py \
-  --project <project> --max-cost <usd-per-hour> \
-  --instance-type <machine-type> --cpu <vcpus> --ram <gib> \
-  --patch-repo OWNER/REPO
-```
-
-When the plan is correct, add `--apply` to the same command. The manager renders the patch into the startup script, the runner image, and the container flags, writes the pending metadata, waits for the bootstrap, syncs labels, and records the applied metadata. The `src/spot_runner_manager.py --help` output lists the remaining options.
-
-### Hot-patch a running host
-
-`--patch-live` applies a patch to a running VM and its runner containers. The command has no preview mode and doesn't need `--apply`: it acts as soon as the checks pass. Preview the effect first in the dashboard, which classifies every recorded host for a repository and changes no host. With a hot-patch executor, the preview reads each host's receipt over `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or to your OS Login profile. See [Preview and hot-patch](dashboard.md#the-patch-console).
-
-You must pass the same deployment values that the host was provisioned with, because the live patch derives the runner names, labels, and runner group from them. The values include `--instance-name`, `--instance-type`, `--region`, `--zone`, `--runner-prefix`, `--runner-count`, `--runner-label`, `--target`, and `--runner-group-id`.
-
-The manager also selects the host's sizing before it applies the patch, so replay the sizing mode the host was provisioned with, whichever applies:
-
-- For a tier host, pass `--tier`, and add `--tier-slots`, `--tier-job-memory-gib`, and `--host-overhead-gib` when you changed them from their defaults.
-- For fixed sizing, pass `--fixed-runner-sizing` with `--runner-cpu`, `--runner-memory-gb`, and `--runner-count`.
-- For a strict heavy pool, pass `--heavy-runner-pool` with the same pool size (`2` or `3`).
-
-A mismatch with the observed VM, such as a different `--instance-type`, is refused.
+1. **Manifest validation (`POST /api/patch-console/validate`):** the endpoint verifies the schema version (`spot-runner-patch-v1`), parses YAML or JSON syntax, checks hardware sizing floors (at least 16 vCPUs, 32 GiB host RAM, 2 runners at 7 vCPUs and 14 GiB RAM each, 4 GiB host overhead, and `queued_jobs_threshold >= 20`), and verifies that container mounts do not expose forbidden paths such as `/var/run/docker.sock` or `/var/lib/gha-admission`. It returns the canonical SHA-256 digest:
 
 ```bash
-PYTHONPATH=src python3 -B src/spot_runner_manager.py \
-  --project <project> --max-cost <usd-per-hour> \
-  --instance-name <vm-name> --instance-type <machine-type> \
-  --region <region> --zone <zone> --cpu <vcpus> --ram <gib> \
-  --runner-prefix <prefix> --runner-count <count> --runner-label <label> \
-  --target <org-or-owner/repo> --runner-group-id <group-id> \
-  --patch-repo OWNER/REPO --patch-live
+curl -X POST https://spot.swacktech.com/api/patch-console/validate \
+  -H "Content-Type: application/json" \
+  -H "Cookie: __Host-spot_session=<session-cookie>" \
+  -d '{"content": "schema: spot-runner-patch-v1\nrepository: swack-tools/oxidex\nhardware:\n  min_vcpu: 16\n  min_ram_gib: 32\n  runners_count: 2\n  runner_vcpu: 7\n  runner_ram_gib: 14\n  host_overhead_gib: 4\n  queued_jobs_threshold: 20\n"}'
 ```
 
-The example doesn't include a sizing mode. Add the `--tier`, `--fixed-runner-sizing`, or `--heavy-runner-pool` flags that match your host. A strict heavy pool also replaces `--runner-count` and `--runner-label` with its own values.
+2. **Rollout classification preview (`POST /api/patch-console/preview`):** the preview endpoint compares the target manifest against running hosts and classifies required actions:
+   - `noop`: the host already runs the target patch (SHA-256 digests match).
+   - `hot_patch`: the changes only add packages, files, or non-destructive sysctl settings that apply in place.
+   - `recreate_containers`: only container mounts differ, requiring container re-creation.
+   - `replace_vm`: the change modifies the architecture, drops packages or files, alters startup scripts, or requires a different machine type.
 
-The command refuses, and changes no VM, metadata, or GitHub label, in these cases. The receipt check and the later checks run after a receipt read over `gcloud compute ssh`, which can add your SSH key to project or instance metadata, or to your OS Login profile:
+### Submit changes through the pull request workflow
 
-- The VM isn't running, or its machine type differs from `--instance-type`.
-- The observed host violates a hardware constraint, or a constraint can't be verified.
-- The host's receipt is unreadable, or the classification is `replace_vm` or `recreate_containers`.
-- Label sync can't run because the runner group, a strict pool, or a listed runner is missing.
+Saving a patch creates a pull request on the configuration repository (`swack-tools/spot-runners-config`) using `POST /api/patch-console/save`:
 
-When all checks pass, the manager writes the pending metadata, runs the live script over SSH, requires `LIVE_PATCH_APPLIED:<sha256>` in the output, syncs labels, and then records the applied metadata and clears the pending keys. For a host that is already at the patch, the command syncs labels and records the patch without running the live script.
+```bash
+curl -X POST https://spot.swacktech.com/api/patch-console/save \
+  -H "Content-Type: application/json" \
+  -H "Cookie: __Host-spot_session=<session-cookie>" \
+  -H "Idempotency-Key: patch-oxidex-20261022" \
+  -d '{"path": "repos/swack-tools/oxidex.yaml", "manifest": {"schema": "spot-runner-patch-v1", "repository": "swack-tools/oxidex", "hardware": {"min_vcpu": 16, "min_ram_gib": 32, "runners_count": 2, "runner_vcpu": 7, "runner_ram_gib": 14, "host_overhead_gib": 4, "queued_jobs_threshold": 20}}}'
+```
 
-### Keep the autoscaler consistent
+The pull request workflow enforces configuration safety:
 
-The autoscaler launches replacement hosts through `spot_runner_manager.py`. Pass `--patch-repo OWNER/REPO` (and `--config-repo` when you don't use the default) to `src/spot_runner_autoscaler.py`, so that every host it launches gets the same verified patch. The option is required to rotate any host that runs a patch.
+- **Dedicated branch creation:** the Worker generates a unique branch named `spot-dashboard/<target-slug>-<digest-prefix>` from the default branch head.
+- **Atomic commit:** the Worker commits the canonical JSON representation of the manifest to the manifest path (`defaults.yaml` or `repos/<owner>/<repo>.yaml`).
+- **Pull request creation:** the Worker opens a pull request targeting `main` with the manifest digest and description. The Worker rejects direct commits to `main`.
+- **Idempotency protection:** repeated submissions with the same `Idempotency-Key` return the existing pull request without creating duplicate branches.
 
-A controller holds a rotation, and keeps the running host over the price cap, when the host runs a patch and either of these is true:
+### Automated fleet reconciliation and provisioning
 
-- The controller has no `--patch-repo`.
-- The host's recorded `spot-runner-patch-target` names a different repository than the controller's `--patch-repo`.
+After operators review and merge the pull request into the default branch (`main`), the Cloudflare Worker reconciler (`cloudflare/src/reconciler.rs`) automates fleet updates on its 5-minute scheduled cron cadence (`#[event(scheduled)]`):
 
-A host counts as patched when its applied or pending digest is recorded and isn't `none`. Both the make-before-break rotation and the delete-first price eviction skip a held host and log a warning. For the rest of the autoscaler, see [Fleet and autoscaler](fleet-and-autoscaler.md).
-
-!!! note "The LaunchAgent copies the option"
-    Installing the macOS LaunchAgent with `--install-launch-agent` copies `--patch-repo` and `--config-repo` into the agent's arguments. Installing also writes and bootstraps the live daemon, so treat it as a live change.
+1. **Manifest synchronization:** on each tick, the reconciler reads merged manifests from `swack-tools/spot-runners-config`.
+2. **Floor maintenance:** for each controlled target in `SPOT_RUNNER_FLOOR_TARGETS`, the reconciler ensures at least one 16-vCPU Spot runner host is active. If no host exists or an existing host requires replacement, the reconciler provisions a new Spot VM.
+3. **Template rendering and JIT configuration:** the reconciler renders `cloud-init/startup.sh` with the merged patch manifest, requests 2-slot Just-In-Time (JIT) credentials from GitHub Actions (`POST /orgs/{org}/actions/runners/generate-jitconfig`), and records the canonical `spot-runner-patch-sha256` digest in instance metadata.
+4. **Demand-driven autoscaling:** if GitHub Actions reports a backlog of 20 or more queued jobs (`queued_jobs >= 20`), the reconciler provisions additional Spot runner hosts up to the configured fleet limit.
+5. **Label reconciliation:** the reconciler automatically synchronizes GitHub Actions runner labels to match the instance type, region, instruction set architecture flags, and extra labels defined in the manifest.
+6. **Preemption and stale cleanup:** the reconciler removes terminated Spot instances along with their attached disks, and deletes offline runner registrations.
+7. **Diff-gated state durability:** the reconciler computes a SHA-256 state fingerprint and skips writing to `SPOT_KV` on unchanged ticks, keeping write operations below 50 writes per day.
 
 ## Example: 16 vCPU and 32 GiB baseline with 2 runners
 
@@ -373,8 +361,7 @@ container:
 
 | Topic | Source |
 | --- | --- |
-| Schema, merge, classification, receipts | [`src/lib/runner_patch.py`](https://github.com/swack-tools/spot-github-runners/blob/main/src/lib/runner_patch.py) |
-| Label sync, metadata, `--patch-*` options, live apply | [`src/lib/runner_manager.py`](https://github.com/swack-tools/spot-github-runners/blob/main/src/lib/runner_manager.py) |
-| Metadata key names | [`src/lib/runner_fleet.py`](https://github.com/swack-tools/spot-github-runners/blob/main/src/lib/runner_fleet.py) |
-| Rotation hold, option pass-through | [`src/lib/spot_runner_autoscaler.py`](https://github.com/swack-tools/spot-github-runners/blob/main/src/lib/spot_runner_autoscaler.py) |
-| Dashboard classification, validation, hot-patch gates | [`src/lib/patch_console.py`](https://github.com/swack-tools/spot-github-runners/blob/main/src/lib/patch_console.py) |
+| Schema validation, merge, and classification | [`cloudflare/src/patch.rs`](https://github.com/swack-tools/spot-github-runners/blob/main/cloudflare/src/patch.rs) |
+| Manifest parsing and validation | [`cloudflare/src/patch.rs`](https://github.com/swack-tools/spot-github-runners/blob/main/cloudflare/src/patch.rs) |
+| Patch console API and pull request generation | [`cloudflare/src/patch_console.rs`](https://github.com/swack-tools/spot-github-runners/blob/main/cloudflare/src/patch_console.rs) |
+| Edge reconciliation and deployment | [`cloudflare/src/reconciler.rs`](https://github.com/swack-tools/spot-github-runners/blob/main/cloudflare/src/reconciler.rs) |

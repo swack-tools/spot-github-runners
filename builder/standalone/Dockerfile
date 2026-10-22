@@ -2,15 +2,14 @@ FROM ubuntu:24.04
 ARG DEBIAN_FRONTEND=noninteractive
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential clang cmake curl git jq libssl-dev make pkg-config python3 python3-pip \
+      build-essential clang cmake curl git jq libssl-dev make pkg-config \
       perl cpanminus libarchive-zip-perl zlib1g-dev libzstd-dev libarchive-dev ca-certificates \
       unzip zip xz-utils zstd procps util-linux openssh-client gnupg \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1001 runner \
     && useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner
-RUN apt-get update && apt-get install -y --no-install-recommends rsync time python3-venv llvm \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3 -m venv /opt/uv && /opt/uv/bin/pip install --no-cache-dir uv
+RUN apt-get update && apt-get install -y --no-install-recommends rsync time llvm \
+    && rm -rf /var/lib/apt/lists/*
 # Official Node distribution checksum, resolved once and pinned in source.
 RUN curl --proto '=https' --tlsv1.2 -fsS \
       https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
@@ -33,10 +32,6 @@ RUN cd /opt/playwright \
     && rm -rf /var/lib/apt/lists/* /root/.npm \
     && test "$(node --version)" = 'v24.21.0' \
     && test "$(./node_modules/.bin/playwright --version)" = 'Version 1.63.0'
-ENV UV_PYTHON_INSTALL_DIR=/opt/python
-RUN /opt/uv/bin/uv python install 3.11 \
-    && mkdir -p /opt/build-tools \
-    && ln -s "$(/opt/uv/bin/uv python find 3.11)" /opt/build-tools/python3
 # Primary release checksums: https://ziglang.org/download/index.json and
 # https://index.crates.io/ca/rg/cargo-zigbuild. Verify both archives before use.
 # Zig supplies target musl headers/libraries and compiles zip's C-backed codecs;
@@ -95,15 +90,21 @@ RUN install -d -m 0755 /opt/opensourceDarwinStubs/CoreFoundation.framework \
       'OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN' \
       'THE SOFTWARE.' > /opt/opensourceDarwinStubs/NOTICE \
     && chmod 0444 /opt/opensourceDarwinStubs/CoreFoundation.framework/CoreFoundation.tbd /opt/opensourceDarwinStubs/NOTICE
-COPY standalone-entrypoint.py /usr/local/bin/oxidex-build-entrypoint
-COPY worktree_commands.py /usr/local/bin/oxidex-worktree-commands
-COPY toolchain_probe.py /usr/local/bin/oxidex-toolchain-probe
-RUN chmod 0755 /usr/local/bin/oxidex-build-entrypoint \
-      /usr/local/bin/oxidex-worktree-commands /usr/local/bin/oxidex-toolchain-probe \
+COPY host-agent /usr/local/bin/host-agent
+RUN chmod 0755 /usr/local/bin/host-agent \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-build-entrypoint \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/builder-entrypoint \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-worktree-commands \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/worktree-commands \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-toolchain-probe \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/toolchain-probe \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/docker-admission \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/host-launcher \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-remote-build \
     && install -m 0444 /dev/null /run/oxidex-build-container
 USER runner
 ENV RUSTUP_HOME=/home/runner/.rustup
-ENV PATH=/home/runner/.cargo/bin:/opt/node/bin:/opt/build-tools:/opt/uv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/home/runner/.cargo/bin:/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh \
     && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 \
     && rm /tmp/rustup-init.sh \
@@ -118,10 +119,9 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
     && test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.4' \
     && rustc -vV | grep -Fx 'commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4' \
     && rustc -vV && cargo -V && cargo nextest --version && cbindgen --version \
-    && just --version && uv --version && python3 --version \
+    && just --version \
     && /opt/zig/zig version && cargo-zigbuild --version && llvm-strip --version
 ENV CARGO_HOME=/cargo
 ENV CARGO_TARGET_DIR=/target
-ENV UV_CACHE_DIR=/cargo/uv-cache
 WORKDIR /src
-ENTRYPOINT ["/usr/bin/python3", "/usr/local/bin/oxidex-build-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/host-agent", "builder-entrypoint"]

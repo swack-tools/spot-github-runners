@@ -1,14 +1,22 @@
 # Spot runner fleet and dedicated builders
 
 Provision and operate persistent GitHub Actions runners and dedicated Rust build
-VMs on GCP (Google's cloud platform) Spot instances. The repository includes a
-price finder, a deployment manager, a fleet controller, remote build clients, and a
-web dashboard that runs on a small control VM behind a Cloudflare Worker.
+VMs on GCP (Google's cloud platform) Spot instances. The repository uses a pure-Rust
+serverless and host architecture:
 
-The controller manages runner capacity for a GitHub organization or repository.
-Dedicated builders are separate VMs with no GitHub runner registration. SSH
-terminates on the host; app builds run as an unprivileged user in a
-resource-limited Docker container with persistent Cargo and target caches.
+- **Edge control plane (`cloudflare/`)**: A pure-Rust Cloudflare Worker on
+  `https://spot.swacktech.com` backed by Cloudflare KV (`SPOT_KV`). It provides the
+  Web UI dashboard, OAuth 2.0 and session management, Runner Patch Console, and a
+  5-minute scheduled reconciler that manages Spot runner capacity and cleans up
+  preempted VMs.
+- **Host agent (`host-agent/`)**: A native multi-call binary for runner hosts and
+  dedicated builder VMs. It handles descriptor-safe workspace cleanup, memory lease
+  admission, Docker container isolation, and dedicated Rust 1.99.0 build execution.
+
+The edge reconciler manages runner capacity for configured GitHub organizations and
+repositories. Dedicated builders are separate VMs with no GitHub runner registration.
+SSH terminates on the host; app builds run as an unprivileged user (UID 1001)
+in a resource-limited Docker container with persistent Cargo and target caches.
 
 This guide describes the source on `main`. Merging source does not update a
 running controller, container, or VM. Inspect the deployed configuration and
@@ -29,7 +37,7 @@ Pages. You can also read the Markdown sources directly.
 | Scaling modes, runner floor, price rotation, drain, admission | [Fleet and autoscaler](docs/fleet-and-autoscaler.md) |
 | Patch manifests and hot patching | [Runner patches](docs/runner-patches.md) |
 | Sign-in, administrators, patch console | [Dashboard](docs/dashboard.md) |
-| Worker, tunnels, KV, control VM, free-tier VM | [Edge hosting and control VM](docs/edge-dashboard.md) |
+| Cloudflare Worker, KV state, reconciler, auth | [Edge dashboard and reconciler](docs/edge-dashboard.md) |
 | Dedicated Rust builders | [Set up a builder](docs/dedicated-builders.md), [Remote builds and clients](docs/remote-builds.md), and [Runtime updates](docs/builder-runtime-updates.md) |
 | Local ARM64 Docker runners | [Local Docker runners](docs/local-arm64-runners.md) |
 | Every environment variable | [Configuration](docs/configuration.md) |
@@ -38,21 +46,21 @@ Pages. You can also read the Markdown sources directly.
 | Trust boundaries and secrets | [Security model](docs/security.md) |
 | Tests, Vale, and the review workflow | [Development](docs/development.md) |
 
-## Choose a workflow
+## Repository components and entry points
 
-| Goal | Entry point | Creates or changes resources? |
-| --- | --- | --- |
-| List Spot compute prices by minimum CPU, RAM, and daily cap | `tools/spot_prices.py` | No |
-| Find candidate Spot offers with deployment constraints | `src/spot_finder.py` | No |
-| Inspect runners and VMs | `src/runner_fleet.py` | No |
-| Preview or provision runner hosts | `src/spot_runner_manager.py` | Only with `--apply`, or `--patch-live` (which changes a running host without a preview) |
-| Plan or manage runner capacity | `src/spot_runner_autoscaler.py` | Yes, except a tiered `--dry-run` without `--install-launch-agent` |
-| Render a dedicated builder launch | `src/render_builder_startup.py` | Writes local files; the generated launch command creates a VM |
-| Build on an explicitly selected legacy host | `src/remote_rust_build.py` | Transfers source and starts a remote build |
-| Install Cargo client commands | `src/install_remote_commands.py` | Writes local executable shims |
-| Run the Web UI control plane and telemetry dashboard | `src/web_dashboard.py` | Updates the local dashboard state file. With `SPOT_CONFIG_GH_TOKEN` or `GH_TOKEN` set, `POST /api/patches/save` creates a branch, commits, and opens a pull request on the config repository. With `DASHBOARD_HOT_PATCH_EXECUTOR=gcloud`, `/api/patches/hot-patch` changes running hosts. |
-| Update an occupied dedicated builder in place | `src/lib/builder_runtime_update.py` | Only with `--apply`, `--finish`, `--recover-finish`, or `--recover-committed` |
-| Inspect, plan, or manage the Spot control VM that hosts the dashboard | `src/control_vm.py` | Only with `--apply`; `render-startup` writes a local file |
+| Component | Entry point | Purpose | Mutates resources? |
+| --- | --- | --- | --- |
+| Edge Web UI and REST API | `cloudflare/src/lib.rs` (`#[event(fetch)]`) | Serve the edge dashboard, authenticate sessions via HMAC cookies, and expose read-only overview and scaling endpoints | No |
+| Scheduled edge reconciler | `cloudflare/src/lib.rs` (`#[event(scheduled)]`) | Run the 5-minute cron reconciler to maintain floor targets, scale up on queued backlog, clean up terminated VMs, and deregister stale runners | Yes (provisions or terminates Spot VMs when required) |
+| Runner Patch Console | `POST /api/patch-console/save` | Validate manifest changes and open pull requests against `swack-tools/spot-runners-config` | Creates Git branch and pull request |
+| Host target cleanup | `host-agent clean-target <path>` | Perform descriptor-relative Cargo `target/` cleanup using `unlinkat` while refusing symlink traversal | Modifies local workspace files only |
+| Host memory admission | `host-agent admission <subcommand>` | Run the host admission daemon (`serve`), acquire (`acquire`), release (`release`), or inspect headroom (`headroom`) for runner memory leases | Updates `/var/lib/gha-admission/leases.json` |
+| Runner Docker wrapper | `host-agent docker-wrapper` (or `docker` symlink) | Intercept runner network container launches, rewrite published ports to loopback, and manage `socat` relays | Local container networking only |
+| Builder Docker admission | `host-agent docker-admission` (or `docker` symlink) | Validate container arguments, enforce UID 1001:1001, 16 CPUs, and 28 GiB RAM, and reject `/var/run/docker.sock` mounts | Prevents unauthorized container options |
+| Dedicated builder launcher | `host-agent host-launcher` | Validate project name, configure permissions (`02770`), clean sources, and launch build container | Prepares builder host workspace |
+| Builder container entrypoint | `host-agent builder-entrypoint` | Verify Rust 1.99.0 toolchain commit hash, set up environment, and run compilation | Runs build commands inside container |
+| Worktree command runner | `host-agent worktree-commands` | Execute concurrent worktree builds and sample cgroup v2 metrics | Runs worktree build commands |
+| Toolchain verification probe | `host-agent toolchain-probe` | Probe toolchain binaries, root ownership, and cgroup resource limits | Read-only local system probe |
 
 Keep the distinction between registered listeners and active jobs. Twenty
 registered runners do not mean that twenty jobs can each use 32 GiB at once.
@@ -61,40 +69,41 @@ space for its operating system, services, and idle listeners.
 
 ## Quick start
 
-Install Python 3.11 or later, Git, `gcloud`, and `gh`. The Python entry points use
-the standard library only. Then run the read-only commands first:
+Install Rust 1.80 or later, Cargo, `worker-build`, Git, `gcloud`, and `gh`.
+Clone the repository and run the test suites:
 
 ```bash
 git clone https://github.com/swack-tools/spot-github-runners.git
 cd spot-github-runners
 
-python3 tools/spot_prices.py --min-cpu 4 --min-ram 8 \
-  --price-per-day 5 --list cheapest --results 20
+# Run host-agent unit and adversarial tests
+cargo test --manifest-path host-agent/Cargo.toml
 
-python3 src/runner_fleet.py --org swack-tools --project YOUR_PROJECT \
-  --label spot --minimum-runners 1 --runners-per-vm 8
+# Run Cloudflare Worker unit and adversarial tests
+cargo test --manifest-path cloudflare/Cargo.toml
+
+# Build the release Wasm Worker bundle
+cd cloudflare && worker-build --release
 ```
 
-For runner operations, copy `.env.example` to `.env`, run `chmod 600 .env`, and set a
-renewable `GH_TOKEN`. Git ignores the file. See
+For edge deployment, configure Cloudflare secrets (`SPOT_KV`, `GCP_SERVICE_ACCOUNT_KEY`,
+`SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`). See
 [Getting started](docs/getting-started.md) for the full setup.
 
 ## Safety rules
 
 - A request to edit code or documentation does not authorize changing live
-  resources. Use read-only commands or previews (`--dry-run`, the `plan` and
-  `status` subcommands) unless you explicitly want a live operation. An
-  autoscaler `--dry-run` still connects with `gcloud compute ssh`, which can add
-  your SSH key to project or instance metadata, or to your OS Login profile. It
-  also writes the local state lock file and controller log.
-- `spot_runner_manager.py --apply` deletes old, unattached, manager-labeled disks
-  in the selected zone before it provisions, even if the deployment then fails.
-- Do not add `--install-launch-agent` to a preview: it writes and starts the macOS
-  LaunchAgent before the dry-run check.
-- Never replay fresh-host bootstrap on an occupied runner or builder. Use the staged
-  [runtime update workflow](docs/builder-runtime-updates.md) for an occupied builder.
-- Never delete or hand-edit controller state, admission lease ledgers, or
-  runtime-update journals to bypass a hold or drain.
+  resources. Use read-only commands, test suites, or dry-run previews
+  (`/api/instances/delete`, `/api/instances/scale-region`) unless you explicitly
+  intend a live operational action.
+- Never delete or hand-edit the admission lease ledger (`/var/lib/gha-admission/leases.json`)
+  or its lock file (`leases.json.lock`) to bypass an admission hold.
+- Maintain container security boundaries: `host-agent docker-admission` strictly
+  enforces UID 1001:1001, 16 vCPUs, 28 GiB memory limits, and rejects Docker
+  socket mounts (`/var/run/docker.sock`). Never weaken or bypass these checks.
+- Reconciler rate limiting and KV quota: `cloudflare/src/reconciler.rs` uses
+  diff-gating to avoid writing to `SPOT_KV` when the fleet state is unchanged. Do
+  not remove or turn off fingerprint checks.
 - Keep untrusted external pull requests off persistent self-hosted runners.
 
 See [Operations and troubleshooting](docs/operations.md) and the
@@ -104,34 +113,29 @@ See [Operations and troubleshooting](docs/operations.md) and the
 
 | Path | Responsibility |
 | --- | --- |
-| `src/` | Command-line entry points. Most are thin wrappers around modules in `src/lib/`. |
-| `src/lib/runner_manager.py` | Runner provisioning, sizing, bootstrap, and registration |
-| `src/lib/spot_runner_autoscaler.py` | Controller entry, persisted operations, and service installation |
-| `src/lib/tier_controller.py`, `tier_policy.py` | Tier decisions and migration coordination |
-| `src/lib/runner_drain.py`, `vm_recovery.py`, `job_recovery.py` | Drain, loss cleanup, and eligible job retries |
-| `src/lib/runner_patch.py`, `patch_console.py` | Runner patch manifests and the dashboard patch console |
-| `src/lib/control_vm.py`, `edge_state.py` | Control VM lifecycle and the edge state contract |
-| `src/lib/spot_pricing.py`, `billing_catalog.py`, `storage_selection.py` | Compute and storage pricing and compatible disk selection |
-| `src/lib/host_admission.py` | Work reservations, leases, and actual-owner checks |
-| `src/lib/builder_startup.py`, `builder_access.py` | Dedicated startup, identity enrollment, and readiness |
-| `src/lib/qualification_trust/` | Source authentication, sealed import, and qualification mounts |
-| `src/lib/dashboard_*.py`, `rust_build_telemetry.py` | Web UI control plane, CPU benchmarks, OOM deep links, and Rust builder telemetry |
-| `cloud-init/` | Canonical runner, control VM, and dedicated-builder startup templates |
-| `runner/` | Runner image and hooks |
-| `builder/standalone/`, `builder/dedicated/` | Standalone Rust 1.99 image and the dedicated host launcher and Docker admission adapter |
-| `cloudflare/` | The Cloudflare Worker that fronts the dashboard |
-| `dashboard/` | The dashboard container image |
+| `host-agent/` | Native pure-Rust multi-call binary and library for runner admission, target cleanup, and builder runtime |
+| `cloudflare/` | Pure-Rust Cloudflare Worker (`spot-dashboard-edge`, compiled to Wasm) providing the Web UI, OAuth 2.0, Patch Console, GCP client, and 5-minute scheduled reconciler backed by `SPOT_KV` |
+| `cloud-init/` | Canonical startup scripts for runner hosts (`startup.sh`) and dedicated builders (`builder-startup.sh`) invoking `host-agent` and `jq` |
+| `runner/` | Docker runner image (`Dockerfile`), entrypoint, and job admission hooks (`job-started.sh`, `job-completed.sh`) |
+| `builder/standalone/`, `builder/dedicated/` | Standalone Rust 1.99.0 builder image, Playwright website audit tools, toolchain probe, worktree command runner, and dedicated host launcher |
+| `tests/fixtures/` | Test vectors for canonical patch digests (`patch_vector.json`) and session tokens (`session_vector.json`) |
 | `m4air/` | Persistent local ARM64 Docker runners |
-| `docs/` | The documentation site sources |
-| `tests/` | Unit and lifecycle controls |
+| `docs/` | MkDocs Material documentation site sources |
 
 ## Development
 
-Develop on an isolated branch based on current `main`. Run the full Python unit
-suite before you commit:
+Develop on an isolated branch based on current `main`. Run the full test suites
+before you commit:
 
 ```bash
-PYTHONPATH=src python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+# Run host-agent test suite
+cargo test --manifest-path host-agent/Cargo.toml
+
+# Run Cloudflare Worker test suite
+cargo test --manifest-path cloudflare/Cargo.toml
+
+# Verify Wasm compilation and release bundle size (< 3 MiB)
+cd cloudflare && worker-build --release
 ```
 
 Check documentation with Vale and build the site in strict mode:
@@ -145,5 +149,5 @@ python3 -m venv "$HOME/oxidex-ops/docs-venv"
 "$HOME/oxidex-ops/docs-venv/bin/mkdocs" build --strict --site-dir "$HOME/oxidex-ops/docs-site"
 ```
 
-See [Development](docs/development.md) for the remote test proof, the embedded asset
-rules, and the pull request review workflow.
+See [Development](docs/development.md) for the build and verification rules and the
+pull request review workflow.

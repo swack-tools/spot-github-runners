@@ -1,95 +1,75 @@
 # Development
 
-This page covers how to change the repository: the environment, tests, documentation checks, the embedded
-asset rules, and the review and merge workflow. For safety rules that apply to a live fleet, see
-[Operations and troubleshooting](operations.md).
+This page covers the development workflow for the pure-Rust architecture: toolchains, test suites,
+code formatting, documentation style checks, and pull request review gates. For operational safety
+rules that apply to live environments, see [Operations and troubleshooting](operations.md).
 
-## Environment
+## Environment and prerequisites
 
-- The control-plane scripts target Python 3.11 or later on macOS and Linux and use only the standard library.
-  Don't add a third-party runtime dependency without explicit approval.
-- The documentation build is the only exception. `docs/requirements.txt` pins MkDocs and its theme for the
-  site build. Nothing in `src/`, `tools/`, or the Docker images imports them.
-- Keep secrets, `.env`, SSH private keys, approved uploader JSON files, rendered launch directories, and
-  operational state outside the Git checkout when you can, for example under `$HOME/oxidex-ops`.
-- When you add or rename an environment variable, document it in `.env.example` and in the
-  [configuration reference](configuration.md).
+The repository consists of two Rust workspaces and edge deployment tooling:
 
-## Run the tests
+- **Host agent** (`host-agent/`): compiled with Rust 1.85 or later on Linux and macOS. Uses standard
+  system libraries and POSIX descriptors without runtime dependencies.
+- **Edge control plane** (`cloudflare/`): compiled with Rust target `wasm32-unknown-unknown` and packaged
+  using the Wrangler command-line tool.
+- **Task automation** (`justfile`): recipes for building, testing, linting, and formatting.
+- **Documentation site** (`docs/` and `mkdocs.yml`): built using MkDocs Material (`docs/requirements.txt`).
+- **Secrets and keys**: maintain `.env` (mode `0600`), SSH private keys, and operational state outside
+  the Git checkout. Document new environment variables in `.env.example` and [Configuration](configuration.md).
 
-Run focused tests while you iterate, and run the full discovery suite before you commit:
+## Build and test workflows
 
-```bash
-PYTHONPATH=src python3 -B -m unittest discover -s tests -p 'test_*.py' -v
-```
-
-Run Cargo compilation and the full Python suite on an eligible remote Spot worker through the reviewed build
-route. Local work is limited to edits, Git, formatting, bounded metadata and control checks, and prose lint.
-
-The reviewed remote proof runs the complete signed-source suite inside the admitted builder container. Set
-`OXIDEX_CONTROL_REPO` to a reviewed OxiDex checkout that has the `test-infra-ci-remote` recipe, then run:
+Run focused tests while iterating, and run the complete workspace test suite before committing:
 
 ```bash
+# Run all 268 tests across host-agent and cloudflare workspaces
 just test
+
+# Alternatively, test workspaces directly via Cargo
+cargo test --manifest-path host-agent/Cargo.toml
+cargo test --manifest-path cloudflare/Cargo.toml
 ```
 
-The fixed CI-only profile verifies module coverage, discovered and executed test identities, actual test
-results, and artifact hashes. There is no local full-suite fallback for `just test`. Don't claim that
-`just test` ran if you ran only local `unittest` discovery. Local tests, remote proof runs, GitHub checks,
-merged commits, rendered startup payloads, and live observations each prove something different, so state the
-exact command and environment for every verification claim.
+### Static analysis and style checks
 
-### Remote proof contracts
+Ensure all code passes compiler warnings and formatting checks before pushing commits:
 
-- `tools/infra_python_complete_proof.py` pins the SHA-256 of `tools/infra_python_test_proof.py` in
-  `PRODUCER_SHA`. After a reviewed change to the producer, update `PRODUCER_SHA` and run
-  `tests/test_infra_python_test_proof.py`. That test checks the producer's behavior, not the pin: only
-  `tools/infra_python_complete_proof.py` itself, run through `just test` or
-  `just infra-python-complete-tests` in the admitted builder, detects a stale `PRODUCER_SHA`.
-- `tools/infra_python_test_proof.py` enforces minimum counts for test cases (`MIN_CASES`, 854) and test
-  modules (`MIN_MODULES`, 82). The complete proof replaces those floors with `max(774, module count)` cases
-  and `max(76, module count)` modules. The producer also checks that every `tests/test_*.py` module matches
-  its digest in the manifest, with no duplicate test identities. Don't delete or merge test modules below those floors without a reviewed contract
-  update.
+```bash
+# Run clippy and compiler checks across both workspaces
+just check
 
-## Keep embedded assets in sync
+# Check formatting without modifying files
+just fmt-check
 
-Some modules embed scripts that tests compare byte for byte with the files on disk:
+# Format Rust code automatically
+just fmt
+```
 
-| Module | Embeds or reads |
-| --- | --- |
-| `src/lib/runner_assets.py` | `runner/clean_target.py`, `runner/docker-wrapper.py`, `runner/job-completed.sh`, `runner/Dockerfile`, `runner/entrypoint.sh`, and `cloud-init/startup.sh`. Update the constant in the same commit as the file. |
-| `src/lib/builder_assets.py` | The legacy shared-host builder files: `builder/Dockerfile`, `builder/entrypoint.py`, and `builder/host-launcher.py`. |
-| `src/lib/builder_only_assets.py` | Dedicated builder files from `builder/standalone/`, `builder/dedicated/`, and `cloud-init/builder-startup.sh`. Keep the file lists, permissions, and runtime-update target manifests in `src/lib/builder_runtime_update.py` aligned. |
+Local tests, proof runs, GitHub CI checks, merged commits on `main`, and live cloud observations
+prove different properties. State the exact command, target, and environment for every verification claim.
 
-## Write and check documentation
+## Documentation and prose checks
 
 Documentation follows the [Google developer documentation style guide](https://developers.google.com/style):
-sentence-case headings, active voice, direct instructions, and explicit prerequisites. Preserve command names
-and technical meaning when you fix prose. Check command examples against `--help` output and the source.
+sentence-case headings, active voice, direct instructions, and explicit prerequisites.
 
-Install Vale from its [installation guide](https://docs.vale.sh/topics/installation). Then synchronize the
-configured Google rules and lint every documentation file:
+Install Vale from its official documentation. Synchronize the configured Google style rules and run the linter:
 
 ```bash
 vale sync
 vale README.md AGENTS.md CLAUDE.md docs/*.md
 ```
 
-A clean Vale result covers the configured rules, not every editorial requirement of the style guide.
-
-When you add a Markdown file:
+When adding a new Markdown documentation file:
 
 1. Register it in `.vale.ini` under `BasedOnStyles = Google`.
-1. Add it to the `nav` section of `mkdocs.yml`. The site build runs in strict mode, so an unlisted page, a
-   broken link, or a missing anchor fails the build.
-1. Allowlist any new root file or asset path in `.gitignore`. The file starts with `*`, so Git ignores anything
-   that isn't un-ignored with a `!` entry. `docs/*.md` and `docs/requirements.txt` are already allowed.
+1. Add it to the `nav` section of `mkdocs.yml`. The documentation build runs in strict mode, so an unlisted
+   page, broken internal link, or missing anchor fails the build.
+1. Allowlist any non-standard path in `.gitignore`.
 
-### Build the site locally
+### Build the documentation site locally
 
-Create a virtual environment outside the checkout, install the pinned build dependencies, and build in strict
-mode:
+Create a virtual environment outside the checkout, install the build dependencies, and build in strict mode:
 
 ```bash
 python3 -m venv "$HOME/oxidex-ops/docs-venv"
@@ -97,55 +77,48 @@ python3 -m venv "$HOME/oxidex-ops/docs-venv"
 "$HOME/oxidex-ops/docs-venv/bin/mkdocs" build --strict --site-dir "$HOME/oxidex-ops/docs-site"
 ```
 
-`mkdocs serve` previews the site at `http://127.0.0.1:8000`. The `site/` directory is ignored by Git. The
-**Documentation** workflow (`.github/workflows/docs.yml`) runs the same strict build on pull requests that
-change the documentation. On pushes to `main` that change the documentation it also deploys the site to GitHub Pages through the
-`github-pages` environment. In the repository settings, set **Pages** > **Source** to **GitHub Actions** once.
+Preview the site locally using `mkdocs serve` at `http://127.0.0.1:8000`. The GitHub Pages workflow
+(`.github/workflows/docs.yml`) executes the same strict build on pull requests and publishes on merges to `main`.
 
-!!! warning "The site is public"
-    A GitHub Pages site can be readable by anyone, even when the repository is private. Describing the
-    architecture, including the edge and tunnel design, is fine. Don't put deployment identifiers in the
-    documentation: project, account, namespace, runner group, or tunnel IDs, internal hostnames, tokens, or
-    secret values. Resource names fixed in the code, such as the `spot-control-a` and `spot-control-b` slots,
-    may appear. Use placeholders such as `YOUR_PROJECT`.
+!!! warning "The documentation site is public"
+    A GitHub Pages site is publicly readable. Describing the architecture, edge design, and admission protocols
+    is expected, but do not include deployment identifiers: project IDs, account IDs, namespace IDs, runner group
+    IDs, private hostnames, tokens, or secret values. Use generic placeholders such as `your-project` or
+    `your-unique-name`.
 
 ## Git and review workflow
 
-A task prompt authorizes you to work on an isolated feature branch, commit the task changes, push the branch,
-open a pull request against `main`, resolve review comments, and squash-merge once every review and CI gate
-passes. It doesn't authorize force-pushing, changing branch protections, or changing live cloud resources.
+A task prompt authorizes working on an isolated feature branch, committing changes, pushing the branch,
+opening a pull request against `main`, resolving review feedback, and squash-merging once all review and CI
+gates pass. It does not authorize force-pushing, changing branch protections, or mutating live cloud resources.
 
 ### Branch, identity, and accounts
 
-- Develop on a dedicated branch or an isolated Git worktree based on the latest `origin/main`. Never commit or
-  push directly to `main`.
+- Develop on a dedicated feature branch or isolated Git worktree based on latest `origin/main`. Never push
+  directly to `main`.
 - Author and SSH-sign commits as `swackhamer` (`user.name=swackhamer`,
-  `user.email=swackhamer@users.noreply.github.com`, `commit.gpgsign=true`). Verify the local signature with
-  `git cat-file commit HEAD`, and verify GitHub's verification status on the pushed commits.
-- When several `gh` accounts are logged in, export the `swackhamer` token for the shell session so that no
-  command falls back to another stored account:
+  `user.email=swackhamer@users.noreply.github.com`, `commit.gpgsign=true`). Verify local signatures with
+  `git cat-file commit HEAD`, and verify GitHub's verification status on pushed commits.
+- When multiple `gh` accounts exist, export the `swackhamer` token for the shell session:
 
   ```bash
   export GH_TOKEN="$(gh auth token --user swackhamer)"
   gh pr status --repo swack-tools/spot-github-runners
   ```
 
-- Stage files by explicit path with `git add <path>`, so scratch files, local `.vale/styles/`, and unrelated
-  edits never reach a commit.
+- Stage task files by explicit path with `git add <path>` so scratch files and unrelated edits are never committed.
 
 ### Review loop
 
-1. Run the full unit test suite and Vale on every changed documentation file.
-1. Get an independent local review of the full diff against `origin/main`, and resolve its findings before you
-   open the pull request.
-1. Push the branch and open a pull request that targets `main`. Request an independent review on the pull
-   request.
-1. Check each review comment against the code. Fix every valid issue, rerun the tests and Vale, push a signed
-   commit, reply with the fix and the verification evidence, and resolve the thread.
-1. Request a fresh review on the new head commit. Repeat until the reviewer reports no remaining issues, every
-   thread is resolved, and the required GitHub checks pass.
-1. Confirm that `main` hasn't advanced in a conflicting way and that the reviewed head commit matches the pull
-   request head. Then squash-merge, pinning the reviewed commit so that the review and CI gate can't be raced:
+1. Run the full unit test suite and Vale checks on every modified documentation file.
+1. Obtain an independent local review of the complete diff against `origin/main` before opening a pull request.
+1. Push the branch and open a pull request targeting `main`. Request independent review.
+1. Inspect each review comment against the codebase. Address every valid issue, rerun unit tests and Vale checks,
+   push a signed commit, reply with the fix and verification evidence, and resolve the review thread.
+1. Request a fresh review on the new head commit. Repeat until the reviewer reports no remaining issues, all
+   review threads are resolved, and required GitHub checks pass.
+1. Confirm that `origin/main` has not advanced in a conflicting way and that the reviewed head commit matches
+   the pull request head. Then squash-merge while pinning the reviewed commit SHA:
 
    ```bash
    gh pr merge --repo swack-tools/spot-github-runners \

@@ -13,16 +13,16 @@
 
 use serde_json::{json, Value};
 use spot_dashboard_edge::patch::{
-    classify_patch_diff, classify_rollout, compute_canonical_patch_sha256,
-    merge_patches, to_canonical_json_str, validate_patch_manifest,
-    write_canonical_json_value, RunnerPatch,
+    classify_patch_diff, classify_rollout, compute_canonical_patch_sha256, merge_patches,
+    to_canonical_json_str, validate_patch_manifest, write_canonical_json_value, RunnerPatch,
     FORBIDDEN_MOUNTS, PERMITTED_MACHINE_TYPES,
 };
 
 #[test]
 fn test_vector_fixtures_all_6_exact_match() {
     let fixture_str = include_str!("../../tests/fixtures/patch_vector.json");
-    let fixture: Value = serde_json::from_str(fixture_str).expect("Valid patch_vector.json fixture");
+    let fixture: Value =
+        serde_json::from_str(fixture_str).expect("Valid patch_vector.json fixture");
     let vectors = fixture["vectors"].as_array().expect("vectors array");
 
     assert_eq!(vectors.len(), 6, "Must test exactly 6 canonical vectors");
@@ -179,12 +179,18 @@ fn test_adversarial_null_values_and_stripping_oracle() {
     m_src["source_commit"] = Value::Null;
     m_src["source_branch"] = Value::Null;
     let p_src1 = serde_json::from_value::<RunnerPatch>(m_src.clone()).unwrap();
-    assert_eq!(p_src1.patch_sha256(), fixture["vectors"][1]["patch_sha256"].as_str().unwrap());
+    assert_eq!(
+        p_src1.patch_sha256(),
+        fixture["vectors"][1]["patch_sha256"].as_str().unwrap()
+    );
 
     m_src["source_commit"] = json!("deadbeef12345678");
     m_src["source_branch"] = json!("refs/heads/main");
     let p_src2 = serde_json::from_value::<RunnerPatch>(m_src.clone()).unwrap();
-    assert_eq!(p_src2.patch_sha256(), fixture["vectors"][1]["patch_sha256"].as_str().unwrap());
+    assert_eq!(
+        p_src2.patch_sha256(),
+        fixture["vectors"][1]["patch_sha256"].as_str().unwrap()
+    );
 }
 
 #[test]
@@ -209,12 +215,18 @@ fn test_adversarial_unicode_and_surrogates_oracle() {
         // DEL character
         ("\x7f", "\"\\u007f\""),
         // Latin-1 characters
-        ("\u{00fc}\u{00f1}\u{00ee}\u{00e7}\u{00f8}d\u{00e9}", "\"\\u00fc\\u00f1\\u00ee\\u00e7\\u00f8d\\u00e9\""),
+        (
+            "\u{00fc}\u{00f1}\u{00ee}\u{00e7}\u{00f8}d\u{00e9}",
+            "\"\\u00fc\\u00f1\\u00ee\\u00e7\\u00f8d\\u00e9\"",
+        ),
         ("\u{00a9} 2026", "\"\\u00a9 2026\""),
         // CJK characters
         ("\u{4e16}\u{754c}", "\"\\u4e16\\u754c\""),
         // Hebrew / Arabic RTL
-        ("\u{0645}\u{0631}\u{062d}\u{0628}\u{0627}", "\"\\u0645\\u0631\\u062d\\u0628\\u0627\""),
+        (
+            "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627}",
+            "\"\\u0645\\u0631\\u062d\\u0628\\u0627\"",
+        ),
         // Math symbols
         ("\u{221e} \u{2192} \u{2200}", "\"\\u221e \\u2192 \\u2200\""),
         // SMP / Astral Code Points (> 0xFFFF) requiring UTF-16 surrogate pairs
@@ -269,14 +281,29 @@ echo "All done \o/"
     let canonical = p.to_canonical_json();
 
     // Verify canonical json contains properly escaped newlines and unicode surrogates
-    assert!(canonical.contains("\\ud83d\\ude80"), "Emoji must be escaped to surrogate pair");
-    assert!(canonical.contains("\\u00fc\\u00f1\\u00ee\\u00e7\\u00f8d\\u00e8"), "Accented chars must be escaped");
-    assert!(canonical.contains(r#"\"Adversarial"#), "Double quotes must be escaped with backslash");
-    assert!(canonical.contains(r#"\\path\\separators"#), "Backslashes must be double escaped");
+    assert!(
+        canonical.contains("\\ud83d\\ude80"),
+        "Emoji must be escaped to surrogate pair"
+    );
+    assert!(
+        canonical.contains("\\u00fc\\u00f1\\u00ee\\u00e7\\u00f8d\\u00e8"),
+        "Accented chars must be escaped"
+    );
+    assert!(
+        canonical.contains(r#"\"Adversarial"#),
+        "Double quotes must be escaped with backslash"
+    );
+    assert!(
+        canonical.contains(r#"\\path\\separators"#),
+        "Backslashes must be double escaped"
+    );
 
     let sha_raw = compute_canonical_patch_sha256(&manifest).unwrap();
     let sha_typed = p.patch_sha256();
-    assert_eq!(sha_raw, sha_typed, "Raw and typed hash for multiline script must match");
+    assert_eq!(
+        sha_raw, sha_typed,
+        "Raw and typed hash for multiline script must match"
+    );
 }
 
 #[test]
@@ -293,7 +320,10 @@ fn test_golden_image_and_instance_template_deep_oracle() {
     m_null["source_instance_template"] = Value::Null;
     let p_null = serde_json::from_value::<RunnerPatch>(m_null.clone()).unwrap();
     assert_eq!(p_null.patch_sha256(), v6_sha);
-    assert_eq!(compute_canonical_patch_sha256(&m_null).unwrap(), fixture["vectors"][5]["raw_dict_sha256"].as_str().unwrap());
+    assert_eq!(
+        compute_canonical_patch_sha256(&m_null).unwrap(),
+        fixture["vectors"][5]["raw_dict_sha256"].as_str().unwrap()
+    );
 
     // 2. Setting each additive field produces deterministic, distinct hashes
     let mut m_img = v6_manifest.clone();
@@ -303,14 +333,16 @@ fn test_golden_image_and_instance_template_deep_oracle() {
     assert_ne!(sha_img, v6_sha);
 
     let mut m_fam = v6_manifest.clone();
-    m_fam["golden_image_family"] = json!("projects/homelab-424523/global/imageFamilies/spot-runners-golden");
+    m_fam["golden_image_family"] =
+        json!("projects/homelab-424523/global/imageFamilies/spot-runners-golden");
     let p_fam = serde_json::from_value::<RunnerPatch>(m_fam).unwrap();
     let sha_fam = p_fam.patch_sha256();
     assert_ne!(sha_fam, v6_sha);
     assert_ne!(sha_fam, sha_img);
 
     let mut m_tpl = v6_manifest.clone();
-    m_tpl["source_instance_template"] = json!("projects/homelab-424523/global/instanceTemplates/runner-template-16vcpu");
+    m_tpl["source_instance_template"] =
+        json!("projects/homelab-424523/global/instanceTemplates/runner-template-16vcpu");
     let p_tpl = serde_json::from_value::<RunnerPatch>(m_tpl).unwrap();
     let sha_tpl = p_tpl.patch_sha256();
     assert_ne!(sha_tpl, v6_sha);
@@ -319,7 +351,8 @@ fn test_golden_image_and_instance_template_deep_oracle() {
 
     // 3. Avalanche effect: a 1-character difference in source_image must change the SHA-256 completely
     let mut m_img_perturbed = v6_manifest.clone();
-    m_img_perturbed["source_image"] = json!("projects/homelab-424523/global/images/runner-golden-20261022");
+    m_img_perturbed["source_image"] =
+        json!("projects/homelab-424523/global/images/runner-golden-20261022");
     let p_img_perturbed = serde_json::from_value::<RunnerPatch>(m_img_perturbed).unwrap();
     let sha_perturbed = p_img_perturbed.patch_sha256();
     assert_ne!(sha_perturbed, sha_img);
@@ -339,12 +372,20 @@ fn test_sizing_floor_exhaustive_boundaries_oracle() {
         let mut m = base_valid.clone();
         m["hardware"]["min_vcpu"] = json!(vcpu);
         let errs = validate_patch_manifest(&m).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("min_vcpu_below_floor")), "vcpu {} must be rejected", vcpu);
+        assert!(
+            errs.iter().any(|e| e.contains("min_vcpu_below_floor")),
+            "vcpu {} must be rejected",
+            vcpu
+        );
     }
     for vcpu in [16, 17, 32, 64] {
         let mut m = base_valid.clone();
         m["hardware"]["min_vcpu"] = json!(vcpu);
-        assert!(validate_patch_manifest(&m).is_ok(), "vcpu {} must be accepted", vcpu);
+        assert!(
+            validate_patch_manifest(&m).is_ok(),
+            "vcpu {} must be accepted",
+            vcpu
+        );
     }
 
     // Boundary: min_ram_gib (floor: 32)
@@ -352,12 +393,20 @@ fn test_sizing_floor_exhaustive_boundaries_oracle() {
         let mut m = base_valid.clone();
         m["hardware"]["min_ram_gib"] = json!(ram);
         let errs = validate_patch_manifest(&m).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("min_ram_gib_below_floor")), "ram {} must be rejected", ram);
+        assert!(
+            errs.iter().any(|e| e.contains("min_ram_gib_below_floor")),
+            "ram {} must be rejected",
+            ram
+        );
     }
     for ram in [32, 33, 64, 128] {
         let mut m = base_valid.clone();
         m["hardware"]["min_ram_gib"] = json!(ram);
-        assert!(validate_patch_manifest(&m).is_ok(), "ram {} must be accepted", ram);
+        assert!(
+            validate_patch_manifest(&m).is_ok(),
+            "ram {} must be accepted",
+            ram
+        );
     }
 
     // Boundary: runners_count (must be exactly 2)
@@ -365,7 +414,11 @@ fn test_sizing_floor_exhaustive_boundaries_oracle() {
         let mut m = base_valid.clone();
         m["hardware"]["runners_count"] = json!(cnt);
         let errs = validate_patch_manifest(&m).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("runners_count_must_be_2")), "runners_count {} must be rejected", cnt);
+        assert!(
+            errs.iter().any(|e| e.contains("runners_count_must_be_2")),
+            "runners_count {} must be rejected",
+            cnt
+        );
     }
 
     // Boundary: runner_vcpu (must be exactly 7)
@@ -373,7 +426,11 @@ fn test_sizing_floor_exhaustive_boundaries_oracle() {
         let mut m = base_valid.clone();
         m["hardware"]["runner_vcpu"] = json!(vcpu);
         let errs = validate_patch_manifest(&m).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("runner_vcpu_must_be_7")), "runner_vcpu {} must be rejected", vcpu);
+        assert!(
+            errs.iter().any(|e| e.contains("runner_vcpu_must_be_7")),
+            "runner_vcpu {} must be rejected",
+            vcpu
+        );
     }
 
     // Boundary: runner_ram_gib (must be exactly 14)
@@ -381,7 +438,11 @@ fn test_sizing_floor_exhaustive_boundaries_oracle() {
         let mut m = base_valid.clone();
         m["hardware"]["runner_ram_gib"] = json!(ram);
         let errs = validate_patch_manifest(&m).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("runner_ram_gib_must_be_14")), "runner_ram_gib {} must be rejected", ram);
+        assert!(
+            errs.iter().any(|e| e.contains("runner_ram_gib_must_be_14")),
+            "runner_ram_gib {} must be rejected",
+            ram
+        );
     }
 
     // Boundary: host_overhead_gib (must be exactly 4)
@@ -389,7 +450,12 @@ fn test_sizing_floor_exhaustive_boundaries_oracle() {
         let mut m = base_valid.clone();
         m["hardware"]["host_overhead_gib"] = json!(oh);
         let errs = validate_patch_manifest(&m).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("host_overhead_gib_must_be_4")), "host_overhead_gib {} must be rejected", oh);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("host_overhead_gib_must_be_4")),
+            "host_overhead_gib {} must be rejected",
+            oh
+        );
     }
 
     // Boundary: queued_jobs_threshold (floor: 20)
@@ -397,12 +463,21 @@ fn test_sizing_floor_exhaustive_boundaries_oracle() {
         let mut m = base_valid.clone();
         m["hardware"]["queued_jobs_threshold"] = json!(q);
         let errs = validate_patch_manifest(&m).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("queued_jobs_threshold_below_floor")), "queued_jobs_threshold {} must be rejected", q);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("queued_jobs_threshold_below_floor")),
+            "queued_jobs_threshold {} must be rejected",
+            q
+        );
     }
     for q in [20, 21, 50, 100] {
         let mut m = base_valid.clone();
         m["hardware"]["queued_jobs_threshold"] = json!(q);
-        assert!(validate_patch_manifest(&m).is_ok(), "queued_jobs_threshold {} must be accepted", q);
+        assert!(
+            validate_patch_manifest(&m).is_ok(),
+            "queued_jobs_threshold {} must be accepted",
+            q
+        );
     }
 }
 
@@ -416,7 +491,11 @@ fn test_permitted_machine_types_and_forbidden_mounts_oracle() {
     for mtype in PERMITTED_MACHINE_TYPES {
         let mut m = base_valid.clone();
         m["hardware"]["extra_labels"] = json!([format!("type-{}", mtype)]);
-        assert!(validate_patch_manifest(&m).is_ok(), "Permitted type {} must pass", mtype);
+        assert!(
+            validate_patch_manifest(&m).is_ok(),
+            "Permitted type {} must pass",
+            mtype
+        );
     }
 
     // Unpermitted machine types
@@ -444,14 +523,22 @@ fn test_permitted_machine_types_and_forbidden_mounts_oracle() {
         let mut m1 = base_valid.clone();
         m1["container"]["mounts"] = json!([{"source": forbidden, "target": "/mnt/test"}]);
         let errs1 = validate_patch_manifest(&m1).unwrap_err();
-        assert!(errs1.iter().any(|e| e.contains("forbidden_mount_source")), "Exact forbidden mount {} must be rejected", forbidden);
+        assert!(
+            errs1.iter().any(|e| e.contains("forbidden_mount_source")),
+            "Exact forbidden mount {} must be rejected",
+            forbidden
+        );
 
         // Subpath
         let subpath = format!("{}/subfile", forbidden);
         let mut m2 = base_valid.clone();
         m2["container"]["mounts"] = json!([{"source": subpath, "target": "/mnt/test"}]);
         let errs2 = validate_patch_manifest(&m2).unwrap_err();
-        assert!(errs2.iter().any(|e| e.contains("forbidden_mount_source")), "Subpath forbidden mount {} must be rejected", subpath);
+        assert!(
+            errs2.iter().any(|e| e.contains("forbidden_mount_source")),
+            "Subpath forbidden mount {} must be rejected",
+            subpath
+        );
     }
 
     // Allowed mount sources
@@ -464,7 +551,11 @@ fn test_permitted_machine_types_and_forbidden_mounts_oracle() {
     for allowed in allowed_mounts {
         let mut m = base_valid.clone();
         m["container"]["mounts"] = json!([{"source": allowed, "target": "/mnt/test"}]);
-        assert!(validate_patch_manifest(&m).is_ok(), "Allowed mount {} must pass", allowed);
+        assert!(
+            validate_patch_manifest(&m).is_ok(),
+            "Allowed mount {} must pass",
+            allowed
+        );
     }
 }
 
@@ -518,7 +609,8 @@ fn test_rollout_diff_classification_oracle() {
 
     // 6. source instance template change in hardware => replace_vm
     let mut tpl_changed = empty.clone();
-    tpl_changed.hardware.source_instance_template = Some("projects/p/global/instanceTemplates/t-1".to_string());
+    tpl_changed.hardware.source_instance_template =
+        Some("projects/p/global/instanceTemplates/t-1".to_string());
     let diff = classify_patch_diff(&empty, &tpl_changed);
     assert_eq!(diff, "replace_vm");
 
@@ -544,9 +636,15 @@ fn test_multi_repo_merge_oracle() {
     assert_eq!(merged.repository, "swack-tools/oxidex");
     assert_eq!(merged.hardware.min_vcpu, Some(16));
     assert_eq!(merged.hardware.min_ram_gib, Some(32));
-    assert_eq!(merged.hardware.extra_labels, vec!["type-c4d-highcpu-16".to_string()]);
+    assert_eq!(
+        merged.hardware.extra_labels,
+        vec!["type-c4d-highcpu-16".to_string()]
+    );
     // apt_packages must be unioned: git, curl, jq
-    assert_eq!(merged.host.apt_packages, vec!["git".to_string(), "curl".to_string(), "jq".to_string()]);
+    assert_eq!(
+        merged.host.apt_packages,
+        vec!["git".to_string(), "curl".to_string(), "jq".to_string()]
+    );
 }
 
 #[test]
@@ -568,4 +666,3 @@ fn test_root_vs_hardware_golden_image_rollout_anomaly() {
     let diff_hw = classify_patch_diff(&empty, &hw_img);
     assert_eq!(diff_hw, "replace_vm");
 }
-

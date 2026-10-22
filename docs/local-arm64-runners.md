@@ -1,7 +1,7 @@
 # Local Docker runners
 
 The `m4air/` directory configures two persistent ARM64 runners on a local Apple silicon host that runs
-OrbStack. These runners are separate from the GCP fleet. They don't count toward any fleet target, and the
+OrbStack. These runners are separate from the GCP fleet. They do not count toward any fleet target, and the
 autoscaler never provisions, drains, or retires them.
 
 Use them for native ARM64 Linux Docker work. Route native macOS work to native hosts instead.
@@ -40,7 +40,7 @@ docker exec oxidex-gha-runner-2 docker version
 ```
 
 Compose preserves the named volumes that hold the runner registrations and workspaces. Keep the existing Compose
-project name and volume names. Existing registrations don't need another registration token.
+project name and volume names. Existing registrations do not need another registration token.
 
 ## Register a new runner
 
@@ -48,7 +48,7 @@ The entrypoint configures a runner only when its state volume has no `.runner` f
 
 1. Put a registration token in a private `.env` file as `RUNNER_TOKEN`.
 1. Mount that file read-only at `/run/secrets/runner.env` for the first start. Without it, the container exits
-   with the message that the runner isn't configured.
+   with the message that the runner is not configured.
 1. Remove the mount before you start jobs. The entrypoint unsets `RUNNER_TOKEN` before it starts the listener.
    Pass `--register-only` to register and exit.
 

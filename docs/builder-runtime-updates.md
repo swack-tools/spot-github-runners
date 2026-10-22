@@ -1,203 +1,176 @@
 # Update an existing builder runtime
 
-Use this administrative guide only when updating an occupied builder. For a
-fresh instance and ordinary `just build` usage, see
-[Dedicated remote builders](dedicated-builders.md).
+Use this administrative guide when updating the runtime binary or container image on a dedicated builder. For fresh instance provisioning and routine build client usage, see [Dedicated remote builders](dedicated-builders.md).
 
+## Dedicated builder architecture
 
-Use the standalone `src/lib/builder_runtime_update.py` helper through the existing
-authenticated root control path for an occupied dedicated builder. Its default
-mode checks a reviewed plan without writing files. Capture mode records the
-actual VM, boot, runtime files, and admission process; plans expire after
-120 seconds. It does not provision a VM or rebuild an image.
+Dedicated builders are single-purpose build VMs (`builder-*`) using the `n4-highcpu-16` machine shape (16 vCPUs, 32 GiB RAM) without registering GitHub runner listeners. The pure-Rust architecture separates immutable compute from persistent storage:
 
-The maintainer supplies a root-owned asset JSON file containing exactly the
-fifteen runtime targets and their reviewed bytes and hashes. Capture a fresh
-plan after source review and builder handback:
+- **Persistent cache disk**: A 100 GiB Hyperdisk Balanced disk provisioned with `auto-delete=no` and mounted at `/mnt/runner-data`. This disk retains Cargo downloads (`/mnt/runner-data/remote-build/cargo`), per-project worktree build targets (`/mnt/runner-data/remote-build/targets`), and local Docker data (`/mnt/runner-data/docker`). The cache disk survives VM recreation.
+- **Native host agent**: the multi-call binary `/usr/local/bin/host-agent` handles memory admission, Docker container restrictions, root command execution, and toolchain verification through symlink aliases.
+- **Container build environment**: builds run inside the unprivileged container image `oxidex-remote-builder:1.99.0` pinned by SHA-256 digest in `/etc/oxidex-remote-build.json`.
 
-```bash
-python3 -I -B builder_runtime_update.py --capture-assets assets.json \
-  --assets-sha256 ASSET_FILE_SHA256 --source-main REVIEWED_SOURCE_COMMIT
-```
+Runtime updates apply when upgrading the `host-agent` binary, compiler toolchains, website audit tools, or container admission rules.
 
-Save the returned plan as a private root-owned file and record its SHA-256.
-Check it before applying:
+## Rotation with persistent cache disk retention
+
+The standard and recommended procedure for updating a dedicated builder is VM rotation. Because the persistent cache disk survives VM deletion, rotating the compute instance applies updated startup payloads cleanly without risk of dirty host state.
+
+### 1. Drain active builds
+
+Place the build drain marker to refuse incoming builds while allowing active compilations, leases, and cache locks to complete:
 
 ```bash
-python3 -I -B builder_runtime_update.py --plan plan.json \
-  --plan-sha256 PLAN_FILE_SHA256
-python3 -I -B builder_runtime_update.py --plan plan.json \
-  --plan-sha256 PLAN_FILE_SHA256 --apply
+sudo touch /run/oxidex-build-draining
 ```
 
-Applying takes the existing build lock, refuses active builds and uploads,
-creates an owned drain, backs up old files, and replaces only the fixed runtime
-file set. It also writes its plan and journal to the backup directory, creates
-the `qualification-sealed` directory when it's missing, installs the boot guard
-described below, and runs `systemctl daemon-reload`. It restarts admission
-alone. It preserves the image, build limits,
-source worktrees, and caches. A partial failure retains the drain and backups
-for explicit recovery. Success verifies installed bytes and the new admission
-process while retaining the owned drain.
+Inspect active memory leases and verify allocatable headroom:
 
-Coordinate the exact OxiDex launcher pin before this update. The helper does not
-change clients or declare qualification ready. Run the reviewed Linux gate and
-ordinary build checks before routing qualification work to the updated host. A successful installation
-returns `INSTALLED_DRAINED`; it keeps the route off until an independently
-verified client-pin handoff authorizes removal of the exact owned drain. The
-updater never reopens the route automatically.
-
-The update also installs a fixed admission-service boot guard and a persistent
-pending marker. A private permit in `/run` allows only the current maintenance
-boot to restart admission while that marker exists. Reboot removes the permit,
-so admission stays off until explicit recovery or the verified handoff. The
-pending marker and volatile drain are separate from build leases.
-
-Preparation writes only the private backup directory (backups, plan, and journal) and leaves the live
-runtime unchanged.
-The first live cutover removes launcher execution permission and persists that
-mode before runtime replacement. Both the previous and installed launcher stay
-readable but non-executable (`0644`) through partial updates and reboot. Restoring
-`0755` is part of the separately verified client-pin handoff, not automatic
-installation success. Administrative controlled proofs use the authenticated
-root control path; the uploader cannot bypass this hold.
-
-
-### Finish an installed update
-
-After controlled source checks and coordination of the exact client launcher
-pin, capture a new observation with the original installation nonce:
-
-```sh
-python3 -I -B builder_runtime_update.py --capture-assets assets.json \
-  --assets-sha256 "$ASSETS_SHA256" --source-main "$SOURCE_MAIN" \
-  --finish-nonce "$INSTALLED_NONCE" \
-  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256" > finish-plan.json
+```bash
+host-agent admission headroom --json
 ```
 
-Keep the original installation plan and journal. This capture has its own
-observation time and does not extend or rewrite the original plan. Inspect the
-new plan and select its exact digest through the authenticated root control path.
-First check the selected plan without changing the route:
+Wait until active leases reach zero.
 
-```sh
-python3 -I -B builder_runtime_update.py --plan finish-plan.json \
-  --plan-sha256 "$FINISH_PLAN_SHA256" \
-  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+### 2. Delete the builder VM
+
+Delete the running builder instance. Because the cache disk has `auto-delete=no`, the disk device remains available in the GCP project:
+
+```bash
+gcloud compute instances delete "builder-old-name" \
+  --project="your-project" \
+  --zone="asia-east2-a"
 ```
 
-Then explicitly finish:
+### 3. Launch the replacement builder
 
-```sh
-python3 -I -B builder_runtime_update.py --plan finish-plan.json \
-  --plan-sha256 "$FINISH_PLAN_SHA256" --finish \
-  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+Render `cloud-init/builder-startup.sh` with the updated parameters, referencing the existing persistent cache disk device name:
+
+```bash
+sed -e 's/{{INSTANCE_NAME}}/builder-new-name/g' \
+    -e 's/{{PROJECT}}/your-project/g' \
+    -e 's/{{ZONE}}/asia-east2-a/g' \
+    -e 's/{{DISK_DEVICE_NAME}}/builder-cache-disk/g' \
+    cloud-init/builder-startup.sh > /private/builder-startup.sh
+
+gcloud compute instances create "builder-new-name" \
+  --project="your-project" \
+  --zone="asia-east2-a" \
+  --machine-type="n4-highcpu-16" \
+  --provisioning-model="SPOT" \
+  --instance-termination-action="STOP" \
+  --metadata-from-file="startup-script=/private/builder-startup.sh"
 ```
 
-Finish verifies the successful installation journal and current host under the
-existing build lock. It keeps the launcher held through final checks and records a durable release
-decision before restoring execution. It then removes its persistent pending
-marker and removes the owned drain last. It returns
-`REOPENED_UNQUALIFIED`, with qualification readiness false. Run one actual
-ordinary OxiDex Just build and the qualification checks afterward. The client
-selector requires an executable launcher and no drain, so this ordinary build
-cannot be a pre-finish check. Do not treat reopening as proof of an app build.
+During bootstrap, `builder-startup.sh`:
+- Detects the existing ext4 filesystem on the cache disk and mounts it at `/mnt/runner-data` without reformatting.
+- Configures Docker and containerd data roots on `/mnt/runner-data`.
+- Copies and symlinks the updated `host-agent` binary.
+- Builds the `oxidex-remote-builder:1.99.0` container image and records its digest in `/etc/oxidex-remote-build.json`.
+- Runs `oxidex-toolchain-probe` inside a bootstrap container to verify compiler commit hash `b940084d7eb6a299eb4bfeb8e34901bc051e7ac4`, tool versions, and cgroup limits (28 GiB RAM, 16 CPUs, zero swap).
+- Records observed readiness telemetry in `/var/lib/oxidex-builder-readiness.json` and writes `/var/lib/oxidex-builder-bootstrap.complete`.
 
-If finish fails, inspect its journal and actual files before recovery. Its
-failure handler attempts to close execution only on the exact installed
-launcher while the build lock remains held. It never rolls back runtime bytes,
-clears leases, stops builds, or modifies unrelated services. A changed or foreign
-file needs explicit recovery.
+### 4. Verify builder readiness
 
-### Recover an interrupted finish
+Connect to the instance using authenticated SSH and confirm bootstrap completion and toolchain verification:
 
-For an interrupted finish on the same boot and unchanged admission process,
-capture with the recovery action as well as the original nonce and client pin:
-
-```sh
-python3 -I -B builder_runtime_update.py --capture-assets assets.json \
-  --assets-sha256 "$ASSETS_SHA256" --source-main "$SOURCE_MAIN" \
-  --finish-nonce "$INSTALLED_NONCE" --recover-finish \
-  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256" > recovery-plan.json
+```bash
+sudo cat /var/lib/oxidex-builder-readiness.json
 ```
 
-Inspect the new observation and select its digest. Recovery is explicit:
+Verify that the JSON payload contains `"workload_qualified": false` with valid `tool_evidence` matching schema `builder-tools-actual-v1`.
 
-```sh
-python3 -I -B builder_runtime_update.py --plan recovery-plan.json \
-  --plan-sha256 "$RECOVERY_PLAN_SHA256" --recover-finish \
-  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+### 5. Update client configuration
+
+Update the remote builder endpoint in OxiDex's `.cargo/config.toml` under the `[env]` table to point to the new builder instance name. Run a test compilation using `just build` to qualify the builder for project workloads.
+
+## In-place runtime update procedure
+
+If VM rotation is impractical and an administrator needs to update the `host-agent` binary or rebuild the container image directly on an existing VM:
+
+### 1. Drain the builder and halt admission
+
+Place the drain marker and confirm no builds or leases remain active:
+
+```bash
+sudo touch /run/oxidex-build-draining
+host-agent admission headroom --json
 ```
 
-Recovery checks the successful installation and known finish stages under the
-existing exclusive lock. It closes execution only on the selected launcher,
-restores missing owned update markers, and retains the drain. It appends a
-`FINISH_RECOVERED_HELD` record; it does not rewrite the original journal or
-observation time. Capture a fresh finish plan afterward. Never replay apply or
-remove journal entries to retry.
+Stop the admission daemon to prevent new leases during maintenance:
 
-A changed boot, admission process, runtime file, or foreign marker is refused.
-Those cases need a separately reviewed recovery scope. This command does not
-restart services, reopen builds, or declare qualification readiness.
-
-### Complete a committed release after reboot
-
-If reboot interrupted an already committed release, use `--recover-committed`
-in the capture command instead of `--recover-finish`. The new schema-2
-observation preserves the original journal and boot history. It records either
-an exactly inactive unit or the verified PID and start ticks of its running
-admission process. It refuses changed runtime files, image, configuration,
-client pin, or unknown service state.
-
-```sh
-python3 -I -B builder_runtime_update.py --capture-assets assets.json \
-  --assets-sha256 "$ASSETS_SHA256" --source-main "$SOURCE_MAIN" \
-  --finish-nonce "$INSTALLED_NONCE" --recover-committed \
-  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256" > reboot-plan.json
+```bash
+sudo systemctl stop gha-admission.service
 ```
 
-After inspecting that fresh observation and selecting its exact digest:
+### 2. Install updated host-agent binary
 
-```sh
-python3 -I -B builder_runtime_update.py --plan reboot-plan.json \
-  --plan-sha256 "$REBOOT_PLAN_SHA256" --recover-committed \
-  --client-launcher-sha256 "$CLIENT_LAUNCHER_SHA256"
+Copy the reviewed release binary and refresh host symlinks:
+
+```bash
+sudo install -m 0755 /path/to/new/host-agent /usr/local/bin/host-agent
+sudo cp /usr/local/bin/host-agent /opt/oxidex-builder/image/host-agent
+
+for alias in clean-target host-admission docker-wrapper docker-admission \
+             host-launcher builder-entrypoint worktree-commands toolchain-probe \
+             gha-runner-clean-target gha-host-admission oxidex-remote-build \
+             oxidex-build-entrypoint oxidex-worktree-commands oxidex-toolchain-probe docker; do
+  sudo ln -sf /usr/local/bin/host-agent "/usr/local/bin/$alias"
+done
 ```
 
-Recovery rechecks the durable release decision under the build lock. It retains
-the persistent pending marker and uses an owned current-boot permit to start
-only an inactive admission unit. After verifying its process, socket, and current
-host state, it records a durable checkpoint, removes its markers, and releases
-the drain. A missing pending marker is recreated before startup.
-If the exact process is already running after a partial attempt, recovery checks
-it without another start command. A failed start or postflight retains the persistent marker and owned
-drain; another reboot removes the permit and leaves admission held. Successful recovery remains unqualified until actual OxiDex build and
-gate checks pass.
+### 3. Rebuild the builder container image
 
-After reboot, recovery initializes an absent volatile build lock without
-replacing an existing inode. A held post-commit launcher remains recoverable:
-the saved release decision must match every file, with only its execution mode
-held. Recovery restores execution through the verified descriptor while the
-owned drain remains. It rechecks freshness after publishing its checkpoint and
-before drain release.
+Rebuild the unprivileged container image with bounded resource flags:
 
-Permission transitions publish durable intent before changing the selected
-launcher. Recovery checks both sides of that transition against the same inode
-and bytes. Slow recovery observations must pass the selected plan's freshness
-check again before any permission change.
+```bash
+DOCKER_BUILDKIT=0 sudo docker build \
+  --memory=28g --memory-swap=28g --cpu-period=100000 --cpu-quota=1600000 \
+  --iidfile /var/lib/oxidex-builder/image-id \
+  -t oxidex-remote-builder:1.99.0 /opt/oxidex-builder/image
+```
 
-The release journal distinguishes the observed held files from the authorized
-executable state. A committed decision is permission to complete that transition,
-not evidence that it already happened. A completed re-hold keeps that authority
-for checked recovery after another reboot.
+Extract the newly built image ID and update the approved image configuration:
 
-If unlink succeeded but directory sync failed, the helper reports
-`RELEASE_UNLINKED_SYNC_UNCONFIRMED` and exits with status 75. It states that the drain was
-removed and does not claim a protective hold or close launcher execution.
-Inspect actual jobs, leases and files before any further recovery; do not replay
-apply or treat this result as a held installation.
+```bash
+image=$(tr -d '[:space:]' </var/lib/oxidex-builder/image-id)
+sudo jq --arg img "$image" '.approved_image_id = $img' /etc/oxidex-remote-build.json > /tmp/remote-build.json
+sudo install -m 0644 /tmp/remote-build.json /etc/oxidex-remote-build.json
+rm -f /tmp/remote-build.json
+```
 
-The transaction pins the authorized journal identity and complete prefix. Only
-verified writes by that transaction advance the pin. Unexpected replacement or
-appended history is preserved and refused, including during failure holding.
-Selected reboot plans must match the complete schema before recovery effects.
+### 4. Run toolchain verification probe
+
+Execute the toolchain probe using the root host launcher to verify compiler pins, website tools, and cgroup controller limits:
+
+```bash
+sudo /usr/local/bin/oxidex-remote-build bootstrap-tools prepare
+sudo /usr/local/bin/oxidex-remote-build bootstrap-tools /usr/local/bin/oxidex-toolchain-probe
+```
+
+Verify that the output schema is `builder-tools-actual-v1` and that `commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4` is present.
+
+### 5. Resume admission and remove drain
+
+Restart the admission daemon and clear the drain marker:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start gha-admission.service
+sudo rm -f /run/oxidex-build-draining
+```
+
+Confirm that the admission socket `/run/gha-admission/socket` is active and ready:
+
+```bash
+host-agent admission headroom --json
+```
+
+## Interrupted update recovery
+
+If an update or bootstrap operation is interrupted:
+
+- **Check bootstrap logs**: inspect `/var/log/oxidex-builder-bootstrap.log` or run `sudo journalctl -u google-startup-scripts.service --no-pager`.
+- **Inspect locks and drains**: check for `/run/oxidex-builder-bootstrap.lock` or `/run/oxidex-build-draining`. If an interrupted operation left a drain in place, verify container state with `docker ps -a` before clearing the marker.
+- **Inspect admission state**: check `sudo systemctl status gha-admission.service` and review `/var/lib/gha-admission/leases.json`.
+- **Fall back to rotation**: if host configuration is ambiguous or inconsistent, delete the VM instance and rotate to a fresh builder instance reusing the persistent cache disk.

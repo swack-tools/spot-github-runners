@@ -8,8 +8,8 @@ use spot_dashboard_edge::patch::{
     validate_patch_manifest, FORBIDDEN_MOUNTS, PERMITTED_MACHINE_TYPES,
 };
 use spot_dashboard_edge::patch_console::{
-    handle_manifest, handle_save, make_valid_manifest_json,
-    manifest_path_for_target, GitHubTransport, MockGitHubTransport,
+    handle_manifest, handle_save, make_valid_manifest_json, manifest_path_for_target,
+    GitHubTransport, MockGitHubTransport,
 };
 
 // ============================================================================
@@ -24,7 +24,9 @@ fn test_sizing_boundary_vcpu_15_vs_16() {
     m["hardware"]["min_vcpu"] = json!(15);
     let errs15 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs15.iter().any(|e| e.contains("min_vcpu_below_floor: 15 < 16")),
+        errs15
+            .iter()
+            .any(|e| e.contains("min_vcpu_below_floor: 15 < 16")),
         "15 vCPU must fail floor: {:?}",
         errs15
     );
@@ -48,7 +50,9 @@ fn test_sizing_boundary_ram_31_vs_32() {
     m["hardware"]["min_ram_gib"] = json!(31);
     let errs31 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs31.iter().any(|e| e.contains("min_ram_gib_below_floor: 31 < 32")),
+        errs31
+            .iter()
+            .any(|e| e.contains("min_ram_gib_below_floor: 31 < 32")),
         "31 GiB RAM must fail floor: {:?}",
         errs31
     );
@@ -72,7 +76,9 @@ fn test_sizing_boundary_runners_count_1_vs_2_vs_3() {
     m["hardware"]["runners_count"] = json!(1);
     let errs1 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs1.iter().any(|e| e.contains("runners_count_must_be_2: got 1")),
+        errs1
+            .iter()
+            .any(|e| e.contains("runners_count_must_be_2: got 1")),
         "1 runner must fail: {:?}",
         errs1
     );
@@ -85,7 +91,9 @@ fn test_sizing_boundary_runners_count_1_vs_2_vs_3() {
     m["hardware"]["runners_count"] = json!(3);
     let errs3 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs3.iter().any(|e| e.contains("runners_count_must_be_2: got 3")),
+        errs3
+            .iter()
+            .any(|e| e.contains("runners_count_must_be_2: got 3")),
         "3 runners must fail: {:?}",
         errs3
     );
@@ -103,20 +111,27 @@ fn test_sizing_boundary_runner_vcpu_6_vs_7_vs_8() {
     m["hardware"]["runner_vcpu"] = json!(6);
     let errs6 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs6.iter().any(|e| e.contains("runner_vcpu_must_be_7: got 6")),
+        errs6
+            .iter()
+            .any(|e| e.contains("runner_vcpu_must_be_7: got 6")),
         "6 vCPU per runner must fail: {:?}",
         errs6
     );
 
     // 7 vCPU per runner: must pass
     m["hardware"]["runner_vcpu"] = json!(7);
-    assert!(validate_patch_manifest(&m).is_ok(), "7 vCPU per runner must pass");
+    assert!(
+        validate_patch_manifest(&m).is_ok(),
+        "7 vCPU per runner must pass"
+    );
 
     // 8 vCPU per runner: must fail
     m["hardware"]["runner_vcpu"] = json!(8);
     let errs8 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs8.iter().any(|e| e.contains("runner_vcpu_must_be_7: got 8")),
+        errs8
+            .iter()
+            .any(|e| e.contains("runner_vcpu_must_be_7: got 8")),
         "8 vCPU per runner must fail: {:?}",
         errs8
     );
@@ -130,20 +145,27 @@ fn test_sizing_boundary_runner_ram_13_vs_14_vs_15() {
     m["hardware"]["runner_ram_gib"] = json!(13);
     let errs13 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs13.iter().any(|e| e.contains("runner_ram_gib_must_be_14: got 13")),
+        errs13
+            .iter()
+            .any(|e| e.contains("runner_ram_gib_must_be_14: got 13")),
         "13 GiB RAM per runner must fail: {:?}",
         errs13
     );
 
     // 14 GiB RAM per runner: must pass
     m["hardware"]["runner_ram_gib"] = json!(14);
-    assert!(validate_patch_manifest(&m).is_ok(), "14 GiB RAM per runner must pass");
+    assert!(
+        validate_patch_manifest(&m).is_ok(),
+        "14 GiB RAM per runner must pass"
+    );
 
     // 15 GiB RAM per runner: must fail
     m["hardware"]["runner_ram_gib"] = json!(15);
     let errs15 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs15.iter().any(|e| e.contains("runner_ram_gib_must_be_14: got 15")),
+        errs15
+            .iter()
+            .any(|e| e.contains("runner_ram_gib_must_be_14: got 15")),
         "15 GiB RAM per runner must fail: {:?}",
         errs15
     );
@@ -157,20 +179,27 @@ fn test_sizing_boundary_host_overhead_3_vs_4_vs_5() {
     m["hardware"]["host_overhead_gib"] = json!(3);
     let errs3 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs3.iter().any(|e| e.contains("host_overhead_gib_must_be_4: got 3")),
+        errs3
+            .iter()
+            .any(|e| e.contains("host_overhead_gib_must_be_4: got 3")),
         "3 GiB overhead must fail: {:?}",
         errs3
     );
 
     // 4 GiB host overhead: must pass
     m["hardware"]["host_overhead_gib"] = json!(4);
-    assert!(validate_patch_manifest(&m).is_ok(), "4 GiB overhead must pass");
+    assert!(
+        validate_patch_manifest(&m).is_ok(),
+        "4 GiB overhead must pass"
+    );
 
     // 5 GiB host overhead: must fail
     m["hardware"]["host_overhead_gib"] = json!(5);
     let errs5 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs5.iter().any(|e| e.contains("host_overhead_gib_must_be_4: got 5")),
+        errs5
+            .iter()
+            .any(|e| e.contains("host_overhead_gib_must_be_4: got 5")),
         "5 GiB overhead must fail: {:?}",
         errs5
     );
@@ -184,18 +213,26 @@ fn test_sizing_boundary_queued_jobs_threshold_19_vs_20() {
     m["hardware"]["queued_jobs_threshold"] = json!(19);
     let errs19 = validate_patch_manifest(&m).unwrap_err();
     assert!(
-        errs19.iter().any(|e| e.contains("queued_jobs_threshold_below_floor: 19 < 20")),
+        errs19
+            .iter()
+            .any(|e| e.contains("queued_jobs_threshold_below_floor: 19 < 20")),
         "19 queued jobs threshold must fail: {:?}",
         errs19
     );
 
     // 20 queued jobs threshold: must pass
     m["hardware"]["queued_jobs_threshold"] = json!(20);
-    assert!(validate_patch_manifest(&m).is_ok(), "20 queued jobs threshold must pass");
+    assert!(
+        validate_patch_manifest(&m).is_ok(),
+        "20 queued jobs threshold must pass"
+    );
 
     // 21 queued jobs threshold: must pass
     m["hardware"]["queued_jobs_threshold"] = json!(21);
-    assert!(validate_patch_manifest(&m).is_ok(), "21 queued jobs threshold must pass");
+    assert!(
+        validate_patch_manifest(&m).is_ok(),
+        "21 queued jobs threshold must pass"
+    );
 }
 
 // ============================================================================
@@ -271,7 +308,9 @@ fn test_forbidden_mounts_exact_and_subpaths() {
         ]);
         let errs_exact = validate_patch_manifest(&m).unwrap_err();
         assert!(
-            errs_exact.iter().any(|e| e.contains("forbidden_mount_source")),
+            errs_exact
+                .iter()
+                .any(|e| e.contains("forbidden_mount_source")),
             "Exact forbidden mount '{}' must be rejected: {:?}",
             forbidden,
             errs_exact
@@ -283,7 +322,9 @@ fn test_forbidden_mounts_exact_and_subpaths() {
         ]);
         let errs_sub = validate_patch_manifest(&m).unwrap_err();
         assert!(
-            errs_sub.iter().any(|e| e.contains("forbidden_mount_source")),
+            errs_sub
+                .iter()
+                .any(|e| e.contains("forbidden_mount_source")),
             "Subpath mount '{}/subpath/item' must be rejected: {:?}",
             forbidden,
             errs_sub
@@ -295,7 +336,9 @@ fn test_forbidden_mounts_exact_and_subpaths() {
         ]);
         let errs_slash = validate_patch_manifest(&m).unwrap_err();
         assert!(
-            errs_slash.iter().any(|e| e.contains("forbidden_mount_source")),
+            errs_slash
+                .iter()
+                .any(|e| e.contains("forbidden_mount_source")),
             "Trailing slash mount '{}/' must be rejected: {:?}",
             forbidden,
             errs_slash
@@ -335,7 +378,11 @@ async fn test_patch_console_error_paths_unauthorized_and_traversal() {
         let (status, body) = handle_manifest(t, &mock, "mock_token").await;
         assert_eq!(status, 400, "Traversal path '{}' must return 400", t);
         assert_eq!(body["error"], "unsupported_or_missing_repository");
-        assert!(manifest_path_for_target(t).is_err(), "manifest_path_for_target must reject '{}'", t);
+        assert!(
+            manifest_path_for_target(t).is_err(),
+            "manifest_path_for_target must reject '{}'",
+            t
+        );
     }
 
     // 2. Unauthorized targets on manifest endpoint
@@ -359,7 +406,11 @@ async fn test_patch_console_error_paths_unauthorized_and_traversal() {
             }
         });
         let (save_status, save_body) = handle_save(&save_req, &mock, "mock_token").await;
-        assert_eq!(save_status, 400, "Save for unauthorized target '{}' must return 400", u);
+        assert_eq!(
+            save_status, 400,
+            "Save for unauthorized target '{}' must return 400",
+            u
+        );
         assert_eq!(save_body["error"], "unsupported_repository");
     }
 }
@@ -380,7 +431,10 @@ impl GitHubTransport for ConflictPutTransport {
     ) -> Result<(u16, Vec<u8>), String> {
         if method == "PUT" && path.contains("/contents/") {
             // Return 409 Conflict (e.g. concurrent commit or base SHA mismatch)
-            return Ok((409, b"{\"message\": \"Conflict: file was modified concurrently\"}".to_vec()));
+            return Ok((
+                409,
+                b"{\"message\": \"Conflict: file was modified concurrently\"}".to_vec(),
+            ));
         }
         self.mock.request(method, path, headers, body).await
     }

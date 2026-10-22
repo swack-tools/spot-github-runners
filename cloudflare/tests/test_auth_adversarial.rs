@@ -110,11 +110,26 @@ fn test_session_token_truncation_and_extension_attacks() {
     }
 
     // 4. Dot structure attacks
-    assert!(verify_session(&format!("{body}{sig}"), TEST_SECRET, None, now).is_none(), "Missing dot");
-    assert!(verify_session(&format!("{body}.{sig}."), TEST_SECRET, None, now).is_none(), "Trailing dot");
-    assert!(verify_session(&format!(".{body}.{sig}"), TEST_SECRET, None, now).is_none(), "Leading dot");
-    assert!(verify_session(&format!("{body}..{sig}"), TEST_SECRET, None, now).is_none(), "Double dot");
-    assert!(verify_session(&format!("{body}.{sig}.extra"), TEST_SECRET, None, now).is_none(), "Three parts");
+    assert!(
+        verify_session(&format!("{body}{sig}"), TEST_SECRET, None, now).is_none(),
+        "Missing dot"
+    );
+    assert!(
+        verify_session(&format!("{body}.{sig}."), TEST_SECRET, None, now).is_none(),
+        "Trailing dot"
+    );
+    assert!(
+        verify_session(&format!(".{body}.{sig}"), TEST_SECRET, None, now).is_none(),
+        "Leading dot"
+    );
+    assert!(
+        verify_session(&format!("{body}..{sig}"), TEST_SECRET, None, now).is_none(),
+        "Double dot"
+    );
+    assert!(
+        verify_session(&format!("{body}.{sig}.extra"), TEST_SECRET, None, now).is_none(),
+        "Three parts"
+    );
     assert!(verify_session(".", TEST_SECRET, None, now).is_none());
     assert!(verify_session("..", TEST_SECRET, None, now).is_none());
     assert!(verify_session("", TEST_SECRET, None, now).is_none());
@@ -168,7 +183,8 @@ fn test_session_payload_tampering_attacks() {
     let mut tampered = session.clone();
     tampered.sub = "attacker".to_string();
     let tampered_payload_str = to_compact_sorted_json(&tampered).unwrap();
-    let tampered_body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered_payload_str.as_bytes());
+    let tampered_body =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered_payload_str.as_bytes());
     let token = format!("{tampered_body}.{original_sig}");
     assert!(verify_session(&token, TEST_SECRET, None, now).is_none());
 
@@ -176,7 +192,8 @@ fn test_session_payload_tampering_attacks() {
     let mut tampered = session.clone();
     tampered.uid = 999999;
     let tampered_payload_str = to_compact_sorted_json(&tampered).unwrap();
-    let tampered_body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered_payload_str.as_bytes());
+    let tampered_body =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered_payload_str.as_bytes());
     let token = format!("{tampered_body}.{original_sig}");
     assert!(verify_session(&token, TEST_SECRET, None, now).is_none());
 
@@ -184,7 +201,10 @@ fn test_session_payload_tampering_attacks() {
     let mut tampered = session.clone();
     tampered.v = 2;
     let token = sign_token(&session_key, &tampered).unwrap();
-    assert!(verify_session(&token, TEST_SECRET, None, now).is_none(), "v != 1 must be rejected");
+    assert!(
+        verify_session(&token, TEST_SECRET, None, now).is_none(),
+        "v != 1 must be rejected"
+    );
 
     // Attack 4: Missing fields in JSON payload (properly signed)
     let incomplete_payloads = vec![
@@ -319,7 +339,10 @@ fn test_cookie_parser_fuzzing_and_edge_cases() {
 
     // 6. Quoted tokens (RFC 6265 cookie-octet quoting)
     let c = parse_cookies("__Host-spot_session=\"quoted_token_val\"");
-    assert_eq!(c.get("__Host-spot_session"), Some(&"quoted_token_val".to_string()));
+    assert_eq!(
+        c.get("__Host-spot_session"),
+        Some(&"quoted_token_val".to_string())
+    );
 
     // 7. Empty quoted token
     let c = parse_cookies("__Host-spot_session=\"\"");
@@ -390,7 +413,13 @@ fn test_bulk_revocation_numeric_and_non_numeric_strings() {
 
     // 6. Numeric with leading/trailing spaces -> Trimmed, correctly evaluated
     assert!(verify_session(&valid_token, TEST_SECRET, Some(&format!("  {iat}  ")), now).is_some());
-    assert!(verify_session(&valid_token, TEST_SECRET, Some(&format!("  {}  ", iat + 1)), now).is_none());
+    assert!(verify_session(
+        &valid_token,
+        TEST_SECRET,
+        Some(&format!("  {}  ", iat + 1)),
+        now
+    )
+    .is_none());
 
     // 7. Non-numeric strings: MUST FAIL CLOSED (return None for all sessions)
     let non_numeric_strings = vec![
@@ -426,7 +455,10 @@ fn test_bulk_revocation_numeric_and_non_numeric_strings() {
 
     // 8. Valid 15-digit boundary (maximum allowed length)
     let max_15_digits = "999999999999999";
-    assert_eq!(parse_session_not_before(Some(max_15_digits)), Some(999999999999999));
+    assert_eq!(
+        parse_session_not_before(Some(max_15_digits)),
+        Some(999999999999999)
+    );
 }
 
 // ============================================================================
@@ -448,35 +480,41 @@ fn test_github_username_identity_validation_oracle() {
         u39.as_str(), // exactly 39 chars
     ];
     for username in valid_usernames {
-        assert!(is_valid_github_login(username), "Valid username was rejected: '{username}'");
+        assert!(
+            is_valid_github_login(username),
+            "Valid username was rejected: '{username}'"
+        );
     }
 
     let u40 = "a".repeat(40);
     let u100 = "a".repeat(100);
     // Invalid GitHub usernames (must be rejected)
     let invalid_usernames = vec![
-        "",                      // Empty
-        "-swackhamer",           // Leading hyphen
-        "-",                     // Single hyphen
-        "swack_hamer",           // Underscore
-        "swack.hamer",           // Period/dot
-        "swack@hamer",           // Special char @
-        "swack/hamer",           // Special char /
-        "swack\\hamer",          // Backslash
-        "swack hamer",           // Space inside
-        " swackhamer",           // Leading space
-        "swackhamer ",           // Trailing space
-        "swack\nhamer",          // Newline
-        "swack\thamer",          // Tab
-        "swack\0hamer",          // Null byte
-        "swäckhamer",            // Non-ASCII Unicode umlaut
-        "swackhamer🦀",          // Non-ASCII Emoji
-        "日本語",                 // Multi-byte CJK
-        u40.as_str(),            // 40 chars: exceeds 39 limit
-        u100.as_str(),           // 100 chars
+        "",             // Empty
+        "-swackhamer",  // Leading hyphen
+        "-",            // Single hyphen
+        "swack_hamer",  // Underscore
+        "swack.hamer",  // Period/dot
+        "swack@hamer",  // Special char @
+        "swack/hamer",  // Special char /
+        "swack\\hamer", // Backslash
+        "swack hamer",  // Space inside
+        " swackhamer",  // Leading space
+        "swackhamer ",  // Trailing space
+        "swack\nhamer", // Newline
+        "swack\thamer", // Tab
+        "swack\0hamer", // Null byte
+        "swäckhamer",   // Non-ASCII Unicode umlaut
+        "swackhamer🦀", // Non-ASCII Emoji
+        "日本語",       // Multi-byte CJK
+        u40.as_str(),   // 40 chars: exceeds 39 limit
+        u100.as_str(),  // 100 chars
     ];
     for username in invalid_usernames {
-        assert!(!is_valid_github_login(username), "Invalid username was accepted: '{username}'");
+        assert!(
+            !is_valid_github_login(username),
+            "Invalid username was accepted: '{username}'"
+        );
 
         // Verify session verification rejects it as well
         let session_key = derive_purpose_key(TEST_SECRET, "session");
@@ -501,7 +539,10 @@ fn test_github_uid_validation_oracle() {
     let mut zero_uid_session = session.clone();
     zero_uid_session.uid = 0;
     let token = sign_token(&session_key, &zero_uid_session).unwrap();
-    assert!(verify_session(&token, TEST_SECRET, None, now).is_none(), "uid == 0 must be rejected");
+    assert!(
+        verify_session(&token, TEST_SECRET, None, now).is_none(),
+        "uid == 0 must be rejected"
+    );
 
     // 2. uid == (1 << 53) - 1 (9007199254740991, max safe JS integer): Accepted
     let max_safe_uid = (1u64 << 53) - 1;
@@ -523,7 +564,10 @@ fn test_github_uid_validation_oracle() {
     let mut max_u64_session = session.clone();
     max_u64_session.uid = u64::MAX;
     let token = sign_token(&session_key, &max_u64_session).unwrap();
-    assert!(verify_session(&token, TEST_SECRET, None, now).is_none(), "uid == u64::MAX must be rejected");
+    assert!(
+        verify_session(&token, TEST_SECRET, None, now).is_none(),
+        "uid == u64::MAX must be rejected"
+    );
 
     // 5. Negative and non-integer UIDs in signed JSON payloads
     let invalid_uid_payloads = vec![
@@ -559,7 +603,13 @@ fn test_purpose_key_cryptographic_domain_isolation() {
     let raw_purpose_key = derive_purpose_key(TEST_SECRET, "spot-dashboard/session/v1");
 
     // All purpose keys must be mutually distinct
-    let keys = vec![session_key, control_key, pkce_key, state_key, raw_purpose_key];
+    let keys = vec![
+        session_key,
+        control_key,
+        pkce_key,
+        state_key,
+        raw_purpose_key,
+    ];
     for i in 0..keys.len() {
         for j in (i + 1)..keys.len() {
             assert_ne!(keys[i], keys[j], "Purpose keys must be strictly orthogonal");
@@ -621,10 +671,15 @@ fn test_check_session_owner_added_admins_and_target_verification() {
     assert!(matches!(status, SessionCheckStatus::Forbidden { .. }));
 
     // 7. Missing controlled targets -> Forbidden with missing_targets listed
-    let multi_targets = vec!["swack-tools/oxidex".to_string(), "swack-tools/extra-repo".to_string()];
+    let multi_targets = vec![
+        "swack-tools/oxidex".to_string(),
+        "swack-tools/extra-repo".to_string(),
+    ];
     let status = check_session(&session, &multi_targets, &[], false);
     match status {
-        SessionCheckStatus::Forbidden { missing_targets, .. } => {
+        SessionCheckStatus::Forbidden {
+            missing_targets, ..
+        } => {
             assert_eq!(missing_targets, vec!["swack-tools/extra-repo".to_string()]);
         }
         _ => panic!("Expected Forbidden with missing targets"),
@@ -649,25 +704,31 @@ fn test_safe_return_path_open_redirect_defenses() {
     // Valid same-origin absolute paths
     assert_eq!(safe_return_path("/"), "/");
     assert_eq!(safe_return_path("/dashboard"), "/dashboard");
-    assert_eq!(safe_return_path("/api/overview?slot=a"), "/api/overview?slot=a");
-    assert_eq!(safe_return_path("/deep/nested/path/123"), "/deep/nested/path/123");
+    assert_eq!(
+        safe_return_path("/api/overview?slot=a"),
+        "/api/overview?slot=a"
+    );
+    assert_eq!(
+        safe_return_path("/deep/nested/path/123"),
+        "/deep/nested/path/123"
+    );
 
     // Open redirect attacks (must all fall back to "/")
     let attack_paths = vec![
-        "",                                    // Empty
-        "https://evil.com",                    // Absolute scheme
-        "http://evil.com",                     // HTTP scheme
-        "//evil.com",                          // Protocol-relative scheme
-        "///evil.com",                         // Triple slash
-        "/\\evil.com",                         // Backslash evasion
-        "\\evil.com",                          // Windows backslash
-        "javascript:alert(1)",                 // Javascript pseudo-protocol
+        "",                                         // Empty
+        "https://evil.com",                         // Absolute scheme
+        "http://evil.com",                          // HTTP scheme
+        "//evil.com",                               // Protocol-relative scheme
+        "///evil.com",                              // Triple slash
+        "/\\evil.com",                              // Backslash evasion
+        "\\evil.com",                               // Windows backslash
+        "javascript:alert(1)",                      // Javascript pseudo-protocol
         "data:text/html,<script>alert(1)</script>", // Data URI
-        "/path://evil.com",                    // Embedded ://
-        "/path with space",                    // Unsafe space (byte 0x20 < 0x21)
-        "/path\r\nSet-Cookie: evil=1",         // CRLF injection attempt
-        "/path\0null",                         // Null byte
-        "/path\u{007f}del",                    // DEL character (0x7F)
+        "/path://evil.com",                         // Embedded ://
+        "/path with space",                         // Unsafe space (byte 0x20 < 0x21)
+        "/path\r\nSet-Cookie: evil=1",              // CRLF injection attempt
+        "/path\0null",                              // Null byte
+        "/path\u{007f}del",                         // DEL character (0x7F)
     ];
     for attack in attack_paths {
         assert_eq!(
@@ -730,11 +791,14 @@ fn test_oauth_state_adversarial_tampering_and_mismatch() {
 
     // Parse the cookie to get raw cookie value
     let cookies = parse_cookies(&cookie_str);
-    let cookie_val = cookies.get(OAUTH_STATE_COOKIE_NAME).expect("Must have state cookie");
+    let cookie_val = cookies
+        .get(OAUTH_STATE_COOKIE_NAME)
+        .expect("Must have state cookie");
     assert_eq!(cookie_val, &state);
 
     // 1. Baseline: valid state matches cookie
-    let verified = verify_oauth_state(TEST_SECRET, &state, cookie_val, now).expect("Valid state must verify");
+    let verified =
+        verify_oauth_state(TEST_SECRET, &state, cookie_val, now).expect("Valid state must verify");
     assert_eq!(verified.r, "/admin/overview");
     assert_eq!(verified.v, 1);
 
@@ -760,8 +824,20 @@ fn test_oauth_state_adversarial_tampering_and_mismatch() {
     assert!(verify_oauth_state(TEST_SECRET, &state, cookie_val, verified.exp + 100).is_err());
 
     // 6. Clock skew check: valid at iat - CLOCK_SKEW_SECONDS, invalid at iat - CLOCK_SKEW_SECONDS - 1
-    assert!(verify_oauth_state(TEST_SECRET, &state, cookie_val, verified.iat - CLOCK_SKEW_SECONDS).is_ok());
-    assert!(verify_oauth_state(TEST_SECRET, &state, cookie_val, verified.iat - CLOCK_SKEW_SECONDS - 1).is_err());
+    assert!(verify_oauth_state(
+        TEST_SECRET,
+        &state,
+        cookie_val,
+        verified.iat - CLOCK_SKEW_SECONDS
+    )
+    .is_ok());
+    assert!(verify_oauth_state(
+        TEST_SECRET,
+        &state,
+        cookie_val,
+        verified.iat - CLOCK_SKEW_SECONDS - 1
+    )
+    .is_err());
 }
 
 // ============================================================================
@@ -816,7 +892,11 @@ fn test_device_flow_complete_lifecycle_and_interval_slow_down() {
     assert_eq!(poll_invalid, DevicePollResult::Invalid);
 
     // Authorize device
-    assert!(authorize_device(&record.device_code, ALLOWED_ADMIN_LOGIN, ALLOWED_ADMIN_ID));
+    assert!(authorize_device(
+        &record.device_code,
+        ALLOWED_ADMIN_LOGIN,
+        ALLOWED_ADMIN_ID
+    ));
 
     // Poll 4 after authorization with device_code -> Authorized
     let poll_auth_code = poll_device_flow(&record.device_code, now + 25);

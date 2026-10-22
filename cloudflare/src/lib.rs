@@ -1,21 +1,21 @@
 //! Spot GitHub Runners & Rust Builders Edge Serverless Worker
 //! Pure-Rust Cloudflare Worker serving the Web UI, Auth, Edge State, and Fleet Controller.
 
-pub mod ui;
 pub mod auth;
-pub mod state;
-pub mod patch;
-pub mod patch_console;
 pub mod gcp;
 pub mod github;
+pub mod patch;
+pub mod patch_console;
 pub mod reconciler;
+pub mod state;
+pub mod ui;
 
-use std::collections::HashMap;
-use worker::*;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use worker::*;
 
-pub const MAX_AUTH_BODY_BYTES: usize = 16 * 1024;      // 16 KiB
+pub const MAX_AUTH_BODY_BYTES: usize = 16 * 1024; // 16 KiB
 pub const MAX_DASHBOARD_BODY_BYTES: usize = 256 * 1024; // 256 KiB
 pub const SESSION_COOKIE_NAME: &str = "__Host-spot_session";
 
@@ -106,7 +106,9 @@ pub fn json_response<T: Serialize>(status: u16, data: &T) -> Result<Response> {
     headers.set("Content-Type", "application/json")?;
     headers.set("Cache-Control", "no-store, no-cache, must-revalidate")?;
     let body = serde_json::to_string(data)?;
-    Ok(Response::ok(body)?.with_status(status).with_headers(headers))
+    Ok(Response::ok(body)?
+        .with_status(status)
+        .with_headers(headers))
 }
 
 pub fn error_response(status: u16, error: &str, message: &str) -> Result<Response> {
@@ -117,7 +119,9 @@ pub fn error_response(status: u16, error: &str, message: &str) -> Result<Respons
         "error": error,
         "message": message,
     });
-    Ok(Response::ok(body.to_string())?.with_status(status).with_headers(headers))
+    Ok(Response::ok(body.to_string())?
+        .with_status(status)
+        .with_headers(headers))
 }
 
 fn is_global_admins_enabled(env: &Env) -> bool {
@@ -128,7 +132,8 @@ fn is_global_admins_enabled(env: &Env) -> bool {
 }
 
 fn is_production_oauth_configured(env: &Env) -> bool {
-    let secret = env.secret("GITHUB_OAUTH_CLIENT_SECRET")
+    let secret = env
+        .secret("GITHUB_OAUTH_CLIENT_SECRET")
         .or_else(|_| env.var("GITHUB_OAUTH_CLIENT_SECRET"))
         .map(|s| s.to_string())
         .unwrap_or_default();
@@ -165,7 +170,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
     }
 
     let now = current_time_epoch();
-    let session_secret_str = match env.secret("SESSION_SECRET")
+    let session_secret_str = match env
+        .secret("SESSION_SECRET")
         .map(|s| s.to_string())
         .or_else(|_| env.var("SESSION_SECRET").map(|v| v.to_string()))
     {
@@ -178,12 +184,16 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
     let nbf_str = env.var("SESSION_NOT_BEFORE").ok().map(|v| v.to_string());
 
     // Parse cookies and verify session
-    let cookie_header = req.headers().get("Cookie").ok().flatten().unwrap_or_default();
+    let cookie_header = req
+        .headers()
+        .get("Cookie")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let cookies = auth::parse_cookies(&cookie_header);
     let session_token = cookies.get(SESSION_COOKIE_NAME);
-    let verified_session = session_token.and_then(|tok| {
-        auth::verify_session(tok, session_secret, nbf_str.as_deref(), now)
-    });
+    let verified_session = session_token
+        .and_then(|tok| auth::verify_session(tok, session_secret, nbf_str.as_deref(), now));
 
     let kv = env.kv("SPOT_KV")?;
 
@@ -191,42 +201,56 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
     match (method.clone(), path) {
         // UI & Login Gate serving (GET / and HEAD /)
         (Method::Get | Method::Head, "/" | "/index.html") => {
-            let project = env.var("GCP_PROJECT").map(|v| v.to_string()).unwrap_or_else(|_| "homelab-424523".to_string());
-            let org = env.var("GITHUB_ORG").map(|v| v.to_string()).unwrap_or_else(|_| "swack-tools".to_string());
+            let project = env
+                .var("GCP_PROJECT")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "homelab-424523".to_string());
+            let org = env
+                .var("GITHUB_ORG")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "swack-tools".to_string());
 
             if let Some(ref session) = verified_session {
                 // Check session against state
-                let (bundle, _) = state::load_state(&kv, now).await
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
                     .map_err(|e| Error::RustError(e.to_string()))?;
-                let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
                 let global_admins = is_global_admins_enabled(&env);
-                let status = auth::check_session(session, &bundle.state.controlled_targets, &added_admins, global_admins);
+                let status = auth::check_session(
+                    session,
+                    &bundle.state.controlled_targets,
+                    &added_admins,
+                    global_admins,
+                );
 
                 match status {
-                    auth::SessionCheckStatus::Ok => {
-                        ui::serve_dashboard_ui(&req, &project, &org)
-                    }
+                    auth::SessionCheckStatus::Ok => ui::serve_dashboard_ui(&req, &project, &org),
                     auth::SessionCheckStatus::Forbidden { message, .. } => {
                         ui::serve_login_gate(&req, &message, &session.sub, 403)
                     }
-                    auth::SessionCheckStatus::None => {
-                        ui::serve_login_gate(&req, "", "", 200)
-                    }
+                    auth::SessionCheckStatus::None => ui::serve_login_gate(&req, "", "", 200),
                 }
             } else {
                 ui::serve_login_gate(&req, "", "", 200)
             }
         }
 
-        (Method::Get, "/favicon.ico") => {
-            Ok(Response::empty()?.with_status(204))
-        }
+        (Method::Get, "/favicon.ico") => Ok(Response::empty()?.with_status(204)),
 
         // Fast Edge Health Endpoint
         (Method::Get, "/api/health") => {
             let (status_code, mut body) = state::handle_api_health(&kv, now).await;
             if let Some(obj) = body.as_object_mut() {
-                obj.insert("reconciler_ticks".to_string(), serde_json::json!(reconciler::get_reconciler_ticks()));
+                obj.insert(
+                    "reconciler_ticks".to_string(),
+                    serde_json::json!(reconciler::get_reconciler_ticks()),
+                );
             }
             json_response(status_code, &body)
         }
@@ -241,21 +265,25 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         // Scaling Endpoints
-        (Method::Get, "/api/scaling") => {
-            match state::handle_get_scaling(&kv, now).await {
-                Ok((status_code, body)) => json_response(status_code, &body),
-                Err(e) => error_response(500, "internal_error", &e.to_string()),
-            }
-        }
+        (Method::Get, "/api/scaling") => match state::handle_get_scaling(&kv, now).await {
+            Ok((status_code, body)) => json_response(status_code, &body),
+            Err(e) => error_response(500, "internal_error", &e.to_string()),
+        },
 
         (Method::Post, "/api/scaling") => {
             let session = match verified_session {
                 Some(s) => s,
                 None => return error_response(401, "unauthorized", "Sign in required"),
             };
-            let (bundle, _) = state::load_state(&kv, now).await
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
                 .map_err(|e| Error::RustError(e.to_string()))?;
-            let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
             if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
                 return error_response(403, "forbidden", "Administrator permissions required");
             }
@@ -298,9 +326,15 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Some(s) => s,
                 None => return error_response(401, "unauthorized", "Sign in required"),
             };
-            let (bundle, _) = state::load_state(&kv, now).await
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
                 .map_err(|e| Error::RustError(e.to_string()))?;
-            let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
             if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
                 return error_response(403, "forbidden", "Administrator permissions required");
             }
@@ -316,9 +350,15 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Some(s) => s,
                 None => return error_response(401, "unauthorized", "Sign in required"),
             };
-            let (bundle, _) = state::load_state(&kv, now).await
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
                 .map_err(|e| Error::RustError(e.to_string()))?;
-            let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
             if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
                 return error_response(403, "forbidden", "Administrator permissions required");
             }
@@ -348,7 +388,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 None => return error_response(401, "unauthorized", "Sign in required"),
             };
             let add_req: state::AddAdminRequest = req.json().await?;
-            match state::handle_post_admins_add(&kv, add_req, &session.sub, session.uid, now).await {
+            match state::handle_post_admins_add(&kv, add_req, &session.sub, session.uid, now).await
+            {
                 Ok((status_code, body)) => json_response(status_code, &body),
                 Err(state::StateError::Forbidden(msg)) => error_response(403, "forbidden", &msg),
                 Err(state::StateError::Conflict(msg)) => error_response(409, "conflict", &msg),
@@ -362,7 +403,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 None => return error_response(401, "unauthorized", "Sign in required"),
             };
             let remove_req: state::RemoveAdminRequest = req.json().await?;
-            match state::handle_post_admins_remove(&kv, remove_req, &session.sub, session.uid, now).await {
+            match state::handle_post_admins_remove(&kv, remove_req, &session.sub, session.uid, now)
+                .await
+            {
                 Ok((status_code, body)) => json_response(status_code, &body),
                 Err(state::StateError::Forbidden(msg)) => error_response(403, "forbidden", &msg),
                 Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
@@ -376,9 +419,15 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Some(s) => s,
                 None => return error_response(401, "unauthorized", "Sign in required"),
             };
-            let (bundle, _) = state::load_state(&kv, now).await
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
                 .map_err(|e| Error::RustError(e.to_string()))?;
-            let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
             if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
                 return error_response(403, "forbidden", "Administrator permissions required");
             }
@@ -396,9 +445,15 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Some(s) => s,
                 None => return error_response(401, "unauthorized", "Sign in required"),
             };
-            let (bundle, _) = state::load_state(&kv, now).await
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
                 .map_err(|e| Error::RustError(e.to_string()))?;
-            let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
             if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
                 return error_response(403, "forbidden", "Administrator permissions required");
             }
@@ -423,11 +478,13 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             if verified_session.is_none() {
                 return error_response(401, "unauthorized", "Sign in required");
             }
-            let repo = url.query_pairs()
+            let repo = url
+                .query_pairs()
                 .find(|(k, _)| k == "repo" || k == "path")
                 .map(|(_, v)| v.to_string())
                 .unwrap_or_default();
-            let gh_token = env.secret("SPOT_CONFIG_GH_TOKEN")
+            let gh_token = env
+                .secret("SPOT_CONFIG_GH_TOKEN")
                 .map(|s| s.to_string())
                 .or_else(|_| env.var("SPOT_CONFIG_GH_TOKEN").map(|v| v.to_string()))
                 .or_else(|_| env.secret("GH_TOKEN").map(|s| s.to_string()))
@@ -437,7 +494,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 &repo,
                 &patch_console::WorkerGitHubTransport,
                 &gh_token,
-            ).await;
+            )
+            .await;
             json_response(status_code, &body)
         }
 
@@ -452,7 +510,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 return error_response(401, "unauthorized", "Sign in required");
             }
             let save_val: Value = req.json().await.unwrap_or(Value::Null);
-            let gh_token = env.secret("SPOT_CONFIG_GH_TOKEN")
+            let gh_token = env
+                .secret("SPOT_CONFIG_GH_TOKEN")
                 .map(|s| s.to_string())
                 .or_else(|_| env.var("SPOT_CONFIG_GH_TOKEN").map(|v| v.to_string()))
                 .or_else(|_| env.secret("GH_TOKEN").map(|s| s.to_string()))
@@ -462,7 +521,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 &save_val,
                 &patch_console::WorkerGitHubTransport,
                 &gh_token,
-            ).await;
+            )
+            .await;
             json_response(status_code, &body)
         }
 
@@ -479,15 +539,28 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         // Auth Status
         (Method::Get, "/api/auth/status" | "/auth/status") => {
             if let Some(ref session) = verified_session {
-                let (bundle, _) = state::load_state(&kv, now).await
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
                     .map_err(|e| Error::RustError(e.to_string()))?;
-                let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
                 let global_admins = is_global_admins_enabled(&env);
-                let status_enum = auth::check_session(session, &bundle.state.controlled_targets, &added_admins, global_admins);
+                let status_enum = auth::check_session(
+                    session,
+                    &bundle.state.controlled_targets,
+                    &added_admins,
+                    global_admins,
+                );
 
                 let (status_str, missing_targets) = match status_enum {
                     auth::SessionCheckStatus::Ok => ("authorized", Vec::new()),
-                    auth::SessionCheckStatus::Forbidden { missing_targets, .. } => ("forbidden", missing_targets),
+                    auth::SessionCheckStatus::Forbidden {
+                        missing_targets, ..
+                    } => ("forbidden", missing_targets),
                     auth::SessionCheckStatus::None => ("none", Vec::new()),
                 };
 
@@ -528,39 +601,51 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // GitHub OAuth Login
         (Method::Get, "/auth/github/login") => {
-            let return_to = url.query_pairs()
+            let return_to = url
+                .query_pairs()
                 .find(|(k, _)| k == "next")
                 .map(|(_, v)| v.to_string())
                 .unwrap_or_else(|| "/".to_string());
             let return_to = auth::safe_return_path(&return_to);
 
-            let (signed_state, state_cookie) = match auth::create_oauth_state(session_secret, &return_to, now) {
-                Ok(res) => res,
-                Err(e) => return error_response(500, "internal_error", &e),
-            };
+            let (signed_state, state_cookie) =
+                match auth::create_oauth_state(session_secret, &return_to, now) {
+                    Ok(res) => res,
+                    Err(e) => return error_response(500, "internal_error", &e),
+                };
 
             let verifier = auth::pkce_verifier(session_secret, &signed_state);
             let challenge = auth::pkce_challenge(&verifier);
 
-            let client_id = env.var("GITHUB_OAUTH_CLIENT_ID")
+            let client_id = env
+                .var("GITHUB_OAUTH_CLIENT_ID")
                 .or_else(|_| env.secret("GITHUB_OAUTH_CLIENT_ID"))
                 .map(|s| s.to_string())
                 .unwrap_or_else(|_| "mock-spot-client-id".to_string());
 
-            let redirect_uri = env.var("GITHUB_OAUTH_REDIRECT_URI")
+            let redirect_uri = env
+                .var("GITHUB_OAUTH_REDIRECT_URI")
                 .map(|s| s.to_string())
                 .unwrap_or_else(|_| {
                     let scheme = url.scheme();
                     let host = url.host_str().unwrap_or("spot.swacktech.com");
                     match url.port() {
-                        Some(port) if (scheme == "http" && port != 80) || (scheme == "https" && port != 443) => {
+                        Some(port)
+                            if (scheme == "http" && port != 80)
+                                || (scheme == "https" && port != 443) =>
+                        {
                             format!("{}://{}:{}/auth/github/callback", scheme, host, port)
                         }
                         _ => format!("{}://{}/auth/github/callback", scheme, host),
                     }
                 });
 
-            let auth_url = auth::build_github_authorize_url(&client_id, &redirect_uri, &signed_state, &challenge);
+            let auth_url = auth::build_github_authorize_url(
+                &client_id,
+                &redirect_uri,
+                &signed_state,
+                &challenge,
+            );
 
             let headers = Headers::new();
             headers.set("Location", &auth_url)?;
@@ -579,45 +664,77 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             if pairs.contains_key("error") {
                 let headers = Headers::new();
                 headers.append("Set-Cookie", &clear_state_cookie)?;
-                return ui::serve_login_gate(&req, "GitHub authorization was not granted.", "", 403);
+                return ui::serve_login_gate(
+                    &req,
+                    "GitHub authorization was not granted.",
+                    "",
+                    403,
+                );
             }
 
             let code = match pairs.get("code") {
                 Some(c) if !c.is_empty() && c.len() <= 1024 => c.clone(),
-                _ => return error_response(400, "invalid_or_expired_oauth_state", "Missing or invalid code parameter"),
+                _ => {
+                    return error_response(
+                        400,
+                        "invalid_or_expired_oauth_state",
+                        "Missing or invalid code parameter",
+                    )
+                }
             };
 
             let state = match pairs.get("state") {
                 Some(s) if !s.is_empty() && s.len() <= auth::MAX_TOKEN_CHARS => s.clone(),
-                _ => return error_response(400, "invalid_or_expired_oauth_state", "Missing or invalid state parameter"),
+                _ => {
+                    return error_response(
+                        400,
+                        "invalid_or_expired_oauth_state",
+                        "Missing or invalid state parameter",
+                    )
+                }
             };
 
-            let cookie_state = cookies.get(auth::OAUTH_STATE_COOKIE_NAME).cloned().unwrap_or_default();
+            let cookie_state = cookies
+                .get(auth::OAUTH_STATE_COOKIE_NAME)
+                .cloned()
+                .unwrap_or_default();
             if cookie_state.is_empty() {
-                return error_response(400, "invalid_or_expired_oauth_state", "Missing state cookie");
+                return error_response(
+                    400,
+                    "invalid_or_expired_oauth_state",
+                    "Missing state cookie",
+                );
             }
 
-            let payload = match auth::verify_oauth_state(session_secret, &state, &cookie_state, now) {
+            let payload = match auth::verify_oauth_state(session_secret, &state, &cookie_state, now)
+            {
                 Ok(p) => p,
                 Err(err) => return error_response(400, "invalid_or_expired_oauth_state", err),
             };
 
             if !auth::mark_state_nonce_used(&payload.n) {
-                return error_response(400, "invalid_or_expired_oauth_state", "State nonce already used");
+                return error_response(
+                    400,
+                    "invalid_or_expired_oauth_state",
+                    "State nonce already used",
+                );
             }
 
-            let client_id = env.var("GITHUB_OAUTH_CLIENT_ID")
+            let client_id = env
+                .var("GITHUB_OAUTH_CLIENT_ID")
                 .or_else(|_| env.secret("GITHUB_OAUTH_CLIENT_ID"))
                 .map(|s| s.to_string())
                 .unwrap_or_default();
-            let client_secret = env.secret("GITHUB_OAUTH_CLIENT_SECRET")
+            let client_secret = env
+                .secret("GITHUB_OAUTH_CLIENT_SECRET")
                 .or_else(|_| env.var("GITHUB_OAUTH_CLIENT_SECRET"))
                 .map(|s| s.to_string())
                 .unwrap_or_default();
 
             let (login, uid) = if !client_id.is_empty() && !client_secret.is_empty() {
                 let verifier = auth::pkce_verifier(session_secret, &state);
-                let redirect_uri = env.var("GITHUB_OAUTH_REDIRECT_URI")
+                let redirect_uri = env
+                    .var("GITHUB_OAUTH_REDIRECT_URI")
                     .map(|s| s.to_string())
                     .unwrap_or_else(|_| {
                         let scheme = url.scheme();
@@ -627,11 +744,26 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
                 let token_form = format!(
                     "client_id={}&client_secret={}&code={}&redirect_uri={}&code_verifier={}",
-                    percent_encoding::utf8_percent_encode(&client_id, percent_encoding::NON_ALPHANUMERIC),
-                    percent_encoding::utf8_percent_encode(&client_secret, percent_encoding::NON_ALPHANUMERIC),
-                    percent_encoding::utf8_percent_encode(&code, percent_encoding::NON_ALPHANUMERIC),
-                    percent_encoding::utf8_percent_encode(&redirect_uri, percent_encoding::NON_ALPHANUMERIC),
-                    percent_encoding::utf8_percent_encode(&verifier, percent_encoding::NON_ALPHANUMERIC),
+                    percent_encoding::utf8_percent_encode(
+                        &client_id,
+                        percent_encoding::NON_ALPHANUMERIC
+                    ),
+                    percent_encoding::utf8_percent_encode(
+                        &client_secret,
+                        percent_encoding::NON_ALPHANUMERIC
+                    ),
+                    percent_encoding::utf8_percent_encode(
+                        &code,
+                        percent_encoding::NON_ALPHANUMERIC
+                    ),
+                    percent_encoding::utf8_percent_encode(
+                        &redirect_uri,
+                        percent_encoding::NON_ALPHANUMERIC
+                    ),
+                    percent_encoding::utf8_percent_encode(
+                        &verifier,
+                        percent_encoding::NON_ALPHANUMERIC
+                    ),
                 );
 
                 let mut init = RequestInit::new();
@@ -643,9 +775,13 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 init.with_headers(gh_headers);
                 init.with_body(Some(worker::wasm_bindgen::JsValue::from_str(&token_form)));
 
-                let gh_req = Request::new_with_init("https://github.com/login/oauth/access_token", &init)?;
+                let gh_req =
+                    Request::new_with_init("https://github.com/login/oauth/access_token", &init)?;
                 let mut gh_resp = Fetch::Request(gh_req).send().await?;
-                let token_json: Value = gh_resp.json().await.map_err(|e| Error::RustError(e.to_string()))?;
+                let token_json: Value = gh_resp
+                    .json()
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
 
                 let access_token = match token_json.get("access_token").and_then(|v| v.as_str()) {
                     Some(tok) => tok.to_string(),
@@ -663,20 +799,47 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
                 let user_req = Request::new_with_init("https://api.github.com/user", &user_init)?;
                 let mut user_resp = Fetch::Request(user_req).send().await?;
-                let user_json: Value = user_resp.json().await.map_err(|e| Error::RustError(e.to_string()))?;
+                let user_json: Value = user_resp
+                    .json()
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
 
-                let gh_login = user_json.get("login").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                let gh_id = user_json.get("id").and_then(|v| v.as_u64()).unwrap_or_default();
+                let gh_login = user_json
+                    .get("login")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let gh_id = user_json
+                    .get("id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or_default();
                 (gh_login, gh_id)
             } else {
-                (auth::ALLOWED_ADMIN_LOGIN.to_string(), auth::ALLOWED_ADMIN_ID)
+                (
+                    auth::ALLOWED_ADMIN_LOGIN.to_string(),
+                    auth::ALLOWED_ADMIN_ID,
+                )
             };
 
-            let (bundle, _) = state::load_state(&kv, now).await
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
                 .map_err(|e| Error::RustError(e.to_string()))?;
-            let added_admins: Vec<u64> = bundle.state.dashboard_admins.iter().map(|a| a.uid).collect();
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
             if !auth::may_sign_in(&login, uid, &added_admins) {
-                return ui::serve_login_gate(&req, &format!("Forbidden: GitHub user '{}' is not an authorized administrator", login), &login, 403);
+                return ui::serve_login_gate(
+                    &req,
+                    &format!(
+                        "Forbidden: GitHub user '{}' is not an authorized administrator",
+                        login
+                    ),
+                    &login,
+                    403,
+                );
             }
 
             let session_cookie = match auth::mint_session_cookie(
@@ -723,20 +886,29 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         // GitHub Device Flow - Poll Token
         (Method::Post, "/auth/device/token" | "/auth/device/poll") => {
             let body_val: Value = req.json().await.unwrap_or(Value::Null);
-            let code_or_handle = body_val.get("device_code")
+            let code_or_handle = body_val
+                .get("device_code")
                 .or_else(|| body_val.get("device_handle"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
 
             if code_or_handle.is_empty() {
-                return error_response(400, "invalid_device_code", "Missing device_code or device_handle");
+                return error_response(
+                    400,
+                    "invalid_device_code",
+                    "Missing device_code or device_handle",
+                );
             }
 
             let is_poll = path == "/auth/device/poll";
 
             match auth::poll_device_flow(code_or_handle, now) {
-                auth::DevicePollResult::Authorized { user_login, user_id } => {
-                    let (bundle, _) = state::load_state(&kv, now).await
+                auth::DevicePollResult::Authorized {
+                    user_login,
+                    user_id,
+                } => {
+                    let (bundle, _) = state::load_state(&kv, now)
+                        .await
                         .map_err(|e| Error::RustError(e.to_string()))?;
                     let session_cookie = auth::mint_session_cookie(
                         session_secret,
@@ -744,7 +916,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                         user_id,
                         bundle.state.controlled_targets.clone(),
                         now,
-                    ).map_err(|e| Error::RustError(e))?;
+                    )
+                    .map_err(|e| Error::RustError(e))?;
 
                     let headers = Headers::new();
                     headers.set("Content-Type", "application/json")?;
@@ -775,7 +948,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                         "interval": interval,
                     });
                     let status = if is_poll { 400 } else { 200 };
-                    Ok(Response::ok(body.to_string())?.with_status(status).with_headers(headers))
+                    Ok(Response::ok(body.to_string())?
+                        .with_status(status)
+                        .with_headers(headers))
                 }
                 auth::DevicePollResult::Expired => {
                     error_response(400, "expired_token", "Device code expired")
@@ -792,9 +967,15 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 return error_response(404, "not_found", "Not found");
             }
             let body_val: Value = req.json().await.unwrap_or(Value::Null);
-            let dev_code = body_val.get("device_code").and_then(|v| v.as_str()).unwrap_or_default();
+            let dev_code = body_val
+                .get("device_code")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if auth::authorize_device(dev_code, auth::ALLOWED_ADMIN_LOGIN, auth::ALLOWED_ADMIN_ID) {
-                json_response(200, &serde_json::json!({"status": "ok", "authorized": true}))
+                json_response(
+                    200,
+                    &serde_json::json!({"status": "ok", "authorized": true}),
+                )
             } else {
                 error_response(400, "invalid_device_code", "Device code not found")
             }
@@ -805,18 +986,27 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             if is_production_oauth_configured(&env) && verified_session.is_none() {
                 return error_response(401, "unauthorized", "Sign in required");
             }
-            let sa_key = env.secret("GCP_SERVICE_ACCOUNT_KEY")
+            let sa_key = env
+                .secret("GCP_SERVICE_ACCOUNT_KEY")
                 .map(|s| s.to_string())
                 .or_else(|_| env.var("GCP_SERVICE_ACCOUNT_KEY").map(|v| v.to_string()))
                 .ok();
-            let gh_token = env.secret("SPOT_CONFIG_GH_TOKEN")
+            let gh_token = env
+                .secret("SPOT_CONFIG_GH_TOKEN")
                 .map(|s| s.to_string())
                 .or_else(|_| env.var("SPOT_CONFIG_GH_TOKEN").map(|v| v.to_string()))
                 .or_else(|_| env.secret("GH_TOKEN").map(|s| s.to_string()))
                 .or_else(|_| env.var("GH_TOKEN").map(|v| v.to_string()))
                 .ok();
 
-            match reconciler::reconcile_worker_fleet(&kv, sa_key.as_deref(), gh_token.as_deref(), now).await {
+            match reconciler::reconcile_worker_fleet(
+                &kv,
+                sa_key.as_deref(),
+                gh_token.as_deref(),
+                now,
+            )
+            .await
+            {
                 Ok(report) => json_response(200, &report),
                 Err(e) => error_response(500, "reconciliation_failed", &e.to_string()),
             }
@@ -840,7 +1030,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 return error_response(404, "not_found", "Not found");
             }
             let body_val: Value = req.json().await.unwrap_or(Value::Null);
-            let vm_name = body_val.get("name").and_then(|v| v.as_str()).unwrap_or("oxidex-runners-preempted");
+            let vm_name = body_val
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("oxidex-runners-preempted");
             reconciler::inject_terminated_vm(vm_name.to_string());
             let resp = serde_json::json!({
                 "status": "injected",
@@ -854,7 +1047,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 return error_response(404, "not_found", "Not found");
             }
             let body_val: Value = req.json().await.unwrap_or(Value::Null);
-            let runner_id = body_val.get("runner_id").and_then(|v| v.as_str()).unwrap_or("runner-stale-999");
+            let runner_id = body_val
+                .get("runner_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("runner-stale-999");
             reconciler::inject_stale_runner(runner_id.to_string());
             let resp = serde_json::json!({
                 "status": "injected",
@@ -892,30 +1088,35 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         // 404 for unhandled routes
-        _ => {
-            error_response(404, "not_found", "Not found")
-        }
+        _ => error_response(404, "not_found", "Not found"),
     }
 }
 
 /// Scheduled event hook for the 5-minute Fleet Reconciler (Requirement R3).
 #[event(scheduled)]
 pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    console_log!("Scheduled fleet reconciliation triggered at {}", event.cron());
+    console_log!(
+        "Scheduled fleet reconciliation triggered at {}",
+        event.cron()
+    );
     let now = current_time_epoch();
     if let Ok(kv) = env.kv("SPOT_KV") {
-        let sa_key = env.secret("GCP_SERVICE_ACCOUNT_KEY")
+        let sa_key = env
+            .secret("GCP_SERVICE_ACCOUNT_KEY")
             .map(|s| s.to_string())
             .or_else(|_| env.var("GCP_SERVICE_ACCOUNT_KEY").map(|v| v.to_string()))
             .ok();
-        let gh_token = env.secret("SPOT_CONFIG_GH_TOKEN")
+        let gh_token = env
+            .secret("SPOT_CONFIG_GH_TOKEN")
             .map(|s| s.to_string())
             .or_else(|_| env.var("SPOT_CONFIG_GH_TOKEN").map(|v| v.to_string()))
             .or_else(|_| env.secret("GH_TOKEN").map(|s| s.to_string()))
             .or_else(|_| env.var("GH_TOKEN").map(|v| v.to_string()))
             .ok();
 
-        let _ = reconciler::reconcile_worker_fleet(&kv, sa_key.as_deref(), gh_token.as_deref(), now).await;
+        let _ =
+            reconciler::reconcile_worker_fleet(&kv, sa_key.as_deref(), gh_token.as_deref(), now)
+                .await;
     }
 }
 

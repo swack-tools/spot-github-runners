@@ -3591,7 +3591,11 @@ pub fn html_escape(input: &str) -> String {
 
 /// Render the complete dashboard HTML with custom GCP project and GitHub Org parameters.
 pub fn render_dashboard_html(project: &str, org: &str) -> String {
-    let proj = if project.is_empty() { "homelab-424523" } else { project };
+    let proj = if project.is_empty() {
+        "homelab-424523"
+    } else {
+        project
+    };
     let github_org = if org.is_empty() { "swack-tools" } else { org };
 
     // If default values are requested, avoid replacement allocations
@@ -3761,7 +3765,9 @@ pub fn serve_login_gate(
         return Ok(Response::empty()?.with_status(status).with_headers(headers));
     }
 
-    Ok(Response::ok(html)?.with_status(status).with_headers(headers))
+    Ok(Response::ok(html)?
+        .with_status(status)
+        .with_headers(headers))
 }
 
 #[cfg(test)]

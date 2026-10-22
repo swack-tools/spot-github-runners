@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rendered by spot_runner_manager.py and delivered as GCE startup-script metadata.
+# Rendered by Cloudflare Worker and delivered as GCE startup-script metadata.
 set -Eeuo pipefail
 set +x
 exec > >(tee -a /var/log/gha-runner-bootstrap.log) 2>&1
@@ -110,36 +110,54 @@ fi
 printf '%s' '{{DOCKERFILE_B64}}' | base64 -d >/opt/gha-runners/build/Dockerfile
 printf '%s' '{{ENTRYPOINT_B64}}' | base64 -d >/opt/gha-runners/build/entrypoint.sh
 printf '%s' '{{JOB_COMPLETED_B64}}' | base64 -d >/opt/gha-runners/build/job-completed.sh
-printf '%s' '{{CLEAN_TARGET_B64}}' | base64 -d >/opt/gha-runners/build/clean_target.py
-printf '%s' '{{DOCKER_WRAPPER_B64}}' | base64 -d >/opt/gha-runners/build/docker-wrapper.py
-chmod 0755 /opt/gha-runners/build/docker-wrapper.py
-printf '%s' '{{ADMISSION_B64}}' | base64 -d >/opt/gha-runners/build/host_admission.py
 printf '%s' '{{JOB_STARTED_B64}}' | base64 -d >/opt/gha-runners/build/job-started.sh
-printf '%s' '{{EVIDENCE_B64}}' | base64 -d >/opt/gha-runners/host_evidence.py
+
+# Pure-Rust host-agent binary placement and symlink setup
+install -d -m 0755 /usr/local/bin
+if [[ -x /usr/local/bin/host-agent ]]; then
+  cp /usr/local/bin/host-agent /opt/gha-runners/build/host-agent
+fi
+for alias in clean-target host-admission docker-wrapper docker-admission \
+             host-launcher builder-entrypoint worktree-commands toolchain-probe \
+             gha-runner-clean-target gha-host-admission oxidex-remote-build \
+             oxidex-build-entrypoint oxidex-worktree-commands oxidex-toolchain-probe; do
+  ln -sf /usr/local/bin/host-agent "/usr/local/bin/$alias"
+done
+
 TIERED={{TIERED}}
 STRICT_HEAVY_POOL={{STRICT_HEAVY_POOL}}
 if [[ "$TIERED" == 1 ]]; then
   install -d -m 0755 /run/gha-admission
-  cp /opt/gha-runners/build/host_admission.py /opt/gha-runners/host_admission.py
-  printf '%s' '{{DOCKER_ADMISSION_B64}}' | base64 -d >/usr/local/bin/docker
-  chmod 0755 /usr/local/bin/docker
-  python3 - <<'ADMISSION_CONFIG'
-import json, socket
-names = ['{{RUNNER_PREFIX}}-'+socket.gethostname().split('.')[0]+'-'+str(i) for i in range(1,{{RUNNER_COUNT}}+1)]
-config=dict(work_gib={{ADMISSION_WORK_GIB}},runner_gib={{RUNNER_MEMORY_GB}},builder_gib={{BUILDER_MEMORY_GIB}},runner_names=names)
-if {{STRICT_HEAVY_POOL}}:
-    config.update(role='runner',heavy_runners=names)
-with open('/etc/gha-admission.json','w') as target:
-    json.dump(config,target)
-ADMISSION_CONFIG
+  ln -sf /usr/local/bin/host-agent /usr/local/bin/docker
+
+  hostname_short=$(hostname -s)
+  runner_names=$(jq -n --arg prefix "{{RUNNER_PREFIX}}" --arg host "$hostname_short" --argjson count {{RUNNER_COUNT}} \
+    '[range(1; ($count + 1) | floor) | "\($prefix)-\($host)-\(.)"]')
+  if [[ "{{STRICT_HEAVY_POOL}}" == "1" || "{{STRICT_HEAVY_POOL}}" == "True" || "{{STRICT_HEAVY_POOL}}" == "true" ]]; then
+    jq -n \
+      --argjson work_gib {{ADMISSION_WORK_GIB}} \
+      --argjson runner_gib {{RUNNER_MEMORY_GB}} \
+      --argjson builder_gib {{BUILDER_MEMORY_GIB}} \
+      --argjson names "$runner_names" \
+      '{work_gib: $work_gib, runner_gib: $runner_gib, builder_gib: $builder_gib, runner_names: $names, role: "runner", heavy_runners: $names}' \
+      >/etc/gha-admission.json
+  else
+    jq -n \
+      --argjson work_gib {{ADMISSION_WORK_GIB}} \
+      --argjson runner_gib {{RUNNER_MEMORY_GB}} \
+      --argjson builder_gib {{BUILDER_MEMORY_GIB}} \
+      --argjson names "$runner_names" \
+      '{work_gib: $work_gib, runner_gib: $runner_gib, builder_gib: $builder_gib, runner_names: $names}' \
+      >/etc/gha-admission.json
+  fi
   chmod 0644 /etc/gha-admission.json
   cat >/etc/systemd/system/gha-admission.service <<'ADMISSION_SERVICE'
 [Unit]
-Description=Shared runner and builder memory admission
+Description=Shared runner and builder memory admission (host-agent)
 After=docker.service
 Requires=docker.service
 [Service]
-ExecStart=/usr/bin/python3 /opt/gha-runners/host_admission.py serve
+ExecStart=/usr/local/bin/host-agent host-admission serve
 Restart=always
 RestartSec=5
 [Install]
@@ -157,9 +175,7 @@ REMOTE_BUILDER={{REMOTE_BUILDER}}
 if [[ "$REMOTE_BUILDER" == 1 ]]; then
   install -d -m 0755 /opt/gha-runners/builder
   printf '%s' '{{BUILDER_DOCKERFILE_B64}}' | base64 -d >/opt/gha-runners/builder/Dockerfile
-  printf '%s' '{{BUILDER_ENTRYPOINT_B64}}' | base64 -d >/opt/gha-runners/builder/entrypoint.py
-  printf '%s' '{{HOST_LAUNCHER_B64}}' | base64 -d >/usr/local/bin/oxidex-remote-build
-  chmod 0755 /usr/local/bin/oxidex-remote-build
+  cp /usr/local/bin/host-agent /opt/gha-runners/builder/host-agent
   printf '%s\n' '{"cpus":{{BUILDER_CPUS}},"memory_gib":{{BUILDER_MEMORY_GIB}}}' >/etc/oxidex-remote-build.json
   chmod 0644 /etc/oxidex-remote-build.json
   docker build -t oxidex-remote-builder:1.97.1 /opt/gha-runners/builder

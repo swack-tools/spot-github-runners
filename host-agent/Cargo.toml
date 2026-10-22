@@ -1,0 +1,42 @@
+[package]
+name = "host-agent"
+version = "0.1.0"
+edition = "2021"
+authors = ["swackhamer <swackhamer@users.noreply.github.com>"]
+description = "Pure-Rust host admission, target cleanup, docker wrapper, and builder runtime agent"
+license = "Apache-2.0"
+
+[lib]
+name = "host_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "host-agent"
+path = "src/main.rs"
+
+[dependencies]
+# POSIX and platform FFI
+libc = "0.2"
+nix = { version = "0.29", default-features = false, features = ["fs", "dir", "socket", "signal", "process"] }
+
+# Structured serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography and pattern matching
+sha2 = "0.10"
+hex = "0.4"
+regex = "1.10"
+
+# Error handling
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

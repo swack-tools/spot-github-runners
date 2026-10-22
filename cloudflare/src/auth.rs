@@ -1,13 +1,13 @@
 //! HMAC Session Authentication and OAuth module for Cloudflare Worker.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use hmac::{Hmac, Mac};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -65,7 +65,10 @@ pub struct DeviceHandshakeRecord {
 pub enum SessionCheckStatus {
     Ok,
     None,
-    Forbidden { message: String, missing_targets: Vec<String> },
+    Forbidden {
+        message: String,
+        missing_targets: Vec<String>,
+    },
 }
 
 /// Derives a 32-byte purpose key: HMAC-SHA256(secret, "spot-dashboard/<purpose>/v1")
@@ -179,14 +182,18 @@ pub fn parse_cookies(cookie_header: &str) -> HashMap<String, String> {
             if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
                 val = &val[1..val.len() - 1];
             }
-            cookies.entry(name.to_string()).or_insert_with(|| val.to_string());
+            cookies
+                .entry(name.to_string())
+                .or_insert_with(|| val.to_string());
         }
     }
     cookies
 }
 
 pub fn format_session_cookie(token: &str, max_age: u64) -> String {
-    format!("{SESSION_COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=Lax")
+    format!(
+        "{SESSION_COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=Lax"
+    )
 }
 
 pub fn format_cleared_session_cookie() -> String {
@@ -225,7 +232,9 @@ pub fn is_valid_github_login(login: &str) -> bool {
     if !bytes[0].is_ascii_alphanumeric() {
         return false;
     }
-    bytes.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 pub fn parse_session_not_before(raw: Option<&str>) -> Option<u64> {
@@ -298,14 +307,18 @@ pub fn check_session(
 ) -> SessionCheckStatus {
     if !may_sign_in(&session.sub, session.uid, added_admins) {
         return SessionCheckStatus::Forbidden {
-            message: format!("Forbidden: GitHub user '{}' is not an authorized administrator", session.sub),
+            message: format!(
+                "Forbidden: GitHub user '{}' is not an authorized administrator",
+                session.sub
+            ),
             missing_targets: Vec::new(),
         };
     }
     if global_admins {
         return SessionCheckStatus::Ok;
     }
-    let verified: std::collections::HashSet<String> = session.tgt.iter().map(|t| t.to_lowercase()).collect();
+    let verified: std::collections::HashSet<String> =
+        session.tgt.iter().map(|t| t.to_lowercase()).collect();
     let missing: Vec<String> = controlled_targets
         .iter()
         .filter(|t| !verified.contains(&t.to_lowercase()))
@@ -369,18 +382,12 @@ pub fn build_github_authorize_url(
     state: &str,
     challenge: &str,
 ) -> String {
-    let encoded_redirect = percent_encoding::utf8_percent_encode(
-        redirect_uri,
-        percent_encoding::NON_ALPHANUMERIC,
-    );
-    let encoded_state = percent_encoding::utf8_percent_encode(
-        state,
-        percent_encoding::NON_ALPHANUMERIC,
-    );
-    let encoded_challenge = percent_encoding::utf8_percent_encode(
-        challenge,
-        percent_encoding::NON_ALPHANUMERIC,
-    );
+    let encoded_redirect =
+        percent_encoding::utf8_percent_encode(redirect_uri, percent_encoding::NON_ALPHANUMERIC);
+    let encoded_state =
+        percent_encoding::utf8_percent_encode(state, percent_encoding::NON_ALPHANUMERIC);
+    let encoded_challenge =
+        percent_encoding::utf8_percent_encode(challenge, percent_encoding::NON_ALPHANUMERIC);
     format!(
         "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read%3Aorg%2Crepo&state={}&code_challenge={}&code_challenge_method=S256&allow_signup=false",
         client_id, encoded_redirect, encoded_state, encoded_challenge
@@ -403,14 +410,17 @@ pub fn verify_oauth_state(
         return Err("State mismatch between query parameter and cookie");
     }
     let state_key = derive_purpose_key(secret, "oauth-state");
-    let val = verify_token_signature(&state_key, param_state)
-        .ok_or("Invalid state token signature")?;
-    let payload: OAuthStatePayload = serde_json::from_value(val)
-        .map_err(|_| "Malformed state token payload")?;
+    let val =
+        verify_token_signature(&state_key, param_state).ok_or("Invalid state token signature")?;
+    let payload: OAuthStatePayload =
+        serde_json::from_value(val).map_err(|_| "Malformed state token payload")?;
     if payload.v != 1 {
         return Err("Invalid state token version");
     }
-    if payload.exp <= now || payload.iat > now + CLOCK_SKEW_SECONDS || payload.exp.saturating_sub(payload.iat) > DEFAULT_STATE_TTL_SECONDS {
+    if payload.exp <= now
+        || payload.iat > now + CLOCK_SKEW_SECONDS
+        || payload.exp.saturating_sub(payload.iat) > DEFAULT_STATE_TTL_SECONDS
+    {
         return Err("State token expired or invalid timestamp");
     }
     Ok(payload)
@@ -451,7 +461,10 @@ pub fn mint_session_cookie(
     };
     let session_key = derive_purpose_key(secret, "session");
     let token = sign_token(&session_key, &session)?;
-    Ok(format_session_cookie(&token, DEFAULT_DASHBOARD_SESSION_TTL_SECONDS))
+    Ok(format_session_cookie(
+        &token,
+        DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,10 +489,7 @@ pub enum DevicePollResult {
     Invalid,
 }
 
-pub fn start_device_flow(
-    secret: &[u8],
-    now: u64,
-) -> Result<(DeviceRecord, String), String> {
+pub fn start_device_flow(secret: &[u8], now: u64) -> Result<(DeviceRecord, String), String> {
     let mut dev_bytes = [0u8; 32];
     getrandom::getrandom(&mut dev_bytes).map_err(|e| e.to_string())?;
     let device_code = hex::encode(dev_bytes);
@@ -487,8 +497,12 @@ pub fn start_device_flow(
     let mut user_bytes = [0u8; 8];
     getrandom::getrandom(&mut user_bytes).map_err(|e| e.to_string())?;
     const ALPHANUM: &[u8] = b"BCDFGHJKLMNPQRSTVWXYZ23456789";
-    let p1: String = (0..4).map(|i| ALPHANUM[(user_bytes[i] as usize) % ALPHANUM.len()] as char).collect();
-    let p2: String = (4..8).map(|i| ALPHANUM[(user_bytes[i] as usize) % ALPHANUM.len()] as char).collect();
+    let p1: String = (0..4)
+        .map(|i| ALPHANUM[(user_bytes[i] as usize) % ALPHANUM.len()] as char)
+        .collect();
+    let p2: String = (4..8)
+        .map(|i| ALPHANUM[(user_bytes[i] as usize) % ALPHANUM.len()] as char)
+        .collect();
     let user_code = format!("{}-{}", p1, p2);
 
     let handshake = DeviceHandshakeRecord {
@@ -529,7 +543,10 @@ pub fn poll_device_flow(code_or_handle: &str, now: u64) -> DevicePollResult {
         return DevicePollResult::Invalid;
     }
     let code = HANDLE_TO_CODE.with(|cell| {
-        cell.borrow().get(code_or_handle).cloned().unwrap_or_else(|| code_or_handle.to_string())
+        cell.borrow()
+            .get(code_or_handle)
+            .cloned()
+            .unwrap_or_else(|| code_or_handle.to_string())
     });
     DEVICE_STORE.with(|cell| {
         let mut store = cell.borrow_mut();
@@ -547,9 +564,12 @@ pub fn poll_device_flow(code_or_handle: &str, now: u64) -> DevicePollResult {
             };
         }
         if now < record.next_poll_at {
-            record.interval = (record.interval + DEVICE_SLOW_DOWN_INCREMENT_SECONDS).min(DEVICE_MAX_INTERVAL_SECONDS);
+            record.interval = (record.interval + DEVICE_SLOW_DOWN_INCREMENT_SECONDS)
+                .min(DEVICE_MAX_INTERVAL_SECONDS);
             record.next_poll_at = now + record.interval;
-            return DevicePollResult::SlowDown { interval: record.interval };
+            return DevicePollResult::SlowDown {
+                interval: record.interval,
+            };
         }
         record.next_poll_at = now + record.interval;
         DevicePollResult::Pending
@@ -558,7 +578,10 @@ pub fn poll_device_flow(code_or_handle: &str, now: u64) -> DevicePollResult {
 
 pub fn authorize_device(code_or_handle: &str, user_login: &str, user_id: u64) -> bool {
     let code = HANDLE_TO_CODE.with(|cell| {
-        cell.borrow().get(code_or_handle).cloned().unwrap_or_else(|| code_or_handle.to_string())
+        cell.borrow()
+            .get(code_or_handle)
+            .cloned()
+            .unwrap_or_else(|| code_or_handle.to_string())
     });
     DEVICE_STORE.with(|cell| {
         let mut store = cell.borrow_mut();

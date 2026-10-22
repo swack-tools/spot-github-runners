@@ -9,5 +9,5 @@ if [[ -e /run/gha-runner-cordon/draining ]]; then
   exit 1
 fi
 if [[ "${GHA_ADMISSION_REQUIRED:-0}" == 1 ]]; then
-  exec python3 /usr/local/bin/gha-host-admission.py acquire
+  exec host-agent host-admission acquire
 fi

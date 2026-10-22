@@ -27,7 +27,6 @@ fn test_slash_smuggling_and_control_path_blocking_exhaustive() {
         "/api/control/",
         "/api/control/secret",
         "/api/control/sub/path",
-        
         // Consecutive slash smuggling
         "//api/control",
         "///api///control",
@@ -36,7 +35,6 @@ fn test_slash_smuggling_and_control_path_blocking_exhaustive() {
         "//api//control//",
         "//////api//////control//////",
         "//api///control/something",
-        
         // Percent-encoded variations (single encoding)
         "//api/%63ontrol",
         "/api/%63%6f%6e%74%72%6f%6c",
@@ -45,11 +43,9 @@ fn test_slash_smuggling_and_control_path_blocking_exhaustive() {
         "/api/%43ontrol", // uppercase 'C'
         "/API/CONTROL",
         "//API/CONTROL",
-        
         // Double percent-encoding (%2563 -> %63 -> c)
         "//api/%2563ontrol",
         "/api/%2563%256f%256e%2574%2572%256f%256c",
-        
         // Dot segments and path traversal
         "/foo/../api/control",
         "/foo/bar/../../api/control",
@@ -59,7 +55,6 @@ fn test_slash_smuggling_and_control_path_blocking_exhaustive() {
         "//api/./control",
         "/api/%2e/control",
         "/api/%2e%2e/api/control",
-        
         // Suffix & delimiter smuggling
         "/api/control?anything",
         "/api/control?foo=bar&baz=1",
@@ -68,7 +63,6 @@ fn test_slash_smuggling_and_control_path_blocking_exhaustive() {
         "/api/control;param=1",
         "/api/control.json",
         "/api/control.php",
-        
         // Encoded slash and control variations
         "/api/control%2f",
         "/api/control%2F",
@@ -76,7 +70,6 @@ fn test_slash_smuggling_and_control_path_blocking_exhaustive() {
         "//api%2fcontrol",
         "/api/control%20",
         "/api/control%09",
-        
         // Backslash mixing and smuggling
         "\\api\\control",
         "/api\\control",
@@ -85,7 +78,6 @@ fn test_slash_smuggling_and_control_path_blocking_exhaustive() {
         "/\\api/\\control",
         "\\\\api\\\\control",
         "\\\\api/control",
-        
         // Path without leading slash
         "api/control",
         "api//control",
@@ -118,8 +110,8 @@ fn test_slash_smuggling_and_control_path_blocking_exhaustive() {
         "/auth/device/token",
         "/auth/device/poll",
         "/auth/logout",
-        "/api/controller",     // legitimate hypothetical distinct route
-        "/api/controlling",    // legitimate hypothetical distinct route
+        "/api/controller",  // legitimate hypothetical distinct route
+        "/api/controlling", // legitimate hypothetical distinct route
     ];
 
     for path in allowed_cases {
@@ -144,10 +136,16 @@ fn test_oauth_state_hmac_forgery_expired_and_nonce_replay() {
     assert!(cookie.contains(&valid_state));
 
     let parsed_cookie = parse_cookies(&cookie);
-    let cookie_val = parsed_cookie.get(OAUTH_STATE_COOKIE_NAME).expect("Cookie must exist");
+    let cookie_val = parsed_cookie
+        .get(OAUTH_STATE_COOKIE_NAME)
+        .expect("Cookie must exist");
 
     let verified = verify_oauth_state(TEST_SECRET, &valid_state, cookie_val, now);
-    assert!(verified.is_ok(), "Baseline verification failed: {:?}", verified);
+    assert!(
+        verified.is_ok(),
+        "Baseline verification failed: {:?}",
+        verified
+    );
     let payload = verified.unwrap();
     assert_eq!(payload.r, "/overview");
     assert_eq!(payload.v, 1);
@@ -283,16 +281,16 @@ fn test_session_token_malformed_base64_bad_signatures_and_missing_purpose() {
 
     // 1. Malformed Base64 Bodies
     let malformed_bodies: Vec<String> = vec![
-        "".to_string(),                                     // empty body
-        "!!!not_valid_base64!!!".to_string(),               // invalid chars
-        "abc===".to_string(),                               // invalid padding length
-        "abcde=".to_string(),                               // standard base64 with '=' padding (URL_SAFE_NO_PAD required)
-        "abcde==".to_string(),                              // double padding
-        "a+b/c==".to_string(),                              // standard base64 alphabet ('+' and '/')
-        "hello%20world".to_string(),                        // url-encoded instead of b64
-        "{\"v\":1}".to_string(),                            // raw json not b64
-        body_b64[..body_b64.len() - 1].to_string(),        // truncated base64
-        format!("{body_b64}@@"),                            // corrupted b64
+        "".to_string(),                             // empty body
+        "!!!not_valid_base64!!!".to_string(),       // invalid chars
+        "abc===".to_string(),                       // invalid padding length
+        "abcde=".to_string(), // standard base64 with '=' padding (URL_SAFE_NO_PAD required)
+        "abcde==".to_string(), // double padding
+        "a+b/c==".to_string(), // standard base64 alphabet ('+' and '/')
+        "hello%20world".to_string(), // url-encoded instead of b64
+        "{\"v\":1}".to_string(), // raw json not b64
+        body_b64[..body_b64.len() - 1].to_string(), // truncated base64
+        format!("{body_b64}@@"), // corrupted b64
     ];
 
     for bad_body in &malformed_bodies {
@@ -306,12 +304,12 @@ fn test_session_token_malformed_base64_bad_signatures_and_missing_purpose() {
     // 2. Decodable Base64 but Malformed JSON / Schema
     let non_json_bodies = vec![
         URL_SAFE_NO_PAD.encode(b"not json at all"),
-        URL_SAFE_NO_PAD.encode(b"12345"),                    // json number
-        URL_SAFE_NO_PAD.encode(b"\"just a string\""),        // json string
-        URL_SAFE_NO_PAD.encode(b"[1, 2, 3]"),                // json array
-        URL_SAFE_NO_PAD.encode(b"true"),                     // json bool
-        URL_SAFE_NO_PAD.encode(b"{\"sub\": \"admin\"}"),     // missing required fields
-        URL_SAFE_NO_PAD.encode(b"\x00\x01\x02\x03"),         // binary bytes
+        URL_SAFE_NO_PAD.encode(b"12345"),             // json number
+        URL_SAFE_NO_PAD.encode(b"\"just a string\""), // json string
+        URL_SAFE_NO_PAD.encode(b"[1, 2, 3]"),         // json array
+        URL_SAFE_NO_PAD.encode(b"true"),              // json bool
+        URL_SAFE_NO_PAD.encode(b"{\"sub\": \"admin\"}"), // missing required fields
+        URL_SAFE_NO_PAD.encode(b"\x00\x01\x02\x03"),  // binary bytes
     ];
 
     for bad_body in non_json_bodies {
@@ -329,12 +327,12 @@ fn test_session_token_malformed_base64_bad_signatures_and_missing_purpose() {
 
     // 3. Incorrect / Tampered Signatures
     let bad_signatures: Vec<String> = vec![
-        "".to_string(),                                                             // empty sig
-        "abc".to_string(),                                                          // too short
+        "".to_string(),    // empty sig
+        "abc".to_string(), // too short
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde".to_string(), // 63 chars
-        format!("{valid_sig}0"),                                                    // 65 chars
+        format!("{valid_sig}0"), // 65 chars
         "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string(), // non-hex chars
-        valid_sig.to_uppercase(),                                                   // uppercase hex (spec requires lowercase)
+        valid_sig.to_uppercase(), // uppercase hex (spec requires lowercase)
         "0000000000000000000000000000000000000000000000000000000000000000".to_string(), // null signature
     ];
 
@@ -412,12 +410,12 @@ fn test_session_adversarial_boundaries_and_identity() {
 
     // B. Invalid GitHub usernames
     let invalid_logins = vec![
-        "",                     // empty
-        "-swackhamer",          // leading hyphen (illegal in GitHub)
-        "swack_hamer",          // underscore (illegal in GitHub user logins)
-        "swack..hamer",         // consecutive dots
-        "swackhamer@github",    // email style
-        "swack/hamer",          // slash
+        "",                                                             // empty
+        "-swackhamer",       // leading hyphen (illegal in GitHub)
+        "swack_hamer",       // underscore (illegal in GitHub user logins)
+        "swack..hamer",      // consecutive dots
+        "swackhamer@github", // email style
+        "swack/hamer",       // slash
         "a-very-long-github-username-that-exceeds-39-characters-total", // > 39 chars
     ];
 
@@ -453,7 +451,7 @@ fn test_session_adversarial_boundaries_and_identity() {
         "123abc456",
         "-100",
         "1792000000.5",
-        " 1792000000 ", // leading/trailing spaces with non-digit
+        " 1792000000 ",        // leading/trailing spaces with non-digit
         "1792000000000000000", // > 15 chars
     ];
 

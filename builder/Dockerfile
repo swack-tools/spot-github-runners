@@ -1,12 +1,7 @@
 FROM oxidex-self-hosted-runner:2.337.0
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends rsync time python3-venv llvm \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3 -m venv /opt/uv && /opt/uv/bin/pip install --no-cache-dir uv
-ENV UV_PYTHON_INSTALL_DIR=/opt/python
-RUN /opt/uv/bin/uv python install 3.11 \
-    && mkdir -p /opt/build-tools \
-    && ln -s "$(/opt/uv/bin/uv python find 3.11)" /opt/build-tools/python3
+RUN apt-get update && apt-get install -y --no-install-recommends rsync time llvm \
+    && rm -rf /var/lib/apt/lists/*
 # Primary release checksums: https://ziglang.org/download/index.json and
 # https://index.crates.io/ca/rg/cargo-zigbuild. Verify both archives before use.
 # Zig supplies target musl headers/libraries and compiles zip's C-backed codecs;
@@ -65,13 +60,22 @@ RUN install -d -m 0755 /opt/opensourceDarwinStubs/CoreFoundation.framework \
       'OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN' \
       'THE SOFTWARE.' > /opt/opensourceDarwinStubs/NOTICE \
     && chmod 0444 /opt/opensourceDarwinStubs/CoreFoundation.framework/CoreFoundation.tbd /opt/opensourceDarwinStubs/NOTICE
-COPY entrypoint.py /usr/local/bin/oxidex-build-entrypoint
-RUN chmod 0755 /usr/local/bin/oxidex-build-entrypoint \
+COPY host-agent /usr/local/bin/host-agent
+RUN chmod 0755 /usr/local/bin/host-agent \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-build-entrypoint \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/builder-entrypoint \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-worktree-commands \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/worktree-commands \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-toolchain-probe \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/toolchain-probe \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/docker-admission \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/host-launcher \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-remote-build \
     && install -m 0444 /dev/null /run/oxidex-build-container
 USER runner
 ENV CARGO_HOME=/home/runner/.cargo
 ENV RUSTUP_HOME=/home/runner/.rustup
-ENV PATH=/home/runner/.cargo/bin:/opt/build-tools:/opt/uv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/home/runner/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh \
     && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.97.1 \
     && rm /tmp/rustup-init.sh \
@@ -85,10 +89,9 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
     && rm -rf /tmp/cargo-zigbuild-source \
     && test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.4' \
     && rustc -vV && cargo -V && cargo nextest --version && cbindgen --version \
-    && just --version && uv --version && python3 --version \
+    && just --version \
     && /opt/zig/zig version && cargo-zigbuild --version && llvm-strip --version
 ENV CARGO_HOME=/cargo
 ENV CARGO_TARGET_DIR=/target
-ENV UV_CACHE_DIR=/cargo/uv-cache
 WORKDIR /src
-ENTRYPOINT ["/usr/bin/python3", "/usr/local/bin/oxidex-build-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/host-agent", "builder-entrypoint"]
