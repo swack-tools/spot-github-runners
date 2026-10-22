@@ -1304,4 +1304,7 @@ fn test_dynamic_overview_filtering_resets_reused_vm_id_and_start_time() {
     assert_eq!(vm["instance_id"], "new-gce-id-222");
     assert_eq!(vm["started_epoch"], new_epoch);
     assert_eq!(vm["started_at"], chrono_iso(new_epoch as u64));
+    assert!(ov["pricing"].is_object());
+    assert_eq!(ov["pricing"]["running_runner_slots"], 2);
+    assert_eq!(ov["pricing"]["active_instances_count"], 1);
 }
