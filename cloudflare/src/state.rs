@@ -43,6 +43,7 @@ pub struct DashboardBundle {
     pub state_version: u64,
     pub writer_slot: String,
     pub written_at: u64,
+    #[serde(default)]
     pub state_fingerprint: String,
     pub state: DashboardState,
 }
@@ -506,13 +507,74 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
 ) -> Result<(u16, serde_json::Value), StateError> {
     let (bundle, _source) = load_state(kv, now).await?;
 
-    // If precomputed overview is present in bundle, serve directly (<1ms)
+    // If precomputed overview is present in bundle, serve directly (<1ms) with live budget/scaling overlaid
     if let Some(ref overview) = bundle.state.overview {
-        return Ok((200, overview.clone()));
+        let mut ov = overview.clone();
+        if let Some(obj) = ov.as_object_mut() {
+            if let Ok(gb) = serde_json::to_value(&bundle.state.global_budget) {
+                obj.insert("global_budget".to_string(), gb);
+            }
+            if let Ok(sc) = serde_json::to_value(&bundle.state.scaling) {
+                obj.insert("scaling".to_string(), sc);
+            }
+            if !bundle.state.profiles.is_empty() {
+                if let Ok(pr) = serde_json::to_value(&bundle.state.profiles) {
+                    obj.insert("profiles".to_string(), pr);
+                }
+            }
+        }
+        return Ok((200, ov));
     }
 
     // Otherwise serialize state snapshot directly
     Ok((200, serde_json::to_value(&bundle.state)?))
+}
+
+pub async fn handle_post_budget<K: KvStoreBackend>(
+    kv: &K,
+    req: BudgetConfig,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let (mut bundle, _) = load_state(kv, now).await?;
+    bundle.state.global_budget = req.clone();
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+    Ok((200, serde_json::json!({
+        "status": "ok",
+        "global_budget": req,
+    })))
+}
+
+pub async fn handle_post_regions<K: KvStoreBackend>(
+    kv: &K,
+    body: serde_json::Value,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let (mut bundle, _) = load_state(kv, now).await?;
+    if let Some(map) = body.get("regions_enabled").and_then(|v| v.as_object()) {
+        for (region, enabled_val) in map {
+            if let Some(en) = enabled_val.as_bool() {
+                bundle.state.regions_enabled.insert(region.clone(), en);
+                if let Some(ref mut ov) = bundle.state.overview {
+                    if let Some(regions_arr) = ov.get_mut("regions").and_then(|r| r.as_array_mut()) {
+                        for r_obj in regions_arr.iter_mut() {
+                            if r_obj.get("region").and_then(|s| s.as_str()) == Some(region.as_str()) {
+                                if let Some(m) = r_obj.as_object_mut() {
+                                    m.insert("enabled".to_string(), serde_json::json!(en));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+    Ok((200, serde_json::json!({
+        "status": "ok",
+        "regions_enabled": bundle.state.regions_enabled,
+    })))
 }
 
 pub async fn handle_get_scaling<K: KvStoreBackend>(
