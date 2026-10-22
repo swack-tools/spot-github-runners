@@ -758,14 +758,38 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             let (bundle, _) = state::load_state(&kv, now)
                 .await
                 .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            let global_admins = is_global_admins_enabled(&env);
+            let is_authed_admin = if let Some(ref session) = verified_session {
+                matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                )
+            } else {
+                false
+            };
             let mut builds_val = bundle.state.rust_builds.clone();
-            if let Some(builds_arr) = builds_val.get_mut("builds").and_then(|v| v.as_array_mut()) {
-                for b in builds_arr.iter_mut() {
-                    if let Some(obj) = b.as_object_mut() {
-                        obj.remove("origin_ip");
-                        obj.remove("origin_hostname");
-                        obj.remove("ip");
-                        obj.remove("client_ip");
+            if !is_authed_admin {
+                if let Some(builds_arr) =
+                    builds_val.get_mut("builds").and_then(|v| v.as_array_mut())
+                {
+                    for b in builds_arr.iter_mut() {
+                        if let Some(obj) = b.as_object_mut() {
+                            obj.remove("origin_ip");
+                            obj.remove("origin_hostname");
+                            obj.remove("ip");
+                            obj.remove("client_ip");
+                        }
                     }
                 }
             }
@@ -1284,8 +1308,32 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Dedicated Read-Only Inventory Refresh Endpoint
         (Method::Post, "/api/inventory/refresh") => {
-            if is_production_oauth_configured(&env) && verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            if is_production_oauth_configured(&env) {
+                let session = match verified_session {
+                    Some(ref s) => s,
+                    None => return error_response(401, "unauthorized", "Sign in required"),
+                };
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
+                let global_admins = is_global_admins_enabled(&env);
+                if !matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                ) {
+                    return error_response(403, "forbidden", "Administrator permissions required");
+                }
             }
             let sa_key = env
                 .secret("GCP_SERVICE_ACCOUNT_KEY")
@@ -1301,8 +1349,32 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Reconciler Simulation & Control Endpoints
         (Method::Post, "/api/reconciler/tick") => {
-            if is_production_oauth_configured(&env) && verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            if is_production_oauth_configured(&env) {
+                let session = match verified_session {
+                    Some(ref s) => s,
+                    None => return error_response(401, "unauthorized", "Sign in required"),
+                };
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
+                let global_admins = is_global_admins_enabled(&env);
+                if !matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                ) {
+                    return error_response(403, "forbidden", "Administrator permissions required");
+                }
             }
             let is_read_only = url
                 .query_pairs()

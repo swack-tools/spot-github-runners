@@ -640,6 +640,35 @@ pub fn apply_dynamic_overview_filtering(
             .find(|inst| inst.get("name").and_then(|v| v.as_str()) == Some(&rec.name))
         {
             if let Some(obj) = existing.as_object_mut() {
+                let existing_id = obj
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| obj.get("instance_id").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let id_changed =
+                    !existing_id.is_empty() && !rec.id.is_empty() && existing_id != rec.id;
+                if id_changed {
+                    obj.insert("id".to_string(), serde_json::json!(rec.id));
+                    obj.insert("instance_id".to_string(), serde_json::json!(rec.id));
+                    let launch_epoch_from_name = parse_launch_epoch_from_name(&rec.name);
+                    let (started_epoch, started_at) = if let Some(epoch) = rec.created_epoch {
+                        (epoch as f64, chrono_iso(epoch))
+                    } else if let Some(ref at) = rec.created_at {
+                        let ep = chrono::DateTime::parse_from_rfc3339(at)
+                            .map(|dt| dt.timestamp() as f64)
+                            .unwrap_or(now as f64);
+                        (ep, at.clone())
+                    } else if let Some(epoch) = launch_epoch_from_name {
+                        (epoch as f64, chrono_iso(epoch))
+                    } else {
+                        (now as f64, chrono_iso(now))
+                    };
+                    obj.insert(
+                        "started_epoch".to_string(),
+                        serde_json::json!(started_epoch),
+                    );
+                    obj.insert("started_at".to_string(), serde_json::json!(started_at));
+                }
                 obj.insert("status".to_string(), serde_json::json!(rec.status));
                 obj.insert("zone".to_string(), serde_json::json!(rec.zone));
                 obj.insert("region".to_string(), serde_json::json!(rec.region));
@@ -651,7 +680,7 @@ pub fn apply_dynamic_overview_filtering(
                     "runners_count".to_string(),
                     serde_json::json!(rec.runners_count),
                 );
-                if !rec.status.eq_ignore_ascii_case("TERMINATED") {
+                if !rec.status.eq_ignore_ascii_case("TERMINATED") || id_changed {
                     obj.remove("deleted_epoch");
                     obj.remove("deleted_at");
                     obj.remove("deletion_trigger");

@@ -117,6 +117,19 @@ pub struct SimpleGceInstance {
     pub disks: Vec<GceAttachedDisk>,
 }
 
+impl SimpleGceInstance {
+    pub fn zone_short(&self) -> &str {
+        self.zone.rsplit('/').next().unwrap_or(&self.zone)
+    }
+
+    pub fn machine_type_short(&self) -> &str {
+        self.machine_type
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.machine_type)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpleGitHubRunner {
     pub id: u64,
@@ -607,30 +620,40 @@ where
         })
         .map(|i| {
             let is_builder = i.name.starts_with("builder-");
+            let norm_zone = i.zone_short().to_string();
+            let norm_region = norm_zone.split('-').take(2).collect::<Vec<_>>().join("-");
+            let norm_machine_type = i.machine_type_short().to_string();
+            let gce_id = i.id.clone().unwrap_or_else(|| i.name.clone());
+
             if let Some(existing) = existing_by_name.get(&i.name) {
-                let mut rec = existing.clone();
-                rec.status = i.status.clone();
-                rec.zone = i.zone.clone();
-                rec.region = i.zone.split('-').take(2).collect::<Vec<_>>().join("-");
-                rec.machine_type = i.machine_type.clone();
-                if is_builder {
-                    rec.role = "rust_builder".to_string();
-                    rec.vcpu = 16;
-                    rec.ram_gib = 32;
-                    rec.runners_count = 0;
-                    rec.runners_count_known = true;
-                    rec.runner_limits_known = true;
+                // If GCE ID changed, a new VM was created under the same name: reset identity and start timestamps
+                let id_changed =
+                    !existing.id.is_empty() && !gce_id.is_empty() && existing.id != gce_id;
+                if !id_changed {
+                    let mut rec = existing.clone();
+                    rec.status = i.status.clone();
+                    rec.zone = norm_zone.clone();
+                    rec.region = norm_region.clone();
+                    rec.machine_type = norm_machine_type.clone();
+                    if is_builder {
+                        rec.role = "rust_builder".to_string();
+                        rec.vcpu = 16;
+                        rec.ram_gib = 32;
+                        rec.runners_count = 0;
+                        rec.runners_count_known = true;
+                        rec.runner_limits_known = true;
+                    }
+                    return rec;
                 }
-                return rec;
             }
             let launch_epoch = crate::state::parse_launch_epoch_from_name(&i.name);
             let created_at = launch_epoch.map(crate::state::chrono_iso);
             InstanceRecord {
-                id: i.id.clone().unwrap_or_else(|| i.name.clone()),
+                id: gce_id,
                 name: i.name.clone(),
-                zone: i.zone.clone(),
-                region: i.zone.split('-').take(2).collect::<Vec<_>>().join("-"),
-                machine_type: i.machine_type.clone(),
+                zone: norm_zone,
+                region: norm_region,
+                machine_type: norm_machine_type,
                 status: i.status.clone(),
                 role: if is_builder {
                     "rust_builder".to_string()

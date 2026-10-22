@@ -1182,3 +1182,126 @@ async fn test_overview_filter_clears_deletion_markers_when_instance_is_live_agai
         "deletion_trigger must be cleared"
     );
 }
+
+#[tokio::test]
+async fn test_reconciler_normalizes_zone_and_machine_type_and_resets_reused_vm_id() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    set_reconciler_lease(None);
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    // Seed existing instance with old GCE ID "old-id-123" and old created timestamp
+    bundle.state.instances = vec![InstanceRecord {
+        id: "old-id-123".to_string(),
+        name: "oxidex-runners-reused-name".to_string(),
+        zone: "us-central1-a".to_string(),
+        region: "us-central1".to_string(),
+        machine_type: "c4d-standard-16".to_string(),
+        status: "RUNNING".to_string(),
+        role: "cicd_runner".to_string(),
+        vcpu: 16,
+        ram_gib: 32,
+        runners_count: 2,
+        runners_count_known: true,
+        runner_limits_known: true,
+        created_at: Some("2026-01-01T00:00:00Z".to_string()),
+        created_epoch: Some(1767225600),
+    }];
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    // GCE responds with resource-qualified zone and machine type, and a NEW GCE ID "new-id-456"
+    let gcp = MockGcpFloorClient {
+        instances: vec![SimpleGceInstance {
+            id: Some("new-id-456".to_string()),
+            name: "oxidex-runners-reused-name".to_string(),
+            zone: "zones/us-central1-a".to_string(),
+            machine_type: "machineTypes/c4d-standard-16".to_string(),
+            status: "RUNNING".to_string(),
+            metadata: spot_dashboard_edge::gcp::GceMetadata {
+                fingerprint: None,
+                items: vec![],
+            },
+            disks: vec![],
+        }],
+    };
+
+    let report = run_inventory_refresh(&kv, &gcp, now).await.unwrap();
+    assert_eq!(report.status, "inventory_refresh_success");
+
+    let (fresh_bundle, _) = load_state(&kv, now).await.unwrap();
+    assert_eq!(fresh_bundle.state.instances_view.len(), 1);
+    let refreshed = &fresh_bundle.state.instances_view[0];
+
+    // Resource names are normalized
+    assert_eq!(refreshed.zone, "us-central1-a");
+    assert_eq!(refreshed.region, "us-central1");
+    assert_eq!(refreshed.machine_type, "c4d-standard-16");
+
+    // Reused VM name with new GCE ID had identity and start reset
+    assert_eq!(refreshed.id, "new-id-456");
+    assert_ne!(
+        refreshed.created_at,
+        Some("2026-01-01T00:00:00Z".to_string())
+    );
+}
+
+#[test]
+fn test_dynamic_overview_filtering_resets_reused_vm_id_and_start_time() {
+    let now = 1792000000;
+    let old_epoch = (now - 86400) as f64;
+    let new_epoch = (now - 1800) as f64;
+
+    let mut ov = serde_json::json!({
+        "instances_view": {
+            "instances": [
+                {
+                    "id": "old-gce-id-111",
+                    "instance_id": "old-gce-id-111",
+                    "name": "oxidex-runners-reused-worker",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "zone": "us-central1-a",
+                    "region": "us-central1",
+                    "machine_type": "c4d-standard-16",
+                    "started_epoch": old_epoch,
+                    "started_at": chrono_iso(old_epoch as u64),
+                    "pricing": {
+                        "compute_hourly_usd": 0.12,
+                        "total_hourly_usd": 0.18
+                    }
+                }
+            ]
+        }
+    });
+
+    let live_inventory = vec![InstanceRecord {
+        id: "new-gce-id-222".to_string(),
+        name: "oxidex-runners-reused-worker".to_string(),
+        zone: "us-central1-a".to_string(),
+        region: "us-central1".to_string(),
+        machine_type: "c4d-standard-16".to_string(),
+        status: "RUNNING".to_string(),
+        role: "cicd_runner".to_string(),
+        vcpu: 16,
+        ram_gib: 32,
+        runners_count: 2,
+        runners_count_known: true,
+        runner_limits_known: true,
+        created_at: Some(chrono_iso(new_epoch as u64)),
+        created_epoch: Some(new_epoch as u64),
+    }];
+
+    let query = OverviewQuery::default();
+    apply_dynamic_overview_filtering(&mut ov, &query, &live_inventory, now);
+
+    let instances = ov["instances_view"]["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 1);
+    let vm = &instances[0];
+
+    assert_eq!(vm["id"], "new-gce-id-222");
+    assert_eq!(vm["instance_id"], "new-gce-id-222");
+    assert_eq!(vm["started_epoch"], new_epoch);
+    assert_eq!(vm["started_at"], chrono_iso(new_epoch as u64));
+}

@@ -55,15 +55,17 @@ DEPLOYMENT_ID="${INSTANCE_NAME}"
 UPLOADER_MAPPING="/path/to/approved-uploader-mapping.json"
 UPLOADER_CONFIG=$(jq -c . "$UPLOADER_MAPPING")
 UPLOADER_SHA=$(printf '%s' "$UPLOADER_CONFIG" | sha256sum | awk '{print $1}')
+HOST_AGENT_VERSION="v0.1.0"
+HOST_AGENT_SHA=$(sha256sum /usr/local/bin/host-agent | awk '{print $1}')
 BUILD_CONFIG='{"approved_image_id":null,"cpus":16,"image":"oxidex-remote-builder:1.99.0","memory_gib":28,"role":"builder"}'
 ADMISSION_CONFIG='{"builder_cpus":16,"builder_gib":28,"host_cpus":16,"role":"builder","runner_gib":0,"runner_names":[],"work_gib":28}'
 
 # Prepare builder asset writes script to stage configuration and download host-agent without exceeding GCE's 256 KiB metadata limit
-cat << 'EOF' > /tmp/builder_assets.sh
+cat << EOF > /tmp/builder_assets.sh
 install -d -m 0755 /usr/local/bin /opt/oxidex-builder/image
-# Download native host-agent binary from artifact storage rather than embedding large binary in instance metadata
-curl -fsSL --retry 3 --retry-connrefused "https://storage.googleapis.com/${PROJECT}-artifacts/host-agent/host-agent" -o /usr/local/bin/host-agent || \
-  curl -fsSL --retry 3 --retry-connrefused "https://github.com/swack-tools/spot-github-runners/releases/latest/download/host-agent" -o /usr/local/bin/host-agent
+# Download native host-agent binary from immutable versioned release and verify pinned checksum
+curl -fsSL --retry 3 --retry-connrefused "https://github.com/swack-tools/spot-github-runners/releases/download/${HOST_AGENT_VERSION}/host-agent" -o /usr/local/bin/host-agent
+echo "${HOST_AGENT_SHA}  /usr/local/bin/host-agent" | sha256sum -c -
 chmod 0755 /usr/local/bin/host-agent
 
 cat << 'ASSET_EOF' > /opt/oxidex-builder/image/Dockerfile
