@@ -189,3 +189,18 @@ A human task prompt authorizes agents to work on an isolated feature branch, com
      GH_TOKEN="$(gh auth token --user swackhamer)" gh pr merge --repo swack-tools/spot-github-runners \
        --squash --delete-branch --match-head-commit "$REVIEWED_HEAD_SHA"
      ```
+
+## Automated PR review scope (@codex)
+
+- Flag only concrete P0/P1 defects: auth bypasses, secret leaks, panics/crashes, KV quota regressions, or broken API/test contracts.
+- Do not flag P2 nitpicks on fallback display defaults, plan-only UI preview endpoints, or doc examples unless they cause a runtime failure or fail `just check`.
+- When reviewing a follow-up fix commit, verify only that prior review threads were resolved and no P1 regressions were introduced.
+- For any P2 or lower findings that are posted, open a follow-up GitHub issue (ticket) in `swack-tools/spot-github-runners`, reply to the review thread with the ticket link, and resolve the thread. Once a pull request has 0 P0 or P1 issues, all threads are resolved, and required CI checks pass, it is good to go (`gtg`) to squash-merge into `main`.
+
+### Local pre-PR checklist before `gh pr create`
+
+Always run the independent local review gate before opening a pull request (`gh pr create`) so the first pushed commit is already clean:
+- Verify null and `NaN` guards on query parameters (such as `window_hours.is_finite()`) and optional JSON or JavaScript fields (such as `inst.pricing` and `origin_ip`).
+- Verify administrator session revalidation (`may_sign_in`) on every newly added or modified endpoint.
+- Verify that documentation examples respect GCE's 256 KiB `startup-script` metadata limit and do not rely on single-pass `sed` `r` insertions for placeholder substitution.
+
