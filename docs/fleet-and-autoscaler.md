@@ -15,7 +15,7 @@ The edge reconciler executes an autonomous control loop on every 5-minute cron t
 1. **Inventory discovery**: queries Compute Engine (`instances.aggregatedList`, `disks.aggregatedList`) and GitHub Actions
    runner registrations for the configured organization.
 2. **Backlog detection**: queries GitHub Actions workflow runs and jobs to detect queued job backlog.
-3. **Floor target maintenance**: ensures at least one 16-vCPU Spot runner host per configured target in `SPOT_RUNNER_FLOOR_TARGETS`.
+3. **Floor target maintenance**: ensures at least one 16-vCPU Spot runner host per configured controlled target (`controlled_targets`).
 4. **Demand-driven scale-up**: launches additional 16-vCPU Spot runner hosts when queued backlog reaches or exceeds 20 jobs (`queued_jobs >= 20`).
 5. **JIT configuration minting**: requests 2-slot Just-in-Time (JIT) configurations from GitHub Actions API (`generate-jitconfig`)
    with registration token fallback.
@@ -46,16 +46,15 @@ for the host kernel, systemd services, and the Docker engine.
 
 ## Runner floor maintenance
 
-The reconciler maintains a runner floor for each target in `SPOT_RUNNER_FLOOR_TARGETS`. Each entry defines:
-
-- Organization or repository target (for example `swack-tools`).
-- Runner group ID (repository-scoped runner group).
-- Target machine shapes (such as `c4d-highcpu-16`, `n4d-highcpu-16`, `n4-highcpu-16`, `c2d-highcpu-16`).
-- Maximum daily cost budget per host (default $1.50 per day for compute and SSD storage).
+The reconciler maintains a runner floor for each target in `controlled_targets`. Each entry is an organization or `OWNER/REPO` string (for example `example-org` or `example-org/example-repo`). The reconciler derives the runner group and machine shapes automatically during deployment.
 
 If no active runner host exists for a target, the reconciler immediately provisions a replacement.
 
 ## Scale-up and backlog management
+
+![Scaling and OOM Deep-Links tab](images/dashboard-scaling.png)
+
+*The Scaling and OOM Deep-Links tab sets scale-up and scale-down triggers and budget caps, and shows the current controller decision.*
 
 When GitHub Actions reports a queued job backlog of 20 or more jobs (`queued_jobs >= 20`), the reconciler triggers
 scale-up:

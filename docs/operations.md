@@ -55,6 +55,10 @@ Runner idleness does not indicate dedicated builder availability, and builder dr
 
 ### Classify out-of-memory exits with evidence
 
+![OOM evidence panel](images/dashboard-oom-evidence.png)
+
+*The OOM panel separates confirmed out-of-memory kills (exit code 137 with cgroup evidence) from timeouts, and links to the exact job step and log line.*
+
 Exit status 137 indicates that a process received `SIGKILL`. It does not confirm an out-of-memory event or
 identify the affected boundary. Correlate kernel and cgroup metrics within the exact job execution interval:
 

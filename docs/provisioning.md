@@ -9,13 +9,17 @@ The startup script installs the native pure-Rust `host-agent` binary and configu
 
 The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 
-- **Floor target maintenance**: ensures at least one 16-vCPU Spot runner host per configured target in `SPOT_RUNNER_FLOOR_TARGETS`.
+- **Floor target maintenance**: ensures at least one 16-vCPU Spot runner host per configured controlled target (`controlled_targets`).
 - **Backlog scale-up**: launches additional runner hosts when queued job backlog reaches or exceeds 20 jobs (`queued_jobs >= 20`).
 - **JIT configuration minting**: requests 2-slot Just-in-Time (JIT) configurations from GitHub Actions API (`generate-jitconfig`)
   with automatic fallback to registration tokens.
 - **Preempted VM cleanup**: detects instances in `TERMINATED` status and cleans up orphaned resources.
 
 ## Startup bootstrap and host agent installation
+
+![The cloud-init and VM templates tab](images/dashboard-cloudinit.png)
+
+*The `cloud-init` editor with an example runner template and saved VM templates.*
 
 When a new runner host boots, `cloud-init/startup.sh` executes the bootstrap sequence:
 

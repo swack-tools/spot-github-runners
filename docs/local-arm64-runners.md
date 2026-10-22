@@ -14,8 +14,8 @@ Use them for native ARM64 Linux Docker work. Route native macOS work to native h
 | `m4air/docker-compose.yml` | Two services, `runner-1` and `runner-2`, with a named state volume each. |
 | `m4air/runner-entrypoint.sh` | Registers a runner on first start, then runs the listener. |
 
-Each runner registers at the organization level with the runner group `oxidex-m4air` and the custom labels
-`oxidex-m4air` and `docker`. GitHub also adds the built-in `self-hosted`, `Linux`, and `ARM64` labels.
+Each runner registers at the organization level with a dedicated runner group (such as `local-arm64`) and the custom labels
+`local-arm64` and `docker`. GitHub also adds the built-in `self-hosted`, `Linux`, and `ARM64` labels.
 
 ## Trust boundary
 
@@ -35,8 +35,8 @@ the deployment on the host. When both runners are idle, run these commands in th
 ```bash
 docker compose build runner-1
 docker compose up -d --no-build
-docker exec oxidex-gha-runner-1 docker version
-docker exec oxidex-gha-runner-2 docker version
+docker exec local-runner-1 docker version
+docker exec local-runner-2 docker version
 ```
 
 Compose preserves the named volumes that hold the runner registrations and workspaces. Keep the existing Compose

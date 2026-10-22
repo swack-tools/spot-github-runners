@@ -31,7 +31,7 @@ git clone https://github.com/swack-tools/spot-github-runners.git
 cd spot-github-runners
 
 gcloud auth login
-gcloud config set project YOUR_PROJECT
+gcloud config set project example-project
 
 gh auth login
 gh auth status
@@ -74,8 +74,6 @@ Inspect `host-agent` subcommands and options:
 
 ```bash
 cargo run --manifest-path host-agent/Cargo.toml -- --help
-cargo run --manifest-path host-agent/Cargo.toml -- clean-target --help
-cargo run --manifest-path host-agent/Cargo.toml -- admission --help
 ```
 
 Inspect host memory headroom:
