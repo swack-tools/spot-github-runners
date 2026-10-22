@@ -624,9 +624,23 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/cloud-init/save") => {
-            if verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
             }
+
             let save_req: state::SaveCloudInitRequest = match req.json().await {
                 Ok(parsed) => parsed,
                 Err(err) => return error_response(400, "bad_request", &err.to_string()),
@@ -642,9 +656,23 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // VM Instance Templates
         (Method::Post, "/api/vm-templates/from-instance") => {
-            if verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
             }
+
             let tpl_req: state::CreateVmTemplateRequest = match req.json().await {
                 Ok(parsed) => parsed,
                 Err(err) => return error_response(400, "bad_request", &err.to_string()),
@@ -671,6 +699,23 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/rust-builds") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+
             let record_req: state::RecordRustBuildRequest = match req.json().await {
                 Ok(parsed) => parsed,
                 Err(err) => return error_response(400, "bad_request", &err.to_string()),
@@ -1186,7 +1231,35 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             )
             .await
             {
-                Ok(report) => json_response(200, &report),
+                Ok(report) => {
+                    if !report.snapshot_written {
+                        if let Ok((mut bundle, _)) = state::load_state(&kv, now).await {
+                            let fi = serde_json::json!({
+                                "source": "gce",
+                                "last_success_at": state::chrono_iso(now),
+                                "last_success_epoch": now,
+                                "stale": false,
+                                "stale_reason": serde_json::Value::Null,
+                                "last_error": serde_json::Value::Null
+                            });
+                            bundle.state.fleet_inventory = fi.clone();
+                            if let Some(ref mut ov) = bundle.state.overview {
+                                if let Some(obj) = ov.as_object_mut() {
+                                    obj.insert("fleet_inventory".to_string(), fi.clone());
+                                    if let Some(iv) = obj
+                                        .get_mut("instances_view")
+                                        .and_then(|v| v.as_object_mut())
+                                    {
+                                        iv.insert("fleet_inventory".to_string(), fi);
+                                    }
+                                }
+                            }
+                            bundle.state.updated_at = now;
+                            let _ = state::save_state(&kv, &mut bundle, now).await;
+                        }
+                    }
+                    json_response(200, &report)
+                }
                 Err(e) => error_response(500, "reconciliation_failed", &e.to_string()),
             }
         }

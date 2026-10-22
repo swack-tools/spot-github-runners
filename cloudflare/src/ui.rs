@@ -735,6 +735,16 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </select>
             <input type="text" id="inst-search-input" placeholder="Filter by instance, region, spec, trigger..." style="width:240px;" oninput="refreshInstancesTable()" />
             <button class="btn btn-sm" onclick="sortInstancesBy('total_cost_in_window_usd', 'desc')">Sort by Most Expensive ($)</button>
+            <button class="btn btn-sm btn-purple" onclick="triggerLiveInventoryRefresh()">🔄 Refresh Inventory</button>
+            <label style="font-size:12px; color:var(--text-muted); display:inline-flex; align-items:center; gap:4px; margin-left:4px;">
+              Auto-refresh:
+              <select id="inst-autorefresh-select" onchange="setInventoryAutoRefresh(this.value)" style="padding:2px 6px; font-size:11.5px;">
+                <option value="0">Off</option>
+                <option value="60">1m</option>
+                <option value="300">5m</option>
+                <option value="900">15m</option>
+              </select>
+            </label>
           </div>
         </div>
 
@@ -2148,12 +2158,12 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
               <div style="font-size:11.5px; font-weight:600; color:var(--text-muted);">SSH Into GCloud Instance (Terminal Command):</div>
               <div class="ssh-block">
-                <code id="ssh-code-${esc(inst.instance_id)}">${esc(inst.ssh_command)}</code>
+                <code id="ssh-code-${esc(inst.instance_id || inst.id)}">${esc(inst.ssh_command)}</code>
                 <button class="btn btn-sm" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'gcloud SSH command')">📋 Copy SSH</button>
               </div>
 
               <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
-                ${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">🖥️ Create VM Template</button>` : ""}
+                ${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id || inst.id)}', '${esc(inst.name)}')">🖥️ Create VM Template</button>` : ""}
               </div>
             </div>
           `;
@@ -2273,6 +2283,41 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       refreshInstancesTable();
     }
 
+    let INVENTORY_AUTOREFRESH_TIMER = null;
+    function setInventoryAutoRefresh(secStr) {
+      if (INVENTORY_AUTOREFRESH_TIMER) {
+        clearInterval(INVENTORY_AUTOREFRESH_TIMER);
+        INVENTORY_AUTOREFRESH_TIMER = null;
+      }
+      const secs = parseInt(secStr, 10);
+      if (secs > 0) {
+        INVENTORY_AUTOREFRESH_TIMER = setInterval(() => {
+          triggerLiveInventoryRefresh(true);
+        }, secs * 1000);
+        showToast(`Auto-refresh set to every ${secs >= 60 ? (secs / 60) + 'm' : secs + 's'}`);
+      } else {
+        showToast("Auto-refresh disabled");
+      }
+    }
+
+    async function triggerLiveInventoryRefresh(silent = false) {
+      if (!silent) showToast("Refreshing live Compute Engine & GitHub inventory...");
+      try {
+        const res = await fetch("/api/reconciler/tick", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" }
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showToast(`Refresh warning: ${err.message || res.statusText}`);
+        }
+      } catch (e) {
+        console.warn("Manual tick error:", e);
+      }
+      await loadOverview();
+      if (!silent) showToast("Refreshed live Compute Engine & GitHub inventory");
+    }
+
     async function refreshInstancesTable() {
       await loadOverview();
     }
@@ -2293,7 +2338,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           <tr>
             <td>
               <div class="mono" style="font-weight:700; color:#f8fafc;">${esc(inst.name)}</div>
-              <div class="mono" style="font-size:11px; color:var(--text-muted);">ID: ${esc(inst.instance_id)}</div>
+              <div class="mono" style="font-size:11px; color:var(--text-muted);">ID: ${esc(inst.instance_id || inst.id)}</div>
             </td>
             <td>
               <span class="badge ${isRunning ? 'badge-running' : 'badge-deleted'}">${esc(inst.status)}</span>
@@ -2335,7 +2380,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <td>
               <div style="display:flex; gap:5px; flex-wrap:wrap;">
                 <button class="btn btn-sm btn-secondary" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'SSH command')">📋 SSH</button>
-                ${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id)}', '${esc(inst.name)}')">Template</button>` : ""}
+                ${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id || inst.id)}', '${esc(inst.name)}')">Template</button>` : ""}
               </div>
             </td>
           </tr>
@@ -2836,7 +2881,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       // Source instance dropdown for VM Template creation
       const srcSel = document.getElementById("vmtpl-source-instance");
       srcSel.innerHTML = APP_STATE.instances_view.instances.map(i =>
-        `<option value="${esc(i.instance_id)}">${esc(i.name)} (${esc(i.machine_type)} · ${esc(i.zone)})</option>`
+        `<option value="${esc(i.instance_id || i.id)}">${esc(i.name)} (${esc(i.machine_type)} · ${esc(i.zone)})</option>`
       ).join("");
 
       // VM Templates list

@@ -633,7 +633,32 @@ where
     let org = bundle.state.org.clone();
 
     // 2. Query Current GCP & GitHub Fleet State
-    let instances = gcp.list_instances(&project, now).await.unwrap_or_default();
+    let instances = match gcp.list_instances(&project, now).await {
+        Ok(inst) => {
+            let fi = serde_json::json!({
+                "source": "gce",
+                "last_success_at": crate::state::chrono_iso(now),
+                "last_success_epoch": now,
+                "stale": false,
+                "stale_reason": serde_json::Value::Null,
+                "last_error": serde_json::Value::Null
+            });
+            bundle.state.fleet_inventory = fi.clone();
+            if let Some(ref mut ov) = bundle.state.overview {
+                if let Some(obj) = ov.as_object_mut() {
+                    obj.insert("fleet_inventory".to_string(), fi.clone());
+                    if let Some(iv) = obj
+                        .get_mut("instances_view")
+                        .and_then(|v| v.as_object_mut())
+                    {
+                        iv.insert("fleet_inventory".to_string(), fi);
+                    }
+                }
+            }
+            inst
+        }
+        Err(_) => Vec::new(),
+    };
 
     let controlled_targets = if bundle.state.controlled_targets.is_empty() {
         CONTROLLED_TARGETS
@@ -736,7 +761,10 @@ where
         .collect();
 
     for runner in &runners {
-        if runner.status.eq_ignore_ascii_case("offline") && !runner.busy {
+        if runner.status.eq_ignore_ascii_case("offline")
+            && !runner.busy
+            && (runner.name.starts_with("oxidex") || runner.name.contains("oxidex-runners"))
+        {
             let matches_active = active_vm_names.iter().any(|&vm| runner.name.contains(vm));
             if !matches_active {
                 let target_path = runner_target_map
@@ -803,11 +831,14 @@ where
     // 8. Floor Target Keeper (Ensure >= 1 Host Per Target)
     for target in &controlled_targets {
         let target_slug = target.replace('/', "-").to_lowercase();
+        let safe_slug = if target_slug.len() > 24 {
+            &target_slug[..24]
+        } else {
+            &target_slug
+        };
         let active_count = instances
             .iter()
-            .filter(|i| {
-                !i.status.eq_ignore_ascii_case("TERMINATED") && i.name.contains(&target_slug)
-            })
+            .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED") && i.name.contains(safe_slug))
             .count();
 
         let in_flight = ACTIVE_LAUNCHES
@@ -818,11 +849,6 @@ where
 
         if active_count == 0 && !in_flight {
             let hex_suffix = generate_unique_suffix(now);
-            let safe_slug = if target_slug.len() > 24 {
-                &target_slug[..24]
-            } else {
-                &target_slug
-            };
             let host_name = format!("oxidex-runners-{}-{}-{}", safe_slug, now, hex_suffix);
             let deployment_id = format!("dep-{}", now);
 
@@ -1106,22 +1132,12 @@ where
             })
             .collect();
 
-        // Preserve any dedicated builders in bundle.state.instances not present in current runner query
-        for prev in bundle.state.instances.iter() {
-            if prev.role == "rust_builder"
-                && !bundle
-                    .state
-                    .instances_view
-                    .iter()
-                    .any(|v| v.name == prev.name)
-            {
-                bundle.state.instances_view.push(prev.clone());
-            }
-        }
         // Synchronize state.instances with live instances_view for unified action inventory
         bundle.state.instances = bundle.state.instances_view.clone();
 
-        bundle.state.scaling_telemetry.queued_jobs = queued_jobs;
+        if backlog_known {
+            bundle.state.scaling_telemetry.queued_jobs = queued_jobs;
+        }
         bundle.state.scaling_telemetry.current_runners = runners
             .iter()
             .filter(|r| r.status.eq_ignore_ascii_case("online"))

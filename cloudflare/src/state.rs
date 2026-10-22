@@ -528,6 +528,33 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
                     obj.insert("profiles".to_string(), pr);
                 }
             }
+            if let Ok(cit) = serde_json::to_value(&bundle.state.cloud_init_templates) {
+                obj.insert("cloud_init_templates".to_string(), cit);
+            }
+            if let Ok(vmt) = serde_json::to_value(&bundle.state.vm_templates) {
+                obj.insert("vm_templates".to_string(), vmt);
+            }
+            if let Ok(rb) = serde_json::to_value(&bundle.state.rust_builds) {
+                obj.insert("rust_builds".to_string(), rb);
+            }
+            if let Ok(da) = serde_json::to_value(&bundle.state.dashboard_admins) {
+                obj.insert("dashboard_admins".to_string(), da);
+            }
+            if !bundle.state.fleet_inventory.is_null() {
+                obj.insert(
+                    "fleet_inventory".to_string(),
+                    bundle.state.fleet_inventory.clone(),
+                );
+                if let Some(iv) = obj
+                    .get_mut("instances_view")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    iv.insert(
+                        "fleet_inventory".to_string(),
+                        bundle.state.fleet_inventory.clone(),
+                    );
+                }
+            }
         }
         return Ok((200, ov));
     }
@@ -553,6 +580,7 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
         "regions": [],
         "instances_view": {
             "instances": bundle.state.instances_view,
+            "fleet_inventory": bundle.state.fleet_inventory,
             "window_hours": 24.0,
             "total_window_spend_usd": 0.0,
             "active_hourly_burn_usd": 0.0,
@@ -998,6 +1026,12 @@ pub async fn handle_post_cloud_init_save<K: KvStoreBackend>(
         .iter_mut()
         .find(|t| t.id == template_id)
     {
+        if existing.role != req.role {
+            return Err(StateError::Validation(format!(
+                "Cannot change workload role of existing template '{}' from '{}' to '{}'; use save_as to create a new template for a different role",
+                template_id, existing.role, req.role
+            )));
+        }
         *existing = saved_template.clone();
     } else {
         bundle
@@ -1035,7 +1069,9 @@ pub async fn handle_post_vm_templates_from_instance<K: KvStoreBackend>(
     req: CreateVmTemplateRequest,
     now: u64,
 ) -> Result<(u16, serde_json::Value), StateError> {
-    let instance_id = req.instance_id.trim();
+    let raw_id = req.instance_id.trim();
+    let instance_id = if raw_id == "undefined" { "" } else { raw_id };
+
     if instance_id.is_empty() {
         return Err(StateError::Validation("instance_id cannot be empty".into()));
     }
@@ -1177,23 +1213,47 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
         0.0
     };
 
-    let cpu_sec = req.cpu_time_seconds.unwrap_or(0.0);
-    let bench = req.vcpu.unwrap_or(16) * 120;
-    let cpu_pts = ((cpu_sec * bench as f64) / 1000.0).round() as u64;
+    let bench = req.vcpu.map(|v| v * 120);
+    let cpu_pts = match (req.cpu_time_seconds, bench) {
+        (Some(sec), Some(b)) => Some(((sec * b as f64) / 1000.0).round() as u64),
+        _ => None,
+    };
+    let cpu_formula = match (req.cpu_time_seconds, bench) {
+        (Some(sec), Some(b)) => Some(format!("{:.1}s CPU × bench {} / 1000", sec, b)),
+        _ => None,
+    };
 
-    let origin_ip = req
-        .origin_ip
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let is_local =
-        origin_ip.starts_with("127.") || origin_ip.starts_with("10.") || origin_ip == "::1";
+    let (origin_hostname, geo, net_sec) = if let Some(ref ip) = req.origin_ip {
+        let is_local = ip.starts_with("127.") || ip.starts_with("10.") || ip == "::1";
+        let hostname = if is_local {
+            "direct.local"
+        } else {
+            "gateway.swacktech.com"
+        };
+        let g = serde_json::json!({
+            "city": if is_local { "Local Subnet" } else { "Council Bluffs" },
+            "country": "United States",
+            "country_code": "US",
+            "asn": "AS15169",
+            "isp": "Google Cloud"
+        });
+        let ns = serde_json::json!({
+            "is_tor": false,
+            "is_vpn": false,
+            "badge_text": "Direct (Clean)",
+            "provider_label": "Direct Datacenter"
+        });
+        (Some(hostname.to_string()), Some(g), Some(ns))
+    } else {
+        (None, None, None)
+    };
 
     let single_build = serde_json::json!({
         "build_id": build_id,
         "status": req.status,
-        "project_name": req.project_name.unwrap_or_else(|| "swack-tools/oxidex".to_string()),
-        "commit_sha": req.commit_sha.unwrap_or_else(|| "head".to_string()),
-        "profile": req.profile.unwrap_or_else(|| "release".to_string()),
+        "project_name": req.project_name,
+        "commit_sha": req.commit_sha,
+        "profile": req.profile,
         "requested_at": iso_now,
         "finished_at": iso_now,
         "delivered_at": iso_now,
@@ -1204,30 +1264,19 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
         "total_crates": crates,
         "cache_misses": crates.saturating_sub(hits),
         "cache_hit_rate_percent": hit_rate,
-        "instance_name": req.instance_name.unwrap_or_else(|| "builder-n4-1".to_string()),
-        "machine_type": req.machine_type.unwrap_or_else(|| "n4-highcpu-16".to_string()),
-        "zone": req.zone.unwrap_or_else(|| "us-central1-a".to_string()),
+        "instance_name": req.instance_name,
+        "machine_type": req.machine_type,
+        "zone": req.zone,
         "instance_benchmark_score": bench,
-        "origin_ip": origin_ip,
-        "origin_hostname": if is_local { "direct.local" } else { "gateway.swacktech.com" },
-        "geolocation": {
-            "city": if is_local { "Local Subnet" } else { "Council Bluffs" },
-            "country": "United States",
-            "country_code": "US",
-            "asn": "AS15169",
-            "isp": "Google Cloud"
-        },
-        "network_security": {
-            "is_tor": false,
-            "is_vpn": false,
-            "badge_text": "Direct (Clean)",
-            "provider_label": "Direct Datacenter"
-        },
-        "peak_ram_gib": req.peak_ram_gib.unwrap_or(12.4),
+        "origin_ip": req.origin_ip,
+        "origin_hostname": origin_hostname,
+        "geolocation": geo,
+        "network_security": net_sec,
+        "peak_ram_gib": req.peak_ram_gib,
         "container_ram_cap_gib": 28,
-        "cpu_time_seconds": cpu_sec,
+        "cpu_time_seconds": req.cpu_time_seconds,
         "cpu_points": cpu_pts,
-        "cpu_points_formula": format!("{:.1}s CPU × bench {} / 1000", cpu_sec, bench)
+        "cpu_points_formula": cpu_formula,
     });
 
     let mut builds_vec: Vec<serde_json::Value> = bundle

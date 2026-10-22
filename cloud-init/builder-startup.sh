@@ -126,14 +126,15 @@ if [[ "$uploader_raw" =~ ^\{\{.*\}\}$ || -z "$uploader_raw" ]]; then
   if [[ -f /etc/oxidex-builder-uploader.json ]]; then
     uploader_raw=$(cat /etc/oxidex-builder-uploader.json)
   else
-    echo "Warning: {{UPLOADER_CONFIG}} template placeholder was not rendered; using default oxidex-uploader config" >&2
-    uploader_raw='{"schema":"root-approved-ssh-mapping-v1","principal":"swackhamer","username":"oxidex-uploader","uid":1002,"public_key":"","public_key_sha256":"","identity_receipt_sha256":""}'
+    echo "Approved uploader mapping is absent: {{UPLOADER_CONFIG}} unrendered and /etc/oxidex-builder-uploader.json missing: hold" >&2
+    exit 78
   fi
 fi
 uploader_user=$(printf '%s' "$uploader_raw" | jq -re '.username // empty')
 uploader_uid=$(printf '%s' "$uploader_raw" | jq -re '.uid // empty')
-if [[ -z "$uploader_user" || -z "$uploader_uid" ]]; then
-  echo "Missing or invalid uploader configuration" >&2
+uploader_pubkey=$(printf '%s' "$uploader_raw" | jq -re '.public_key // empty')
+if [[ -z "$uploader_user" || -z "$uploader_uid" || -z "$uploader_pubkey" ]]; then
+  echo "Missing or invalid uploader configuration (username, uid, or public_key empty)" >&2
   exit 78
 fi
 ! getent passwd 1001 >/dev/null || { echo "Host account collides with container build UID 1001" >&2; exit 78; }

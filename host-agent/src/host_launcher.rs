@@ -205,12 +205,27 @@ pub fn source_not_mounted(source: &Path, target: &Path) -> Result<(), HostLaunch
     verify_mounts_not_active(source, target, &inspect_text)
 }
 
+pub const TRUSTED_BIN_DIRS: &[&str] = &[
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/opt/bin",
+    "/opt/rust/bin",
+    "/usr/local/cargo/bin",
+];
+
 pub fn is_command_allowed(cmd: &str) -> bool {
-    let file_name = Path::new(cmd)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or(cmd);
-    ALLOWED_COMMANDS.contains(&cmd) || ALLOWED_COMMANDS.contains(&file_name)
+    let path = Path::new(cmd);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let parent_str = parent.to_string_lossy();
+            if !TRUSTED_BIN_DIRS.iter().any(|&dir| parent_str == dir) {
+                return false;
+            }
+        }
+    }
+    let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or(cmd);
+    ALLOWED_COMMANDS.contains(&file_name)
 }
 
 pub fn resolve_uploader_uid(explicit_uid: Option<u32>) -> Result<u32, HostLauncherError> {
@@ -230,27 +245,31 @@ pub fn resolve_uploader_uid(explicit_uid: Option<u32>) -> Result<u32, HostLaunch
         .ok()
         .and_then(|s| s.parse::<u32>().ok());
 
-    let target_uid = match (explicit_uid, sudo_uid, approved_uid) {
-        (Some(exp), _, Some(app)) => {
-            if exp != app {
-                return Err(HostLauncherError::InvalidUploader(format!(
-                    "explicit uid {exp} does not match approved uploader uid {app}"
-                )));
-            }
-            exp
+    if let (Some(exp), Some(sudo)) = (explicit_uid, sudo_uid) {
+        if exp != sudo {
+            return Err(HostLauncherError::InvalidUploader(format!(
+                "explicit uid {exp} does not match caller SUDO_UID {sudo}"
+            )));
         }
-        (Some(exp), _, None) => exp,
-        (None, Some(sudo), Some(app)) => {
-            if sudo != app {
-                return Err(HostLauncherError::InvalidUploader(format!(
-                    "caller SUDO_UID {sudo} does not match approved uploader uid {app}"
-                )));
-            }
-            sudo
+    }
+    if let (Some(sudo), Some(app)) = (sudo_uid, approved_uid) {
+        if sudo != app {
+            return Err(HostLauncherError::InvalidUploader(format!(
+                "caller SUDO_UID {sudo} does not match approved uploader uid {app}"
+            )));
         }
-        (None, Some(sudo), None) => sudo,
-        (None, None, Some(app)) => app,
-        (None, None, None) => {
+    }
+    if let (Some(exp), Some(app)) = (explicit_uid, approved_uid) {
+        if exp != app {
+            return Err(HostLauncherError::InvalidUploader(format!(
+                "explicit uid {exp} does not match approved uploader uid {app}"
+            )));
+        }
+    }
+
+    let target_uid = match explicit_uid.or(sudo_uid).or(approved_uid) {
+        Some(uid) => uid,
+        None => {
             if std::env::var("OXIDEX_ALLOW_UNPRIVILEGED").is_ok() {
                 let uid = unsafe { libc::getuid() };
                 if uid != 0 {

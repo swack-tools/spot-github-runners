@@ -675,6 +675,9 @@ fn test_toolchain_probe_allowed_in_container_command() {
     assert!(is_command_allowed("/opt/bin/toolchain-probe"));
     assert!(!is_command_allowed("bash"));
     assert!(!is_command_allowed("/bin/sh"));
+    assert!(!is_command_allowed("/src/cargo"));
+    assert!(!is_command_allowed("../cargo"));
+    assert!(!is_command_allowed("/target/checkout/cargo"));
 
     let cmd = vec!["/usr/local/bin/oxidex-toolchain-probe".to_string()];
     let res = container_command("my-proj", &cmd, 16, 28, None, None);
@@ -728,6 +731,16 @@ fn test_resolve_uploader_uid_matrix() {
     std::env::set_var("OXIDEX_UPLOADER_CONFIG", root_cfg.to_str().unwrap());
     let err = resolve_uploader_uid(None).unwrap_err();
     assert!(matches!(err, HostLauncherError::InvalidUploader(_)));
+
+    // 7. Explicit UID matches config but SUDO_UID caller does not
+    std::env::set_var("OXIDEX_UPLOADER_CONFIG", config_file.to_str().unwrap());
+    std::env::set_var("SUDO_UID", "1005");
+    let err = resolve_uploader_uid(Some(1002)).unwrap_err();
+    assert!(matches!(err, HostLauncherError::InvalidUploader(_)));
+
+    // 8. Explicit UID, SUDO_UID, and config all agree
+    std::env::set_var("SUDO_UID", "1002");
+    assert_eq!(resolve_uploader_uid(Some(1002)).unwrap(), 1002);
 
     // Cleanup env
     std::env::remove_var("OXIDEX_UPLOADER_CONFIG");
