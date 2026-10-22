@@ -34,12 +34,16 @@ The serverless Worker eliminates the legacy control plane components:
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Edge Worker request routing flowchart](images/flow-edge-worker-request.svg)
+<figcaption markdown>Request routing flowchart inside `cloudflare/src/lib.rs` (`#[event(fetch)]`) showing session verification, administrator revalidation, and KV state access.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Dashboard header](images/ui-header.png)
-<figcaption markdown>The Worker renders the GCP project from the `GCP_PROJECT` variable into the header.</figcaption>
+<figcaption markdown>Dashboard header rendered at the edge with the `GCP_PROJECT` Worker variable injected into the project badge.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![World map](images/map-world.png)
-<figcaption markdown>The world map is drawn in the browser from the overview data.</figcaption>
+<figcaption markdown>Interactive SVG world map rendered client-side from `/api/overview` telemetry with green pins for active regions and blue pins for enabled regions.</figcaption>
 </figure>
 </div>
 </div>
@@ -58,15 +62,15 @@ The dashboard single-page web app is embedded directly into Worker memory at com
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Sign-in page](images/login-gate.png)
-<figcaption markdown>Unauthenticated requests get the sign-in page.</figcaption>
+<figcaption markdown>Unauthenticated sign-in gate served at `/login` before any dashboard HTML or API payload is exposed.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Device code](images/login-device-code.png)
-<figcaption markdown>The device flow for terminals and shared machines.</figcaption>
+<figcaption markdown>RFC 8628 device authorization flow for signing in from headless environments or restricted browsers.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Administrators](images/admins.png)
-<figcaption markdown>Owners manage added administrators.</figcaption>
+<figcaption markdown>Owner-only administrator management table backed by `auth/admins/v1` in Cloudflare Workers KV.</figcaption>
 </figure>
 </div>
 </div>
@@ -148,11 +152,11 @@ Unchanged cron ticks perform zero KV writes. In steady state, the Worker perform
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Scale decision](images/scaling-decision-scale-up.png)
-<figcaption markdown>The scaling evaluation when queued jobs reach the 20-job scale-up threshold.</figcaption>
+<figcaption markdown>Scaling evaluation panel showing a backlog-driven scale-up when queued jobs reach the `20`-job threshold.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Health endpoint](images/term-api-health.png)
-<figcaption markdown>Example `/api/health` response.</figcaption>
+<figcaption markdown>Example `/api/health` response showing Worker status, KV health, and the scheduled reconciler tick counter.</figcaption>
 </figure>
 </div>
 </div>
@@ -201,11 +205,11 @@ The fleet reconciler supports GitHub Actions Just-In-Time (JIT) runner configura
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Patch console](images/patches-validated.png)
-<figcaption markdown>The patch console validates manifests at the edge.</figcaption>
+<figcaption markdown>Edge manifest validation displaying the merged `spot-runner-patch-v1` configuration and SHA-256 digest.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Rollout preview](images/patches-preview.png)
-<figcaption markdown>The rollout preview with live hot-patching off.</figcaption>
+<figcaption markdown>Rollout preview panel confirming that live hot-patching is off and merged pull requests roll out via the scheduled reconciler.</figcaption>
 </figure>
 </div>
 </div>
@@ -267,7 +271,7 @@ When external services experience outages:
 
 <figure class="shot" markdown>
 ![Deploy with the gcloud project](images/term-gcp-project.png)
-<figcaption markdown>`just deploy-worker` passes the default gcloud project as `GCP_PROJECT`.</figcaption>
+<figcaption markdown>Terminal capture of `just gcp-project` and `just deploy-worker` injecting the active `gcloud` project as `GCP_PROJECT`.</figcaption>
 </figure>
 <!-- /shot -->
 

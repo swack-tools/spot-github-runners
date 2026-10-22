@@ -28,6 +28,7 @@
 !docs/requirements.txt
 !docs/images/
 !docs/images/*.png
+!docs/images/*.svg
 !docs/stylesheets/
 !docs/stylesheets/*.css
 !docs/javascripts/

@@ -1,21 +1,43 @@
-/* Screenshot figures and carousels for the documentation site. */
+/* Screenshot figures, reference footers, carousels, and full-screen zoom lightbox. */
 
 .md-typeset figure.shot {
   margin: 1.2em 0;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--md-code-bg-color);
+  box-shadow: var(--md-shadow-z1);
+  display: flex;
+  flex-direction: column;
 }
 
 .md-typeset figure.shot img,
 .md-typeset .carousel img {
-  border: 1px solid var(--md-default-fg-color--lightest);
-  border-radius: 6px;
-  box-shadow: var(--md-shadow-z1);
+  display: block;
+  margin: 0 auto;
+  cursor: zoom-in;
+  transition: transform 0.15s ease;
 }
 
 .md-typeset figure.shot figcaption,
 .md-typeset .carousel figcaption {
   max-width: none;
-  font-size: 0.68rem;
-  color: var(--md-default-fg-color--light);
+  width: 100%;
+  margin: 0;
+  padding: 0.65rem 0.95rem;
+  font-size: 0.74rem;
+  line-height: 1.45;
+  color: var(--md-default-fg-color);
+  background: var(--md-default-bg-color);
+  border-top: 1px solid var(--md-default-fg-color--lightest);
+  text-align: left;
+}
+
+.md-typeset figure.shot figcaption::before,
+.md-typeset .carousel figcaption::before {
+  content: "Reference — ";
+  font-weight: 700;
+  color: var(--md-accent-fg-color);
 }
 
 .md-typeset .carousel {
@@ -32,20 +54,19 @@
   padding-bottom: 0.4rem;
 }
 
-.md-typeset .carousel-track > figure {
+.md-typeset .carousel-track > figure.shot {
   flex: 0 0 100%;
   margin: 0;
   scroll-snap-align: center;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
+  align-items: stretch;
 }
 
-.md-typeset .carousel-track > figure img {
+.md-typeset .carousel-track > figure.shot img {
   max-height: 34rem;
   width: auto;
   max-width: 100%;
   object-fit: contain;
+  padding: 0.5rem;
 }
 
 .md-typeset .carousel-nav {
@@ -53,15 +74,15 @@
   align-items: center;
   justify-content: center;
   gap: 0.8rem;
-  margin-top: 0.3rem;
-  font-size: 0.7rem;
+  margin-top: 0.45rem;
+  font-size: 0.72rem;
 }
 
 .md-typeset .carousel-nav button {
   cursor: pointer;
   border: 1px solid var(--md-default-fg-color--lighter);
   border-radius: 4px;
-  padding: 0.1rem 0.6rem;
+  padding: 0.15rem 0.65rem;
   background: var(--md-default-bg-color);
   color: var(--md-default-fg-color);
 }
@@ -69,4 +90,168 @@
 .md-typeset .carousel-nav button:hover {
   border-color: var(--md-accent-fg-color);
   color: var(--md-accent-fg-color);
+}
+
+/* Full-screen in-page lightbox modal */
+.shot-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(11, 15, 25, 0.94);
+  backdrop-filter: blur(6px);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  user-select: none;
+}
+
+.shot-lightbox[hidden] {
+  display: none !important;
+}
+
+.shot-lightbox-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.65rem 1.1rem;
+  background: rgba(15, 23, 42, 0.92);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+  color: #e2e8f0;
+  font-size: 0.78rem;
+}
+
+.shot-lightbox-counter {
+  font-weight: 600;
+  color: #38bdf8;
+}
+
+.shot-lightbox-hint {
+  color: #94a3b8;
+  font-size: 0.72rem;
+}
+
+.shot-lightbox-close {
+  cursor: pointer;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 6px;
+  background: rgba(30, 41, 59, 0.9);
+  color: #f8fafc;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.35rem 0.65rem;
+}
+
+.shot-lightbox-close:hover {
+  border-color: #38bdf8;
+  color: #38bdf8;
+}
+
+.shot-lightbox-stage {
+  position: relative;
+  flex: 1 1 auto;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem 4rem;
+}
+
+.shot-lightbox-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  transform-origin: center center;
+  transition: transform 0.12s ease-out;
+  cursor: zoom-in;
+  border-radius: 6px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.65);
+  background: #0f172a;
+}
+
+.shot-lightbox-img.is-zoomed {
+  cursor: grab;
+}
+
+.shot-lightbox-img.is-dragging {
+  cursor: grabbing;
+  transition: none;
+}
+
+.shot-lightbox-arrow {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  cursor: pointer;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  width: 2.6rem;
+  height: 2.6rem;
+  background: rgba(15, 23, 42, 0.88);
+  color: #f8fafc;
+  font-size: 1.4rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.shot-lightbox-arrow:hover {
+  border-color: #38bdf8;
+  color: #38bdf8;
+}
+
+.shot-lightbox-arrow.prev {
+  left: 0.9rem;
+}
+
+.shot-lightbox-arrow.next {
+  right: 0.9rem;
+}
+
+.shot-lightbox-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1.25rem;
+  background: rgba(15, 23, 42, 0.95);
+  border-top: 1px solid rgba(148, 163, 184, 0.22);
+  color: #f1f5f9;
+}
+
+.shot-lightbox-caption {
+  flex: 1 1 24rem;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: #e2e8f0;
+}
+
+.shot-lightbox-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  font-size: 0.75rem;
+  color: #cbd5e1;
+}
+
+.shot-lightbox-slider {
+  width: 9rem;
+  accent-color: #38bdf8;
+  cursor: pointer;
+}
+
+.shot-lightbox-reset {
+  cursor: pointer;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 5px;
+  padding: 0.25rem 0.6rem;
+  background: rgba(30, 41, 59, 0.9);
+  color: #f8fafc;
+  font-size: 0.73rem;
+}
+
+.shot-lightbox-reset:hover {
+  border-color: #38bdf8;
+  color: #38bdf8;
 }

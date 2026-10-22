@@ -10,12 +10,16 @@ The startup script installs the native pure-Rust `host-agent` binary and configu
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Spot VM provisioning flowchart](images/flow-vm-provisioning.svg)
+<figcaption markdown>Automated provisioning flowchart showing how the edge reconciler detects a capacity deficit, calls the Compute Engine Spot insert API, runs `cloud-init`, and registers listeners.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Running hosts by region](images/map-region-iowa.png)
-<figcaption markdown>Running runner hosts and builders by region, with the plan-only scale controls.</figcaption>
+<figcaption markdown>World Map and Fleet Inspector with Iowa selected, showing active runner and builder Spot VMs alongside plan-only regional scale controls.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Region without hosts](images/map-europe-empty.png)
-<figcaption markdown>A region without hosts offers plan-only buttons; the dashboard never creates VMs itself.</figcaption>
+<figcaption markdown>World Map and Fleet Inspector for an enabled European region with zero running VMs, illustrating plan-only preview buttons that never mutate live capacity.</figcaption>
 </figure>
 </div>
 </div>
@@ -35,15 +39,15 @@ The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Template editor](images/cloudinit-runner.png)
-<figcaption markdown>The `cloud-init` editor with an example runner template and saved VM templates.</figcaption>
+<figcaption markdown>The `cloud-init` and VM Templates studio showing an example runner host configuration alongside parsed boot stages.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Builder template](images/cloudinit-builder-editor.png)
-<figcaption markdown>An example dedicated builder template.</figcaption>
+<figcaption markdown>The `cloud-init` editor loaded with an example dedicated Rust builder template that mounts the persistent cache disk.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![VM templates](images/vm-templates.png)
-<figcaption markdown>Saved VM templates record a shape, CPU platform, benchmark, and disk.</figcaption>
+<figcaption markdown>Saved VM templates panel showing reusable machine shapes, CPU platforms, benchmark scores, and data disk configurations.</figcaption>
 </figure>
 </div>
 </div>
@@ -72,11 +76,11 @@ See [Set up a builder](dedicated-builders.md).
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Runner sizing profile](images/sizing-runner-profile.png)
-<figcaption markdown>The runner profile sets per-runner vCPU and RAM, the benchmark floor, disks, budget, and templates.</figcaption>
+<figcaption markdown>CI/CD Runner Sizing profile configuring minimum runners, per-runner vCPU and RAM, minimum CPU benchmark score, data disk size, and budget caps.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Sizing tab](images/sizing-tab.png)
-<figcaption markdown>The sizing tab shows the runner and builder profiles side by side.</figcaption>
+<figcaption markdown>Full Sizing and Benchmark Qualifier tab displaying the CI/CD runner profile and dedicated Rust builder profile side by side.</figcaption>
 </figure>
 </div>
 </div>

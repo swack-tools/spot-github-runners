@@ -7,12 +7,16 @@ Use this administrative guide when updating the runtime binary or container imag
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Builder in-place update flowchart](images/flow-builder-in-place-update.svg)
+<figcaption markdown>Flowchart for updating `host-agent` and the Rust `1.99.0` builder container in place on a running builder VM while preserving the warm `375 GB` cache disk.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Dedicated builders](images/instances-builders.png)
-<figcaption markdown>Dedicated builders with their persistent cache disk size.</figcaption>
+<figcaption markdown>Instances view filtered to dedicated Rust builders, highlighting the persistent `375 GB` cache disk attached to `builder-uscentral1-f-demo01`.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Builder telemetry summary](images/rust-kpis.png)
-<figcaption markdown>Build totals, cache hit rate, peak memory, and CPU points across builds.</figcaption>
+<figcaption markdown>Rust builder KPI summary cards showing total builds, `87.9%` crate cache hit rate, `26.1 GiB` peak active memory, and total CPU points.</figcaption>
 </figure>
 </div>
 </div>
@@ -150,11 +154,11 @@ Update the remote builder endpoint in OxiDex's `.cargo/config.toml` under the `[
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Readiness after an update](images/term-builder-readiness.png)
-<figcaption markdown>Example readiness record written after bootstrap.</figcaption>
+<figcaption markdown>Example `/var/lib/oxidex-builder-readiness.json` output verified after completing an in-place builder runtime update.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Toolchain probe](images/term-toolchain-probe.png)
-<figcaption markdown>The `host-agent toolchain-probe` subcommand.</figcaption>
+<figcaption markdown>Terminal capture of `host-agent toolchain-probe` verifying root-owned toolchain binaries, Rust commit hash, and cgroup v2 limits.</figcaption>
 </figure>
 </div>
 </div>

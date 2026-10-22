@@ -9,9 +9,12 @@ plane (`cloudflare/src/ui.rs`). It is served directly from edge memory on `https
 sub-15 ms latency, backed by Cloudflare Workers KV (`SPOT_KV`). Zero control VMs are required.
 
 !!! info "Screenshots use example data"
-    Every screenshot on this site renders the real dashboard or command output with made-up data. Project,
-    organization, instance names, IP addresses, users, and templates are examples, not a live deployment.
-    Pages with several screenshots show them in a carousel: use **Previous** and **Next**, or scroll sideways.
+    Every screenshot and flowchart on this site uses made-up data (`example-ci-fleet`, `example-org`, example
+    hosts, RFC 5737 IP addresses, and example templates), not a live deployment. Each figure includes a
+    **Reference** footer explaining what it shows. Click any screenshot or SVG flowchart to open the full-screen
+    viewer on the same page: left-click an area to zoom in, use the bottom slider or **Reset 100%** button to
+    adjust zoom, and press the Left/Right arrow keys (or click the side arrows) to cycle through every image on
+    the current page.
 
 ## Pages and tabs
 
@@ -19,39 +22,39 @@ sub-15 ms latency, backed by Cloudflare Workers KV (`SPOT_KV`). Zero control VMs
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![World Map and Fleet Inspector](images/map-region-iowa.png)
-<figcaption markdown>World Map and Fleet Inspector: running hosts per region, Spot prices, and SSH commands.</figcaption>
+<figcaption markdown>Tab 1 (World Map and Fleet Inspector): global region pins, active VMs per region, all-in Spot rates, and SSH commands.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Instances and Cost History](images/instances-all.png)
-<figcaption markdown>Instances and Cost History: running and deleted instances with cost in the selected window.</figcaption>
+<figcaption markdown>Tab 2 (Instances and Cost History): sortable inventory of running and deleted Spot VMs with window spend and lifecycle triggers.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Sizing and Benchmark Qualifier](images/sizing-tab.png)
-<figcaption markdown>Sizing and Benchmark Qualifier: hardware floors, disks, budgets, and templates.</figcaption>
+<figcaption markdown>Tab 3 (Sizing and Benchmark Qualifier): per-role vCPU, RAM, benchmark floors, disk profiles, and qualifying Spot offer tables.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Scaling and OOM Deep-Links](images/scaling-tab.png)
-<figcaption markdown>Scaling and OOM Deep-Links: triggers, budget caps, and OOM evidence.</figcaption>
+<figcaption markdown>Tab 4 (Scaling and OOM Deep-Links): autoscaling policy thresholds, live scenario evaluator, and GitHub Actions OOM step/line deep-links.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Template studio](images/cloudinit-runner.png)
-<figcaption markdown>The `cloud-init` and VM templates tab.</figcaption>
+<figcaption markdown>Tab 5 (`cloud-init` and VM Templates): interactive YAML editor, boot-stage visualizer, and saved VM shape templates.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Regions and Latency Filter](images/regions-all.png)
-<figcaption markdown>Regions and Latency Filter: enable regions by latency, family, CPU, and disk.</figcaption>
+<figcaption markdown>Tab 6 (Regions and Latency Filter): per-region enablement toggles filtered by backend latency, continent, machine series, and CPU platform.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Rust Builders Telemetry](images/rust-builds.png)
-<figcaption markdown>Rust Builders Telemetry and IP Intel: remote build records.</figcaption>
+<figcaption markdown>Tab 7 (Rust Builders Telemetry and IP Intel): remote build durations, crate cache hit rates, peak container RAM, CPU points, and network badges.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Runner Patches](images/patches-validated.png)
-<figcaption markdown>Runner Patches: manifest editing, validation, and pull requests.</figcaption>
+<figcaption markdown>Tab 8 (Runner Patches): `spot-runner-patch-v1` manifest editor, security validator, effective JSON view, and pull request creator.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Admins](images/admins.png)
-<figcaption markdown>Admins: owner-only administrator management.</figcaption>
+<figcaption markdown>Tab 9 (Admins): owner-only dashboard administrator allowlist keyed by numeric GitHub user ID with an audit history table.</figcaption>
 </figure>
 </div>
 </div>
@@ -84,11 +87,11 @@ qualifying offers, and scaling alerts) and a daily budget tracking bar.
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Dashboard header](images/ui-header.png)
-<figcaption markdown>The header shows the GCP project and GitHub organization, the browser time zone, and the live budget bar.</figcaption>
+<figcaption markdown>Top navigation header showing the configured GCP project, GitHub organization, browser time zone badge, and live budget controls.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Summary cards](images/ui-kpis.png)
-<figcaption markdown>Summary cards for burn rate, runners, builders, qualifying offers, and scaling.</figcaption>
+<figcaption markdown>Five top-level KPI cards summarizing active Spot burn rate, online CI/CD runners, dedicated Rust builders, qualifying Spot offers, and scaling state.</figcaption>
 </figure>
 </div>
 </div>
@@ -109,12 +112,16 @@ Environment variables and bindings are configured in `cloudflare/wrangler.toml`.
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Dashboard sign-in flowchart](images/flow-device-signin.svg)
+<figcaption markdown>Authentication flowchart comparing the GitHub Web OAuth 2.0 redirect path and RFC 8628 Device Code path before issuing the HMAC-SHA256 `__Host-spot_session` cookie.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Dashboard sign-in page](images/login-gate.png)
-<figcaption markdown>The sign-in page offers GitHub web sign-in and a GitHub device code.</figcaption>
+<figcaption markdown>Sign-in page presented to unauthenticated visitors with buttons for GitHub Web OAuth 2.0 and GitHub Device Code authentication.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Device code sign-in](images/login-device-code.png)
-<figcaption markdown>The device flow shows a one-time code and waits for approval.</figcaption>
+<figcaption markdown>Device Code prompt displaying a one-time user code and verification link while polling for authorization completion.</figcaption>
 </figure>
 </div>
 </div>
@@ -138,11 +145,11 @@ When `GITHUB_OAUTH_CLIENT_ID` is set, the dashboard signs users in using GitHub 
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Admins tab](images/admins.png)
-<figcaption markdown>The Admins tab lists owners, added administrators, and recent changes.</figcaption>
+<figcaption markdown>Dashboard Administrators panel listing configured owners, added administrators by numeric GitHub UID, and the change history log.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Administrator added](images/admins-added.png)
-<figcaption markdown>After an owner adds an administrator, the list and history update.</figcaption>
+<figcaption markdown>Dashboard Administrators panel immediately after adding `new-operator`; it shows the updated allowlist and the audit log entry.</figcaption>
 </figure>
 </div>
 </div>
@@ -167,11 +174,11 @@ The **Admins** tab and `/api/admins` endpoints allow the owner to manage dashboa
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Patch console](images/patches-list.png)
-<figcaption markdown>The patch console loads manifests from the configuration repository.</figcaption>
+<figcaption markdown>Runner Patches console displaying the configuration repository branch, commit SHA, and manifest file list.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Pull request opened](images/patches-pr-opened.png)
-<figcaption markdown>Saving opens a pull request and links to it.</figcaption>
+<figcaption markdown>Runner Patches console after saving an edit as a pull request on the configuration repository.</figcaption>
 </figure>
 </div>
 </div>

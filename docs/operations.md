@@ -8,12 +8,16 @@ recovery procedures, and troubleshooting guidance for the pure-Rust runner fleet
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Exit 137 OOM classification flowchart](images/flow-oom-classification.svg)
+<figcaption markdown>Flowchart for classifying exit code `137`: join the active job time window against kernel `journalctl` and cgroup v2 `memory.events` (`oom_kill`) before recording a confirmed OOM.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Plan-only controls](images/map-europe-empty.png)
-<figcaption markdown>Scale controls in the dashboard only plan; they never create or delete VMs.</figcaption>
+<figcaption markdown>Region inspector demonstrating that dashboard scale buttons only preview capacity plans and never mutate live cloud resources.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Running instances](images/instances-running-only.png)
-<figcaption markdown>The instance list mirrors live Compute Engine inventory.</figcaption>
+<figcaption markdown>Instances table filtered to currently `RUNNING` Compute Engine VMs with read-only SSH inspection commands.</figcaption>
 </figure>
 </div>
 </div>
@@ -73,11 +77,11 @@ Runner idleness does not indicate dedicated builder availability, and builder dr
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![OOM evidence](images/scaling-oom-panel.png)
-<figcaption markdown>Confirmed OOM kills (exit code 137 with cgroup evidence) are separated from timeouts and linked to the exact job step.</figcaption>
+<figcaption markdown>OOM Scaling Triggers panel separating a confirmed exit code `137` OOM exit (with step/line deep-link and kernel journal line) from an ignored job timeout.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Record an OOM link](images/scaling-oom-record.png)
-<figcaption markdown>Record a GitHub Actions OOM link with its run, job, step, and line.</figcaption>
+<figcaption markdown>Form for recording and testing a GitHub Actions OOM run deep-link with repository, run ID, job ID, step number, and log line.</figcaption>
 </figure>
 </div>
 </div>
@@ -177,11 +181,11 @@ evaluates capacity against policies, and commits a fresh JSON state snapshot.
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Refresh inventory](images/instances-refresh-toast.png)
-<figcaption markdown>Refresh Inventory re-lists Compute Engine instances when the list looks stale.</figcaption>
+<figcaption markdown>Toast notification shown when triggering an on-demand Compute Engine inventory refresh from the Instances tab.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Health check](images/term-api-health.png)
-<figcaption markdown>Example `/api/health` response.</figcaption>
+<figcaption markdown>Example `curl https://spot.swacktech.com/api/health | jq` output used to verify Worker and KV health.</figcaption>
 </figure>
 </div>
 </div>

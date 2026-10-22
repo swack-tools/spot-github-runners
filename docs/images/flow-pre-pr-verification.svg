@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 560" width="1280" height="560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" filterUnits="userSpaceOnUse" x="0" y="0" width="1280" height="560">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#1e293b" stroke-width="0.7" opacity="0.55"/>
+    </pattern>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/></marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/></marker>
+    <marker id="arrow-rose" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fb7185"/></marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8"/></marker>
+  </defs>
+  <rect width="1280" height="560" rx="14" fill="url(#bgGrad)" stroke="#334155" stroke-width="2"/>
+  <rect x="2" y="68" width="1276" height="490" fill="url(#grid)"/>
+  <rect x="2" y="2" width="1276" height="66" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="28" cy="35" r="7" fill="#38bdf8"/>
+  <text x="48" y="31" fill="#f8fafc" font-size="18" font-weight="700">Development, Local Verification, Independent Review &amp; Squash-Merge Flow</text>
+  <text x="48" y="52" fill="#94a3b8" font-size="12.5">Required verification and review gates before any change is squash-merged into main.</text>
+  <rect x="1115" y="18" width="142" height="30" rx="6" fill="#1e293b" stroke="#38bdf8" stroke-width="1"/>
+  <text x="1186" y="38" text-anchor="middle" fill="#38bdf8" font-size="11.5" font-weight="700">MERMAID FLOW SVG</text>
+  <path d="M 255.0 212.5 C 273.0 212.5, 273.0 212.5, 291.0 212.5" fill="none" stroke="#a78bfa" stroke-width="2.4" marker-end="url(#arrow-purple)"/>
+  <rect x="227.6" y="191.5" width="90.8" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+  <text x="273.0" y="205.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Tests green</text>
+  <path d="M 510.0 212.5 C 528.0 212.5, 528.0 212.5, 546.0 212.5" fill="none" stroke="#fbbf24" stroke-width="2.4" marker-end="url(#arrow-amber)"/>
+  <rect x="475.8" y="191.5" width="104.4" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>
+  <text x="528.0" y="205.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">0 Vale issues</text>
+  <path d="M 765.0 212.5 C 783.0 212.5, 783.0 212.5, 801.0 212.5" fill="none" stroke="#fb7185" stroke-width="2.4" marker-end="url(#arrow-rose)"/>
+  <rect x="730.8" y="191.5" width="104.4" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>
+  <text x="783.0" y="205.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">git push &amp; PR</text>
+  <path d="M 1020.0 212.5 C 1038.0 212.5, 1038.0 212.5, 1056.0 212.5" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#arrow-emerald)"/>
+  <rect x="979.0" y="191.5" width="118.0" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="1038.0" y="205.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">0 P0/P1 + CI OK</text>
+  <g filter="url(#shadow)">    <rect x="40" y="145" width="215" height="135" rx="10" fill="#0f2942" stroke="#38bdf8" stroke-width="2"/>    <rect x="52" y="155" width="154" height="20" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="1"/>    <text x="59" y="169" fill="#38bdf8" font-size="10.5" font-weight="700">GATE 1 · RUST &amp; WASM</text>    <text x="54" y="193" fill="#ffffff" font-size="14" font-weight="700">Unit &amp; Adversarial Suites</text>
+    <text x="54" y="213" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">just test (host + worker)</text>
+    <text x="54" y="231" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">worker-build --release</text>
+    <text x="54" y="249" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Verify Wasm &lt; 3 MiB</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="295" y="145" width="215" height="135" rx="10" fill="#241646" stroke="#a78bfa" stroke-width="2"/>    <rect x="307" y="155" width="154" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>    <text x="314" y="169" fill="#a78bfa" font-size="10.5" font-weight="700">GATE 2 · DOCS &amp; VALE</text>    <text x="309" y="193" fill="#ffffff" font-size="14" font-weight="700">Style &amp; Strict Build</text>
+    <text x="309" y="213" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">vale README AGENTS docs/*</text>
+    <text x="309" y="231" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">0 errors, 0 warnings</text>
+    <text x="309" y="249" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">mkdocs build --strict</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="550" y="145" width="215" height="135" rx="10" fill="#332108" stroke="#fbbf24" stroke-width="2"/>    <rect x="562" y="155" width="154" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>    <text x="569" y="169" fill="#fbbf24" font-size="10.5" font-weight="700">GATE 3 · SSH SIGNING</text>    <text x="564" y="193" fill="#ffffff" font-size="14" font-weight="700">Signed Commit &amp; Local Review</text>
+    <text x="564" y="213" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">git commit -S (SSH-signed)</text>
+    <text x="564" y="231" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Independent local review</text>
+    <text x="564" y="249" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Verify zero P0/P1 issues</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="805" y="145" width="215" height="135" rx="10" fill="#38111c" stroke="#fb7185" stroke-width="2"/>    <rect x="817" y="155" width="140" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>    <text x="824" y="169" fill="#fb7185" font-size="10.5" font-weight="700">GATE 4 · PR REVIEW</text>    <text x="819" y="193" fill="#ffffff" font-size="14" font-weight="700">GitHub CI &amp; @codex review</text>
+    <text x="819" y="213" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Verify GitHub SSH signature</text>
+    <text x="819" y="231" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Resolve P0/P1 in branch</text>
+    <text x="819" y="249" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Track P2s in follow-up issue</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="1060" y="145" width="180" height="135" rx="10" fill="#062e22" stroke="#34d399" stroke-width="2"/>    <rect x="1072" y="155" width="112" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>    <text x="1079" y="169" fill="#34d399" font-size="10.5" font-weight="700">GATE 5 · MERGE</text>    <text x="1074" y="193" fill="#ffffff" font-size="14" font-weight="700">Pinned Squash-Merge</text>
+    <text x="1074" y="213" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">All threads resolved</text>
+    <text x="1074" y="231" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Checks green (gtg)</text>
+    <text x="1074" y="249" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">--match-head-commit</text>
+  </g>
+  <rect x="1134" y="264" width="32" height="32" rx="16" fill="none" stroke="#34d399" stroke-width="2.5" stroke-dasharray="5,4"/>
+  <path d="M 620.0 365 L 1150 280" fill="none" stroke="#34d399" stroke-width="2.5" stroke-dasharray="6,4" marker-end="url(#arrow-emerald)"/>
+  <g filter="url(#shadow)">    <rect x="295" y="365" width="650" height="58" rx="9" fill="#0f172a" stroke="#34d399" stroke-width="2.2"/>    <text x="309" y="388" fill="#34d399" font-size="12.5" font-weight="700">PINNED HEAD MERGE GATE</text>    <text x="309" y="408" fill="#e2e8f0" font-size="12">gh pr merge --squash --match-head-commit ensures the reviewed and CI-verified commit cannot be raced.</text>  </g>
+</svg>

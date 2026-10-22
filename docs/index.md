@@ -6,37 +6,44 @@ This site describes the source on `main`. Merging source does not update a runni
 Inspect the deployed configuration and the actual tool versions before you route work to a host.
 
 !!! info "Screenshots use example data"
-    Every screenshot on this site renders the real dashboard or command output with made-up data. Project,
-    organization, instance names, IP addresses, users, and templates are examples, not a live deployment.
-    Pages with several screenshots show them in a carousel: use **Previous** and **Next**, or scroll sideways.
+    Every screenshot and flowchart on this site uses made-up data (`example-ci-fleet`, `example-org`, example
+    hosts, RFC 5737 IP addresses, and example templates), not a live deployment. Each figure includes a
+    **Reference** footer explaining what it shows. Click any screenshot or SVG flowchart to open the full-screen
+    viewer on the same page: left-click an area to zoom in, use the bottom slider or **Reset 100%** button to
+    adjust zoom, and press the Left/Right arrow keys (or click the side arrows) to cycle through every image on
+    the current page.
 
 ## What the repository contains
 
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Architecture overview flowchart](images/flow-architecture-overview.svg)
+<figcaption markdown>End-to-end architecture flowchart showing the two-tier pure-Rust design: the Cloudflare Worker edge control plane backed by Workers KV (`SPOT_KV`) and the native `host-agent` multi-call binary on Spot runner and dedicated builder VMs.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Dashboard world map](images/map-region-iowa.png)
-<figcaption markdown>The edge dashboard: fleet burn rate, online runners and builders, qualifying Spot offers, and the scaling decision, with a live region map.</figcaption>
+<figcaption markdown>The edge dashboard world map view showing active fleet burn rate, online runners and builders, qualifying Spot offers, the scaling decision, and the region inspector for Iowa.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Instances and cost history](images/instances-all.png)
-<figcaption markdown>Every running and deleted instance with its runtime, hourly rate, and cost in the selected window.</figcaption>
+<figcaption markdown>The Instances and Cost History table listing running and deleted Spot VMs with runtime hours, hourly and daily Spot rates, window spend, lifecycle trigger, and copyable SSH command.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Scale-up decision](images/scaling-decision-scale-up.png)
-<figcaption markdown>The scaling decision panel shows the queued-jobs trigger (24 queued jobs >= threshold 20) and the projected spend for the target runner count.</figcaption>
+<figcaption markdown>The scaling evaluation panel showing a `SCALE_UP` decision (`6` to `8` runners across `4` VMs) triggered when queued jobs reach the `20`-job threshold, with projected hourly, daily, and monthly spend.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Rust builder telemetry](images/rust-builds.png)
-<figcaption markdown>Dedicated Rust builders report duration, cache hits, peak memory, and CPU points for every remote build.</figcaption>
+<figcaption markdown>The Rust Builders Telemetry table recording compile and delivery duration, crate cache hit rate, peak active container RAM, and CPU points for each remote build.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Runner patch console](images/patches-pr-opened.png)
-<figcaption markdown>Runner patches are edited and validated in the dashboard and saved as pull requests.</figcaption>
+<figcaption markdown>The Runner Patches console after validating a repository manifest and saving the change as a GitHub pull request on the configuration repository.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Host agent help](images/term-host-agent-help.png)
-<figcaption markdown>The `host-agent` multi-call binary runs admission, cleanup, Docker admission, and builder tooling on hosts.</figcaption>
+<figcaption markdown>Terminal output of `host-agent --help` showing the eight subcommands compiled into the single native binary deployed on runner hosts and dedicated builders.</figcaption>
 </figure>
 </div>
 </div>
@@ -102,7 +109,7 @@ See the [command reference](commands.md) for every flag.
 
 <figure class="shot" markdown>
 ![Fleet summary cards](images/ui-kpis.png)
-<figcaption markdown>The summary cards show registered runner slots and VMs separately from memory admission headroom.</figcaption>
+<figcaption markdown>Top-level summary cards separating registered runner slots and running VM counts from per-job memory lease admission headroom.</figcaption>
 </figure>
 <!-- /shot -->
 

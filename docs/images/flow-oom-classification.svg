@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 560" width="1280" height="560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" filterUnits="userSpaceOnUse" x="0" y="0" width="1280" height="560">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#1e293b" stroke-width="0.7" opacity="0.55"/>
+    </pattern>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/></marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/></marker>
+    <marker id="arrow-rose" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fb7185"/></marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8"/></marker>
+  </defs>
+  <rect width="1280" height="560" rx="14" fill="url(#bgGrad)" stroke="#334155" stroke-width="2"/>
+  <rect x="2" y="68" width="1276" height="490" fill="url(#grid)"/>
+  <rect x="2" y="2" width="1276" height="66" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="28" cy="35" r="7" fill="#38bdf8"/>
+  <text x="48" y="31" fill="#f8fafc" font-size="18" font-weight="700">Exit Code 137 Out-of-Memory (OOM) Evidence Classification Flow</text>
+  <text x="48" y="52" fill="#94a3b8" font-size="12.5">Joining container exit code 137 with kernel journalctl and cgroup v2 memory.events before classifying OOMs.</text>
+  <rect x="1115" y="18" width="142" height="30" rx="6" fill="#1e293b" stroke="#38bdf8" stroke-width="1"/>
+  <text x="1186" y="38" text-anchor="middle" fill="#38bdf8" font-size="11.5" font-weight="700">MERMAID FLOW SVG</text>
+  <path d="M 255.0 212.5 C 275.5 212.5, 275.5 212.5, 296.0 212.5" fill="none" stroke="#a78bfa" stroke-width="2.4" marker-end="url(#arrow-purple)"/>
+  <rect x="219.9" y="191.5" width="111.2" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+  <text x="275.5" y="205.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Query host log</text>
+  <path d="M 530.0 212.5 C 550.5 212.5, 550.5 212.5, 571.0 212.5" fill="none" stroke="#fb7185" stroke-width="2.4" marker-end="url(#arrow-rose)"/>
+  <rect x="491.5" y="191.5" width="118.0" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>
+  <text x="550.5" y="205.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Join timestamps</text>
+  <path d="M 800.0 212.5 C 823.0 212.5, 823.0 142.5, 846.0 142.5" fill="none" stroke="#fb7185" stroke-width="2.4" marker-end="url(#arrow-rose)"/>
+  <rect x="770.8" y="156.5" width="104.4" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>
+  <text x="823.0" y="170.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">oom_kill &gt;= 1</text>
+  <path d="M 800.0 212.5 C 823.0 212.5, 823.0 292.5, 846.0 292.5" fill="none" stroke="#94a3b8" stroke-width="2.4" marker-end="url(#arrow-slate)"/>
+  <rect x="770.8" y="231.5" width="104.4" height="20" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-width="1"/>
+  <text x="823.0" y="245.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">No kernel OOM</text>
+  <g filter="url(#shadow)">    <rect x="40" y="145" width="215" height="135" rx="10" fill="#332108" stroke="#fbbf24" stroke-width="2"/>    <rect x="52" y="155" width="147" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>    <text x="59" y="169" fill="#fbbf24" font-size="10.5" font-weight="700">SIGNAL 1 · WORKFLOW</text>    <text x="54" y="193" fill="#ffffff" font-size="14" font-weight="700">Job Fails (Exit 137)</text>
+    <text x="54" y="213" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">SIGKILL (128 + 9 = 137)</text>
+    <text x="54" y="231" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Could be OOM or cancel</text>
+    <text x="54" y="249" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Capture job time window</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="300" y="145" width="230" height="135" rx="10" fill="#241646" stroke="#a78bfa" stroke-width="2"/>    <rect x="312" y="155" width="154" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>    <text x="319" y="169" fill="#a78bfa" font-size="10.5" font-weight="700">SIGNAL 2 · CGROUP V2</text>    <text x="314" y="193" fill="#ffffff" font-size="14" font-weight="700">Check memory.events</text>
+    <text x="314" y="213" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Inspect oom_kill counter</text>
+    <text x="314" y="231" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Check journalctl kernel log</text>
+    <text x="314" y="249" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Match active job interval</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="575" y="145" width="225" height="135" rx="10" fill="#38111c" stroke="#fb7185" stroke-width="2"/>    <rect x="587" y="155" width="105" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>    <text x="594" y="169" fill="#fb7185" font-size="10.5" font-weight="700">EVIDENCE GATE</text>    <text x="589" y="193" fill="#ffffff" font-size="14" font-weight="700">Kernel/Cgroup Match?</text>
+    <text x="589" y="213" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Evidence joined to window?</text>
+    <text x="589" y="231" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Distinguish host vs container</text>
+    <text x="589" y="249" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Reject plain timeouts</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="850" y="85" width="390" height="115" rx="10" fill="#38111c" stroke="#fb7185" stroke-width="2"/>    <rect x="862" y="95" width="105" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>    <text x="869" y="109" fill="#fb7185" font-size="10.5" font-weight="700">CONFIRMED OOM</text>    <text x="864" y="133" fill="#ffffff" font-size="14" font-weight="700">Classify as OOM Killed (Exit 137)</text>
+    <text x="864" y="153" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Attach step &amp; line deep-link (#step:N:M)</text>
+    <text x="864" y="171" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Surface in OOM Scaling Triggers panel</text>
+    <text x="864" y="189" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Eligible for OOM scale-up evaluation</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="850" y="235" width="390" height="115" rx="10" fill="#162032" stroke="#94a3b8" stroke-width="2"/>    <rect x="862" y="245" width="84" height="20" rx="5" fill="#0f172a" stroke="#94a3b8" stroke-width="1"/>    <text x="869" y="259" fill="#94a3b8" font-size="10.5" font-weight="700">NOT AN OOM</text>    <text x="864" y="283" fill="#ffffff" font-size="14" font-weight="700">Classify as Timeout / Cancelled (Ignored)</text>
+    <text x="864" y="303" fill="#f1f5f9" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Badge: Timeout (Not OOM — Ignored)</text>
+    <text x="864" y="321" fill="#f1f5f9" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Do not trigger OOM capacity scale-up</text>
+    <text x="864" y="339" fill="#f1f5f9" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Preserve accurate telemetry</text>
+  </g>
+  <rect x="671" y="264" width="32" height="32" rx="16" fill="none" stroke="#fb7185" stroke-width="2.5" stroke-dasharray="5,4"/>
+  <path d="M 590.0 415 L 687 280" fill="none" stroke="#fb7185" stroke-width="2.5" stroke-dasharray="6,4" marker-end="url(#arrow-rose)"/>
+  <g filter="url(#shadow)">    <rect x="260" y="415" width="660" height="58" rx="9" fill="#0f172a" stroke="#fb7185" stroke-width="2.2"/>    <text x="274" y="438" fill="#fb7185" font-size="12.5" font-weight="700">EVIDENCE REQUIREMENT</text>    <text x="274" y="458" fill="#e2e8f0" font-size="12">Exit code 137 is never classified as an OOM without kernel or cgroup oom_kill evidence in the job window.</text>  </g>
+</svg>

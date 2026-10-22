@@ -12,12 +12,16 @@ This page covers the manifest, how the tools classify a change, the receipts tha
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Runner patch lifecycle flowchart](images/flow-runner-patch-lifecycle.svg)
+<figcaption markdown>Flowchart of the Runner Patch Console lifecycle: load `defaults.yaml` and repository manifests, compute the merged patch and SHA-256, enforce security gates, and open a pull request.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Manifest list](images/patches-list.png)
-<figcaption markdown>The console lists `defaults.yaml` and each repository manifest in the configuration repository.</figcaption>
+<figcaption markdown>Runner Patches console listing the organization-wide `defaults.yaml` and per-repository manifests loaded from the configuration repository.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Organization defaults](images/patches-defaults.png)
-<figcaption markdown>An example `defaults.yaml` that every repository inherits.</figcaption>
+<figcaption markdown>Manifest editor loaded with `defaults.yaml`, showing default hardware floors and package lists inherited by every repository.</figcaption>
 </figure>
 </div>
 </div>
@@ -245,23 +249,23 @@ Label sync runs when a runner host is provisioned:
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Validated manifest](images/patches-validated.png)
-<figcaption markdown>Validate shows the effective patch and its SHA-256 digest.</figcaption>
+<figcaption markdown>Validated repository manifest showing the merged effective configuration and its canonical SHA-256 digest.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Rejected manifest](images/patches-invalid.png)
-<figcaption markdown>A manifest that mounts the Docker socket fails validation.</figcaption>
+<figcaption markdown>Validation error display when a manifest attempts to mount `/var/run/docker.sock`; it clears the effective patch and surfaces the exact field error.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Validation API](images/term-patch-validate.png)
-<figcaption markdown>Example validation API response for a forbidden mount.</figcaption>
+<figcaption markdown>Example `POST /api/patch-console/validate` JSON response rejecting a forbidden `/var/run/docker.sock` container mount.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Pull request opened](images/patches-pr-opened.png)
-<figcaption markdown>Save as pull request opens a pull request on the configuration repository.</figcaption>
+<figcaption markdown>Runner Patches status banner linking to the newly created GitHub pull request after saving a validated manifest change.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Rollout preview](images/patches-preview.png)
-<figcaption markdown>The rollout preview. Per-host results are empty because the edge preview compares manifests, not live hosts; live hot-patching is off.</figcaption>
+<figcaption markdown>Rollout impact preview table showing that live hot-patching stays off at the edge and merged changes roll out on the next 5-minute cron tick.</figcaption>
 </figure>
 </div>
 </div>

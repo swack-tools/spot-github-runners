@@ -13,16 +13,20 @@ and workspace cleanup.
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Autoscaling and memory admission flowchart](images/flow-reconciler-scaling.svg)
+<figcaption markdown>Flowchart showing how edge backlog scaling (`queued_jobs >= 20`) coordinates with on-host memory lease admission (`host-agent admission`) and post-job target cleanup.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Scale-up summary](images/ui-kpis-scale-up.png)
-<figcaption markdown>The summary cards during a backlog scale-up: 24 queued jobs trigger a scale-up from 6 to 8 runners.</figcaption>
+<figcaption markdown>Dashboard summary cards during a backlog scale-up event where `24` queued jobs trigger a scale-up from `6` to `8` runners.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Scale-up decision](images/scaling-decision-scale-up.png)
-<figcaption markdown>The scaling evaluation shows the queued-jobs trigger (24 queued jobs >= threshold 20) and projected spend.</figcaption>
+<figcaption markdown>Live Controller Evaluation box showing `SCALE_UP (6 -> 8 CI/CD Runners / 4 VMs)` driven by `[queued_jobs] 24 queued jobs >= threshold 20`.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Steady state summary](images/ui-kpis.png)
-<figcaption markdown>In steady state the controller holds at the runner floor.</figcaption>
+<figcaption markdown>Dashboard summary cards in steady state (`HOLD` at the `6`-runner floor across `3` VMs when queue depth is below threshold).</figcaption>
 </figure>
 </div>
 </div>
@@ -74,15 +78,15 @@ If no active runner host exists for a target, the reconciler immediately provisi
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Runner scaling policy](images/scaling-runner-policy.png)
-<figcaption markdown>Runner policy controls in the dashboard, including the queued-jobs threshold used by the scheduled reconciler and additional scenario evaluation inputs.</figcaption>
+<figcaption markdown>CI/CD runner autoscaling policy panel highlighting the `20`-job queued backlog threshold used by the scheduled reconciler alongside scenario evaluation inputs.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Builder scaling policy](images/scaling-builder-policy.png)
-<figcaption markdown>Dedicated Rust builder policy controls for instance floor/ceiling, queue depth, CPU, OOM, and idle scale-down.</figcaption>
+<figcaption markdown>Dedicated Rust builder autoscaling subpanel showing instance floor and ceiling, queued build threshold, CPU threshold, and idle scale-down rules.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Scaling tab](images/scaling-tab.png)
-<figcaption markdown>The full scaling tab with the OOM evidence panel.</figcaption>
+<figcaption markdown>Full Scaling and OOM Deep-Links tab combining policy configuration on the left with GitHub Actions and kernel journal OOM evidence on the right.</figcaption>
 </figure>
 </div>
 </div>
@@ -100,7 +104,7 @@ scale-up:
 
 <figure class="shot" markdown>
 ![Admission subcommand](images/term-host-agent-admission.png)
-<figcaption markdown>The `host-agent admission` subcommand reserves and releases memory leases.</figcaption>
+<figcaption markdown>Terminal output of `host-agent admission` showing the `serve`, `acquire`, `release`, and `headroom` subcommands that guard `/var/lib/gha-admission/leases.json`.</figcaption>
 </figure>
 <!-- /shot -->
 
@@ -121,7 +125,7 @@ Never edit or delete `/var/lib/gha-admission/leases.json` or its lock file to by
 
 <figure class="shot" markdown>
 ![Target cleanup](images/term-clean-target.png)
-<figcaption markdown>`host-agent clean-target` removes a Cargo `target/` directory without following symbolic links.</figcaption>
+<figcaption markdown>Terminal output demonstrating `host-agent clean-target` performing descriptor-relative `openat`/`unlinkat` cleanup while refusing symbolic links.</figcaption>
 </figure>
 <!-- /shot -->
 

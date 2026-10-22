@@ -12,12 +12,16 @@ For template values that you copy into a file, see
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Configuration and secret binding flowchart](images/flow-config-precedence.svg)
+<figcaption markdown>Flowchart illustrating how `just deploy-worker` reads the active `gcloud` project for `GCP_PROJECT` while Wrangler secrets and `.env` supply credentials.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Environment template](images/term-env-example.png)
-<figcaption markdown>`.env.example` with placeholder values.</figcaption>
+<figcaption markdown>Sanitized `.env.example` listing required and optional environment variables with placeholder values.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Sign-in page](images/login-gate.png)
-<figcaption markdown>The sign-in methods that the OAuth 2.0 settings enable.</figcaption>
+<figcaption markdown>Dashboard login gate enabled by configuring the GitHub OAuth 2.0 app and session secret.</figcaption>
 </figure>
 </div>
 </div>
@@ -54,11 +58,11 @@ edge dashboard.
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![GCP project from gcloud](images/term-gcp-project.png)
-<figcaption markdown>The deploy recipe reads `GCP_PROJECT` from the active gcloud configuration.</figcaption>
+<figcaption markdown>Terminal output showing `just gcp-project` resolving the active `gcloud` project and `just deploy-worker` passing it via `--var GCP_PROJECT`.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Configured header](images/ui-header.png)
-<figcaption markdown>The dashboard header shows the configured project and organization.</figcaption>
+<figcaption markdown>Dashboard top bar displaying the configured `GCP_PROJECT` and `GITHUB_ORG` values alongside the live budget bar.</figcaption>
 </figure>
 </div>
 </div>

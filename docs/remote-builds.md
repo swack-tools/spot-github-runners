@@ -43,16 +43,20 @@ it fits.
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Remote build execution flowchart](images/flow-remote-build-execution.svg)
+<figcaption markdown>End-to-end remote build execution flowchart through `host-agent host-launcher`, `docker-admission`, `builder-entrypoint`, and `worktree-commands`.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Remote build records](images/rust-builds.png)
-<figcaption markdown>Each remote build: duration, cache hits, builder, origin location, peak memory, and CPU points. The API redacts origin IP addresses and hostnames.</figcaption>
+<figcaption markdown>Rust Builders Telemetry table displaying compile and delivery durations, crate cache hit rates, builder VM metadata, peak RAM, and CPU points (with origin IPs redacted).</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Filter builds](images/rust-builds-vpn-filter.png)
-<figcaption markdown>The search box filters builds by project, builder, location, or network badge.</figcaption>
+<figcaption markdown>Rust Builders Telemetry table filtered by `vpn` to isolate builds originating from VPN or proxy networks.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Record a build](images/rust-record-build.png)
-<figcaption markdown>Record a build manually; fields left empty are stored as not reported.</figcaption>
+<figcaption markdown>Manual and API build telemetry recording form inside the Rust Builders tab.</figcaption>
 </figure>
 </div>
 </div>
@@ -105,7 +109,7 @@ qualified from a successful source-only test suite or a bootstrap tool probe.
 
 <figure class="shot" markdown>
 ![Cache and memory summary](images/rust-kpis.png)
-<figcaption markdown>Cache hit rate and peak active memory across builds.</figcaption>
+<figcaption markdown>Rust builder KPI bar highlighting the `87.9%` crate cache hit rate on the persistent NVMe/Hyperdisk volume and the `26.1 GiB` peak RAM high-water mark.</figcaption>
 </figure>
 <!-- /shot -->
 

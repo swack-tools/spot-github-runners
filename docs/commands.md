@@ -19,19 +19,19 @@ The repository features two primary execution environments:
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Host agent help](images/term-host-agent-help.png)
-<figcaption markdown>`host-agent --help`.</figcaption>
+<figcaption markdown>Terminal output of `host-agent --help` showing all subcommands of the multi-call binary.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Admission subcommand](images/term-host-agent-admission.png)
-<figcaption markdown>`host-agent admission`.</figcaption>
+<figcaption markdown>Terminal output of `host-agent admission` for memory lease reservation and headroom queries.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Target cleanup](images/term-clean-target.png)
-<figcaption markdown>`host-agent clean-target`.</figcaption>
+<figcaption markdown>Terminal output of `host-agent clean-target` performing descriptor-safe directory cleanup without following symlinks.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Toolchain probe](images/term-toolchain-probe.png)
-<figcaption markdown>`host-agent toolchain-probe`.</figcaption>
+<figcaption markdown>Terminal output of `host-agent toolchain-probe` checking toolchain binaries and cgroup resource caps.</figcaption>
 </figure>
 </div>
 </div>
@@ -164,11 +164,11 @@ Validates that compiler toolchains, browser binaries, and cgroup v2 controllers 
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Just recipes](images/term-just-list.png)
-<figcaption markdown>`just --list`.</figcaption>
+<figcaption markdown>Output of `just --list` showing every task runner recipe in the root `justfile`.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Deploy recipe](images/term-gcp-project.png)
-<figcaption markdown>`just gcp-project` and `just deploy-worker`.</figcaption>
+<figcaption markdown>Output of `just gcp-project` and `just deploy-worker` passing the active `gcloud` project to Wrangler.</figcaption>
 </figure>
 </div>
 </div>
@@ -195,7 +195,7 @@ just <recipe> [arguments...]
 
 <figure class="shot" markdown>
 ![Worker build](images/term-worker-build.png)
-<figcaption markdown>`worker-build --release` and the resulting Wasm size.</figcaption>
+<figcaption markdown>Output of `cd cloudflare && worker-build --release` showing the compiled Wasm bundle size (`2.12 MiB`, well under the `3 MiB` limit).</figcaption>
 </figure>
 <!-- /shot -->
 
@@ -249,11 +249,11 @@ wrangler kv key get --binding=SPOT_KV "dashboard:state"
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Test suites](images/term-cargo-test.png)
-<figcaption markdown>`just test`.</figcaption>
+<figcaption markdown>Condensed output of `just test` running all `host-agent` and `cloudflare` integration and adversarial test suites.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Format check](images/term-fmt-check.png)
-<figcaption markdown>`just fmt-check`.</figcaption>
+<figcaption markdown>Output of `just fmt-check` verifying zero `rustfmt` diffs across both Rust crates.</figcaption>
 </figure>
 </div>
 </div>

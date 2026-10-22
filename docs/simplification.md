@@ -5,12 +5,16 @@
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Simplified operator and developer workflow flowchart](images/flow-workflow-simplification.svg)
+<figcaption markdown>Flowchart comparing the two-step operator deployment (`gcloud config` + `just deploy-worker`) and the single-command developer remote build workflow.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Remote builds](images/rust-builds.png)
-<figcaption markdown>Remote builds as users see them in the dashboard.</figcaption>
+<figcaption markdown>Rust Builders Telemetry view showing completed remote builds, crate cache hit rates, and compile durations.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Device sign-in](images/login-device-code.png)
-<figcaption markdown>Device sign-in for terminal users.</figcaption>
+<figcaption markdown>One-time GitHub Device Code sign-in used from terminal sessions.</figcaption>
 </figure>
 </div>
 </div>
@@ -25,7 +29,7 @@ provides the VM startup payload and restricted host launcher.
 
 <figure class="shot" markdown>
 ![One deploy command](images/term-gcp-project.png)
-<figcaption markdown>One command deploys the Worker with the gcloud project.</figcaption>
+<figcaption markdown>`just deploy-worker` reading the default `gcloud` project and deploying the Worker in a single step.</figcaption>
 </figure>
 <!-- /shot -->
 

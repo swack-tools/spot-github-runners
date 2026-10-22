@@ -8,10 +8,22 @@ Use them for native ARM64 Linux Docker work. Route native macOS work to native h
 
 ## What the files define
 
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Local ARM64 runner lifecycle flowchart](images/flow-local-arm64-lifecycle.svg)
+<figcaption markdown>Lifecycle flowchart for persistent local ARM64 Docker runners (`m4air/`), showing how `entrypoint.sh`, `job-started.sh`, and `job-completed.sh` invoke `host-agent`.</figcaption>
+</figure>
 <figure class="shot" markdown>
 ![Local runner Compose file](images/term-m4air-compose.png)
-<figcaption markdown>The Docker Compose file for the local ARM64 runners.</figcaption>
+<figcaption markdown>Sanitized `m4air/docker-compose.yml` excerpt defining the persistent local ARM64 runner service and environment bindings.</figcaption>
 </figure>
+<figure class="shot" markdown>
+![Shared memory admission binary](images/term-host-agent-admission.png)
+<figcaption markdown>Terminal output of `host-agent admission`, which enforces per-job memory leases on both cloud Spot runners and local ARM64 runners.</figcaption>
+</figure>
+</div>
+</div>
 <!-- /shot -->
 
 | File | Purpose |
@@ -65,7 +77,7 @@ labels of runners that are already registered through the GitHub API.
 
 <figure class="shot" markdown>
 ![Just recipes](images/term-just-list.png)
-<figcaption markdown>Recipes for checking the repository before changing local runners.</figcaption>
+<figcaption markdown>Output of `just --list` showing the local verification recipes used before updating runner containers.</figcaption>
 </figure>
 <!-- /shot -->
 

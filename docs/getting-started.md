@@ -29,12 +29,16 @@ the uploader account. See [Set up a builder](dedicated-builders.md).
 <div class="carousel" markdown>
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
+![Onboarding and verification flowchart](images/flow-getting-started.svg)
+<figcaption markdown>Step-by-step onboarding flowchart from cloning the repository and creating an outside-Git `.env` file to running read-only local checks and signing in to the edge dashboard.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Dashboard sign-in page](images/login-gate.png)
-<figcaption markdown>The sign-in page offers GitHub web sign-in and a GitHub device code.</figcaption>
+<figcaption markdown>The edge dashboard sign-in gate offering browser-based GitHub OAuth 2.0 login alongside RFC 8628 GitHub Device Code sign-in.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Device code sign-in](images/login-device-code.png)
-<figcaption markdown>Device sign-in shows a one-time code to enter at the GitHub device page.</figcaption>
+<figcaption markdown>The active device-code sign-in box displaying the one-time eight-character user code to enter at the GitHub device verification page.</figcaption>
 </figure>
 </div>
 </div>
@@ -55,7 +59,7 @@ gh auth status
 
 <figure class="shot" markdown>
 ![Environment file template](images/term-env-example.png)
-<figcaption markdown>`.env.example` lists every variable with placeholder values only.</figcaption>
+<figcaption markdown>Terminal view of `.env.example` showing placeholder environment variables for GCP, GitHub, and Cloudflare Worker configuration.</figcaption>
 </figure>
 <!-- /shot -->
 
@@ -91,15 +95,15 @@ directories, or operational state. Store deployment output under a directory out
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Host agent help](images/term-host-agent-help.png)
-<figcaption markdown>`host-agent --help` lists the subcommands of the multi-call binary.</figcaption>
+<figcaption markdown>Output of `host-agent --help` listing the memory admission, target cleanup, Docker wrapper, Docker admission, and builder subcommands.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Just recipes](images/term-just-list.png)
-<figcaption markdown>`just --list` shows the build, test, lint, and deploy recipes.</figcaption>
+<figcaption markdown>Output of `just --list` displaying the available local build, test, formatting, lint, and Worker deployment recipes.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Test suites](images/term-cargo-test.png)
-<figcaption markdown>`just test` runs the host agent and Worker test suites.</figcaption>
+<figcaption markdown>Output of `just test` executing the pure-Rust unit, concurrency, and adversarial test suites across `host-agent` and `cloudflare`.</figcaption>
 </figure>
 </div>
 </div>
