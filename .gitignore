@@ -26,6 +26,7 @@
 !cloudflare/src/**
 !cloudflare/tests/**
 !cloudflare/build/worker/shim.mjs
+!tools/edge_dashboard_probe.js
 !tests/fixtures/*.json
 
 # Secrets, generated files, and local-only artifacts
