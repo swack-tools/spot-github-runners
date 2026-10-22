@@ -18,9 +18,9 @@ qualifying offers, and scaling alerts) and a daily budget tracking bar.
 | --- | --- |
 | World Map and Fleet Inspector | Shows data center pins by region. You can inspect active runners and view candidate regional configurations. |
 | Instances and Cost History | Lists active and deleted instances with sorting, search, time window filters, and total price columns. |
-| Sizing and Benchmark Qualifier | Configures per-runner vCPU and RAM, minimum counts, CPU benchmark floors, disk types, and templates for runners and Rust builders. The qualification matrix displays candidate Spot offers (with `POST /api/qualify` providing structured prototype qualification data). |
+| Sizing and Benchmark Qualifier | Configures per-runner vCPU and RAM, minimum counts, CPU benchmark floors, disk types, and templates for runners and Rust builders. The qualification matrix displays candidate Spot offers (`/api/qualify` and `/api/profile/{role}` return static placeholders with hard-coded counts and empty lists). |
 | Scaling and OOM Deep-Links | Configures autoscaling triggers and budget caps. Lists out-of-memory (OOM) events with links to relevant workflow runs. |
-| `Cloud-Init` and VM templates | Validates template line count and basic structure (via `POST /api/cloud-init/parse`) and saves VM templates from active configurations. |
+| `Cloud-Init` and VM templates | The `cloud-init` parse endpoint (`POST /api/cloud-init/parse`) is a stub that reports line count and format (`cloud-config` or shell script) with no real validation, and saves VM templates from active configurations. |
 | Regions and Latency Filter | Configures regions by latency, continent, machine families, CPU platforms, and disk types. |
 | Rust Builders Telemetry and IP Intel | Records and summarizes remote build runs: cache hits, peak RAM, CPU time, and builder statistics. |
 | Runner Patches | Edits and validates patch manifests in the configuration repository. See [The patch console](#the-patch-console). |
@@ -41,7 +41,6 @@ qualifying offers, and scaling alerts) and a daily budget tracking bar.
 ![Sizing and Benchmark Qualifier tab](images/dashboard-sizing.png)
 
 *The Sizing and Benchmark Qualifier tab sets per-runner and per-builder hardware floors, disks, budgets, and templates.*
-
 
 !!! note "The dashboard preserves safety gates"
     The dashboard operations for instance deletion and regional scaling operate as safety-gated execution plan
@@ -64,12 +63,12 @@ Environment variables and bindings are configured in `cloudflare/wrangler.toml`.
 
 ![Dashboard sign-in page](images/login-gate.png)
 
-*The sign-in page offers each enabled method, such as GitHub web sign-in, a GitHub device code, or an operator token.*
+*The sign-in page offers GitHub web sign-in and a GitHub device code.*
 
 When `GITHUB_OAUTH_CLIENT_ID` is set, the dashboard signs users in using GitHub OAuth 2.0:
 
 - **Flows**: the web flow uses OAuth 2.0 authorization code flow with Proof Key for Code Exchange (PKCE, `S256`).
-  Device flow (RFC 8628) is enabled when `GITHUB_OAUTH_DEVICE_FLOW=1`.
+  The sign-in page also offers the device flow (RFC 8628).
 - **Identity validation**: the owner is pinned by login and numeric ID fixed in code (for example, `example-owner:100001`). The owner
   can grant administrator privileges to other users on the Admins page.
 - **Per-target permission checks**: non-global administrators must possess administrator rights on all controlled targets.

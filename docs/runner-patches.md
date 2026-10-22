@@ -117,25 +117,25 @@ The identity of a patch is the SHA-256 digest of its canonical JSON. The tools b
 
 ## How a patch applies
 
-The Runner Patch Console computes rollout classifications to preview how manifest changes affect active runner hosts. The `/api/patch-console/preview` endpoint (aliased as `/api/patches/preview`) compares the target patch with each running host:
+The Runner Patch Console computes rollout classifications to preview how a target manifest compares with a baseline manifest. The `/api/patch-console/preview` endpoint (aliased as `/api/patches/preview`) compares the request's `current_manifest` with the target manifest:
 
-| Classification | Meaning | Action taken |
+| Classification | Meaning | Preview description |
 | --- | --- | --- |
-| `noop` | The host already runs the target. The digests match. | No changes required. |
-| `hot_patch` | Changes only add packages, files, or non-destructive sysctls. | Packages and files are installed in place. Direct live hot-patching (`POST /api/patches/hot-patch`) is deprecated; rollout occurs on the next scheduled reconciler tick after pull request merge. |
-| `recreate_containers` | Container mounts or Dockerfile commands differ. | The reconciler drains and recreates runner containers. |
-| `replace_vm` | Hardware settings, host boot scripts, or host sysctls differ. | The reconciler provisions a replacement Spot VM and drains the old instance. |
+| `noop` | The baseline already matches the target. The digests match. | No changes detected. |
+| `hot_patch` | Changes only add packages or files. | In-place package or file updates. Direct live hot-patching (`POST /api/patches/hot-patch`) is deprecated; the edge preview evaluates manifest differences only. |
+| `recreate_containers` | Container mounts or `dockerfile_run` scripts differ. | Container recreation indicated by manifest diff. |
+| `replace_vm` | Hardware settings, host boot scripts, or host sysctls differ. | Host replacement indicated by manifest diff. |
 
-The Patch Console bootstrap endpoint (`GET /api/patch-console/bootstrap`, aliased as `/api/patches`) reports `executor.available=false` with the reason "Serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick." All manifest changes are submitted as pull requests, reviewed, merged into `main`, and deployed autonomously by the edge reconciler.
+The Patch Console bootstrap endpoint (`GET /api/patch-console/bootstrap`, aliased as `/api/patches`) reports `executor.available=false` with the reason "Serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick." All manifest changes are submitted as pull requests, reviewed, and merged into `main`. The reconciler does not automate container recreation or VM replacement driven by patches; classifications serve as previews only.
 
 ### Classification rules
 
-The classification function compares the last completed patch on a host (from its receipt) with the target patch:
+The classification function compares the baseline manifest with the target patch:
 
 1. If the digests match, the result is `noop`.
 2. If hardware settings, host boot scripts, or host sysctl values differ, the result is `replace_vm`.
 3. If container mounts or Dockerfile commands differ, the result is `recreate_containers`.
-4. Otherwise, the result is `hot_patch`.
+4. If only packages or files differ, the result is `hot_patch`.
 
 #### The destructive-diff rule
 
@@ -221,10 +221,9 @@ Each runner registers with a label list, and the manager keeps that list in sync
 
 GitHub's built-in labels (`self-hosted`, `Linux`, `X64`, `Windows`, `macOS`, `ARM64`, and `ARM`) are excluded from the comparison. For each expected runner (`<prefix>-<vm>-<n>`), a mismatch triggers a `PUT` that replaces the runner's custom labels, and the manager reads the result back and checks it.
 
-Label sync runs at two points:
+Label sync runs when a runner host is provisioned:
 
-- **After provisioning:** once every expected runner is online and before the storage check and patch record. A failure keeps the deployment pending.
-- **During reconciliation:** on each 5-minute cron cycle, the edge reconciler verifies runner labels and issues GitHub API updates if labels deviate from the merged manifest.
+- **At provisioning:** runner labels (`RUNNER_LABELS`) are configured when a host is launched based on the machine type, zone, and target parameters. The reconciler does not perform per-tick label synchronization.
 
 ## Apply a patch
 
@@ -238,7 +237,7 @@ To apply a patch, commit the manifest to the configuration repository (`CONFIG_R
 
 ![Patch rollout preview](images/dashboard-patch-rollout.png)
 
-*The rollout preview classifies each running host. Live hot-patching is off; the reconciler rolls out merged manifests.*
+*The rollout preview. Per-host results are empty because the edge preview compares manifests, not live hosts; live hot-patching is off.*
 
 Before applying any change, validate the manifest syntax and preview its classification against the running fleet. You can perform these checks in the dashboard Web UI or by calling the edge endpoints:
 
@@ -251,11 +250,11 @@ curl -X POST https://spot.swacktech.com/api/patch-console/validate \
   -d '{"content": "schema: spot-runner-patch-v1\nrepository: example-org/example-repo\nhardware:\n  min_vcpu: 16\n  min_ram_gib: 32\n  runners_count: 2\n  runner_vcpu: 7\n  runner_ram_gib: 14\n  host_overhead_gib: 4\n  queued_jobs_threshold: 20\n"}'
 ```
 
-2. **Rollout classification preview (`POST /api/patch-console/preview`):** the preview endpoint (aliased as `/api/patches/preview`) compares the target manifest against running hosts and classifies required actions:
-   - `noop`: the host already runs the target patch (SHA-256 digests match).
-   - `hot_patch`: the changes only add packages, files, or non-destructive sysctl settings that apply in place.
-   - `recreate_containers`: only container mounts differ, requiring container re-creation.
-   - `replace_vm`: the change modifies the architecture, drops packages or files, alters startup scripts, or requires a different machine type.
+2. **Rollout classification preview (`POST /api/patch-console/preview`):** the preview endpoint (aliased as `/api/patches/preview`) compares the request's `current_manifest` against the target manifest:
+   - `noop`: the manifests are identical (SHA-256 digests match).
+   - `hot_patch`: changes only add packages or files.
+   - `recreate_containers`: container mounts or `dockerfile_run` commands differ.
+   - `replace_vm`: hardware settings, host boot scripts, or host sysctls differ.
 
 ### Submit changes through the pull request workflow
 
@@ -265,28 +264,25 @@ Saving a patch creates a pull request on the configuration repository (`CONFIG_R
 curl -X POST https://spot.swacktech.com/api/patch-console/save \
   -H "Content-Type: application/json" \
   -H "Cookie: __Host-spot_session=<session-cookie>" \
-  -H "Idempotency-Key: patch-sample-20261022" \
   -d '{"path": "repos/example-org/example-repo.yaml", "manifest": {"schema": "spot-runner-patch-v1", "repository": "example-org/example-repo", "hardware": {"min_vcpu": 16, "min_ram_gib": 32, "runners_count": 2, "runner_vcpu": 7, "runner_ram_gib": 14, "host_overhead_gib": 4, "queued_jobs_threshold": 20}}}'
 ```
 
 The pull request workflow enforces configuration safety:
 
-- **Dedicated branch creation:** the Worker generates a unique branch named `spot-dashboard/<target-slug>-<digest-prefix>` from the default branch head.
+- **Dedicated branch creation:** the Worker generates a unique branch named `spot-dashboard/<target-slug>-<digest-prefix>` (first 12 hex characters of the digest) from the default branch head.
 - **Atomic commit:** the Worker commits the canonical JSON representation of the manifest to the manifest path (`defaults.yaml` or `repos/<owner>/<repo>.yaml`).
 - **Pull request creation:** the Worker opens a pull request targeting `main` with the manifest digest and description. The Worker rejects direct commits to `main`.
-- **Idempotency protection:** repeated submissions with the same `Idempotency-Key` return the existing pull request without creating duplicate branches.
 
 ### Automated fleet reconciliation and provisioning
 
 After operators review and merge the pull request into the default branch (`main`), the Cloudflare Worker reconciler (`cloudflare/src/reconciler.rs`) automates fleet updates on its 5-minute scheduled cron cadence (`#[event(scheduled)]`):
 
-1. **Manifest synchronization:** on each tick, the reconciler reads merged manifests from the configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`).
+1. **Target manifest rendering:** on each tick, the reconciler renders a baseline valid manifest for each target (`patch_console::make_valid_manifest_json(target)`). Reading merged manifests from `CONFIG_REPO` during reconciliation is not implemented yet.
 2. **Floor maintenance:** for each controlled target in `controlled_targets`, the reconciler ensures at least one 16-vCPU Spot runner host is active. If no host exists or an existing host requires replacement, the reconciler provisions a new Spot VM.
-3. **Template rendering and JIT configuration:** the reconciler renders `cloud-init/startup.sh` with the merged patch manifest, requests 2-slot Just-In-Time (JIT) credentials from GitHub Actions (`POST /orgs/{org}/actions/runners/generate-jitconfig`), and records the canonical `spot-runner-patch-sha256` digest in instance metadata.
+3. **Template rendering and JIT configuration:** the reconciler renders `cloud-init/startup.sh` with the target manifest, requests 2-slot Just-In-Time (JIT) credentials from GitHub Actions (`POST /orgs/{org}/actions/runners/generate-jitconfig`), and records the canonical `spot-runner-patch-sha256` digest in instance metadata.
 4. **Demand-driven autoscaling:** if GitHub Actions reports a backlog of 20 or more queued jobs (`queued_jobs >= 20`), the reconciler provisions additional Spot runner hosts up to the configured fleet limit.
-5. **Label reconciliation:** the reconciler automatically synchronizes GitHub Actions runner labels to match the instance type, region, instruction set architecture flags, and extra labels defined in the manifest.
-6. **Preemption and stale cleanup:** the reconciler removes terminated Spot instances along with their attached disks, and deletes offline runner registrations.
-7. **Diff-gated state durability:** the reconciler computes a SHA-256 state fingerprint and skips writing to `SPOT_KV` on unchanged ticks, keeping write operations below 50 writes per day.
+5. **Preemption and stale cleanup:** the reconciler removes terminated Spot instances along with their attached disks, and deletes offline runner registrations.
+6. **Diff-gated state durability:** the reconciler computes a SHA-256 state fingerprint and skips writing to `SPOT_KV` on unchanged ticks, keeping write operations below 50 writes per day.
 
 ## Example: 16 vCPU and 32 GiB baseline with 2 runners
 

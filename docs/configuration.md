@@ -20,7 +20,6 @@ for the edge dashboard.
 | `GCP_SERVICE_ACCOUNT_KEY` | Empty. | Cloudflare Worker (`cloudflare/src/gcp.rs`). | **Secret.** Service account JSON key with Compute Engine administration permissions (`compute.instances.*`) used to manage Spot VM lifecycles directly via REST. Set in production using `wrangler secret put`. |
 | `GITHUB_OAUTH_CLIENT_ID` | Empty (sign-in off). | Cloudflare Worker (`cloudflare/src/auth.rs`). | Client ID of the GitHub OAuth 2.0 App. Required to enable web dashboard sign-in. |
 | `GITHUB_OAUTH_CLIENT_SECRET` | Empty. | Cloudflare Worker (`cloudflare/src/auth.rs`). | **Secret.** Client secret for the GitHub OAuth 2.0 App. Set in production using `wrangler secret put`. |
-| `GITHUB_OAUTH_DEVICE_FLOW` | Empty (off). | Cloudflare Worker (`cloudflare/src/auth.rs`). | Set to `1` to enable GitHub Device Authorization Grant flow on `/auth/device/*`. |
 | `GITHUB_OAUTH_SCOPES` | `repo read:org`. | Cloudflare Worker (`cloudflare/src/auth.rs`). | OAuth 2.0 permission scopes requested during user authentication. |
 | `GITHUB_OAUTH_REDIRECT_URI` | `https://spot.swacktech.com/auth/github/callback`. | Cloudflare Worker (`cloudflare/src/auth.rs`). | Absolute OAuth 2.0 callback URL registered with the GitHub app. |
 
@@ -32,9 +31,8 @@ edge dashboard.
 | Variable | Default | Read by | Meaning |
 | --- | --- | --- | --- |
 | `SESSION_SECRET` | None. | Cloudflare Worker (`cloudflare/src/auth.rs`). | **Secret.** Cryptographic HMAC key of at least 32 bytes used to sign and verify `__Host-spot_session` cookies. Set in production using `wrangler secret put`. |
-| `DASHBOARD_SESSION_TTL_SECONDS` | `43200` (12 hours). | Cloudflare Worker (`cloudflare/src/auth.rs`). | Session lifetime in seconds. Accepted range is 60 to 604800 seconds. |
 | `SESSION_NOT_BEFORE` | `0` (no cut-off). | Cloudflare Worker (`cloudflare/src/auth.rs`). | Unix timestamp epoch seconds. Sessions issued before this timestamp are rejected, enabling immediate global sign-out. |
-| `DASHBOARD_GLOBAL_ADMINS` | `example-owner:100001`. | Cloudflare Worker (`cloudflare/src/auth.rs`). | Administrator identities formatted as `login:numeric_id`. The primary owner is fixed in code; users matching this list bypass target-specific permission checks. |
+| `DASHBOARD_GLOBAL_ADMINS` | Unset (enabled). | Cloudflare Worker (`cloudflare/src/lib.rs`). | Toggle controlling whether added administrators skip per-target checks. The literal `none` disables the exemption (requiring added administrators to administer every controlled target); unset or any other value enables it. The primary owner is fixed in code. |
 
 ## Cloudflare Worker and deployment settings
 
@@ -42,8 +40,8 @@ These variables configure deployment identifiers, Workers KV storage bindings, a
 
 | Variable | Default | Read by | Meaning |
 | --- | --- | --- | --- |
-| `GCP_PROJECT` | `your-gcp-project-id`. | Cloudflare Worker (`cloudflare/wrangler.toml`). | GCP project ID hosting the Spot runner fleet and dedicated builders. |
-| `GITHUB_ORG` | `swack-tools`. | Cloudflare Worker (`cloudflare/wrangler.toml`). | GitHub organization whose runner registrations are managed by the edge reconciler. |
+| `GCP_PROJECT` | `your-gcp-project-id`. | Cloudflare Worker (`cloudflare/wrangler.toml` `[vars]`). | GCP project ID hosting the Spot runner fleet and dedicated builders. |
+| `GITHUB_ORG` | `swack-tools`. | Cloudflare Worker (`cloudflare/wrangler.toml` `[vars]`). | GitHub organization whose runner registrations are managed by the edge reconciler. |
 | `CLOUDFLARE_ACCOUNT_ID` | None. | Wrangler command-line tool. | Cloudflare account identifier that owns the Worker and Workers KV namespace. |
 | `CLOUDFLARE_KV_NAMESPACE_ID` | None. | Wrangler command-line tool. | Workers KV namespace binding identifier for `SPOT_KV`, storing dashboard state. |
 | `CLOUDFLARE_API_TOKEN` | None. | Wrangler command-line tool. | **Secret.** Cloudflare API token with permissions to manage Workers and Workers KV. |

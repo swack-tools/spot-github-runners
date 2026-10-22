@@ -46,12 +46,7 @@ for the host kernel, systemd services, and the Docker engine.
 
 ## Runner floor maintenance
 
-The reconciler maintains a runner floor for each target in `controlled_targets`. Each entry defines:
-
-- Organization or repository target (for example `example-org` or `example-org/example-repo`).
-- Runner group (organization-scoped or repository-scoped).
-- Target machine shapes (such as `c4d-highcpu-16`, `n4d-highcpu-16`, `n4-highcpu-16`, `c2d-highcpu-16`).
-- Maximum daily cost budget per host (default $1.50 per day for compute and SSD storage).
+The reconciler maintains a runner floor for each target in `controlled_targets`. Each entry is an organization or `OWNER/REPO` string (for example `example-org` or `example-org/example-repo`). The reconciler derives the runner group and machine shapes automatically during deployment.
 
 If no active runner host exists for a target, the reconciler immediately provisions a replacement.
 

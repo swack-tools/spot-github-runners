@@ -23,7 +23,7 @@ Cloudflare Tunnels, and zero external background worker processes.
 The serverless Worker eliminates the legacy control plane components:
 
 <!-- vale Google.WordList = NO -->
-- Decommissions Python control VMs (`spot-control-a` and `spot-control-b`), eliminating always-on compute costs and VM maintenance.
+- Decommissions Python control VMs, eliminating always-on compute costs and VM maintenance.
 - Removes `cloudflared` tunnels, Cloudflare Access service tokens, and origin health polling loops.
 - Replaces Cloud Run watchdog jobs and Cloud Storage state locks with native Worker cron triggers and diff-gated KV synchronization.
 - Replaces the JavaScript proxy worker (`cloudflare/worker.js`) with compiled WebAssembly.
@@ -73,8 +73,8 @@ The owner manages administrators on the **Admins** tab and through `/api/admins`
 | Route | Purpose |
 | --- | --- |
 | `GET /api/admins` | Lists owners, added administrators, and recent authorization audit events. |
-| `POST /api/admins/add` | Adds an administrator by GitHub username. Requires `{"login": "<username>", "confirm": true}` and an `Idempotency-Key` header. |
-| `POST /api/admins/remove` | Removes an administrator by numeric ID. Requires `{"uid": <id>, "confirm": true}` and an `Idempotency-Key` header. |
+| `POST /api/admins/add` | Adds an administrator by GitHub username. Requires `{"login": "<username>", "confirm": true}`. |
+| `POST /api/admins/remove` | Removes an administrator by numeric ID. Requires `{"uid": <id>, "confirm": true}`. |
 
 The owner account is immutable and cannot be removed. At most 50 administrators can be added. Every administrator modification updates the consolidated state document in KV.
 
@@ -159,7 +159,7 @@ The **Runner Patches** tab and `/api/patches` routes (aliased under `/api/patch-
 | `GET /api/patches/manifest?path=...` | Retrieves a manifest and calculates its effective patch and canonical SHA-256 digest. Aliased as `/api/patch-console/manifest`. |
 | `POST /api/patches/validate` | Validates manifest syntax and checks hardware sizing floor rules against merged defaults. Aliased as `/api/patch-console/validate`. |
 | `POST /api/patches/preview` | Evaluates running hosts and classifies required actions (`noop`, `hot_patch`, `recreate_containers`, `replace_vm`). Aliased as `/api/patch-console/preview`. |
-| `POST /api/patches/save` | Opens a pull request on the configuration repository with the updated manifest. Requires an `Idempotency-Key` header. Aliased as `/api/patch-console/save`. |
+| `POST /api/patches/save` | Opens a pull request on the configuration repository with the updated manifest. Aliased as `/api/patch-console/save`. |
 
 Direct live hot-patching via `POST /api/patches/hot-patch` is deprecated. The patch console bootstrap endpoint indicates `executor.available=false`, explaining that the serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick.
 
@@ -184,9 +184,9 @@ Patch manifests use schema `spot-runner-patch-v1`. Canonical SHA-256 digests gen
 
 Saving a patch opens a pull request on the configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`):
 
-- The Worker creates a branch named from the `Idempotency-Key` and manifest path, commits the file, and opens a pull request targeting `main`.
-- Manifest saves never commit directly to the default branch.
-- Retries with the same `Idempotency-Key` return the existing pull request without creating duplicate branches.
+- The Worker creates a dedicated branch named `spot-dashboard/<slug>-<digest-prefix>` (first 12 hex characters of the digest) from the default branch head.
+- The Worker commits the canonical JSON representation of the manifest to the manifest path (`defaults.yaml` or `repos/<owner>/<repo>.yaml`).
+- The Worker opens a pull request targeting `main` with the manifest digest and description. Manifest saves never commit directly to the default branch.
 
 ## State durability
 

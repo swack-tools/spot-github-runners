@@ -42,7 +42,7 @@ it fits.
 
 ![Rust Builders Telemetry tab](images/dashboard-rust.png)
 
-*The Rust Builders Telemetry tab records each remote build: duration, cache hits, builder, origin, peak memory, and CPU points.*
+*The Rust Builders Telemetry tab records each remote build: duration, cache hits, builder, origin location, peak memory, and CPU points. The API redacts origin IP addresses and hostnames.*
 
 OxiDex repository-owned `just` recipes and worker configuration are maintained in the OxiDex repository. Configure
 that client for the approved dedicated host, uploader identity, source, image, and cache before you enable its

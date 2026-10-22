@@ -19,7 +19,7 @@ The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 
 ![The cloud-init and VM templates tab](images/dashboard-cloudinit.png)
 
-*The `cloud-init` editor with an example runner template, its stage breakdown, and saved VM templates.*
+*The `cloud-init` editor with an example runner template and saved VM templates.*
 
 When a new runner host boots, `cloud-init/startup.sh` executes the bootstrap sequence:
 
