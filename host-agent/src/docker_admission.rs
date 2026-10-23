@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::admission::client::{acquire_build, release_build};
 
 pub const BUILDER_IMAGE: &str = "oxidex-remote-builder:1.99.0";
+pub const EXAMPLE_BUILDER_IMAGE: &str = "example-rust-project-remote-builder:1.99.0";
 pub const DEFAULT_BUILD_ROOT: &str = "/mnt/runner-data/remote-build";
 
 #[derive(Debug, Error)]
@@ -128,7 +129,9 @@ pub fn validate_build_policy(
         break;
     }
 
-    if index >= arguments.len() || arguments[index] != BUILDER_IMAGE {
+    if index >= arguments.len()
+        || (arguments[index] != BUILDER_IMAGE && arguments[index] != EXAMPLE_BUILDER_IMAGE)
+    {
         return Err(DockerAdmissionError::ImageMismatch);
     }
 
@@ -250,7 +253,11 @@ pub struct BuildLocks {
 }
 
 pub fn acquire_build_locks(project: &str, lock_root: &Path) -> Result<BuildLocks, i32> {
-    if lock_root.join("oxidex-build-draining").exists() {
+    if lock_root.join("oxidex-build-draining").exists()
+        || lock_root
+            .join("example-rust-project-build-draining")
+            .exists()
+    {
         return Err(75);
     }
 

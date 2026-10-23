@@ -2,7 +2,7 @@
 
 Dedicated hosts have `builder-` names and register no GitHub runners. The reviewed
 shape is `n4-highcpu-16`: 16 vCPU, 32 GiB RAM, one unprivileged Docker builder
-limited to an aggregate 16 CPUs and 28 GiB, with no additional swap. Two OxiDex
+limited to an aggregate 16 CPUs and 28 GiB, with no additional swap. Two `example-rust-project`
 worktrees can compile concurrently inside that container, sharing its limits and
 Cargo downloads while using separate target directories.
 
@@ -11,7 +11,7 @@ The image installs Rust 1.99.0 (full compiler commit
 cargo-zigbuild 0.23.4, cbindgen 0.29.2, Just, nextest, Perl, rsync,
 LLVM, and native build dependencies. App builds run as UID/GID 1001 and
 receive no Docker socket. SSH lands on the host; the uploader can sudo only the
-fixed `/usr/local/bin/oxidex-remote-build` launcher (`host-agent host-launcher`).
+fixed `/usr/local/bin/example-rust-project-remote-build` launcher (`host-agent host-launcher`).
 
 The website tool additions pin Node 24.21.0 and Playwright 1.63.0, including
 Chromium revision 1243. The package lock verifies npm archives; the official
@@ -80,30 +80,30 @@ UPLOADER_CONFIG=$(jq -c . "$UPLOADER_MAPPING")
 UPLOADER_SHA=$(printf '%s' "$UPLOADER_CONFIG" | sha256sum | awk '{print $1}')
 HOST_AGENT_VERSION="v0.1.0"
 HOST_AGENT_SHA=$(sha256sum /usr/local/bin/host-agent | awk '{print $1}')
-BUILD_CONFIG='{"approved_image_id":null,"cpus":16,"image":"oxidex-remote-builder:1.99.0","memory_gib":28,"role":"builder"}'
+BUILD_CONFIG='{"approved_image_id":null,"cpus":16,"image":"example-rust-project-remote-builder:1.99.0","memory_gib":28,"role":"builder"}'
 ADMISSION_CONFIG='{"builder_cpus":16,"builder_gib":28,"host_cpus":16,"role":"builder","runner_gib":0,"runner_names":[],"work_gib":28}'
 
 # Prepare builder asset writes script to stage configuration and download host-agent without exceeding GCE's 256 KiB metadata limit
 cat << EOF > /tmp/builder_assets.sh
-install -d -m 0755 /usr/local/bin /opt/oxidex-builder/image
+install -d -m 0755 /usr/local/bin /opt/example-rust-project-builder/image
 # Download native host-agent binary from immutable versioned release and verify pinned checksum
 curl -fsSL --retry 3 --retry-connrefused "https://github.com/swack-tools/spot-github-runners/releases/download/${HOST_AGENT_VERSION}/host-agent" -o /usr/local/bin/host-agent
 echo "${HOST_AGENT_SHA}  /usr/local/bin/host-agent" | sha256sum -c -
 chmod 0755 /usr/local/bin/host-agent
 
-cat << 'ASSET_EOF' > /opt/oxidex-builder/image/Dockerfile
+cat << 'ASSET_EOF' > /opt/example-rust-project-builder/image/Dockerfile
 EOF
 cat builder/standalone/Dockerfile >> /tmp/builder_assets.sh
 cat << 'EOF' >> /tmp/builder_assets.sh
 ASSET_EOF
 
-cat << 'ASSET_EOF' > /opt/oxidex-builder/image/website-package.json
+cat << 'ASSET_EOF' > /opt/example-rust-project-builder/image/website-package.json
 EOF
 cat builder/standalone/website-package.json >> /tmp/builder_assets.sh
 cat << 'EOF' >> /tmp/builder_assets.sh
 ASSET_EOF
 
-cat << 'ASSET_EOF' > /opt/oxidex-builder/image/website-package-lock.json
+cat << 'ASSET_EOF' > /opt/example-rust-project-builder/image/website-package-lock.json
 EOF
 cat builder/standalone/website-package-lock.json >> /tmp/builder_assets.sh
 cat << 'EOF' >> /tmp/builder_assets.sh
@@ -160,7 +160,7 @@ rendered payload.
 <div class="carousel-track" markdown>
 <figure class="shot" markdown>
 ![Builder readiness record](images/term-builder-readiness.png)
-<figcaption markdown>Example `/var/lib/oxidex-builder-readiness.json` file confirming Rust `1.99.0` toolchain verification, UID `1001`, and the `28 GiB` cgroup memory limit.</figcaption>
+<figcaption markdown>Example `/var/lib/example-rust-project-builder-readiness.json` file confirming Rust `1.99.0` toolchain verification, UID `1001`, and the `28 GiB` cgroup memory limit.</figcaption>
 </figure>
 <figure class="shot" markdown>
 ![Builders in the instance list](images/instances-builders.png)
@@ -173,8 +173,8 @@ rendered payload.
 Startup records two files on the builder:
 
 ```text
-/var/lib/oxidex-builder-bootstrap.complete
-/var/lib/oxidex-builder-readiness.json
+/var/lib/example-rust-project-builder-bootstrap.complete
+/var/lib/example-rust-project-builder-readiness.json
 ```
 
 The readiness JSON joins the deployment, boot, source hashes, image and container, actual cgroup limits, tool
@@ -199,12 +199,12 @@ Provisioning a new standalone builder does not upgrade existing runner container
 
 Define `cargo-remote-env.toml` entries with the project, instance name,
 zone, and uploader username. Merge those entries into the existing `[env]` table
-in OxiDex's `.cargo/config.toml`; do not replace unrelated settings.
+in `example-rust-project` `.cargo/config.toml`; do not replace unrelated settings.
 
 After startup, add the actual numeric GCE instance ID and the absolute paths to
 your private SSH key and trusted known-hosts file using the commented entries.
 These values cannot be inferred from a launch plan. The snippet contains no key
-material and does not claim the new VM is ready. OxiDex verifies the identity,
+material and does not claim the new VM is ready. `example-rust-project` verifies the identity,
 SSH trust, installed launcher, and resource admission before executing work.
 Then use `just build`; use `just build-local` for an explicit local build.
 
@@ -228,7 +228,7 @@ Cargo downloads and per-project targets persist on `/mnt/runner-data`. The cache
 disk has `auto-delete=no`, so it survives instance deletion and continues to incur
 storage charges. Recovery must verify the disk and ownership; startup refuses to
 format an existing unidentified filesystem. Use direct authenticated SSH/SCP with
-the established host key for `oxidex-uploader`. `gcloud compute ssh/scp` can enroll
+the established host key for `example-rust-project-uploader`. `gcloud compute ssh/scp` can enroll
 the account into broader guest permissions and is not the restricted uploader
 transport.
 
@@ -244,7 +244,7 @@ deleted after each build. GitHub runner drains are separate from this lifecycle.
 ## Observed validation
 
 On 2026-10-05, the dedicated host completed concurrent cold Linux native command-line
-builds on OxiDex source `429d6f26ec08e703cba2e5a3712b098998d6778d`: debug
+builds on `example-rust-project` source `429d6f26ec08e703cba2e5a3712b098998d6778d`: debug
 45.15 seconds and release 189.80 seconds, total 190.16 seconds, aggregate charged
 memory peak 7.13 GiB, zero OOM kills, and zero throttled CPU periods. Both artifacts
 were independently hashed. The ordinary `just build-debug-remote` recipe also

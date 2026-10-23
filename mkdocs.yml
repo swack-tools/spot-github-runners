@@ -77,6 +77,7 @@ nav:
       - Set up a builder: dedicated-builders.md
       - Runtime updates: builder-runtime-updates.md
       - Remote builds and clients: remote-builds.md
+      - Client workstation setup: client-workstation-setup.md
       - Simplify remote builds: simplification.md
   - Local Docker runners: local-arm64-runners.md
   - Reference:

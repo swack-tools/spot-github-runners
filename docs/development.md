@@ -108,9 +108,9 @@ When adding a new Markdown documentation file:
 Create a virtual environment outside the checkout, install the build dependencies, and build in strict mode:
 
 ```bash
-python3 -m venv "$HOME/oxidex-ops/docs-venv"
-"$HOME/oxidex-ops/docs-venv/bin/pip" install -r docs/requirements.txt
-"$HOME/oxidex-ops/docs-venv/bin/mkdocs" build --strict --site-dir "$HOME/oxidex-ops/docs-site"
+python3 -m venv "$HOME/example-rust-project-ops/docs-venv"
+"$HOME/example-rust-project-ops/docs-venv/bin/pip" install -r docs/requirements.txt
+"$HOME/example-rust-project-ops/docs-venv/bin/mkdocs" build --strict --site-dir "$HOME/example-rust-project-ops/docs-site"
 ```
 
 Preview the site locally using `mkdocs serve` at `http://127.0.0.1:8000`. The GitHub Pages workflow

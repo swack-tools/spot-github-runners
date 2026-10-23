@@ -14,10 +14,10 @@ runner and builder architecture.
 | --- | --- | --- | --- |
 | Operator workstation | Workstation with `cargo`, `just`, and `wrangler`. | Compiles Rust workspaces, runs test suites, manages secrets via Wrangler, and previews deployments. | Operations are bounded by the cloud credentials and GitHub tokens configured on the workstation. |
 | Edge control plane | Cloudflare Worker (`cloudflare/`) at `https://spot.swacktech.com`. | Authenticates web dashboard users, stores telemetry in Workers KV, reconciles fleet capacity against policy, and calls GCE REST APIs. | Has no SSH access to runner hosts or builders; interacts with cloud providers strictly through scoped REST APIs. |
-| Runner host | Spot VM named `oxidex-runners-*`. | Runs the root-owned `host-agent` admission daemon and unprivileged runner containers. | Cannot mount host Docker daemon socket into runner containers. `cloud-init/startup.sh` refuses socket binding. |
+| Runner host | Spot VM named `example-rust-project-runners-*`. | Runs the root-owned `host-agent` admission daemon and unprivileged runner containers. | Cannot mount host Docker daemon socket into runner containers. `cloud-init/startup.sh` refuses socket binding. |
 | Runner container | Docker container per runner instance, running as user `runner` (UID 1001). | Executes workflow job steps. | Cannot alter host admission budgets, release peer leases, or modify host cordon markers. Admission directories are read-only. |
 | Dedicated builder | Spot VM named `builder-*`, shape `n4-highcpu-16`. | Runs one admitted Rust compilation container for the approved uploader account. | Registers zero GitHub runners; launches with no VM service account and blocks project-wide SSH keys. |
-| Build container | Docker container on builder VM, running as UID 1001:GID 1001. | Compiles OxiDex source trees inside 16 vCPU and 28 GiB RAM aggregate bounds. | Cannot access Docker socket, has zero Linux capabilities (`--cap-drop=ALL`), and cannot escalate privileges (`no-new-privileges`). |
+| Build container | Docker container on builder VM, running as UID 1001:GID 1001. | Compiles `example-rust-project` source trees inside 16 vCPU and 28 GiB RAM aggregate bounds. | Cannot access Docker socket, has zero Linux capabilities (`--cap-drop=ALL`), and cannot escalate privileges (`no-new-privileges`). |
 | Signed-in web user | Web browser session. | Views fleet telemetry, inspects runner allocations, and previews runner configuration patches. | Non-administrator users cannot view administrative endpoints or commit configuration changes. |
 
 ## Keep untrusted pull requests off persistent runners
@@ -84,13 +84,13 @@ Dedicated builders execute remote compilations for the approved uploader account
 
 ### Root launcher
 
-The uploader invokes `/usr/local/bin/oxidex-remote-build` (symlinked to `host-agent host-launcher`):
+The uploader invokes `/usr/local/bin/example-rust-project-remote-build` (symlinked to `host-agent host-launcher`):
 
-- Enforces execution as root via `/etc/sudoers.d/oxidex-build`.
+- Enforces execution as root via `/etc/sudoers.d/example-rust-project-build`.
 - Accepts only alphanumeric project identifiers and rejects symbolic links.
 - Restricts build commands to an approved toolchain list (`cargo`, `rustc`, `rustfmt`, `clippy-driver`, `just`, `uv`, `python3`, `cbindgen`).
 - Verifies that the builder container image matches the pinned toolchain ID.
-- Rejects new compilations when the host drain marker `/run/oxidex-build-draining` is present.
+- Rejects new compilations when the host drain marker `/run/example-rust-project-build-draining` is present.
 
 ### Build container policy
 

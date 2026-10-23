@@ -48,7 +48,7 @@
     <text x="294" y="249" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Cached in SPOT_KV</text>
   </g>
   <g filter="url(#shadow)">    <rect x="535" y="145" width="220" height="135" rx="10" fill="#332108" stroke="#fbbf24" stroke-width="2"/>    <rect x="547" y="155" width="112" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>    <text x="554" y="169" fill="#fbbf24" font-size="10.5" font-weight="700">LIVE INVENTORY</text>    <text x="549" y="193" fill="#ffffff" font-size="14" font-weight="700">Query GCE &amp; GitHub</text>
-    <text x="549" y="213" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">List oxidex-runners-*</text>
+    <text x="549" y="213" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">List runner-us* VMs</text>
     <text x="549" y="231" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">List GitHub runner slots</text>
     <text x="549" y="249" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Count queued workflow jobs</text>
   </g>

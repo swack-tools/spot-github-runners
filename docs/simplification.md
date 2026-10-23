@@ -22,8 +22,10 @@
 
 The intended interface is `just build` for a remote build and
 `just build-local` for an explicit local build. Ordinary build and test recipes
-should use the same configured remote builder. OxiDex owns those recipes; this repository
-provides the VM startup payload and restricted host launcher.
+should use the same configured remote builder. `example-rust-project` owns those recipes; this repository
+provides the VM startup payload and restricted host launcher. For step-by-step workstation setup covering
+idle-builder selection, `just`, `cargo`, VS Code, and LLM coding agents, see
+[Client workstation setup](client-workstation-setup.md).
 
 ## Setup workflow
 
@@ -40,7 +42,7 @@ provides the VM startup payload and restricted host launcher.
    supplies the machine shape and the disk types and sizes.
 3. Render the startup payload and run its generated launch command once.
 4. Verify startup completed, then put the authenticated builder endpoint and
-   actual image identity in OxiDex's remote configuration.
+   actual image identity in `example-rust-project` remote configuration.
 5. Run `just build` and verify that the remote build exports its artifact.
 
 See [Dedicated builders](dedicated-builders.md) for the current configuration
@@ -67,7 +69,7 @@ to finish. Registered GitHub runner counts do not describe builder capacity.
 ## Work still required
 
 This document describes the simplification target, not a completed rollout.
-Verify the current OxiDex configuration and recipe implementation before
+Verify the current `example-rust-project` configuration and recipe implementation before
 claiming all commands use this path. Make the configuration and launch inputs
 easier to create, remove duplicate client paths, and validate a fresh launch
 and ordinary remote build. Preserve active workloads and caches during changes.

@@ -777,3 +777,43 @@ fn test_host_launcher_run_positional_syntax() {
     let res4 = host_agent::host_launcher::run(&["beta".to_string(), "cleanup".to_string()]);
     assert_eq!(res4.unwrap(), 0);
 }
+
+#[test]
+fn test_example_rust_project_draining_sentinel_and_aliases() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let lock_root = temp.path().join("run");
+    fs::create_dir_all(&lock_root).unwrap();
+
+    std::env::set_var("OXIDEX_BUILD_ROOT", root.to_str().unwrap());
+    std::env::set_var("OXIDEX_LOCK_ROOT", lock_root.to_str().unwrap());
+    std::env::set_var("OXIDEX_ALLOW_UNPRIVILEGED", "1");
+
+    // Touching /run/example-rust-project-build-draining must return 75 for both prepare and build
+    fs::write(lock_root.join("example-rust-project-build-draining"), "").unwrap();
+
+    let prep_res = host_agent::host_launcher::run(&[
+        "prepare".to_string(),
+        "example-rust-project".to_string(),
+    ]);
+    assert_eq!(prep_res.unwrap(), 75);
+
+    let build_res = host_agent::host_launcher::run(&[
+        "example-rust-project".to_string(),
+        "cargo".to_string(),
+        "build".to_string(),
+    ]);
+    assert_eq!(build_res.unwrap(), 75);
+
+    // Verify example-rust-project-remote-builder:1.99.0 and example-rust-project-toolchain-probe are allowed
+    let cmd = container_command(
+        "example-rust-project",
+        &["/usr/local/bin/example-rust-project-toolchain-probe".to_string()],
+        16,
+        28,
+        Some("example-rust-project-remote-builder:1.99.0"),
+        Some(root.to_str().unwrap()),
+    );
+    assert!(cmd.is_ok());
+}

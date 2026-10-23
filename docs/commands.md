@@ -53,7 +53,7 @@ This prevents symlink attacks and directory escapes.
 - **Usage**: `host-agent clean-target [work-root]`
 - **Default root**: `/work`
 - **Safety guarantees**:
-  - Requires `GITHUB_REPOSITORY` to match `swack-tools/oxidex`.
+  - Requires `GITHUB_REPOSITORY` to match `example-org/example-rust-project`.
   - Traverses directory hierarchy using descriptor-relative system calls (`openat`, `unlinkat` with `O_NOFOLLOW`).
   - Limits traversal to a maximum depth of 64 levels and 100,000 directory entries.
   - Refuses execution if target spans across foreign filesystem mount points.
@@ -106,7 +106,7 @@ on dedicated builders.
 - **Alias**: `docker` (when builder environment is detected)
 - **Usage**: `host-agent docker-admission run [docker-args...]`
 - **Enforced policies**:
-  - Root privilege required unless `OXIDEX_ALLOW_UNPRIVILEGED=1` is set for testing.
+  - Root privilege required unless `EXAMPLE_RUST_PROJECT_ALLOW_UNPRIVILEGED=1` is set for testing.
   - Project name must match alphanumeric naming rules (`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`).
   - Fixed resource limits: exactly 16 vCPUs (`--cpus=16`), 28 GiB RAM (`--memory=28g`), and zero swap (`--memory-swap=28g`).
   - Unprivileged container execution: runs as UID 1001, GID 1001 (`--user 1001:1001`).
@@ -118,7 +118,7 @@ on dedicated builders.
 Root launcher on dedicated builders that validates build commands, prepares isolated project directories,
 executes builds, and securely cleans source files.
 
-- **Alias**: `oxidex-remote-build`
+- **Alias**: `example-rust-project-remote-build`
 - **Usage**:
   - `host-agent host-launcher <project> prepare`
   - `host-agent host-launcher <project> cleanup`
@@ -133,7 +133,7 @@ executes builds, and securely cleans source files.
 Executes inside dedicated builder containers to verify compiler toolchains and environment variables
 before running compilation tasks.
 
-- **Alias**: `oxidex-build-entrypoint`
+- **Alias**: `example-rust-project-build-entrypoint`
 - **Usage**: `host-agent builder-entrypoint [command...]`
 - **Checks**: verifies Rust 1.99.0 toolchain installation, PATH settings, and user UID/GID 1001 before executing.
 
@@ -142,7 +142,7 @@ before running compilation tasks.
 Coordinates concurrent dual worktree compilations on dedicated builders and collects cgroup v2 resource
 metrics.
 
-- **Alias**: `oxidex-worktree-commands`
+- **Alias**: `example-rust-project-worktree-commands`
 - **Usage**: `host-agent worktree-commands <project> <worktree-id> <command...>`
 - **Telemetry**: measures peak memory consumption, throttled CPU periods, and compilation durations.
 
@@ -150,7 +150,7 @@ metrics.
 
 Validates that compiler toolchains, browser binaries, and cgroup v2 controllers meet specification.
 
-- **Alias**: `oxidex-toolchain-probe`
+- **Alias**: `example-rust-project-toolchain-probe`
 - **Usage**: `host-agent toolchain-probe [options...]`
 - **Verification scope**:
   - Rust 1.99.0 compiler, clippy, and rustfmt binaries.

@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 560" width="1280" height="560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" filterUnits="userSpaceOnUse" x="0" y="0" width="1280" height="560">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#1e293b" stroke-width="0.7" opacity="0.55"/>
+    </pattern>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/></marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/></marker>
+    <marker id="arrow-rose" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fb7185"/></marker>
+    <marker id="arrow-slate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8"/></marker>
+  </defs>
+  <rect width="1280" height="560" rx="14" fill="url(#bgGrad)" stroke="#334155" stroke-width="2"/>
+  <rect x="2" y="68" width="1276" height="490" fill="url(#grid)"/>
+  <rect x="2" y="2" width="1276" height="66" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="28" cy="35" r="7" fill="#38bdf8"/>
+  <text x="48" y="31" fill="#f8fafc" font-size="18" font-weight="700">Lightweight Workstation Idle-Builder Selection &amp; Remote Build Dispatch Flow</text>
+  <text x="48" y="52" fill="#94a3b8" font-size="12.5">Probing candidate builder-* VMs so Just, Cargo, VS Code, and LLM agents only dispatch to a host with free CPU and RAM.</text>
+  <rect x="1115" y="18" width="142" height="30" rx="6" fill="#1e293b" stroke="#38bdf8" stroke-width="1"/>
+  <text x="1186" y="38" text-anchor="middle" fill="#38bdf8" font-size="11.5" font-weight="700">MERMAID FLOW SVG</text>
+  <path d="M 255.0 212.5 C 273.0 212.5, 273.0 212.5, 291.0 212.5" fill="none" stroke="#a78bfa" stroke-width="2.4" marker-end="url(#arrow-purple)"/>
+  <rect x="224.2" y="191.5" width="97.6" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+  <text x="273.0" y="205.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Find idle VM</text>
+  <path d="M 530.0 212.5 C 550.5 212.5, 550.5 142.5, 571.0 142.5" fill="none" stroke="#fb7185" stroke-width="2.4" marker-end="url(#arrow-rose)"/>
+  <rect x="488.1" y="156.5" width="124.8" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>
+  <text x="550.5" y="170.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Active build &gt; 0</text>
+  <path d="M 530.0 212.5 C 550.5 212.5, 550.5 292.5, 571.0 292.5" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#arrow-emerald)"/>
+  <rect x="488.1" y="231.5" width="124.8" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="550.5" y="245.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">0 builds &amp; &gt;=28G</text>
+  <path d="M 825.0 292.5 C 848.0 292.5, 848.0 212.5, 871.0 212.5" fill="none" stroke="#fbbf24" stroke-width="2.4" marker-end="url(#arrow-amber)"/>
+  <rect x="802.6" y="231.5" width="90.8" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>
+  <text x="848.0" y="245.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">Route build</text>
+  <g filter="url(#shadow)">    <rect x="40" y="145" width="215" height="135" rx="10" fill="#0f2942" stroke="#38bdf8" stroke-width="2"/>    <rect x="52" y="155" width="154" height="20" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="1"/>    <text x="59" y="169" fill="#38bdf8" font-size="10.5" font-weight="700">STEP 1 · WORKSTATION</text>    <text x="54" y="193" fill="#ffffff" font-size="14" font-weight="700">Invoke Build Trigger</text>
+    <text x="54" y="213" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">just remote-build</text>
+    <text x="54" y="231" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">cargo remote build (--release)</text>
+    <text x="54" y="249" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">VS Code / Codex / Claude</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="295" y="145" width="235" height="135" rx="10" fill="#241646" stroke="#a78bfa" stroke-width="2"/>    <rect x="307" y="155" width="140" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>    <text x="314" y="169" fill="#a78bfa" font-size="10.5" font-weight="700">STEP 2 · SSH PROBE</text>    <text x="309" y="193" fill="#ffffff" font-size="14" font-weight="700">select-idle-rust-builder</text>
+    <text x="309" y="213" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Check bootstrap.complete</text>
+    <text x="309" y="231" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Count active build containers</text>
+    <text x="309" y="249" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Read loadavg &amp; MemAvailable</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="575" y="85" width="250" height="115" rx="10" fill="#38111c" stroke="#fb7185" stroke-width="2"/>    <rect x="587" y="95" width="126" height="20" rx="5" fill="#0f172a" stroke="#fb7185" stroke-width="1"/>    <text x="594" y="109" fill="#fb7185" font-size="10.5" font-weight="700">HOST BUSY (SKIP)</text>    <text x="589" y="133" fill="#ffffff" font-size="14" font-weight="700">builder-uscentral1-f-demo01</text>
+    <text x="589" y="153" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">1 build container running</text>
+    <text x="589" y="171" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">24.8 GiB / 28 GiB RAM in use</text>
+    <text x="589" y="189" fill="#ffe4e6" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">16 vCPUs saturated -&gt; Skip</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="575" y="235" width="250" height="115" rx="10" fill="#062e22" stroke="#34d399" stroke-width="2"/>    <rect x="587" y="245" width="154" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>    <text x="594" y="259" fill="#34d399" font-size="10.5" font-weight="700">HOST IDLE (SELECTED)</text>    <text x="589" y="283" fill="#ffffff" font-size="14" font-weight="700">builder-uscentral1-f-demo02</text>
+    <text x="589" y="303" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">0 active build containers</text>
+    <text x="589" y="321" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">30.1 GiB MemAvailable (&gt;=28G)</text>
+    <text x="589" y="339" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Load 0.18 -&gt; Pick this host</text>
+  </g>
+  <g filter="url(#shadow)">    <rect x="875" y="145" width="365" height="135" rx="10" fill="#332108" stroke="#fbbf24" stroke-width="2"/>    <rect x="887" y="155" width="175" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>    <text x="894" y="169" fill="#fbbf24" font-size="10.5" font-weight="700">STEP 3 · REMOTE COMPILE</text>    <text x="889" y="193" fill="#ffffff" font-size="14" font-weight="700">Sync, Compile &amp; Return Artifacts</text>
+    <text x="889" y="213" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">rsync example-rust-project to /mnt/runner-data</text>
+    <text x="889" y="231" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">host-launcher runs 16 CPU / 28 GiB container</text>
+    <text x="889" y="249" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Stream debug or release binary back to client</text>
+  </g>
+  <rect x="684" y="334" width="32" height="32" rx="16" fill="none" stroke="#34d399" stroke-width="2.5" stroke-dasharray="5,4"/>
+  <path d="M 630.0 415 L 700 350" fill="none" stroke="#34d399" stroke-width="2.5" stroke-dasharray="6,4" marker-end="url(#arrow-emerald)"/>
+  <g filter="url(#shadow)">    <rect x="270" y="415" width="720" height="58" rx="9" fill="#0f172a" stroke="#34d399" stroke-width="2.2"/>    <text x="284" y="438" fill="#34d399" font-size="12.5" font-weight="700">CAPACITY GUARD</text>    <text x="284" y="458" fill="#e2e8f0" font-size="12">Every client pathway skips builders with an active container or &lt; 28 GiB free RAM so builds never contend or OOM.</text>  </g>
+</svg>

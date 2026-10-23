@@ -93,14 +93,18 @@ RUN install -d -m 0755 /opt/opensourceDarwinStubs/CoreFoundation.framework \
 COPY host-agent /usr/local/bin/host-agent
 RUN chmod 0755 /usr/local/bin/host-agent \
     && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-build-entrypoint \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/example-rust-project-build-entrypoint \
     && ln -s /usr/local/bin/host-agent /usr/local/bin/builder-entrypoint \
     && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-worktree-commands \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/example-rust-project-worktree-commands \
     && ln -s /usr/local/bin/host-agent /usr/local/bin/worktree-commands \
     && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-toolchain-probe \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/example-rust-project-toolchain-probe \
     && ln -s /usr/local/bin/host-agent /usr/local/bin/toolchain-probe \
     && ln -s /usr/local/bin/host-agent /usr/local/bin/docker-admission \
     && ln -s /usr/local/bin/host-agent /usr/local/bin/host-launcher \
     && ln -s /usr/local/bin/host-agent /usr/local/bin/oxidex-remote-build \
+    && ln -s /usr/local/bin/host-agent /usr/local/bin/example-rust-project-remote-build \
     && install -m 0444 /dev/null /run/oxidex-build-container
 USER runner
 ENV RUSTUP_HOME=/home/runner/.rustup

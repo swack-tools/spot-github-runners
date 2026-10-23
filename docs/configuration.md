@@ -88,9 +88,9 @@ These variables configure the pure-Rust `host-agent` binary running on runner ho
 | `GHA_DOCKER_WRAPPER_STATE_DIR` | `/run/gha-docker-wrapper`. | `host-agent docker-wrapper`. | Ephemeral runtime directory where container socket proxies and descriptors are managed. |
 | `GHA_DOCKER_WRAPPER_HANDSHAKE_TIMEOUT` | `15.0`. | `host-agent docker-wrapper`. | Timeout in seconds when waiting for Docker container socket handshakes. |
 | `GHA_RUNNER_CONTAINER_ID` | Empty (auto-detected). | `host-agent docker-wrapper`. | Explicit runner container identifier override when running inside nested container environments. |
-| `OXIDEX_BUILD_ROOT` | `/mnt/runner-data/remote-build`. | `host-agent host-launcher`. | Base directory for dedicated builder source trees, target output, and Cargo caches. |
-| `OXIDEX_LOCK_ROOT` | `/run`. | `host-agent host-launcher`. | Runtime directory for advisory build and upload lock files. |
-| `OXIDEX_ALLOW_UNPRIVILEGED` | Empty (root required). | `host-agent host-launcher`. | Set to `1` only during unprivileged local testing to bypass root permission checks. |
+| `EXAMPLE_RUST_PROJECT_BUILD_ROOT` | `/mnt/runner-data/remote-build`. | `host-agent host-launcher`. | Base directory for dedicated builder source trees, target output, and Cargo caches. |
+| `EXAMPLE_RUST_PROJECT_LOCK_ROOT` | `/run`. | `host-agent host-launcher`. | Runtime directory for advisory build and upload lock files. |
+| `EXAMPLE_RUST_PROJECT_ALLOW_UNPRIVILEGED` | Empty (root required). | `host-agent host-launcher`. | Set to `1` only during unprivileged local testing to bypass root permission checks. |
 
 ## Non-environment configuration
 
@@ -101,5 +101,5 @@ Configuration files that do not use environment variables:
 | Worker deployment manifest | `cloudflare/wrangler.toml` | Declares Worker name, entrypoint, Cron Triggers (`*/5 * * * *`), and KV bindings. |
 | Runner host bootstrap | `cloud-init/startup.sh` | Installs Docker, host-agent, and registers GitHub Actions runner listener. |
 | Dedicated builder bootstrap | `cloud-init/builder-startup.sh` | Formats cache disk, sets up build root, installs Rust 1.99.0 container and toolchain. |
-| Builder remote configuration | `/etc/oxidex-remote-build.json` | Specifies allowed projects, approved commands, container image, and resource limits. |
+| Builder remote configuration | `/etc/example-rust-project-remote-build.json` | Specifies allowed projects, approved commands, container image, and resource limits. |
 | Host admission configuration | `/etc/gha-admission.json` | Configures host memory budget, reservation limits, and peer leasing parameters. |
