@@ -309,6 +309,9 @@ fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
     )
     .expect("write env file");
     std::env::set_var("SPOT_QUEUE_WORKER_ENV_FILE", &env_file);
+    let lock_dir = temp.path().join("locks");
+    fs::create_dir_all(&lock_dir).expect("create lock dir");
+    std::env::set_var("OXIDEX_LOCK_ROOT", &lock_dir);
 
     let claim_response = serde_json::json!({
         "status": "claimed",
@@ -433,6 +436,43 @@ fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
             .unwrap();
     assert_eq!(complete_4554["status"], "failed");
     assert_eq!(complete_4554["exit_code"], 127);
+
+    // Also verify that if another build holds the active project lock (`oxidex-cache-active-<project>.lock`),
+    // `process_next_queued_build` fails closed with exit_code 75 BEFORE modifying the shared workspace
+    let held_lock =
+        host_agent::docker_admission::acquire_build_locks("example-rust-project", &lock_dir)
+            .expect("acquire active project lock");
+    let claim_locked = serde_json::json!({
+        "status": "claimed",
+        "claimed": true,
+        "build": {
+            "build_id": 4555,
+            "repo": format!("file://{}/example-rust-project", upstream_repo.parent().unwrap().display()),
+            "branch": "main",
+            "commit_sha": commit_sha,
+            "command": "cargo test --workspace",
+            "profile": "debug",
+            "binary_name": null,
+            "gcs_bucket": "example-rust-project-build-artifacts"
+        }
+    });
+    fs::write(
+        control_dir.join("claim_response.json"),
+        serde_json::to_string_pretty(&claim_locked).unwrap(),
+    )
+    .expect("write claim_response.json for 4555");
+    let locked_err = process_next_queued_build(&cfg)
+        .expect_err("contended project lock must prevent workspace checkout");
+    assert!(
+        locked_err.contains("build lock or draining sentinel is active"),
+        "Expected active lock error, got: {locked_err}"
+    );
+    let complete_4555: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(control_dir.join("complete_4555.json")).unwrap())
+            .unwrap();
+    assert_eq!(complete_4555["status"], "failed");
+    assert_eq!(complete_4555["exit_code"], 75);
+    drop(held_lock);
 }
 
 #[test]
@@ -497,7 +537,7 @@ fn test_debug_build_after_cached_release_build_packages_debug_binary_not_stale_r
     // Verify that packaging with `profile: Some("release")` produces a DIFFERENT binary archive SHA-256
     let cfg_rel = BuildPackageConfig {
         build_id: 4555,
-        workspace: ws,
+        workspace: ws.clone(),
         target_dir: None,
         log_file: None,
         out_dir,
@@ -510,5 +550,52 @@ fn test_debug_build_after_cached_release_build_packages_debug_binary_not_stale_r
     assert_ne!(
         manifest_dbg.binary_sha256, manifest_rel.binary_sha256,
         "Debug build must package target/debug/app rather than the stale target/release/app"
+    );
+
+    // 3. Verify that an absolute/traversal profile (`profile: Some("/etc")` + `binary_name: Some("shadow")`)
+    // or a symlinked profile directory (`target/evil -> /etc`) is rejected / ignored by descriptor-safe packaging
+    let cfg_abs_profile = BuildPackageConfig {
+        build_id: 4556,
+        workspace: ws.clone(),
+        target_dir: None,
+        log_file: None,
+        out_dir: temp.path().join("staged-abs"),
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+        profile: Some("/etc".to_string()),
+        binary_name: Some("shadow".to_string()),
+        upload: false,
+    };
+    assert!(
+        package_build_artifacts(&cfg_abs_profile).is_err(),
+        "Absolute profile path must be rejected by package_build_artifacts"
+    );
+
+    let host_secret_dir = temp.path().join("host-secrets");
+    fs::create_dir_all(&host_secret_dir).expect("create host-secrets");
+    let secret_file = host_secret_dir.join("secret-bin");
+    fs::write(&secret_file, b"#!/bin/sh\necho TOP_SECRET\n").expect("write secret");
+    let mut secret_perms = fs::metadata(&secret_file).unwrap().permissions();
+    secret_perms.set_mode(0o755);
+    fs::set_permissions(&secret_file, secret_perms).expect("chmod +x secret");
+
+    std::os::unix::fs::symlink(&host_secret_dir, ws.join("target").join("customprof"))
+        .expect("symlink profile dir to outside directory");
+    let cfg_symlink_prof = BuildPackageConfig {
+        build_id: 4557,
+        workspace: ws,
+        target_dir: None,
+        log_file: None,
+        out_dir: temp.path().join("staged-sym"),
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+        profile: Some("customprof".to_string()),
+        binary_name: Some("secret-bin".to_string()),
+        upload: false,
+    };
+    let sym_manifest =
+        package_build_artifacts(&cfg_symlink_prof).expect("package with symlinked profile");
+    assert!(
+        sym_manifest.binaries_included.is_empty(),
+        "Symlinked profile directory must not be traversed by open_dir_nofollow, got: {:?}",
+        sym_manifest.binaries_included
     );
 }

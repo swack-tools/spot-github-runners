@@ -716,8 +716,52 @@ async fn test_recover_orphaned_running_builds_on_preempted_builder_or_expired_le
     assert_eq!(b1["claimed"], true);
     assert_eq!(b1["build"]["build_id"], 4553);
 
-    // Before lease expiry, if builder-preempted-01 sends a heartbeat at `now + 3600`,
-    // the lease is renewed so `now + 1 + RUST_BUILD_CLAIM_LEASE_SECS` does NOT requeue #4553!
+    // Before 30m (1800s), an early heartbeat at `now + 300` is coalesced (0 KV writes, persisted == false)
+    let hb_early_req = spot_dashboard_edge::state::HeartbeatRustBuildRequest {
+        build_id: Some(4553),
+        instance_name: "builder-preempted-01".to_string(),
+    };
+    let (_, hb_early_body) = spot_dashboard_edge::state::handle_post_rust_builds_heartbeat(
+        &kv,
+        4553,
+        hb_early_req,
+        now + 300,
+    )
+    .await
+    .expect("early heartbeat coalesced");
+    assert_eq!(hb_early_body["status"], "renewed");
+    assert_eq!(hb_early_body["persisted"], false);
+
+    // Also verify enqueue rejects invalid profile or binary_name containing path traversal / separators
+    let mut bad_prof_req = EnqueueRustBuildRequest {
+        repo: "example-org/example-rust-project".to_string(),
+        branch: "main".to_string(),
+        commit_sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+        command: "cargo build".to_string(),
+        requested_output: Some("binary".to_string()),
+        template_id: None,
+        profile: Some("/etc".to_string()),
+        binary_name: Some("shadow".to_string()),
+        gcs_bucket: None,
+        origin_ip: None,
+    };
+    assert!(
+        handle_post_rust_builds_enqueue(&kv, bad_prof_req.clone(), now + 310)
+            .await
+            .is_err(),
+        "Enqueue must reject profile with path separators"
+    );
+    bad_prof_req.profile = Some("release".to_string());
+    bad_prof_req.binary_name = Some("../shadow".to_string());
+    assert!(
+        handle_post_rust_builds_enqueue(&kv, bad_prof_req, now + 311)
+            .await
+            .is_err(),
+        "Enqueue must reject binary_name with path traversal"
+    );
+
+    // Before lease expiry, if builder-preempted-01 sends a heartbeat at `now + 3600` (>= 1800s),
+    // the lease is renewed and persisted so `now + 1 + RUST_BUILD_CLAIM_LEASE_SECS` does NOT requeue #4553!
     let hb_req = spot_dashboard_edge::state::HeartbeatRustBuildRequest {
         build_id: Some(4553),
         instance_name: "builder-preempted-01".to_string(),
@@ -732,6 +776,7 @@ async fn test_recover_orphaned_running_builds_on_preempted_builder_or_expired_le
     .expect("heartbeat renews lease");
     assert_eq!(hb_st, 200);
     assert_eq!(hb_body["status"], "renewed");
+    assert_eq!(hb_body["persisted"], true);
 
     // At `now + 1 + RUST_BUILD_CLAIM_LEASE_SECS` (before the renewed lease expires),
     // another builder attempting to claim sees an empty queue because #4553's lease is still active

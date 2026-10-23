@@ -7,11 +7,15 @@
 //!    from `target/{release,debug}/`.
 //! 3. `target.tar.zst`: compressed archive of the `target/` directory and `build.log`.
 
+use crate::clean_target::open_dir_nofollow;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::ffi::{CStr, CString};
+use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -196,17 +200,14 @@ fn compute_file_size_and_sha256(path: &Path) -> Result<(u64, String), String> {
     Ok((total, hex::encode(hasher.finalize())))
 }
 
-fn is_candidate_executable(path: &Path, expected_name: Option<&str>) -> bool {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    if !meta.file_type().is_file() {
+fn is_candidate_executable_mode_and_name(
+    file_name: &str,
+    mode: u32,
+    expected_name: Option<&str>,
+) -> bool {
+    if (mode & 0o111) == 0 {
         return false;
     }
-    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
     if let Some(expected) = expected_name {
         return file_name == expected;
     }
@@ -218,7 +219,161 @@ fn is_candidate_executable(path: &Path, expected_name: Option<&str>) -> bool {
             return false;
         }
     }
-    (meta.permissions().mode() & 0o111) != 0
+    true
+}
+
+pub fn validate_profile_dir_name(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "Invalid build profile '{raw}'; must be a single path component (alphanumeric, '-', '_')"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn validate_binary_file_name(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!(
+            "Invalid binary name '{raw}'; must be a single filename without path separators"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Discover and copy candidate executables from `<target_fd>/<profile>` into `bin_stage_dir`
+/// using descriptor-relative `openat(..., O_NOFOLLOW)` and `fstatat(..., AT_SYMLINK_NOFOLLOW)`
+/// so symlinks or path traversal can never escape `target_dir`.
+fn discover_profile_executables_nofollow(
+    target_fd: RawFd,
+    expected_dev: libc::dev_t,
+    profile_name: &str,
+    expected_binary: Option<&str>,
+    best_candidates: &mut std::collections::BTreeMap<String, (OwnedFd, i64, i64)>,
+) -> Result<(), String> {
+    let valid_prof = validate_profile_dir_name(profile_name)?;
+    let c_prof = CString::new(valid_prof.as_bytes()).map_err(|e| e.to_string())?;
+    let prof_fd = match open_dir_nofollow(Some(target_fd), &c_prof) {
+        Ok(fd) => fd,
+        Err(_) => return Ok(()),
+    };
+
+    let mut prof_st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(prof_fd.as_raw_fd(), &mut prof_st) } != 0 {
+        return Ok(());
+    }
+    if prof_st.st_dev != expected_dev {
+        return Err(format!(
+            "Foreign filesystem detected inside target profile '{valid_prof}'"
+        ));
+    }
+
+    let dup_fd = unsafe { libc::dup(prof_fd.as_raw_fd()) };
+    if dup_fd < 0 {
+        return Ok(());
+    }
+    let dir_ptr = unsafe { libc::fdopendir(dup_fd) };
+    if dir_ptr.is_null() {
+        unsafe {
+            libc::close(dup_fd);
+        }
+        return Ok(());
+    }
+
+    loop {
+        let entry = unsafe { libc::readdir(dir_ptr) };
+        if entry.is_null() {
+            break;
+        }
+        let entry_cstr = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = entry_cstr.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let Ok(file_name) = entry_cstr.to_str() else {
+            continue;
+        };
+
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let stat_res = unsafe {
+            libc::fstatat(
+                prof_fd.as_raw_fd(),
+                entry_cstr.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_res != 0 {
+            continue;
+        }
+        if st.st_dev != expected_dev {
+            continue;
+        }
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            continue;
+        }
+        let mode = st.st_mode as u32;
+        if !is_candidate_executable_mode_and_name(file_name, mode, expected_binary) {
+            continue;
+        }
+
+        let file_raw_fd = unsafe {
+            libc::openat(
+                prof_fd.as_raw_fd(),
+                entry_cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if file_raw_fd < 0 {
+            continue;
+        }
+        let file_owned_fd = unsafe { OwnedFd::from_raw_fd(file_raw_fd) };
+        let mut opened_st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(file_owned_fd.as_raw_fd(), &mut opened_st) } != 0
+            || opened_st.st_dev != expected_dev
+            || (opened_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || (opened_st.st_mode as u32 & 0o111) == 0
+        {
+            continue;
+        }
+
+        let mtime_sec = opened_st.st_mtime;
+        let mtime_nsec = opened_st.st_mtime_nsec;
+        let replace = match best_candidates.get(file_name) {
+            None => true,
+            Some((_, prev_sec, prev_nsec)) => (mtime_sec, mtime_nsec) > (*prev_sec, *prev_nsec),
+        };
+        if replace {
+            best_candidates.insert(
+                file_name.to_string(),
+                (file_owned_fd, mtime_sec, mtime_nsec),
+            );
+        }
+    }
+
+    unsafe {
+        libc::closedir(dir_ptr);
+    }
+    Ok(())
 }
 
 fn create_compressed_archive(
@@ -517,56 +672,69 @@ pub fn package_build_artifacts(cfg: &BuildPackageConfig) -> Result<BuildPackageM
     } else {
         (ws_target, true)
     };
+    let validated_binary_name = match cfg
+        .binary_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(b) => Some(validate_binary_file_name(b)?),
+        None => None,
+    };
+
     let profile_dirs: Vec<String> = match cfg
         .profile
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(explicit) => vec![resolve_cargo_target_profile(Some(explicit), None)],
+        Some(explicit) => {
+            let resolved = resolve_cargo_target_profile(Some(explicit), None);
+            vec![validate_profile_dir_name(&resolved)?]
+        }
         None => vec!["debug".to_string(), "release".to_string()],
     };
 
-    // Collect candidate executables across the eligible profile directory(ies);
-    // if `cfg.profile` was None and both `debug` and `release` contain the same binary name,
-    // select the binary with the newer modification timestamp.
-    let mut best_candidates: std::collections::BTreeMap<
-        String,
-        (PathBuf, Option<std::time::SystemTime>),
-    > = std::collections::BTreeMap::new();
-    for prof in &profile_dirs {
-        let prof_path = target_dir.join(prof);
-        if !prof_path.is_dir() {
-            continue;
-        }
-        if let Ok(entries) = fs::read_dir(&prof_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if is_candidate_executable(&path, cfg.binary_name.as_deref()) {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-                        let replace = match best_candidates.get(name) {
-                            None => true,
-                            Some((_, prev_mtime)) => match (mtime, *prev_mtime) {
-                                (Some(cur), Some(prev)) => cur > prev,
-                                (Some(_), None) => true,
-                                _ => false,
-                            },
-                        };
-                        if replace {
-                            best_candidates.insert(name.to_string(), (path, mtime));
-                        }
-                    }
+    // Collect candidate executables across the eligible profile directory(ies) using
+    // descriptor-relative nofollow traversal so symlinks inside `target_dir` cannot escape.
+    let mut best_candidates: std::collections::BTreeMap<String, (OwnedFd, i64, i64)> =
+        std::collections::BTreeMap::new();
+    if let Ok(c_target) = CString::new(target_dir.as_os_str().as_bytes()) {
+        if let Ok(target_fd) = open_dir_nofollow(None, &c_target) {
+            let mut target_st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(target_fd.as_raw_fd(), &mut target_st) } == 0 {
+                let expected_dev = target_st.st_dev;
+                for prof in &profile_dirs {
+                    discover_profile_executables_nofollow(
+                        target_fd.as_raw_fd(),
+                        expected_dev,
+                        prof,
+                        validated_binary_name.as_deref(),
+                        &mut best_candidates,
+                    )?;
                 }
             }
         }
     }
 
     let mut binaries_included = Vec::new();
-    for (name, (path, _)) in best_candidates {
+    for (name, (src_fd, _, _)) in best_candidates {
         let dest_bin = bin_stage_dir.join(&name);
-        fs::copy(&path, &dest_bin)
-            .map_err(|e| format!("Failed copying binary '{}': {e}", path.display()))?;
+        let mut src_file = fs::File::from(src_fd);
+        let mut dest_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o755)
+            .open(&dest_bin)
+            .map_err(|e| {
+                format!(
+                    "Failed creating staged binary '{}': {e}",
+                    dest_bin.display()
+                )
+            })?;
+        std::io::copy(&mut src_file, &mut dest_file)
+            .map_err(|e| format!("Failed copying binary '{name}': {e}"))?;
         binaries_included.push(name);
     }
     binaries_included.sort();
@@ -1062,7 +1230,7 @@ pub fn materialize_repository_checkout(
 }
 
 static RENEWED_BEARER_TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-pub const WORKER_LEASE_HEARTBEAT_INTERVAL_SECS: u64 = 300; // 5 minutes
+pub const WORKER_LEASE_HEARTBEAT_INTERVAL_SECS: u64 = 1800; // 30 minutes (well inside 2h lease, conserving KV writes)
 
 fn active_bearer_token() -> Option<String> {
     if let Ok(guard) = RENEWED_BEARER_TOKEN.lock() {
@@ -1319,6 +1487,59 @@ pub fn process_next_queued_build(
         .join("targets")
         .join(&project_slug);
 
+    // Reserve the project's active build lock and verify that neither source nor target
+    // is mounted in a running container before preparing or modifying the shared source checkout.
+    let lock_root = PathBuf::from(
+        std::env::var("OXIDEX_LOCK_ROOT")
+            .or_else(|_| std::env::var("EXAMPLE_RUST_PROJECT_LOCK_ROOT"))
+            .unwrap_or_else(|_| "/run".to_string()),
+    );
+    let project_locks = match crate::docker_admission::acquire_build_locks(
+        &project_slug,
+        &lock_root,
+    ) {
+        Ok(locks) => locks,
+        Err(lock_code) => {
+            let lock_err = format!(
+                "Project '{}' build lock or draining sentinel is active in '{}' (exit {lock_code}); refusing to overwrite active source workspace",
+                project_slug,
+                lock_root.display()
+            );
+            let fail_payload = serde_json::json!({
+                "build_id": job.build_id,
+                "status": "failed",
+                "exit_code": lock_code,
+                "compile_duration_seconds": 0.0,
+                "delivery_duration_seconds": 0.0,
+                "instance_name": cfg.instance_name,
+                "zone": cfg.zone,
+            });
+            let complete_endpoint = format!("/api/rust-builds/{}/complete", job.build_id);
+            let _ = post_control_plane_json(&cfg.dashboard_url, &complete_endpoint, &fail_payload);
+            return Err(lock_err);
+        }
+    };
+    if let Err(mount_err) =
+        crate::host_launcher::source_not_mounted(&workspace, &launcher_target_dir)
+    {
+        let busy_err = format!(
+            "Workspace or target for project '{}' is actively mounted in a container: {mount_err}",
+            project_slug
+        );
+        let fail_payload = serde_json::json!({
+            "build_id": job.build_id,
+            "status": "failed",
+            "exit_code": 75,
+            "compile_duration_seconds": 0.0,
+            "delivery_duration_seconds": 0.0,
+            "instance_name": cfg.instance_name,
+            "zone": cfg.zone,
+        });
+        let complete_endpoint = format!("/api/rust-builds/{}/complete", job.build_id);
+        let _ = post_control_plane_json(&cfg.dashboard_url, &complete_endpoint, &fail_payload);
+        return Err(busy_err);
+    }
+
     // 1. Verify and invoke dedicated builder launcher to prepare workspace (fail closed if missing)
     if !cfg.launcher.is_file() {
         let missing_err = format!(
@@ -1406,6 +1627,9 @@ pub fn process_next_queued_build(
     }
 
     // 3. Execute the queued build/test command strictly via the dedicated builder launcher
+    // Release the pre-checkout active lock immediately before handing off to `cfg.launcher`
+    // so `docker-admission` inside the launcher can acquire its exclusive active lock.
+    drop(project_locks);
     let start_instant = std::time::Instant::now();
     let cmd_tokens: Vec<&str> = job.command.split_whitespace().collect();
     if cmd_tokens.is_empty() {

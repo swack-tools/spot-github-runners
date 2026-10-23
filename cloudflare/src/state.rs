@@ -3580,6 +3580,7 @@ pub const DEFAULT_INITIAL_BUILD_ID: u64 = 4553;
 pub const DEFAULT_BUILD_DURATION_SECS: f64 = 600.0;
 pub const MAX_RUST_BUILD_QUEUE_ITEMS: usize = 200;
 pub const DEFAULT_GCS_ARTIFACTS_BUCKET: &str = "example-rust-project-build-artifacts";
+pub const RUST_BUILD_HEARTBEAT_MIN_PERSIST_INTERVAL_SECS: u64 = 1800; // Coalesce KV writes to at most once per 30m per build
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RustBuildArtifacts {
@@ -4190,7 +4191,22 @@ pub async fn handle_post_rust_builds_enqueue<K: KvStoreBackend>(
                 "debug".to_string()
             }
         }
-        Some(explicit) => explicit.to_string(),
+        Some(explicit) => {
+            if explicit.len() > 64
+                || explicit == "."
+                || explicit == ".."
+                || explicit.contains('/')
+                || explicit.contains('\\')
+                || !explicit
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(StateError::Validation(
+                    "profile must be a simple identifier (alphanumeric, '-', '_')".into(),
+                ));
+            }
+            explicit.to_string()
+        }
         None => {
             if command
                 .split_whitespace()
@@ -4202,12 +4218,30 @@ pub async fn handle_post_rust_builds_enqueue<K: KvStoreBackend>(
             }
         }
     };
-    let binary_name = req
+    let binary_name = match req
         .binary_name
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(String::from);
+    {
+        Some(bin) => {
+            if bin.len() > 128
+                || bin == "."
+                || bin == ".."
+                || bin.contains('/')
+                || bin.contains('\\')
+                || !bin
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            {
+                return Err(StateError::Validation(
+                    "binary_name must be a simple filename without path separators".into(),
+                ));
+            }
+            Some(bin.to_string())
+        }
+        None => None,
+    };
 
     let repo_owned = repo.to_string();
     let branch_owned = branch.to_string();
@@ -4520,24 +4554,33 @@ pub async fn handle_post_rust_builds_heartbeat<K: KvStoreBackend>(
             }
         }
 
-        queue[idx].started_epoch = Some(now);
-        let expires_at_epoch = now + RUST_BUILD_CLAIM_LEASE_SECS;
+        let prev_started = queue[idx]
+            .started_epoch
+            .unwrap_or(queue[idx].enqueued_epoch);
+        let should_persist_kv =
+            now.saturating_sub(prev_started) >= RUST_BUILD_HEARTBEAT_MIN_PERSIST_INTERVAL_SECS;
+        let effective_started = if should_persist_kv { now } else { prev_started };
+        queue[idx].started_epoch = Some(effective_started);
+        let expires_at_epoch = effective_started + RUST_BUILD_CLAIM_LEASE_SECS;
 
-        let next_build_id = bundle
-            .state
-            .rust_builds
-            .get("next_build_id")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(build_id + 1);
-        save_queue_into_state(&mut bundle.state, &queue, next_build_id);
+        if should_persist_kv {
+            let next_build_id = bundle
+                .state
+                .rust_builds
+                .get("next_build_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(build_id + 1);
+            save_queue_into_state(&mut bundle.state, &queue, next_build_id);
+        }
 
         Ok((
-            true,
+            should_persist_kv,
             serde_json::json!({
                 "status": "renewed",
                 "build_id": build_id,
                 "instance_name": caller_owned,
                 "lease_expires_epoch": expires_at_epoch,
+                "persisted": should_persist_kv,
             }),
         ))
     })
