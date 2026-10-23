@@ -20,6 +20,7 @@ These model rules apply to Claude subagent launches. Keep the human-selected mai
 - Provide each subagent with the exact goal, relevant file paths, constraints, owned files, validation commands (`cargo test --manifest-path host-agent/Cargo.toml`, `cargo test --manifest-path cloudflare/Cargo.toml`), and required completion evidence. Give independent review subagents the acceptance contract and raw diff without the implementer's conclusions.
 - Parallelize read-only exploration freely. Give each writing subagent exclusive file ownership or an isolated Git worktree so concurrent edits never collide.
 - Verify model availability and resolved effort. Environment variables such as `CLAUDE_CODE_EFFORT_LEVEL` or forced subagent model settings can override per-launch parameters; if the active harness lacks per-invocation effort support, use an authorized command-line child with both flags or report the mismatch rather than silently claiming the requested route ran.
+- If a subagent launch or model request fails due to a transient model, capacity, rate-limit, or transport error, always retry until it succeeds.
 
 ## Automated PR review scope (@codex)
 
