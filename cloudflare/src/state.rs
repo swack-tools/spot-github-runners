@@ -4047,6 +4047,59 @@ pub async fn handle_get_rust_builds_queue<K: KvStoreBackend>(
     ))
 }
 
+pub const RUST_BUILD_CLAIM_LEASE_SECS: u64 = 7200;
+
+pub fn recover_orphaned_running_builds_in_state(
+    state: &mut DashboardState,
+    active_builder_names: Option<&std::collections::HashSet<String>>,
+    terminated_builder_names: &[String],
+    now: u64,
+) -> usize {
+    let mut queue = load_queue_from_state(state);
+    if queue.is_empty() {
+        return 0;
+    }
+
+    let mut recovered = 0usize;
+    for q in &mut queue {
+        if q.status != "running" {
+            continue;
+        }
+        let started = q.started_epoch.unwrap_or(q.enqueued_epoch);
+        let lease_expired = now.saturating_sub(started) >= RUST_BUILD_CLAIM_LEASE_SECS;
+        let assigned = q.assigned_instance.as_deref().unwrap_or("");
+        let builder_terminated =
+            !assigned.is_empty() && terminated_builder_names.iter().any(|t| t == assigned);
+        let builder_missing = !assigned.is_empty()
+            && active_builder_names
+                .map(|live| !live.contains(assigned))
+                .unwrap_or(false);
+
+        if lease_expired || builder_terminated || builder_missing {
+            q.status = "queued".to_string();
+            q.started_at = None;
+            q.started_epoch = None;
+            q.assigned_instance = None;
+            q.zone = None;
+            recovered += 1;
+        }
+    }
+
+    if recovered > 0 {
+        let max_existing_id = queue.iter().map(|q| q.build_id).max().unwrap_or(0);
+        let next_build_id = state
+            .rust_builds
+            .get("next_build_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(max_existing_id.saturating_add(1))
+            .max(DEFAULT_INITIAL_BUILD_ID);
+        save_queue_into_state(state, &queue, next_build_id);
+        let _ = evaluate_rust_builder_queue_scaling(state, now);
+    }
+
+    recovered
+}
+
 pub async fn handle_post_rust_builds_claim<K: KvStoreBackend>(
     kv: &K,
     req: ClaimRustBuildRequest,
@@ -4067,12 +4120,26 @@ pub async fn handle_post_rust_builds_claim<K: KvStoreBackend>(
         .map(String::from);
 
     let body = mutate_rust_build_queue(kv, now, |bundle| {
+        let terminated_in_bundle: Vec<String> = bundle
+            .state
+            .instances_view
+            .iter()
+            .chain(bundle.state.instances.iter())
+            .filter(|i| i.status.eq_ignore_ascii_case("TERMINATED"))
+            .map(|i| i.name.clone())
+            .collect();
+        let recovered = recover_orphaned_running_builds_in_state(
+            &mut bundle.state,
+            None,
+            &terminated_in_bundle,
+            now,
+        );
         let mut queue = load_queue_from_state(&bundle.state);
 
         let next_idx = queue.iter().position(|q| q.status == "queued");
         let Some(idx) = next_idx else {
             return Ok((
-                false,
+                recovered > 0,
                 serde_json::json!({
                     "status": "empty",
                     "claimed": false,
@@ -4183,33 +4250,49 @@ pub async fn handle_post_rust_builds_complete<K: KvStoreBackend>(
             }
         }
 
-        let mut defaults = default_artifacts_for_build(&queue[idx].gcs_bucket, build_id);
-        if let Some(ref u) = req.log_url {
-            let trimmed = u.trim();
-            if !trimmed.is_empty() {
-                defaults.log_url = trimmed.to_string();
-            }
-        }
-        if let Some(ref u) = req.binary_url {
-            let trimmed = u.trim();
-            if !trimmed.is_empty() {
-                defaults.binary_url = trimmed.to_string();
-            }
-        }
-        if let Some(ref u) = req.target_zip_url {
-            let trimmed = u.trim();
-            if !trimmed.is_empty() {
-                defaults.target_zip_url = trimmed.to_string();
-            }
-        }
-        defaults.log_size_bytes = req.log_size_bytes;
-        defaults.binary_size_bytes = req.binary_size_bytes;
-        defaults.target_zip_size_bytes = req.target_zip_size_bytes;
-        defaults.log_sha256 = req.log_sha256.clone();
-        defaults.binary_sha256 = req.binary_sha256.clone();
-        defaults.target_zip_sha256 = req.target_zip_sha256.clone();
+        let has_reported_artifacts = status_norm == "completed"
+            || req.log_url.is_some()
+            || req.binary_url.is_some()
+            || req.target_zip_url.is_some()
+            || req.log_size_bytes.is_some()
+            || req.binary_size_bytes.is_some()
+            || req.target_zip_size_bytes.is_some();
 
-        let selected_url = select_artifact_url_for_output(&queue[idx].requested_output, &defaults);
+        if has_reported_artifacts {
+            let mut defaults = default_artifacts_for_build(&queue[idx].gcs_bucket, build_id);
+            if let Some(ref u) = req.log_url {
+                let trimmed = u.trim();
+                if !trimmed.is_empty() {
+                    defaults.log_url = trimmed.to_string();
+                }
+            }
+            if let Some(ref u) = req.binary_url {
+                let trimmed = u.trim();
+                if !trimmed.is_empty() {
+                    defaults.binary_url = trimmed.to_string();
+                }
+            }
+            if let Some(ref u) = req.target_zip_url {
+                let trimmed = u.trim();
+                if !trimmed.is_empty() {
+                    defaults.target_zip_url = trimmed.to_string();
+                }
+            }
+            defaults.log_size_bytes = req.log_size_bytes;
+            defaults.binary_size_bytes = req.binary_size_bytes;
+            defaults.target_zip_size_bytes = req.target_zip_size_bytes;
+            defaults.log_sha256 = req.log_sha256.clone();
+            defaults.binary_sha256 = req.binary_sha256.clone();
+            defaults.target_zip_sha256 = req.target_zip_sha256.clone();
+
+            let selected_url =
+                select_artifact_url_for_output(&queue[idx].requested_output, &defaults);
+            queue[idx].artifacts = Some(defaults);
+            queue[idx].selected_artifact_url = Some(selected_url);
+        } else {
+            queue[idx].artifacts = None;
+            queue[idx].selected_artifact_url = None;
+        }
 
         let compile_sec = req.compile_duration_seconds.unwrap_or_else(|| {
             let started = queue[idx]
@@ -4236,8 +4319,6 @@ pub async fn handle_post_rust_builds_complete<K: KvStoreBackend>(
                 queue[idx].zone = Some(z.trim().to_string());
             }
         }
-        queue[idx].artifacts = Some(defaults.clone());
-        queue[idx].selected_artifact_url = Some(selected_url.clone());
 
         let completed_item = queue[idx].clone();
         let next_build_id = bundle

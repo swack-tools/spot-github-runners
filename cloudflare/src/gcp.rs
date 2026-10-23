@@ -1088,6 +1088,7 @@ pub fn build_spot_runner_vm_request(
 }
 
 pub const DEFAULT_BUILDER_CACHE_DISK_SIZE_GB: u64 = 375;
+pub const RAW_BUILDER_STARTUP_SCRIPT: &str = include_str!("../../cloud-init/builder-startup.sh");
 
 pub struct BuilderVmConfig<'a> {
     pub instance_name: &'a str,
@@ -1101,10 +1102,23 @@ pub struct BuilderVmConfig<'a> {
     pub cache_disk_type: Option<&'a str>,
 }
 
+pub fn is_functional_builder_startup_template(script: &str) -> bool {
+    let trimmed = script.trim();
+    !trimmed.is_empty()
+        && trimmed.contains("{{DISK_DEVICE_NAME}}")
+        && trimmed.contains("host-agent")
+        && trimmed.contains("queue-worker")
+}
+
 pub fn build_spot_builder_vm_request(
     project: &str,
     cfg: &BuilderVmConfig,
 ) -> Result<GceInsertInstanceRequest, GcpError> {
+    if !is_functional_builder_startup_template(cfg.startup_script_template) {
+        return Err(GcpError::Validation(
+            "Builder startup_script_template is incomplete or missing required host-agent queue-worker and cache disk bootstrap".to_string(),
+        ));
+    }
     if !crate::patch::PERMITTED_MACHINE_TYPES.contains(&cfg.machine_type)
         && !crate::patch::PERMITTED_ARM64_MACHINE_TYPES.contains(&cfg.machine_type)
     {

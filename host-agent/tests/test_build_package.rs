@@ -82,6 +82,7 @@ fn test_package_three_artifacts_produces_log_binaries_and_target_archives() {
     let cfg = BuildPackageConfig {
         build_id: 4553,
         workspace: ws,
+        target_dir: None,
         log_file: Some(log_file),
         out_dir: out_dir.clone(),
         gcs_bucket: "example-rust-project-build-artifacts".to_string(),
@@ -124,6 +125,7 @@ fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
     use host_agent::build_package::{
         parse_worker_args, process_next_queued_build, sanitize_project_slug,
     };
+    use std::process::Command;
 
     assert_eq!(
         sanitize_project_slug("example-org/example-rust-project").unwrap(),
@@ -132,26 +134,95 @@ fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
     assert!(sanitize_project_slug("../evil").is_err());
 
     let temp = TempDir::new().expect("tempdir");
+    let remote_build_root = temp.path().join("remote-build");
     let control_dir = temp.path().join("control");
-    let sources_root = temp.path().join("sources");
-    let out_dir = temp.path().join("artifacts");
+    let sources_root = remote_build_root.join("sources");
+    let targets_root = remote_build_root.join("targets");
+    let out_dir = remote_build_root.join("artifacts");
     fs::create_dir_all(&control_dir).expect("create control dir");
 
-    // Seed a claimed build response in the mock control-plane directory
+    // 1. Create a real local Git repository with a committed Cargo.toml so materialize_repository_checkout clones & checks out the exact SHA
+    let upstream_repo = temp.path().join("upstream-repo");
+    fs::create_dir_all(&upstream_repo).expect("create upstream repo");
+    assert!(Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .arg(&upstream_repo)
+        .status()
+        .unwrap()
+        .success());
+    fs::write(
+        upstream_repo.join("Cargo.toml"),
+        "[package]\nname = \"example-rust-project\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&upstream_repo)
+        .args(["add", "Cargo.toml"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&upstream_repo)
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let sha_out = Command::new("git")
+        .arg("-C")
+        .arg(&upstream_repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("rev-parse HEAD");
+    let commit_sha = String::from_utf8(sha_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // 2. Create an executable mock `host-launcher` that enforces ALLOWED_COMMANDS (`cargo`, not `bash`)
+    // and writes compiled outputs into `<remote_build_root>/targets/<project>/release/`
+    let mock_launcher = temp.path().join("mock-host-launcher");
+    let launcher_script = format!(
+        "#!/bin/sh\nset -eu\nPROJECT=\"$1\"\nSHIFT_CMD=\"$2\"\nif [ \"$SHIFT_CMD\" = \"prepare\" ]; then\n  mkdir -p \"{sources}/$PROJECT\" \"{targets}/$PROJECT\"\n  exit 0\nfi\nif [ \"$SHIFT_CMD\" != \"cargo\" ] && [ \"$SHIFT_CMD\" != \"just\" ]; then\n  echo \"UnsupportedCommand: $SHIFT_CMD\" >&2\n  exit 1\nfi\ntest -f \"{sources}/$PROJECT/Cargo.toml\"\nmkdir -p \"{targets}/$PROJECT/release\"\nprintf '#!/bin/sh\\necho ok\\n' > \"{targets}/$PROJECT/release/example-rust-project\"\nchmod 755 \"{targets}/$PROJECT/release/example-rust-project\"\necho 'test result: ok. 12 passed; 0 failed'\n",
+        sources = sources_root.display(),
+        targets = targets_root.display(),
+    );
+    fs::write(&mock_launcher, launcher_script).expect("write mock launcher");
+    let mut perms = fs::metadata(&mock_launcher).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&mock_launcher, perms).expect("chmod +x mock launcher");
+
+    // 3. Seed a claimed build response in the mock control-plane directory
     let claim_response = serde_json::json!({
         "status": "claimed",
         "claimed": true,
         "build": {
             "build_id": 4553,
-            "repo": "example-org/example-rust-project",
-            "branch": "feat/remote-queue",
-            "commit_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
-            "command": "mkdir -p target/release && printf '#!/bin/sh\\necho ok\\n' > target/release/example-rust-project && chmod 755 target/release/example-rust-project && echo 'test result: ok. 12 passed; 0 failed'",
+            "repo": format!("file://{}/example-rust-project", upstream_repo.parent().unwrap().display()),
+            "branch": "main",
+            "commit_sha": commit_sha,
+            "command": "cargo test --workspace --locked",
             "profile": "release",
             "binary_name": "example-rust-project",
             "gcs_bucket": "example-rust-project-build-artifacts"
         }
     });
+    // Symlink `example-rust-project` to `upstream-repo` so the repo slug resolves to `example-rust-project`
+    std::os::unix::fs::symlink(&upstream_repo, temp.path().join("example-rust-project"))
+        .expect("symlink upstream repo");
     fs::write(
         control_dir.join("claim_response.json"),
         serde_json::to_string_pretty(&claim_response).unwrap(),
@@ -170,10 +241,7 @@ fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
         "--out-dir".to_string(),
         out_dir.to_string_lossy().into_owned(),
         "--launcher".to_string(),
-        temp.path()
-            .join("nonexistent-launcher")
-            .to_string_lossy()
-            .into_owned(),
+        mock_launcher.to_string_lossy().into_owned(),
         "--no-upload".to_string(),
         "--once".to_string(),
     ];

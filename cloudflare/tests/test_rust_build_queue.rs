@@ -335,9 +335,27 @@ async fn test_validation_rejects_invalid_inputs_and_non_finite_floats() {
 
 #[test]
 fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_target() {
-    use spot_dashboard_edge::gcp::{build_spot_builder_vm_request, BuilderVmConfig};
+    use spot_dashboard_edge::gcp::{
+        build_spot_builder_vm_request, BuilderVmConfig, RAW_BUILDER_STARTUP_SCRIPT,
+    };
 
-    let template = "#!/bin/bash\nINSTANCE={{INSTANCE_NAME}}\nPROJECT={{PROJECT}}\nZONE={{ZONE}}\nDEV=/dev/disk/by-id/google-{{DISK_DEVICE_NAME}}\nDEP={{DEPLOYMENT_ID}}\n";
+    // Stub script without host-agent / queue-worker / cache disk must be rejected
+    let bad_cfg = BuilderVmConfig {
+        instance_name: "builder-scale-1792000000-abcd1234",
+        machine_type: "n4-highcpu-16",
+        zone: "us-central1-a",
+        deployment_id: "dep-builder-1792000000",
+        cache_disk_name: "builder-scale-1792000000-abcd1234-cache",
+        cache_disk_device_name: "builder-scale-1792000000-abcd1234-cache",
+        startup_script_template: "#!/bin/bash\nset -euo pipefail\n",
+        boot_disk_type: Some("pd-balanced"),
+        cache_disk_type: Some("pd-balanced"),
+    };
+    assert!(
+        build_spot_builder_vm_request("example-ci-fleet", &bad_cfg).is_err(),
+        "Nonfunctional builder startup stub must be rejected"
+    );
+
     let cfg = BuilderVmConfig {
         instance_name: "builder-scale-1792000000-abcd1234",
         machine_type: "n4-highcpu-16",
@@ -345,7 +363,7 @@ fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_ta
         deployment_id: "dep-builder-1792000000",
         cache_disk_name: "builder-scale-1792000000-abcd1234-cache",
         cache_disk_device_name: "builder-scale-1792000000-abcd1234-cache",
-        startup_script_template: template,
+        startup_script_template: RAW_BUILDER_STARTUP_SCRIPT,
         boot_disk_type: Some("pd-balanced"),
         cache_disk_type: Some("pd-balanced"),
     };
@@ -396,11 +414,12 @@ fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_ta
         .find(|m| m.key == "startup-script")
         .map(|m| m.value.as_str())
         .unwrap();
-    assert!(startup.contains("INSTANCE=builder-scale-1792000000-abcd1234"));
-    assert!(startup.contains("PROJECT=example-ci-fleet"));
-    assert!(startup.contains("ZONE=us-central1-a"));
-    assert!(startup.contains("DEV=/dev/disk/by-id/google-builder-scale-1792000000-abcd1234-cache"));
-    assert!(startup.contains("DEP=dep-builder-1792000000"));
+    assert!(startup.contains("builder-scale-1792000000-abcd1234"));
+    assert!(startup.contains("example-ci-fleet"));
+    assert!(startup.contains("us-central1-a"));
+    assert!(startup.contains("/dev/disk/by-id/google-builder-scale-1792000000-abcd1234-cache"));
+    assert!(startup.contains("dep-builder-1792000000"));
+    assert!(startup.contains("example-rust-project-queue-worker.service"));
 }
 
 #[tokio::test]
@@ -531,4 +550,52 @@ async fn test_queue_mutations_bypass_stale_isolate_cache() {
         .expect("claim must read authoritative KV state");
     assert_eq!(claim_body["claimed"], true);
     assert_eq!(claim_body["build"]["build_id"], 4553);
+}
+
+#[tokio::test]
+async fn test_recover_orphaned_running_builds_on_preempted_builder_or_expired_lease() {
+    use spot_dashboard_edge::state::RUST_BUILD_CLAIM_LEASE_SECS;
+
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1_792_050_000;
+
+    let req = EnqueueRustBuildRequest {
+        repo: "example-org/example-rust-project".to_string(),
+        branch: "main".to_string(),
+        commit_sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+        command: "cargo test".to_string(),
+        requested_output: Some("log".to_string()),
+        template_id: None,
+        profile: None,
+        binary_name: None,
+        gcs_bucket: None,
+        origin_ip: None,
+    };
+    handle_post_rust_builds_enqueue(&kv, req, now)
+        .await
+        .expect("enqueue");
+
+    // First builder claims #4553 at `now + 1`
+    let claim1 = ClaimRustBuildRequest {
+        instance_name: "builder-preempted-01".to_string(),
+        zone: Some("us-central1-a".to_string()),
+    };
+    let (_, b1) = handle_post_rust_builds_claim(&kv, claim1, now + 1)
+        .await
+        .expect("claim 1");
+    assert_eq!(b1["claimed"], true);
+    assert_eq!(b1["build"]["build_id"], 4553);
+
+    // After RUST_BUILD_CLAIM_LEASE_SECS expires, a replacement builder can reclaim #4553
+    let claim2 = ClaimRustBuildRequest {
+        instance_name: "builder-replacement-02".to_string(),
+        zone: Some("us-central1-a".to_string()),
+    };
+    let (_, b2) = handle_post_rust_builds_claim(&kv, claim2, now + 1 + RUST_BUILD_CLAIM_LEASE_SECS)
+        .await
+        .expect("claim 2 after lease expiry");
+    assert_eq!(b2["claimed"], true);
+    assert_eq!(b2["build"]["build_id"], 4553);
+    assert_eq!(b2["build"]["assigned_instance"], "builder-replacement-02");
 }

@@ -1401,13 +1401,25 @@ where
             bundle.state_version = cached.state_version;
         }
     }
+    let live_builder_names: std::collections::HashSet<String> = instances
+        .iter()
+        .filter(|i| i.name.starts_with("builder-") && !i.status.eq_ignore_ascii_case("TERMINATED"))
+        .map(|i| i.name.clone())
+        .collect();
+    let recovered_builds = crate::state::recover_orphaned_running_builds_in_state(
+        &mut bundle.state,
+        if gcp_list_succeeded {
+            Some(&live_builder_names)
+        } else {
+            None
+        },
+        &cleaned_vms,
+        now,
+    );
     let queued_rust_builds = crate::state::count_queued_rust_builds(&bundle.state);
     let builder_policy = &bundle.state.scaling.rust_builder;
     let builder_threshold = builder_policy.queued_builds_threshold.max(1);
-    let current_live_builders = instances
-        .iter()
-        .filter(|i| i.name.starts_with("builder-") && !i.status.eq_ignore_ascii_case("TERMINATED"))
-        .count();
+    let current_live_builders = live_builder_names.len();
 
     if builder_policy.enable_queue_trigger
         && queued_rust_builds >= builder_threshold
@@ -1421,9 +1433,12 @@ where
             .state
             .cloud_init_templates
             .iter()
-            .find(|t| t.role == "rust_builder")
+            .find(|t| {
+                t.role == "rust_builder"
+                    && crate::gcp::is_functional_builder_startup_template(&t.content)
+            })
             .map(|t| t.content.as_str())
-            .unwrap_or("#!/bin/bash\nset -euo pipefail\n# Dedicated Rust 1.99.0 Builder\n");
+            .unwrap_or(crate::gcp::RAW_BUILDER_STARTUP_SCRIPT);
 
         let builder_cfg = crate::gcp::BuilderVmConfig {
             instance_name: &builder_host,
@@ -1556,6 +1571,7 @@ where
     let has_mutations = !cleaned_vms.is_empty()
         || !cleaned_runners.is_empty()
         || !launched_hosts.is_empty()
+        || recovered_builds > 0
         || overview_changed
         || (last_fp_guard.as_ref() != Some(&current_fingerprint));
 

@@ -21,6 +21,7 @@ pub const DEFAULT_GCS_BUCKET: &str = "example-rust-project-build-artifacts";
 pub struct BuildPackageConfig {
     pub build_id: u64,
     pub workspace: PathBuf,
+    pub target_dir: Option<PathBuf>,
     pub log_file: Option<PathBuf>,
     pub out_dir: PathBuf,
     pub gcs_bucket: String,
@@ -58,6 +59,7 @@ fn print_help() {
          OPTIONS:\n    \
              --build-id <ID>       Numeric build ID from the queue (e.g. 4553)\n    \
              --workspace <PATH>    Workspace root containing target/\n    \
+             --target-dir <PATH>   Explicit Cargo target directory (e.g. /mnt/runner-data/remote-build/targets/<project>)\n    \
              --log-file <PATH>     Path to build/test stdout+stderr log file\n    \
              --out-dir <PATH>      Output directory for staged builds/<id>/ artifacts\n    \
              --bucket <NAME>       Same-region GCS bucket name (default: {DEFAULT_GCS_BUCKET})\n    \
@@ -71,6 +73,7 @@ fn print_help() {
 pub fn parse_args(args: &[String]) -> Result<Option<BuildPackageConfig>, String> {
     let mut build_id: Option<u64> = None;
     let mut workspace: Option<PathBuf> = None;
+    let mut target_dir: Option<PathBuf> = None;
     let mut log_file: Option<PathBuf> = None;
     let mut out_dir: Option<PathBuf> = None;
     let mut gcs_bucket = DEFAULT_GCS_BUCKET.to_string();
@@ -101,6 +104,11 @@ pub fn parse_args(args: &[String]) -> Result<Option<BuildPackageConfig>, String>
                 i += 1;
                 let raw = args.get(i).ok_or("--workspace requires a path")?;
                 workspace = Some(PathBuf::from(raw));
+            }
+            "--target-dir" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--target-dir requires a path")?;
+                target_dir = Some(PathBuf::from(raw));
             }
             "--log-file" => {
                 i += 1;
@@ -159,6 +167,7 @@ pub fn parse_args(args: &[String]) -> Result<Option<BuildPackageConfig>, String>
     Ok(Some(BuildPackageConfig {
         build_id,
         workspace,
+        target_dir,
         log_file,
         out_dir,
         gcs_bucket,
@@ -255,6 +264,118 @@ fn create_compressed_archive(
     Ok(())
 }
 
+fn fetch_gce_metadata_access_token() -> Result<String, String> {
+    if let Ok(env_tok) = std::env::var("GCS_OAUTH_TOKEN") {
+        let trimmed = env_tok.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "10",
+            "-H",
+            "Metadata-Flavor: Google",
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        ])
+        .output()
+        .map_err(|e| format!("Failed querying GCE metadata token endpoint: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "GCE metadata token endpoint returned status {}",
+            output.status
+        ));
+    }
+    let val: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Invalid JSON from GCE metadata token endpoint: {e}"))?;
+    val.get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "GCE metadata token response missing access_token".to_string())
+}
+
+fn upload_artifacts_to_gcs(
+    bucket: &str,
+    build_id: u64,
+    dest_log: &Path,
+    dest_binaries_archive: &Path,
+    dest_target_archive: &Path,
+) -> Result<(), String> {
+    let gcs_prefix = format!("gs://{bucket}/builds/{build_id}");
+
+    // 1. Try `gcloud storage cp` if `gcloud` is installed on the host
+    if let Ok(status) = Command::new("gcloud")
+        .args([
+            "storage",
+            "cp",
+            "--quiet",
+            &dest_log.to_string_lossy(),
+            &dest_binaries_archive.to_string_lossy(),
+            &dest_target_archive.to_string_lossy(),
+            &format!("{gcs_prefix}/"),
+        ])
+        .status()
+    {
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    // 2. Upload directly to GCS JSON API using curl + GCE instance service account token
+    let token = fetch_gce_metadata_access_token()?;
+    let objects = [
+        (dest_log, "build.log", "text/plain; charset=utf-8"),
+        (
+            dest_binaries_archive,
+            "binaries.tar.zst",
+            "application/octet-stream",
+        ),
+        (
+            dest_target_archive,
+            "target.tar.zst",
+            "application/octet-stream",
+        ),
+    ];
+
+    for (local_path, file_name, content_type) in objects {
+        let object_name = format!("builds/{build_id}/{file_name}");
+        let encoded_name = object_name.replace('/', "%2F");
+        let upload_url = format!(
+            "https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o?uploadType=media&name={encoded_name}"
+        );
+        let output = Command::new("curl")
+            .args([
+                "-fsSL",
+                "--max-time",
+                "300",
+                "-X",
+                "POST",
+                "-H",
+                &format!("Authorization: Bearer {token}"),
+                "-H",
+                &format!("Content-Type: {content_type}"),
+                "--data-binary",
+                &format!("@{}", local_path.to_string_lossy()),
+                &upload_url,
+            ])
+            .output()
+            .map_err(|e| format!("Failed invoking curl for GCS upload of '{file_name}': {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "GCS HTTP upload failed for {gcs_prefix}/{file_name} ({}): {}",
+                output.status,
+                stderr.trim()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn package_build_artifacts(cfg: &BuildPackageConfig) -> Result<BuildPackageManifest, String> {
     if !cfg.workspace.exists() {
         return Err(format!(
@@ -312,7 +433,30 @@ pub fn package_build_artifacts(cfg: &BuildPackageConfig) -> Result<BuildPackageM
     fs::create_dir_all(&bin_stage_dir)
         .map_err(|e| format!("Failed to create binary stage dir: {e}"))?;
 
-    let target_dir = cfg.workspace.join("target");
+    let ws_target = cfg.workspace.join("target");
+    let sibling_target = cfg
+        .workspace
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|root| {
+            cfg.workspace
+                .file_name()
+                .map(|name| root.join("targets").join(name))
+        });
+    let (target_dir, is_workspace_target) = if let Some(ref explicit_target) = cfg.target_dir {
+        let same_as_ws = explicit_target == &ws_target;
+        (explicit_target.clone(), same_as_ws)
+    } else if ws_target.is_dir() {
+        (ws_target, true)
+    } else if let Some(ref sib) = sibling_target {
+        if sib.is_dir() {
+            (sib.clone(), false)
+        } else {
+            (ws_target, true)
+        }
+    } else {
+        (ws_target, true)
+    };
     let mut profile_dirs = Vec::new();
     if let Some(ref prof) = cfg.profile {
         profile_dirs.push(prof.as_str());
@@ -369,7 +513,11 @@ pub fn package_build_artifacts(cfg: &BuildPackageConfig) -> Result<BuildPackageM
     if target_dir.is_dir() {
         // Copy build.log into target/build.log so target.tar.zst is self-contained with logs + build outputs
         let _ = fs::copy(&dest_log, target_dir.join("build.log"));
-        create_compressed_archive(&cfg.workspace, &["target"], &dest_target_archive)?;
+        if is_workspace_target {
+            create_compressed_archive(&cfg.workspace, &["target"], &dest_target_archive)?;
+        } else {
+            create_compressed_archive(&target_dir, &["."], &dest_target_archive)?;
+        }
     } else {
         create_compressed_archive(&build_stage_dir, &["build.log"], &dest_target_archive)?;
     }
@@ -386,23 +534,13 @@ pub fn package_build_artifacts(cfg: &BuildPackageConfig) -> Result<BuildPackageM
 
     let mut uploaded = false;
     if cfg.upload {
-        let status = Command::new("gcloud")
-            .args([
-                "storage",
-                "cp",
-                "--quiet",
-                &dest_log.to_string_lossy(),
-                &dest_binaries_archive.to_string_lossy(),
-                &dest_target_archive.to_string_lossy(),
-                &format!("{gcs_prefix}/"),
-            ])
-            .status()
-            .map_err(|e| format!("Failed to invoke gcloud storage cp: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "gcloud storage cp failed with status {status} uploading to {gcs_prefix}/"
-            ));
-        }
+        upload_artifacts_to_gcs(
+            &cfg.gcs_bucket,
+            cfg.build_id,
+            &dest_log,
+            &dest_binaries_archive,
+            &dest_target_archive,
+        )?;
         uploaded = true;
     }
 
@@ -647,6 +785,151 @@ pub fn sanitize_project_slug(repo: &str) -> Result<String, String> {
     Ok(base.to_string())
 }
 
+fn resolve_git_remote_url(repo: &str) -> String {
+    let trimmed = repo.trim();
+    if trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("ssh://")
+        || trimmed.starts_with("git@")
+        || trimmed.starts_with("file://")
+        || Path::new(trimmed).exists()
+    {
+        return trimmed.to_string();
+    }
+    let base = std::env::var("SPOT_GIT_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://github.com".to_string());
+    let base_trimmed = base.trim_end_matches('/');
+    let repo_trimmed = trimmed.trim_matches('/');
+    if let Some(local_root) = base_trimmed.strip_prefix("file://") {
+        let candidate = Path::new(local_root).join(repo_trimmed);
+        if candidate.exists() {
+            return format!("file://{}", candidate.display());
+        }
+    }
+    if repo_trimmed.ends_with(".git") {
+        format!("{base_trimmed}/{repo_trimmed}")
+    } else {
+        format!("{base_trimmed}/{repo_trimmed}.git")
+    }
+}
+
+pub fn materialize_repository_checkout(
+    workspace: &Path,
+    job: &ClaimedBuildJob,
+) -> Result<(), String> {
+    let remote_url = resolve_git_remote_url(&job.repo);
+
+    if !workspace.join(".git").exists() {
+        let init_status = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(workspace)
+            .status()
+            .map_err(|e| format!("Failed invoking git init in '{}': {e}", workspace.display()))?;
+        if !init_status.success() {
+            return Err(format!(
+                "git init failed with status {init_status} in '{}'",
+                workspace.display()
+            ));
+        }
+    }
+
+    // Configure or update origin remote URL
+    let has_origin = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let remote_cmd = if has_origin {
+        ["remote", "set-url", "origin", &remote_url]
+    } else {
+        ["remote", "add", "origin", &remote_url]
+    };
+    let remote_status = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(remote_cmd)
+        .status()
+        .map_err(|e| format!("Failed configuring git origin '{remote_url}': {e}"))?;
+    if !remote_status.success() {
+        return Err(format!(
+            "git remote configuration failed with status {remote_status} for '{remote_url}'"
+        ));
+    }
+
+    // Fetch requested commit_sha directly first, falling back to fetching branch/all refs
+    let fetch_sha_ok = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args([
+            "fetch",
+            "--quiet",
+            "--depth",
+            "1",
+            "origin",
+            &job.commit_sha,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !fetch_sha_ok {
+        let fetch_branch_ok = Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(["fetch", "--quiet", "origin", &job.branch])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !fetch_branch_ok {
+            let fetch_all = Command::new("git")
+                .arg("-C")
+                .arg(workspace)
+                .args(["fetch", "--all", "--quiet"])
+                .output()
+                .map_err(|e| format!("Failed invoking git fetch from '{remote_url}': {e}"))?;
+            if !fetch_all.status.success() {
+                let stderr = String::from_utf8_lossy(&fetch_all.stderr);
+                return Err(format!(
+                    "git fetch failed from '{remote_url}' ({}): {}",
+                    fetch_all.status,
+                    stderr.trim()
+                ));
+            }
+        }
+    }
+
+    let checkout_out = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["checkout", "--force", &job.commit_sha])
+        .output()
+        .map_err(|e| format!("Failed invoking git checkout '{}': {e}", job.commit_sha))?;
+    if !checkout_out.status.success() {
+        // Fallback: if commit_sha was not a full ref in a shallow test repo, try checking out FETCH_HEAD and verifying
+        let fallback_out = Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(["checkout", "--force", "FETCH_HEAD"])
+            .output()
+            .map_err(|e| format!("Failed invoking git checkout FETCH_HEAD: {e}"))?;
+        if !fallback_out.status.success() {
+            let stderr = String::from_utf8_lossy(&checkout_out.stderr);
+            return Err(format!(
+                "git checkout '{}' failed ({}): {}",
+                job.commit_sha,
+                checkout_out.status,
+                stderr.trim()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn post_control_plane_json(
     base_url: &str,
     endpoint_path: &str,
@@ -769,6 +1052,12 @@ pub fn process_next_queued_build(
 
     let project_slug = sanitize_project_slug(&job.repo)?;
     let workspace = cfg.sources_root.join(&project_slug);
+    let launcher_target_dir = cfg
+        .sources_root
+        .parent()
+        .unwrap_or(&cfg.sources_root)
+        .join("targets")
+        .join(&project_slug);
 
     // 1. Prepare builder workspace (via host-launcher if present, else create directory directly)
     if cfg.launcher.exists() {
@@ -784,21 +1073,6 @@ pub fn process_next_queued_build(
         )
     })?;
 
-    // 2. If workspace contains a Git checkout, fetch/checkout the requested commit_sha best-effort
-    if workspace.join(".git").exists() {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&workspace)
-            .args(["fetch", "--all", "--quiet"])
-            .status();
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&workspace)
-            .args(["checkout", "--force", &job.commit_sha])
-            .status();
-    }
-
-    // 3. Execute the queued build/test command via launcher (or sh -c fallback when testing without launcher)
     let build_stage_dir = cfg.out_dir.join("builds").join(job.build_id.to_string());
     fs::create_dir_all(&build_stage_dir).map_err(|e| {
         format!(
@@ -808,13 +1082,39 @@ pub fn process_next_queued_build(
     })?;
     let raw_log_path = build_stage_dir.join("raw-build.log");
 
+    // 2. Materialize repository checkout at the requested commit_sha before executing build
+    if let Err(git_err) = materialize_repository_checkout(&workspace, &job) {
+        let _ = fs::write(
+            &raw_log_path,
+            format!(
+                "=== Build #{} ({} @ {} / {}) ===\nFATAL: {git_err}\n",
+                job.build_id, job.repo, job.branch, job.commit_sha
+            ),
+        );
+        let fail_payload = serde_json::json!({
+            "build_id": job.build_id,
+            "status": "failed",
+            "exit_code": 128,
+            "compile_duration_seconds": 0.0,
+            "delivery_duration_seconds": 0.0,
+            "instance_name": cfg.instance_name,
+            "zone": cfg.zone,
+        });
+        let complete_endpoint = format!("/api/rust-builds/{}/complete", job.build_id);
+        let _ = post_control_plane_json(&cfg.dashboard_url, &complete_endpoint, &fail_payload);
+        return Err(git_err);
+    }
+
+    // 3. Execute the queued build/test command via launcher (or sh -c fallback when testing without launcher)
     let start_instant = std::time::Instant::now();
     let cmd_output = if cfg.launcher.exists() {
+        let cmd_tokens: Vec<&str> = job.command.split_whitespace().collect();
+        if cmd_tokens.is_empty() {
+            return Err("Claimed build command is empty".to_string());
+        }
         Command::new(&cfg.launcher)
             .arg(&project_slug)
-            .arg("bash")
-            .arg("-lc")
-            .arg(&job.command)
+            .args(&cmd_tokens)
             .current_dir(&workspace)
             .output()
             .map_err(|e| {
@@ -855,9 +1155,15 @@ pub fn process_next_queued_build(
 
     // 4. Always package the 3 artifacts (build.log, binaries.tar.zst, target.tar.zst)
     let delivery_start = std::time::Instant::now();
+    let resolved_target_dir = if launcher_target_dir.is_dir() {
+        Some(launcher_target_dir)
+    } else {
+        None
+    };
     let pkg_cfg = BuildPackageConfig {
         build_id: job.build_id,
         workspace: workspace.clone(),
+        target_dir: resolved_target_dir,
         log_file: Some(raw_log_path.clone()),
         out_dir: cfg.out_dir.clone(),
         gcs_bucket: job.gcs_bucket.clone(),
@@ -867,13 +1173,21 @@ pub fn process_next_queued_build(
     };
     let manifest = match package_build_artifacts(&pkg_cfg) {
         Ok(m) => m,
-        Err(_upload_err) if cfg.upload => {
-            // Fall back to local staging if gcloud upload is unavailable so completion still reports
-            let mut fallback_cfg = pkg_cfg;
-            fallback_cfg.upload = false;
-            package_build_artifacts(&fallback_cfg)?
+        Err(upload_err) => {
+            // Preserve upload/delivery failure: report failed status without advertising nonexistent remote artifacts
+            let fail_payload = serde_json::json!({
+                "build_id": job.build_id,
+                "status": "failed",
+                "exit_code": if exit_code != 0 { exit_code } else { 74 },
+                "compile_duration_seconds": compile_duration_seconds,
+                "delivery_duration_seconds": delivery_start.elapsed().as_secs_f64(),
+                "instance_name": cfg.instance_name,
+                "zone": cfg.zone,
+            });
+            let complete_endpoint = format!("/api/rust-builds/{}/complete", job.build_id);
+            let _ = post_control_plane_json(&cfg.dashboard_url, &complete_endpoint, &fail_payload);
+            return Err(upload_err);
         }
-        Err(e) => return Err(e),
     };
     let delivery_duration_seconds = delivery_start.elapsed().as_secs_f64();
 
