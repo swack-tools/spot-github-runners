@@ -196,6 +196,7 @@ install -d -m0755 /opt/gha-runners /opt/oxidex-builder/image
 install -d -m0700 /var/lib/oxidex-builder
 install -d -o root -g root -m 0755 /opt/oxidex-builder/qualification_trust /etc/oxidex-remote-build
 ln -sfn /opt/oxidex-builder /opt/example-rust-project-builder
+ln -sfn /var/lib/oxidex-builder /var/lib/example-rust-project-builder
 ln -sfn /etc/oxidex-remote-build /etc/example-rust-project-remote-build
 install -d -o root -g root -m 0755 "$MOUNT_POINT/remote-build/qualification-sealed"
 

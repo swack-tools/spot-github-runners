@@ -199,9 +199,10 @@ done
 
 ### 3. Rebuild the builder container image
 
-Rebuild the unprivileged container image with bounded resource flags:
+Ensure the state directory exists and rebuild the unprivileged container image with bounded resource flags:
 
 ```bash
+sudo install -d -m 0700 /var/lib/example-rust-project-builder
 DOCKER_BUILDKIT=0 sudo docker build \
   --memory=28g --memory-swap=28g --cpu-period=100000 --cpu-quota=1600000 \
   --iidfile /var/lib/example-rust-project-builder/image-id \
@@ -212,7 +213,7 @@ Extract the newly built image ID and update the approved image configuration:
 
 ```bash
 image=$(tr -d '[:space:]' </var/lib/example-rust-project-builder/image-id)
-sudo jq --arg img "$image" '.approved_image_id = $img' /etc/example-rust-project-remote-build.json > /tmp/remote-build.json
+sudo jq --arg img "$image" '.image = "example-rust-project-remote-builder:1.99.0" | .approved_image_id = $img' /etc/example-rust-project-remote-build.json > /tmp/remote-build.json
 sudo install -m 0644 /tmp/remote-build.json /etc/example-rust-project-remote-build.json
 rm -f /tmp/remote-build.json
 ```

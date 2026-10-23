@@ -627,8 +627,27 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 ]
             };
 
-            let invocation =
-                container_command(project, &cmd, 16, 28, None, Some(&root.to_string_lossy()))?;
+            let configured_image = [
+                "/etc/example-rust-project-remote-build.json",
+                "/etc/oxidex-remote-build.json",
+            ]
+            .iter()
+            .find_map(|cfg_path| {
+                fs::read_to_string(cfg_path).ok().and_then(|s| {
+                    serde_json::from_str::<serde_json::Value>(&s)
+                        .ok()
+                        .and_then(|v| v.get("image").and_then(|i| i.as_str()).map(String::from))
+                })
+            });
+
+            let invocation = container_command(
+                project,
+                &cmd,
+                16,
+                28,
+                configured_image.as_deref(),
+                Some(&root.to_string_lossy()),
+            )?;
             let status = Command::new(&invocation[0])
                 .args(&invocation[1..])
                 .status()?;
