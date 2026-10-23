@@ -18,6 +18,56 @@ pub const MAX_ADDED_ADMINS: usize = 50;
 pub const SESSION_COOKIE_NAME: &str = "__Host-spot_session";
 pub const OAUTH_STATE_COOKIE_NAME: &str = "__Host-spot_oauth_state";
 pub const SESSION_PURPOSE_LABEL: &str = "spot-dashboard/session/v1";
+pub const BUILDER_QUEUE_PURPOSE: &str = "builder-queue";
+pub const BUILDER_QUEUE_TOKEN_TTL_SECONDS: u64 = 7 * 86_400; // 7 days
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuilderQueueTokenPayload {
+    pub exp: u64,
+    pub iat: u64,
+    pub inst: String,
+    pub v: u32,
+}
+
+pub fn mint_builder_queue_token(
+    secret: &[u8],
+    instance_name: &str,
+    now: u64,
+) -> Result<String, String> {
+    let trimmed = instance_name.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err("Invalid builder instance_name for queue token".to_string());
+    }
+    let payload = BuilderQueueTokenPayload {
+        v: 1,
+        inst: trimmed.to_string(),
+        iat: now,
+        exp: now + BUILDER_QUEUE_TOKEN_TTL_SECONDS,
+    };
+    let key = derive_purpose_key(secret, BUILDER_QUEUE_PURPOSE);
+    sign_token(&key, &payload)
+}
+
+pub fn verify_builder_queue_token(
+    token: &str,
+    secret: &[u8],
+    now: u64,
+) -> Option<BuilderQueueTokenPayload> {
+    let key = derive_purpose_key(secret, BUILDER_QUEUE_PURPOSE);
+    let val = verify_token_signature(&key, token)?;
+    let payload: BuilderQueueTokenPayload = serde_json::from_value(val).ok()?;
+    if payload.v != 1 || payload.inst.trim().is_empty() || payload.inst.len() > 128 {
+        return None;
+    }
+    if payload.exp <= payload.iat {
+        return None;
+    }
+    let min_now = payload.iat.saturating_sub(CLOCK_SKEW_SECONDS);
+    if !(min_now <= now && now < payload.exp) {
+        return None;
+    }
+    Some(payload)
+}
 
 pub const MAX_TOKEN_CHARS: usize = 4096;
 pub const MAX_SESSION_COOKIE_BYTES: usize = 3900;

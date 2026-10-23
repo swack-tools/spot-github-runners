@@ -225,6 +225,7 @@ fn create_compressed_archive(
     source_dir: &Path,
     entries: &[&str],
     dest_archive: &Path,
+    extra_dir_and_entry: Option<(&Path, &str)>,
 ) -> Result<(), String> {
     // Try `tar --zstd -cf <dest> -C <source_dir> <entries...>` first, then fallback to `tar -czf`
     let mut zstd_cmd = Command::new("tar");
@@ -236,6 +237,9 @@ fn create_compressed_archive(
         .arg(source_dir);
     for entry in entries {
         zstd_cmd.arg(entry);
+    }
+    if let Some((extra_dir, extra_entry)) = extra_dir_and_entry {
+        zstd_cmd.arg("-C").arg(extra_dir).arg(extra_entry);
     }
     if let Ok(status) = zstd_cmd.status() {
         if status.success() && dest_archive.exists() {
@@ -251,6 +255,9 @@ fn create_compressed_archive(
         .arg(source_dir);
     for entry in entries {
         gz_cmd.arg(entry);
+    }
+    if let Some((extra_dir, extra_entry)) = extra_dir_and_entry {
+        gz_cmd.arg("-C").arg(extra_dir).arg(extra_entry);
     }
     let status = gz_cmd
         .status()
@@ -505,21 +512,30 @@ pub fn package_build_artifacts(cfg: &BuildPackageConfig) -> Result<BuildPackageM
     }
 
     let dest_binaries_archive = build_stage_dir.join("binaries.tar.zst");
-    create_compressed_archive(&bin_stage_dir, &["."], &dest_binaries_archive)?;
+    create_compressed_archive(&bin_stage_dir, &["."], &dest_binaries_archive, None)?;
     let _ = fs::remove_dir_all(&bin_stage_dir);
 
     // 3. Always stage Artifact #3: `target.tar.zst` (full target/ directory + build.log)
+    // Never write into the container-writable target_dir to avoid following malicious symlinks.
     let dest_target_archive = build_stage_dir.join("target.tar.zst");
     if target_dir.is_dir() {
-        // Copy build.log into target/build.log so target.tar.zst is self-contained with logs + build outputs
-        let _ = fs::copy(&dest_log, target_dir.join("build.log"));
         if is_workspace_target {
-            create_compressed_archive(&cfg.workspace, &["target"], &dest_target_archive)?;
+            create_compressed_archive(
+                &cfg.workspace,
+                &["target"],
+                &dest_target_archive,
+                Some((&build_stage_dir, "build.log")),
+            )?;
         } else {
-            create_compressed_archive(&target_dir, &["."], &dest_target_archive)?;
+            create_compressed_archive(
+                &target_dir,
+                &["."],
+                &dest_target_archive,
+                Some((&build_stage_dir, "build.log")),
+            )?;
         }
     } else {
-        create_compressed_archive(&build_stage_dir, &["build.log"], &dest_target_archive)?;
+        create_compressed_archive(&build_stage_dir, &["build.log"], &dest_target_archive, None)?;
     }
 
     let (log_size_bytes, log_sha256) = compute_file_size_and_sha256(&dest_log)?;
@@ -815,14 +831,46 @@ fn resolve_git_remote_url(repo: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovedUploaderIdentity {
+    username: String,
+    uid: u32,
+}
+
+fn resolve_approved_uploader_identity() -> Option<ApprovedUploaderIdentity> {
+    let config_path = std::env::var("OXIDEX_UPLOADER_CONFIG")
+        .or_else(|_| std::env::var("EXAMPLE_RUST_PROJECT_UPLOADER_CONFIG"))
+        .unwrap_or_else(|_| "/etc/oxidex-builder-uploader.json".to_string());
+    let content = fs::read_to_string(&config_path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let username = val.get("username")?.as_str()?.trim().to_string();
+    let uid = val.get("uid")?.as_u64()? as u32;
+    if username.is_empty() || username == "root" || uid < 1000 || uid == 1001 {
+        return None;
+    }
+    Some(ApprovedUploaderIdentity { username, uid })
+}
+
+fn build_git_command(uploader: Option<&ApprovedUploaderIdentity>) -> Command {
+    if unsafe { libc::geteuid() } == 0 {
+        if let Some(id) = uploader {
+            let mut cmd = Command::new("sudo");
+            cmd.arg("-u").arg(&id.username).arg("--").arg("git");
+            return cmd;
+        }
+    }
+    Command::new("git")
+}
+
 pub fn materialize_repository_checkout(
     workspace: &Path,
     job: &ClaimedBuildJob,
 ) -> Result<(), String> {
     let remote_url = resolve_git_remote_url(&job.repo);
+    let uploader = resolve_approved_uploader_identity();
 
     if !workspace.join(".git").exists() {
-        let init_status = Command::new("git")
+        let init_status = build_git_command(uploader.as_ref())
             .arg("init")
             .arg("--quiet")
             .arg(workspace)
@@ -837,7 +885,7 @@ pub fn materialize_repository_checkout(
     }
 
     // Configure or update origin remote URL
-    let has_origin = Command::new("git")
+    let has_origin = build_git_command(uploader.as_ref())
         .arg("-C")
         .arg(workspace)
         .args(["remote", "get-url", "origin"])
@@ -849,7 +897,7 @@ pub fn materialize_repository_checkout(
     } else {
         ["remote", "add", "origin", &remote_url]
     };
-    let remote_status = Command::new("git")
+    let remote_status = build_git_command(uploader.as_ref())
         .arg("-C")
         .arg(workspace)
         .args(remote_cmd)
@@ -862,7 +910,7 @@ pub fn materialize_repository_checkout(
     }
 
     // Fetch requested commit_sha directly first, falling back to fetching branch/all refs
-    let fetch_sha_ok = Command::new("git")
+    let fetch_sha_ok = build_git_command(uploader.as_ref())
         .arg("-C")
         .arg(workspace)
         .args([
@@ -877,7 +925,7 @@ pub fn materialize_repository_checkout(
         .map(|s| s.success())
         .unwrap_or(false);
     if !fetch_sha_ok {
-        let fetch_branch_ok = Command::new("git")
+        let fetch_branch_ok = build_git_command(uploader.as_ref())
             .arg("-C")
             .arg(workspace)
             .args(["fetch", "--quiet", "origin", &job.branch])
@@ -885,7 +933,7 @@ pub fn materialize_repository_checkout(
             .map(|s| s.success())
             .unwrap_or(false);
         if !fetch_branch_ok {
-            let fetch_all = Command::new("git")
+            let fetch_all = build_git_command(uploader.as_ref())
                 .arg("-C")
                 .arg(workspace)
                 .args(["fetch", "--all", "--quiet"])
@@ -902,29 +950,40 @@ pub fn materialize_repository_checkout(
         }
     }
 
-    let checkout_out = Command::new("git")
+    let checkout_out = build_git_command(uploader.as_ref())
         .arg("-C")
         .arg(workspace)
         .args(["checkout", "--force", &job.commit_sha])
         .output()
         .map_err(|e| format!("Failed invoking git checkout '{}': {e}", job.commit_sha))?;
     if !checkout_out.status.success() {
-        // Fallback: if commit_sha was not a full ref in a shallow test repo, try checking out FETCH_HEAD and verifying
-        let fallback_out = Command::new("git")
-            .arg("-C")
-            .arg(workspace)
-            .args(["checkout", "--force", "FETCH_HEAD"])
-            .output()
-            .map_err(|e| format!("Failed invoking git checkout FETCH_HEAD: {e}"))?;
-        if !fallback_out.status.success() {
-            let stderr = String::from_utf8_lossy(&checkout_out.stderr);
-            return Err(format!(
-                "git checkout '{}' failed ({}): {}",
-                job.commit_sha,
-                checkout_out.status,
-                stderr.trim()
-            ));
-        }
+        let stderr = String::from_utf8_lossy(&checkout_out.stderr);
+        return Err(format!(
+            "git checkout '{}' failed ({}): {}",
+            job.commit_sha,
+            checkout_out.status,
+            stderr.trim()
+        ));
+    }
+
+    // Strictly verify that resolved HEAD matches the requested commit_sha
+    let head_out = build_git_command(uploader.as_ref())
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| format!("Failed invoking git rev-parse HEAD: {e}"))?;
+    if !head_out.status.success() {
+        return Err("git rev-parse HEAD failed after checkout".to_string());
+    }
+    let resolved_head = String::from_utf8_lossy(&head_out.stdout)
+        .trim()
+        .to_lowercase();
+    let requested_sha = job.commit_sha.trim().to_lowercase();
+    if requested_sha.len() < 7 || !resolved_head.starts_with(&requested_sha) {
+        return Err(format!(
+            "Checked out HEAD '{resolved_head}' does not match requested commit_sha '{requested_sha}'"
+        ));
     }
 
     Ok(())

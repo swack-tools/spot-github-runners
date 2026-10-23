@@ -372,13 +372,26 @@ jq -n \
 chmod 0600 /var/lib/oxidex-builder-readiness.json
 ln -sfn /var/lib/oxidex-builder-readiness.json /var/lib/example-rust-project-builder-readiness.json
 
+queue_token='{{QUEUE_BEARER_TOKEN}}'
+if [[ "$queue_token" =~ ^\{\{.*\}\}$ || -z "$queue_token" ]]; then
+  queue_token=$(metadata instance/attributes/spot-queue-token 2>/dev/null || true)
+fi
+install -d -m 0755 /etc/default
+cat >/etc/default/example-rust-project-queue-worker <<EOF
+BUILDER_INSTANCE_NAME={{INSTANCE_NAME}}
+BUILDER_ZONE={{ZONE}}
+SPOT_BEARER_TOKEN=$queue_token
+EOF
+chmod 0600 /etc/default/example-rust-project-queue-worker
+ln -sfn /etc/default/example-rust-project-queue-worker /etc/default/oxidex-queue-worker
+
 cat >/etc/systemd/system/example-rust-project-queue-worker.service <<'QUEUE_WORKER_SERVICE'
 [Unit]
 Description=Dedicated builder remote Rust queue consumer (host-agent queue-worker)
 After=gha-admission.service docker.service network-online.target
 Requires=gha-admission.service docker.service
 [Service]
-EnvironmentFile=-/etc/default/example-rust-project-queue-worker
+EnvironmentFile=/etc/default/example-rust-project-queue-worker
 ExecStart=/usr/local/bin/host-agent queue-worker --instance-name {{INSTANCE_NAME}} --zone {{ZONE}} --upload
 Restart=always
 RestartSec=10

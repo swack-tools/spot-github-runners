@@ -121,6 +121,102 @@ fn test_package_three_artifacts_produces_log_binaries_and_target_archives() {
 }
 
 #[test]
+fn test_package_refuses_to_overwrite_symlink_in_target_dir_and_checkout_rejects_unpushed_sha() {
+    use host_agent::build_package::{materialize_repository_checkout, ClaimedBuildJob};
+    use std::process::Command;
+
+    let temp = TempDir::new().expect("tempdir");
+    let ws = temp.path().join("workspace");
+    let target_dir = temp.path().join("targets").join("example-rust-project");
+    fs::create_dir_all(&ws).expect("create ws");
+    fs::create_dir_all(target_dir.join("release")).expect("create target/release");
+
+    // 1. Place a sensitive sentinel file outside target_dir and symlink `target_dir/build.log -> sentinel`
+    let sentinel = temp.path().join("host-sentinel.conf");
+    fs::write(&sentinel, b"ORIGINAL_ROOT_CONFIG=1\n").expect("write sentinel");
+    std::os::unix::fs::symlink(&sentinel, target_dir.join("build.log")).expect("create symlink");
+
+    let log_file = temp.path().join("raw.log");
+    fs::write(&log_file, b"MALICIOUS_BUILD_LOG_OUTPUT\n").expect("write raw log");
+
+    let out_dir = temp.path().join("staged");
+    let cfg = BuildPackageConfig {
+        build_id: 9001,
+        workspace: ws.clone(),
+        target_dir: Some(target_dir),
+        log_file: Some(log_file),
+        out_dir,
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+        profile: Some("release".to_string()),
+        binary_name: None,
+        upload: false,
+    };
+    let _ =
+        package_build_artifacts(&cfg).expect("package artifacts without touching symlink referent");
+    let sentinel_after = fs::read_to_string(&sentinel).expect("read sentinel");
+    assert_eq!(
+        sentinel_after, "ORIGINAL_ROOT_CONFIG=1\n",
+        "Packaging must never follow or overwrite a symlink at target/build.log"
+    );
+
+    // 2. Verify materialize_repository_checkout fails when requested commit_sha does not exist in remote
+    let upstream = temp.path().join("upstream-git");
+    fs::create_dir_all(&upstream).expect("create upstream");
+    assert!(Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .arg(&upstream)
+        .status()
+        .unwrap()
+        .success());
+    fs::write(upstream.join("README.md"), b"hello\n").expect("write README");
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&upstream)
+        .args(["add", "README.md"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&upstream)
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    let unpushed_job = ClaimedBuildJob {
+        build_id: 9002,
+        repo: format!("file://{}", upstream.display()),
+        branch: "main".to_string(),
+        commit_sha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+        command: "cargo test".to_string(),
+        profile: None,
+        binary_name: None,
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+    };
+    let checkout_ws = temp.path().join("checkout-ws");
+    fs::create_dir_all(&checkout_ws).expect("create checkout-ws");
+    let err = materialize_repository_checkout(&checkout_ws, &unpushed_job)
+        .expect_err("unpushed commit_sha must fail instead of falling back to branch tip");
+    assert!(
+        err.contains("deadbeef"),
+        "Expected checkout error mentioning unpushed SHA, got: {err}"
+    );
+}
+
+#[test]
 fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
     use host_agent::build_package::{
         parse_worker_args, process_next_queued_build, sanitize_project_slug,

@@ -381,6 +381,19 @@ static ISOLATE_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 // Simulated provider state for local/simulation test environments
 static SIMULATED_INSTANCES: Mutex<Vec<SimpleGceInstance>> = Mutex::new(Vec::new());
 static SIMULATED_RUNNERS: Mutex<Vec<SimpleGitHubRunner>> = Mutex::new(Vec::new());
+static RECONCILER_SESSION_SECRET: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_reconciler_session_secret(secret: Option<String>) {
+    *RECONCILER_SESSION_SECRET.lock().unwrap() = secret.filter(|s| !s.trim().is_empty());
+}
+
+fn current_reconciler_session_secret() -> String {
+    RECONCILER_SESSION_SECRET
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| "default-reconciler-builder-queue-secret".to_string())
+}
 
 pub fn get_reconciler_ticks() -> u64 {
     TICK_COUNTER.load(Ordering::SeqCst)
@@ -1440,6 +1453,10 @@ where
             .map(|t| t.content.as_str())
             .unwrap_or(crate::gcp::RAW_BUILDER_STARTUP_SCRIPT);
 
+        let queue_secret = current_reconciler_session_secret();
+        let minted_queue_token =
+            crate::auth::mint_builder_queue_token(queue_secret.as_bytes(), &builder_host, now).ok();
+
         let builder_cfg = crate::gcp::BuilderVmConfig {
             instance_name: &builder_host,
             machine_type: "n4-highcpu-16",
@@ -1448,8 +1465,9 @@ where
             cache_disk_name: &cache_disk_name,
             cache_disk_device_name: &cache_disk_name,
             startup_script_template: builder_script,
-            boot_disk_type: Some("pd-balanced"),
-            cache_disk_type: Some("pd-balanced"),
+            queue_bearer_token: minted_queue_token.as_deref(),
+            boot_disk_type: Some("hyperdisk-balanced"),
+            cache_disk_type: Some("hyperdisk-balanced"),
         };
 
         if let Ok(req) = crate::gcp::build_spot_builder_vm_request(&project, &builder_cfg) {

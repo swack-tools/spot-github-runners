@@ -1098,6 +1098,7 @@ pub struct BuilderVmConfig<'a> {
     pub cache_disk_name: &'a str,
     pub cache_disk_device_name: &'a str,
     pub startup_script_template: &'a str,
+    pub queue_bearer_token: Option<&'a str>,
     pub boot_disk_type: Option<&'a str>,
     pub cache_disk_type: Option<&'a str>,
 }
@@ -1131,8 +1132,10 @@ pub fn build_spot_builder_vm_request(
     let is_arm64 = cfg.machine_type.starts_with("c4a-")
         || cfg.machine_type.starts_with("n4a-")
         || cfg.machine_type.starts_with("t2a-");
-    let is_hyperdisk_native =
-        cfg.machine_type.starts_with("c4a-") || cfg.machine_type.starts_with("n4a-");
+    let is_hyperdisk_native = cfg.machine_type.starts_with("n4-")
+        || cfg.machine_type.starts_with("c4-")
+        || cfg.machine_type.starts_with("c4a-")
+        || cfg.machine_type.starts_with("n4a-");
 
     let source_image = if is_arm64 {
         DEBIAN_13_ARM64_IMAGE_FAMILY.to_string()
@@ -1147,6 +1150,14 @@ pub fn build_spot_builder_vm_request(
     };
     let boot_disk_type = cfg.boot_disk_type.unwrap_or(default_disk_type);
     let cache_disk_type = cfg.cache_disk_type.unwrap_or(default_disk_type);
+    if is_hyperdisk_native
+        && (boot_disk_type != "hyperdisk-balanced" || cache_disk_type != "hyperdisk-balanced")
+    {
+        return Err(GcpError::Validation(format!(
+            "Machine type '{}' requires hyperdisk-balanced for boot and cache disks (got boot='{}', cache='{}')",
+            cfg.machine_type, boot_disk_type, cache_disk_type
+        )));
+    }
     let full_boot_disk_type = format!("zones/{}/diskTypes/{}", cfg.zone, boot_disk_type);
     let full_cache_disk_type = format!("zones/{}/diskTypes/{}", cfg.zone, cache_disk_type);
     let full_machine_type = format!("zones/{}/machineTypes/{}", cfg.zone, cfg.machine_type);
@@ -1187,15 +1198,23 @@ pub fn build_spot_builder_vm_request(
         }),
     };
 
+    let queue_bearer_token = cfg
+        .queue_bearer_token
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let rendered_startup = cfg
         .startup_script_template
         .replace("{{INSTANCE_NAME}}", cfg.instance_name)
         .replace("{{PROJECT}}", project)
         .replace("{{ZONE}}", cfg.zone)
         .replace("{{DISK_DEVICE_NAME}}", cfg.cache_disk_device_name)
-        .replace("{{DEPLOYMENT_ID}}", cfg.deployment_id);
+        .replace("{{DEPLOYMENT_ID}}", cfg.deployment_id)
+        .replace(
+            "{{QUEUE_BEARER_TOKEN}}",
+            queue_bearer_token.unwrap_or_default(),
+        );
 
-    let metadata_items = vec![
+    let mut metadata_items = vec![
         GceMetadataItem {
             key: "startup-script".into(),
             value: rendered_startup,
@@ -1213,6 +1232,12 @@ pub fn build_spot_builder_vm_request(
             value: cfg.cache_disk_device_name.into(),
         },
     ];
+    if let Some(tok) = queue_bearer_token {
+        metadata_items.push(GceMetadataItem {
+            key: "spot-queue-token".into(),
+            value: tok.into(),
+        });
+    }
 
     let mut labels = BTreeMap::new();
     labels.insert("spot-role".into(), "rust_builder".into());

@@ -348,13 +348,46 @@ fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_ta
         cache_disk_name: "builder-scale-1792000000-abcd1234-cache",
         cache_disk_device_name: "builder-scale-1792000000-abcd1234-cache",
         startup_script_template: "#!/bin/bash\nset -euo pipefail\n",
-        boot_disk_type: Some("pd-balanced"),
-        cache_disk_type: Some("pd-balanced"),
+        queue_bearer_token: Some("tok-123"),
+        boot_disk_type: Some("hyperdisk-balanced"),
+        cache_disk_type: Some("hyperdisk-balanced"),
     };
     assert!(
         build_spot_builder_vm_request("example-ci-fleet", &bad_cfg).is_err(),
         "Nonfunctional builder startup stub must be rejected"
     );
+
+    // N4 with pd-balanced must be rejected
+    let bad_pd_cfg = BuilderVmConfig {
+        instance_name: "builder-scale-1792000000-abcd1234",
+        machine_type: "n4-highcpu-16",
+        zone: "us-central1-a",
+        deployment_id: "dep-builder-1792000000",
+        cache_disk_name: "builder-scale-1792000000-abcd1234-cache",
+        cache_disk_device_name: "builder-scale-1792000000-abcd1234-cache",
+        startup_script_template: RAW_BUILDER_STARTUP_SCRIPT,
+        queue_bearer_token: Some("tok-123"),
+        boot_disk_type: Some("pd-balanced"),
+        cache_disk_type: Some("pd-balanced"),
+    };
+    assert!(
+        build_spot_builder_vm_request("example-ci-fleet", &bad_pd_cfg).is_err(),
+        "N4 builder VM with pd-balanced must be rejected"
+    );
+
+    let minted_tok = spot_dashboard_edge::auth::mint_builder_queue_token(
+        b"test-session-secret-0123456789abcdef",
+        "builder-scale-1792000000-abcd1234",
+        1_792_000_000,
+    )
+    .expect("mint builder queue token");
+    let verified = spot_dashboard_edge::auth::verify_builder_queue_token(
+        &minted_tok,
+        b"test-session-secret-0123456789abcdef",
+        1_792_000_010,
+    )
+    .expect("verify builder queue token");
+    assert_eq!(verified.inst, "builder-scale-1792000000-abcd1234");
 
     let cfg = BuilderVmConfig {
         instance_name: "builder-scale-1792000000-abcd1234",
@@ -364,8 +397,9 @@ fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_ta
         cache_disk_name: "builder-scale-1792000000-abcd1234-cache",
         cache_disk_device_name: "builder-scale-1792000000-abcd1234-cache",
         startup_script_template: RAW_BUILDER_STARTUP_SCRIPT,
-        boot_disk_type: Some("pd-balanced"),
-        cache_disk_type: Some("pd-balanced"),
+        queue_bearer_token: Some(&minted_tok),
+        boot_disk_type: None,
+        cache_disk_type: None,
     };
 
     let req = build_spot_builder_vm_request("example-ci-fleet", &cfg)
@@ -377,10 +411,18 @@ fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_ta
     );
     assert!(req.disks[0].boot);
     assert!(req.disks[0].auto_delete);
+    assert_eq!(
+        req.disks[0].initialize_params.as_ref().unwrap().disk_type,
+        "zones/us-central1-a/diskTypes/hyperdisk-balanced"
+    );
     assert!(!req.disks[1].boot);
     assert!(
         !req.disks[1].auto_delete,
         "Dedicated builder cache disk must persist (auto_delete = false)"
+    );
+    assert_eq!(
+        req.disks[1].initialize_params.as_ref().unwrap().disk_type,
+        "zones/us-central1-a/diskTypes/hyperdisk-balanced"
     );
     assert_eq!(
         req.disks[1].device_name.as_deref(),
@@ -402,6 +444,13 @@ fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_ta
         .find(|m| m.key == "spot-role")
         .map(|m| m.value.as_str());
     assert_eq!(role_meta, Some("rust_builder"));
+    let tok_meta = req
+        .metadata
+        .items
+        .iter()
+        .find(|m| m.key == "spot-queue-token")
+        .map(|m| m.value.as_str());
+    assert_eq!(tok_meta, Some(minted_tok.as_str()));
     assert!(
         req.metadata.items.iter().all(|m| m.key != "spot-target"),
         "Builder VM must not set spot-target metadata used by runner floor accounting"
@@ -420,6 +469,8 @@ fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_ta
     assert!(startup.contains("/dev/disk/by-id/google-builder-scale-1792000000-abcd1234-cache"));
     assert!(startup.contains("dep-builder-1792000000"));
     assert!(startup.contains("example-rust-project-queue-worker.service"));
+    assert!(startup.contains(&format!("queue_token='{minted_tok}'")));
+    assert!(startup.contains("SPOT_BEARER_TOKEN=$queue_token"));
 }
 
 #[tokio::test]
