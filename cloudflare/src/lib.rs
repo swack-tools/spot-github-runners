@@ -1017,7 +1017,14 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Ok(parsed) => parsed,
                 Err(err) => return error_response(400, "bad_request", &err.to_string()),
             };
-            if verified_session.is_none() && !has_static_builder_secret {
+            let Some(build_id) = complete_req.build_id else {
+                return error_response(
+                    400,
+                    "validation_error",
+                    "build_id is required when posting to /api/rust-builds/complete",
+                );
+            };
+            if verified_session.is_none() {
                 if let Some(ref btok) = verified_builder_token {
                     if let Some(ref inst) = complete_req.instance_name {
                         if !inst.trim().is_empty() && inst.trim() != btok.inst {
@@ -1029,15 +1036,20 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                         }
                     }
                     complete_req.instance_name = Some(btok.inst.clone());
+                } else if complete_req
+                    .instance_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_none()
+                {
+                    return error_response(
+                        400,
+                        "validation_error",
+                        "instance_name is required for machine completion",
+                    );
                 }
             }
-            let Some(build_id) = complete_req.build_id else {
-                return error_response(
-                    400,
-                    "validation_error",
-                    "build_id is required when posting to /api/rust-builds/complete",
-                );
-            };
             match state::handle_post_rust_builds_complete(&kv, build_id, complete_req, now).await {
                 Ok((status_code, body)) => json_response(status_code, &body),
                 Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
@@ -1083,7 +1095,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Ok(parsed) => parsed,
                 Err(err) => return error_response(400, "bad_request", &err.to_string()),
             };
-            if verified_session.is_none() && !has_static_builder_secret {
+            if verified_session.is_none() {
                 if let Some(ref btok) = verified_builder_token {
                     if let Some(ref inst) = complete_req.instance_name {
                         if !inst.trim().is_empty() && inst.trim() != btok.inst {
@@ -1095,6 +1107,18 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                         }
                     }
                     complete_req.instance_name = Some(btok.inst.clone());
+                } else if complete_req
+                    .instance_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_none()
+                {
+                    return error_response(
+                        400,
+                        "validation_error",
+                        "instance_name is required for machine completion",
+                    );
                 }
             }
             match state::handle_post_rust_builds_complete(&kv, build_id, complete_req, now).await {

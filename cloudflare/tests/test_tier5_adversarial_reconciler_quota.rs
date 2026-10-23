@@ -407,6 +407,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         network_interfaces: vec![],
         metadata: GceMetadata::default(),
         labels: std::collections::BTreeMap::new(),
+        service_accounts: vec![],
     };
 
     // Case 1: sourceInstanceTemplate is None -> clean URL without query parameter

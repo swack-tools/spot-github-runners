@@ -1433,9 +1433,12 @@ where
     let builder_policy = &bundle.state.scaling.rust_builder;
     let builder_threshold = builder_policy.queued_builds_threshold.max(1);
     let current_live_builders = live_builder_names.len();
+    let needs_bootstrap_builder =
+        queued_rust_builds > 0 && current_live_builders < (builder_policy.min_instances as usize);
+    let needs_threshold_scale_up = queued_rust_builds >= builder_threshold;
 
     if builder_policy.enable_queue_trigger
-        && queued_rust_builds >= builder_threshold
+        && (needs_bootstrap_builder || needs_threshold_scale_up)
         && current_live_builders < (builder_policy.max_instances as usize)
     {
         let hex_suffix = generate_unique_suffix(now);

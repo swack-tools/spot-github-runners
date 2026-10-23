@@ -242,6 +242,38 @@ async fn test_reconciler_scales_up_rust_builder_when_queue_reaches_threshold() {
         bundle.state.scaling_evaluations["rust_builder"]["decision"],
         "SCALE_UP"
     );
+
+    // Also verify that when 0 live builders exist and even a single build (1 < threshold 2)
+    // is queued, the reconciler provisions a bootstrap builder to satisfy min_instances (1)
+    reset_reconciler_state();
+    invalidate_state_cache();
+    let kv_single = MockKvStore::new();
+    let req_single = EnqueueRustBuildRequest {
+        repo: "example-org/example-rust-project".to_string(),
+        branch: "main".to_string(),
+        commit_sha: "abcdef0123456789abcdef0123456789abcdef99".to_string(),
+        command: "cargo test --workspace".to_string(),
+        requested_output: Some("log".to_string()),
+        template_id: None,
+        profile: None,
+        binary_name: None,
+        gcs_bucket: None,
+        origin_ip: None,
+    };
+    handle_post_rust_builds_enqueue(&kv_single, req_single, now + 20)
+        .await
+        .expect("enqueue single");
+    let report_single = run_reconciliation(&kv_single, &sim, &sim, now + 30)
+        .await
+        .expect("reconcile single");
+    assert!(
+        report_single
+            .launched_hosts
+            .iter()
+            .any(|h| h.starts_with("builder-scale-")),
+        "Expected reconciler to provision a builder when 1 build is queued and 0 builders are running, got: {:?}",
+        report_single.launched_hosts
+    );
 }
 
 #[tokio::test]
@@ -409,6 +441,16 @@ fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_ta
         2,
         "Builder VM must attach boot + cache disks"
     );
+    assert_eq!(
+        req.service_accounts.len(),
+        1,
+        "Builder VM must attach default GCE service account for same-region GCS uploads"
+    );
+    assert_eq!(req.service_accounts[0].email, "default");
+    assert_eq!(
+        req.service_accounts[0].scopes,
+        vec!["https://www.googleapis.com/auth/devstorage.read_write".to_string()]
+    );
     assert!(req.disks[0].boot);
     assert!(req.disks[0].auto_delete);
     assert_eq!(
@@ -526,8 +568,8 @@ async fn test_queue_overflow_rejects_when_all_items_unfinished_and_evicts_comple
         .expect("build #4553 must not be evicted while unfinished");
     assert_eq!(status_first["build_status"], "queued");
 
-    // Once build #4553 completes, a new enqueue can evict the finished entry
-    let comp = CompleteRustBuildRequest {
+    // Attempting machine completion on unclaimed queued build #4553 must be rejected with Conflict
+    let unclaimed_comp = CompleteRustBuildRequest {
         build_id: Some(4553),
         status: "completed".to_string(),
         exit_code: Some(0),
@@ -541,16 +583,52 @@ async fn test_queue_overflow_rejects_when_all_items_unfinished_and_evicts_comple
         total_crates: None,
         peak_ram_gib: None,
         cpu_time_seconds: None,
-        log_url: None,
-        binary_url: None,
-        target_zip_url: None,
-        log_size_bytes: None,
-        binary_size_bytes: None,
-        target_zip_size_bytes: None,
-        log_sha256: None,
-        binary_sha256: None,
-        target_zip_sha256: None,
+        log_url: Some(
+            "gs://example-rust-project-build-artifacts-us-central1/builds/4553/build.log"
+                .to_string(),
+        ),
+        binary_url: Some(
+            "gs://example-rust-project-build-artifacts-us-central1/builds/4553/binaries.tar.zst"
+                .to_string(),
+        ),
+        target_zip_url: Some(
+            "gs://example-rust-project-build-artifacts-us-central1/builds/4553/target.tar.zst"
+                .to_string(),
+        ),
+        log_size_bytes: Some(1024),
+        binary_size_bytes: Some(2048),
+        target_zip_size_bytes: Some(4096),
+        log_sha256: Some(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+        ),
+        binary_sha256: Some(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+        ),
+        target_zip_sha256: Some(
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210".to_string(),
+        ),
     };
+    let unclaimed_err =
+        handle_post_rust_builds_complete(&kv, 4553, unclaimed_comp.clone(), now + 502)
+            .await
+            .expect_err("unclaimed build must reject machine completion");
+    assert!(
+        matches!(unclaimed_err, StateError::Conflict(_)),
+        "Expected StateError::Conflict for unclaimed machine completion, got: {unclaimed_err:?}"
+    );
+
+    // Once build #4553 is claimed by builder-us-central1-a-01 and completed, a new enqueue can evict the finished entry
+    handle_post_rust_builds_claim(
+        &kv,
+        ClaimRustBuildRequest {
+            instance_name: "builder-us-central1-a-01".to_string(),
+            zone: Some("us-central1-a".to_string()),
+        },
+        now + 502,
+    )
+    .await
+    .expect("claim #4553 before completing");
+    let comp = unclaimed_comp;
     handle_post_rust_builds_complete(&kv, 4553, comp, now + 502)
         .await
         .expect("complete 4553");

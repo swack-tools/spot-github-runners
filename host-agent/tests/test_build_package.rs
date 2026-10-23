@@ -310,7 +310,7 @@ fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
             "repo": format!("file://{}/example-rust-project", upstream_repo.parent().unwrap().display()),
             "branch": "main",
             "commit_sha": commit_sha,
-            "command": "cargo test --workspace --locked",
+            "command": "cargo test --workspace --locked --release",
             "profile": "release",
             "binary_name": "example-rust-project",
             "gcs_bucket": "example-rust-project-build-artifacts"
@@ -382,5 +382,119 @@ fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
     assert_eq!(
         complete_json["target_zip_url"],
         "gs://example-rust-project-build-artifacts/builds/4553/target.tar.zst"
+    );
+
+    // Also verify that if the dedicated builder launcher does not exist on disk,
+    // process_next_queued_build fails closed (exit_code 127) and never falls back to host `sh -c`
+    let claim_missing_launcher = serde_json::json!({
+        "status": "claimed",
+        "claimed": true,
+        "build": {
+            "build_id": 4554,
+            "repo": format!("file://{}/example-rust-project", upstream_repo.parent().unwrap().display()),
+            "branch": "main",
+            "commit_sha": commit_sha,
+            "command": "cargo test --workspace",
+            "profile": "debug",
+            "binary_name": null,
+            "gcs_bucket": "example-rust-project-build-artifacts"
+        }
+    });
+    fs::write(
+        control_dir.join("claim_response.json"),
+        serde_json::to_string_pretty(&claim_missing_launcher).unwrap(),
+    )
+    .expect("write claim_response.json for 4554");
+
+    let mut cfg_missing_launcher = cfg.clone();
+    cfg_missing_launcher.launcher = temp.path().join("nonexistent-host-launcher");
+    let missing_err = process_next_queued_build(&cfg_missing_launcher)
+        .expect_err("missing dedicated launcher must fail closed");
+    assert!(
+        missing_err.contains("missing or unavailable"),
+        "Expected fail-closed launcher error, got: {missing_err}"
+    );
+    let complete_4554: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(control_dir.join("complete_4554.json")).unwrap())
+            .unwrap();
+    assert_eq!(complete_4554["status"], "failed");
+    assert_eq!(complete_4554["exit_code"], 127);
+}
+
+#[test]
+fn test_debug_build_after_cached_release_build_packages_debug_binary_not_stale_release() {
+    use host_agent::build_package::resolve_cargo_target_profile;
+
+    assert_eq!(
+        resolve_cargo_target_profile(Some("test"), Some("cargo build")),
+        "debug"
+    );
+    assert_eq!(
+        resolve_cargo_target_profile(None, Some("cargo build --release")),
+        "release"
+    );
+    assert_eq!(
+        resolve_cargo_target_profile(Some("test"), Some("cargo test --workspace")),
+        "debug"
+    );
+
+    let temp = TempDir::new().expect("tempdir");
+    let ws = temp.path().join("workspace");
+    let rel_dir = ws.join("target").join("release");
+    let dbg_dir = ws.join("target").join("debug");
+    fs::create_dir_all(&rel_dir).expect("create target/release");
+    fs::create_dir_all(&dbg_dir).expect("create target/debug");
+
+    // 1. Seed a stale binary in `target/release/app` from an earlier release build (commit A)
+    let rel_bin = rel_dir.join("app");
+    fs::write(&rel_bin, b"#!/bin/sh\necho STALE_COMMIT_A_RELEASE\n").expect("write release bin");
+    let mut perms = fs::metadata(&rel_bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&rel_bin, perms).expect("chmod +x release");
+
+    // 2. Write a freshly compiled debug binary in `target/debug/app` from commit B (`cargo build`)
+    let dbg_bin = dbg_dir.join("app");
+    fs::write(
+        &dbg_bin,
+        b"#!/bin/sh\necho FRESH_COMMIT_B_DEBUG_BINARY_PAYLOAD\n",
+    )
+    .expect("write debug bin");
+    let mut perms_dbg = fs::metadata(&dbg_bin).unwrap().permissions();
+    perms_dbg.set_mode(0o755);
+    fs::set_permissions(&dbg_bin, perms_dbg).expect("chmod +x debug");
+
+    // Package with profile resolved from `"test"` + `"cargo build"` -> `"debug"`
+    let out_dir = temp.path().join("staged");
+    let effective_profile = resolve_cargo_target_profile(Some("test"), Some("cargo build"));
+    let cfg = BuildPackageConfig {
+        build_id: 4554,
+        workspace: ws.clone(),
+        target_dir: None,
+        log_file: None,
+        out_dir: out_dir.clone(),
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+        profile: Some(effective_profile),
+        binary_name: Some("app".to_string()),
+        upload: false,
+    };
+    let manifest_dbg = package_build_artifacts(&cfg).expect("package debug build");
+    assert_eq!(manifest_dbg.binaries_included, vec!["app"]);
+
+    // Verify that packaging with `profile: Some("release")` produces a DIFFERENT binary archive SHA-256
+    let cfg_rel = BuildPackageConfig {
+        build_id: 4555,
+        workspace: ws,
+        target_dir: None,
+        log_file: None,
+        out_dir,
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+        profile: Some("release".to_string()),
+        binary_name: Some("app".to_string()),
+        upload: false,
+    };
+    let manifest_rel = package_build_artifacts(&cfg_rel).expect("package release build");
+    assert_ne!(
+        manifest_dbg.binary_sha256, manifest_rel.binary_sha256,
+        "Debug build must package target/debug/app rather than the stale target/release/app"
     );
 }

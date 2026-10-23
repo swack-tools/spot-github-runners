@@ -306,6 +306,14 @@ impl GceDisk {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GceServiceAccount {
+    pub email: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GceInsertInstanceRequest {
@@ -318,6 +326,12 @@ pub struct GceInsertInstanceRequest {
     pub network_interfaces: Vec<GceNetworkInterface>,
     pub metadata: GceMetadata,
     pub labels: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        alias = "service_accounts"
+    )]
+    pub service_accounts: Vec<GceServiceAccount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1084,10 +1098,13 @@ pub fn build_spot_runner_vm_request(
             items: metadata_items,
         },
         labels,
+        service_accounts: Vec::new(),
     })
 }
 
 pub const DEFAULT_BUILDER_CACHE_DISK_SIZE_GB: u64 = 375;
+pub const DEFAULT_BUILDER_STORAGE_SCOPE: &str =
+    "https://www.googleapis.com/auth/devstorage.read_write";
 pub const RAW_BUILDER_STARTUP_SCRIPT: &str = include_str!("../../cloud-init/builder-startup.sh");
 
 pub struct BuilderVmConfig<'a> {
@@ -1268,5 +1285,9 @@ pub fn build_spot_builder_vm_request(
             items: metadata_items,
         },
         labels,
+        service_accounts: vec![GceServiceAccount {
+            email: "default".to_string(),
+            scopes: vec![DEFAULT_BUILDER_STORAGE_SCOPE.to_string()],
+        }],
     })
 }

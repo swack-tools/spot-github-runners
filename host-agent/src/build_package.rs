@@ -383,6 +383,59 @@ fn upload_artifacts_to_gcs(
     Ok(())
 }
 
+/// Resolve the effective Cargo output directory under `target/` for a build job.
+///
+/// Cargo writes `"dev"` and `"test"` profiles into `target/debug`, `"release"` and `"bench"`
+/// into `target/release`, and custom `--profile <name>` into `target/<name>`.
+/// When `explicit_profile` is unset or set to the control-plane default `"test"`, the command
+/// tokens determine whether `--release` or `--profile <name>` was requested.
+pub fn resolve_cargo_target_profile(
+    explicit_profile: Option<&str>,
+    command: Option<&str>,
+) -> String {
+    if let Some(cmd) = command {
+        let tokens: Vec<&str> = cmd.split_whitespace().collect();
+        let mut idx = 0;
+        while idx < tokens.len() {
+            let tok = tokens[idx];
+            if tok == "--release" || tok == "-r" {
+                return "release".to_string();
+            }
+            if let Some(prof) = tok.strip_prefix("--profile=") {
+                return match prof.trim() {
+                    "dev" | "test" | "" => "debug".to_string(),
+                    "bench" | "release" => "release".to_string(),
+                    custom => custom.to_string(),
+                };
+            }
+            if tok == "--profile" {
+                if let Some(prof) = tokens.get(idx + 1) {
+                    return match prof.trim() {
+                        "dev" | "test" | "" => "debug".to_string(),
+                        "bench" | "release" => "release".to_string(),
+                        custom => custom.to_string(),
+                    };
+                }
+            }
+            idx += 1;
+        }
+        // If a command was supplied without `--release` or `--profile`, and `explicit_profile`
+        // is None or the default `"test"`/`"dev"`, Cargo outputs into `target/debug`.
+        match explicit_profile.map(str::trim).filter(|s| !s.is_empty()) {
+            None | Some("test") | Some("dev") | Some("debug") => return "debug".to_string(),
+            Some("bench") | Some("release") => return "release".to_string(),
+            Some(custom) => return custom.to_string(),
+        }
+    }
+
+    match explicit_profile.map(str::trim).filter(|s| !s.is_empty()) {
+        Some("dev") | Some("test") | Some("debug") => "debug".to_string(),
+        Some("bench") | Some("release") => "release".to_string(),
+        Some(custom) => custom.to_string(),
+        None => "debug".to_string(),
+    }
+}
+
 pub fn package_build_artifacts(cfg: &BuildPackageConfig) -> Result<BuildPackageManifest, String> {
     if !cfg.workspace.exists() {
         return Err(format!(
@@ -464,18 +517,24 @@ pub fn package_build_artifacts(cfg: &BuildPackageConfig) -> Result<BuildPackageM
     } else {
         (ws_target, true)
     };
-    let mut profile_dirs = Vec::new();
-    if let Some(ref prof) = cfg.profile {
-        profile_dirs.push(prof.as_str());
-    }
-    for default_prof in ["release", "debug"] {
-        if !profile_dirs.contains(&default_prof) {
-            profile_dirs.push(default_prof);
-        }
-    }
+    let profile_dirs: Vec<String> = match cfg
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(explicit) => vec![resolve_cargo_target_profile(Some(explicit), None)],
+        None => vec!["debug".to_string(), "release".to_string()],
+    };
 
-    let mut binaries_included = Vec::new();
-    for prof in profile_dirs {
+    // Collect candidate executables across the eligible profile directory(ies);
+    // if `cfg.profile` was None and both `debug` and `release` contain the same binary name,
+    // select the binary with the newer modification timestamp.
+    let mut best_candidates: std::collections::BTreeMap<
+        String,
+        (PathBuf, Option<std::time::SystemTime>),
+    > = std::collections::BTreeMap::new();
+    for prof in &profile_dirs {
         let prof_path = target_dir.join(prof);
         if !prof_path.is_dir() {
             continue;
@@ -485,17 +544,30 @@ pub fn package_build_artifacts(cfg: &BuildPackageConfig) -> Result<BuildPackageM
                 let path = entry.path();
                 if is_candidate_executable(&path, cfg.binary_name.as_deref()) {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if !binaries_included.iter().any(|b| b == name) {
-                            let dest_bin = bin_stage_dir.join(name);
-                            fs::copy(&path, &dest_bin).map_err(|e| {
-                                format!("Failed copying binary '{}': {e}", path.display())
-                            })?;
-                            binaries_included.push(name.to_string());
+                        let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+                        let replace = match best_candidates.get(name) {
+                            None => true,
+                            Some((_, prev_mtime)) => match (mtime, *prev_mtime) {
+                                (Some(cur), Some(prev)) => cur > prev,
+                                (Some(_), None) => true,
+                                _ => false,
+                            },
+                        };
+                        if replace {
+                            best_candidates.insert(name.to_string(), (path, mtime));
                         }
                     }
                 }
             }
         }
+    }
+
+    let mut binaries_included = Vec::new();
+    for (name, (path, _)) in best_candidates {
+        let dest_bin = bin_stage_dir.join(&name);
+        fs::copy(&path, &dest_bin)
+            .map_err(|e| format!("Failed copying binary '{}': {e}", path.display()))?;
+        binaries_included.push(name);
     }
     binaries_included.sort();
 
@@ -1118,12 +1190,52 @@ pub fn process_next_queued_build(
         .join("targets")
         .join(&project_slug);
 
-    // 1. Prepare builder workspace (via host-launcher if present, else create directory directly)
-    if cfg.launcher.exists() {
-        let _ = Command::new(&cfg.launcher)
-            .arg(&project_slug)
-            .arg("prepare")
-            .status();
+    // 1. Verify and invoke dedicated builder launcher to prepare workspace (fail closed if missing)
+    if !cfg.launcher.is_file() {
+        let missing_err = format!(
+            "Dedicated builder launcher '{}' is missing or unavailable; refusing to execute build command on host",
+            cfg.launcher.display()
+        );
+        let fail_payload = serde_json::json!({
+            "build_id": job.build_id,
+            "status": "failed",
+            "exit_code": 127,
+            "compile_duration_seconds": 0.0,
+            "delivery_duration_seconds": 0.0,
+            "instance_name": cfg.instance_name,
+            "zone": cfg.zone,
+        });
+        let complete_endpoint = format!("/api/rust-builds/{}/complete", job.build_id);
+        let _ = post_control_plane_json(&cfg.dashboard_url, &complete_endpoint, &fail_payload);
+        return Err(missing_err);
+    }
+    let prep_status = Command::new(&cfg.launcher)
+        .arg(&project_slug)
+        .arg("prepare")
+        .status()
+        .map_err(|e| {
+            format!(
+                "Failed invoking launcher '{}' prepare: {e}",
+                cfg.launcher.display()
+            )
+        })?;
+    if !prep_status.success() {
+        let prep_err = format!(
+            "Dedicated builder launcher '{}' prepare failed with status {prep_status}",
+            cfg.launcher.display()
+        );
+        let fail_payload = serde_json::json!({
+            "build_id": job.build_id,
+            "status": "failed",
+            "exit_code": prep_status.code().unwrap_or(1),
+            "compile_duration_seconds": 0.0,
+            "delivery_duration_seconds": 0.0,
+            "instance_name": cfg.instance_name,
+            "zone": cfg.zone,
+        });
+        let complete_endpoint = format!("/api/rust-builds/{}/complete", job.build_id);
+        let _ = post_control_plane_json(&cfg.dashboard_url, &complete_endpoint, &fail_payload);
+        return Err(prep_err);
     }
     fs::create_dir_all(&workspace).map_err(|e| {
         format!(
@@ -1164,32 +1276,23 @@ pub fn process_next_queued_build(
         return Err(git_err);
     }
 
-    // 3. Execute the queued build/test command via launcher (or sh -c fallback when testing without launcher)
+    // 3. Execute the queued build/test command strictly via the dedicated builder launcher
     let start_instant = std::time::Instant::now();
-    let cmd_output = if cfg.launcher.exists() {
-        let cmd_tokens: Vec<&str> = job.command.split_whitespace().collect();
-        if cmd_tokens.is_empty() {
-            return Err("Claimed build command is empty".to_string());
-        }
-        Command::new(&cfg.launcher)
-            .arg(&project_slug)
-            .args(&cmd_tokens)
-            .current_dir(&workspace)
-            .output()
-            .map_err(|e| {
-                format!(
-                    "Failed executing launcher '{}': {e}",
-                    cfg.launcher.display()
-                )
-            })?
-    } else {
-        Command::new("sh")
-            .arg("-c")
-            .arg(&job.command)
-            .current_dir(&workspace)
-            .output()
-            .map_err(|e| format!("Failed executing build command: {e}"))?
-    };
+    let cmd_tokens: Vec<&str> = job.command.split_whitespace().collect();
+    if cmd_tokens.is_empty() {
+        return Err("Claimed build command is empty".to_string());
+    }
+    let cmd_output = Command::new(&cfg.launcher)
+        .arg(&project_slug)
+        .args(&cmd_tokens)
+        .current_dir(&workspace)
+        .output()
+        .map_err(|e| {
+            format!(
+                "Failed executing launcher '{}': {e}",
+                cfg.launcher.display()
+            )
+        })?;
     let compile_duration_seconds = start_instant.elapsed().as_secs_f64();
     let exit_code = cmd_output.status.code().unwrap_or(1);
 
@@ -1219,6 +1322,8 @@ pub fn process_next_queued_build(
     } else {
         None
     };
+    let effective_profile =
+        resolve_cargo_target_profile(job.profile.as_deref(), Some(&job.command));
     let pkg_cfg = BuildPackageConfig {
         build_id: job.build_id,
         workspace: workspace.clone(),
@@ -1226,7 +1331,7 @@ pub fn process_next_queued_build(
         log_file: Some(raw_log_path.clone()),
         out_dir: cfg.out_dir.clone(),
         gcs_bucket: job.gcs_bucket.clone(),
-        profile: job.profile.clone(),
+        profile: Some(effective_profile),
         binary_name: job.binary_name.clone(),
         upload: cfg.upload,
     };

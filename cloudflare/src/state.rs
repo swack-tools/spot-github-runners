@@ -3603,12 +3603,19 @@ pub fn evaluate_rust_builder_queue_scaling(
     let threshold = policy.queued_builds_threshold.max(1);
 
     let should_scale_up = policy.enable_queue_trigger
-        && queued_builds >= threshold
+        && ((queued_builds > 0 && active_builders < policy.min_instances)
+            || queued_builds >= threshold)
         && active_builders < policy.max_instances;
 
     let target_builders = if should_scale_up {
-        let extra = ((queued_builds - threshold) / threshold) + 1;
-        (active_builders + extra).min(policy.max_instances)
+        if queued_builds >= threshold {
+            let extra = ((queued_builds - threshold) / threshold) + 1;
+            (active_builders + extra)
+                .max(policy.min_instances)
+                .min(policy.max_instances)
+        } else {
+            policy.min_instances.min(policy.max_instances)
+        }
     } else {
         active_builders
     };
@@ -3903,13 +3910,34 @@ pub async fn handle_post_rust_builds_enqueue<K: KvStoreBackend>(
         .filter(|s| !s.is_empty())
         .unwrap_or("rust-builder-default")
         .to_string();
-    let profile = req
+    let profile = match req
         .profile
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("test")
-        .to_string();
+    {
+        Some("dev") | Some("test") => {
+            if command
+                .split_whitespace()
+                .any(|t| t == "--release" || t == "-r" || t == "--profile=release")
+            {
+                "release".to_string()
+            } else {
+                "debug".to_string()
+            }
+        }
+        Some(explicit) => explicit.to_string(),
+        None => {
+            if command
+                .split_whitespace()
+                .any(|t| t == "--release" || t == "-r" || t == "--profile=release")
+            {
+                "release".to_string()
+            } else {
+                "debug".to_string()
+            }
+        }
+    };
     let binary_name = req
         .binary_name
         .as_deref()
@@ -4238,15 +4266,32 @@ pub async fn handle_post_rust_builds_complete<K: KvStoreBackend>(
                 StateError::NotFound(format!("Build #{} not found in queue", build_id))
             })?;
 
-        if let (Some(ref assigned), Some(ref caller)) =
-            (&queue[idx].assigned_instance, &req.instance_name)
+        if let Some(caller_trimmed) = req
+            .instance_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         {
-            let caller_trimmed = caller.trim();
-            if !caller_trimmed.is_empty() && caller_trimmed != assigned {
+            if queue[idx].status != "running" {
                 return Err(StateError::Conflict(format!(
-                    "Build #{} is assigned to '{}', not '{}'",
-                    build_id, assigned, caller_trimmed
+                    "Build #{} is in state '{}', not 'running'; claim the build before completing it",
+                    build_id, queue[idx].status
                 )));
+            }
+            match queue[idx].assigned_instance.as_deref() {
+                Some(assigned) if assigned == caller_trimmed => {}
+                Some(assigned) => {
+                    return Err(StateError::Conflict(format!(
+                        "Build #{} is assigned to '{}', not '{}'",
+                        build_id, assigned, caller_trimmed
+                    )));
+                }
+                None => {
+                    return Err(StateError::Conflict(format!(
+                        "Build #{} is unclaimed; claim it as '{}' before completing",
+                        build_id, caller_trimmed
+                    )));
+                }
             }
         }
 
