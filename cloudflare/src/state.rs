@@ -508,7 +508,17 @@ pub struct OverviewQuery {
     pub sort_dir: Option<String>,
     pub search: Option<String>,
     pub role: Option<String>,
+    pub arch: Option<String>,
     pub is_authenticated: Option<bool>,
+}
+
+pub fn infer_arch(machine_type: &str) -> &'static str {
+    let mt = normalize_gce_short_name(machine_type.trim());
+    if mt.starts_with("c4a-") || mt.starts_with("n4a-") || mt.starts_with("t2a-") {
+        "arm64"
+    } else {
+        "x86_64"
+    }
 }
 
 pub fn parse_launch_epoch_from_name(name: &str) -> Option<u64> {
@@ -1063,6 +1073,648 @@ pub fn reconcile_overview_instances_ledger(
     changed
 }
 
+fn make_arm64_candidate_offer(
+    role: &str,
+    family: &str,
+    machine_type: &str,
+    cpu_platform: &str,
+    vcpu: u32,
+    ram_gib: u32,
+    benchmark_score: u32,
+    region: &str,
+    zone: &str,
+    display_location: &str,
+    continent: &str,
+    latency_ms: u32,
+    compute_hourly_usd: f64,
+    disk_hourly_usd: f64,
+    disk_category: &str,
+    disk_type: &str,
+) -> serde_json::Value {
+    let is_builder = role == "rust_builder";
+    let compute_daily = ((compute_hourly_usd * 24.0) * 100.0).round() / 100.0;
+    let compute_monthly = ((compute_hourly_usd * 720.0) * 100.0).round() / 100.0;
+    let disk_daily = ((disk_hourly_usd * 24.0) * 100.0).round() / 100.0;
+    let disk_monthly = ((disk_hourly_usd * 720.0) * 100.0).round() / 100.0;
+    let total_hourly = ((compute_hourly_usd + disk_hourly_usd) * 10000.0).round() / 10000.0;
+    let total_daily = ((compute_daily + disk_daily) * 100.0).round() / 100.0;
+    let total_monthly = ((compute_monthly + disk_monthly) * 100.0).round() / 100.0;
+
+    let units_per_instance = if is_builder {
+        1
+    } else if vcpu >= 16 {
+        2
+    } else {
+        1
+    };
+    let unit_vcpu = if is_builder { 16 } else { 7 };
+    let unit_ram_gib = if is_builder { 28 } else { 14 };
+    let instances_needed_for_floor = if is_builder {
+        1
+    } else if units_per_instance >= 2 {
+        2
+    } else {
+        4
+    };
+    let total_units_at_floor = units_per_instance * instances_needed_for_floor;
+    let fleet_floor_hourly =
+        ((compute_hourly_usd * instances_needed_for_floor as f64) * 10000.0).round() / 10000.0;
+    let fleet_floor_daily =
+        ((compute_daily * instances_needed_for_floor as f64) * 100.0).round() / 100.0;
+    let fleet_floor_monthly =
+        ((compute_monthly * instances_needed_for_floor as f64) * 100.0).round() / 100.0;
+    let prefix = if is_builder {
+        "builder-oxidex"
+    } else {
+        "oxidex-runners"
+    };
+
+    let pricing_json = serde_json::json!({
+        "compute_hourly_usd": compute_hourly_usd,
+        "compute_daily_usd": compute_daily,
+        "compute_monthly_usd": compute_monthly,
+        "disk_hourly_usd": disk_hourly_usd,
+        "disk_daily_usd": disk_daily,
+        "disk_monthly_usd": disk_monthly,
+        "tax_hourly_usd": 0.0,
+        "tax_daily_usd": 0.0,
+        "tax_monthly_usd": 0.0,
+        "tax_rate_percent": 0.0,
+        "total_hourly_usd": total_hourly,
+        "total_daily_usd": total_daily,
+        "total_monthly_usd": total_monthly,
+        "pricing_source": "gcp_capacity_history"
+    });
+
+    let mut map = serde_json::Map::new();
+    map.insert("arch".into(), serde_json::json!("arm64"));
+    map.insert("isa".into(), serde_json::json!(["neon", "sve", "sve2"]));
+    map.insert("family".into(), serde_json::json!(family));
+    map.insert("machine_type".into(), serde_json::json!(machine_type));
+    map.insert("cpu_platform".into(), serde_json::json!(cpu_platform));
+    map.insert("vcpu".into(), serde_json::json!(vcpu));
+    map.insert("ram_gib".into(), serde_json::json!(ram_gib));
+    map.insert("benchmark_score".into(), serde_json::json!(benchmark_score));
+    map.insert("boot_disk_gb".into(), serde_json::json!(40));
+    map.insert("boot_disk_type".into(), serde_json::json!(disk_type));
+    map.insert(
+        "data_disk_gb".into(),
+        serde_json::json!(if is_builder { 375 } else { 100 }),
+    );
+    map.insert("data_disk_type".into(), serde_json::json!(disk_type));
+    map.insert("disk_category".into(), serde_json::json!(disk_category));
+    map.insert("region".into(), serde_json::json!(region));
+    map.insert("zone".into(), serde_json::json!(zone));
+    map.insert(
+        "display_location".into(),
+        serde_json::json!(display_location),
+    );
+    map.insert("continent".into(), serde_json::json!(continent));
+    map.insert("latency_ms".into(), serde_json::json!(latency_ms));
+    map.insert(
+        "units_per_instance".into(),
+        serde_json::json!(units_per_instance),
+    );
+    map.insert("unit_vcpu".into(), serde_json::json!(unit_vcpu));
+    map.insert("unit_ram_gib".into(), serde_json::json!(unit_ram_gib));
+    map.insert(
+        "instances_needed_for_floor".into(),
+        serde_json::json!(instances_needed_for_floor),
+    );
+    map.insert(
+        "total_units_at_floor".into(),
+        serde_json::json!(total_units_at_floor),
+    );
+    map.insert(
+        "evaluated_hourly_usd".into(),
+        serde_json::json!(compute_hourly_usd),
+    );
+    map.insert(
+        "evaluated_daily_usd".into(),
+        serde_json::json!(compute_daily),
+    );
+    map.insert(
+        "evaluated_monthly_usd".into(),
+        serde_json::json!(compute_monthly),
+    );
+    map.insert(
+        "fleet_floor_hourly_usd".into(),
+        serde_json::json!(fleet_floor_hourly),
+    );
+    map.insert(
+        "fleet_floor_daily_usd".into(),
+        serde_json::json!(fleet_floor_daily),
+    );
+    map.insert(
+        "fleet_floor_monthly_usd".into(),
+        serde_json::json!(fleet_floor_monthly),
+    );
+    map.insert("price_qualifies".into(), serde_json::json!(true));
+    map.insert("pricing".into(), pricing_json);
+    map.insert(
+        "ssh_command_preview".into(),
+        serde_json::json!(format!(
+            "gcloud compute ssh {}-{} --zone={}",
+            prefix, region, zone
+        )),
+    );
+    serde_json::Value::Object(map)
+}
+
+fn enrich_arm64_catalog_and_qualifications(
+    ov_obj: &mut serde_json::Map<String, serde_json::Value>,
+    arch_filter: &str,
+) {
+    let cicd_arm64_offers = vec![
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "c4a",
+            "c4a-highcpu-8",
+            "Google Axion (Neoverse V2)",
+            8,
+            16,
+            1635,
+            "us-west8",
+            "us-west8-a",
+            "Phoenix, Arizona",
+            "North America",
+            28,
+            0.0336,
+            0.014,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "c4a",
+            "c4a-standard-8",
+            "Google Axion (Neoverse V2)",
+            8,
+            32,
+            1600,
+            "us-west8",
+            "us-west8-a",
+            "Phoenix, Arizona",
+            "North America",
+            28,
+            0.0399,
+            0.014,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "c4a",
+            "c4a-highcpu-8",
+            "Google Axion (Neoverse V2)",
+            8,
+            16,
+            1635,
+            "europe-west4",
+            "europe-west4-a",
+            "Eemshaven, Netherlands",
+            "Europe",
+            14,
+            0.0429,
+            0.014,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "c4a",
+            "c4a-standard-8",
+            "Google Axion (Neoverse V2)",
+            8,
+            32,
+            1600,
+            "europe-west4",
+            "europe-west4-a",
+            "Eemshaven, Netherlands",
+            "Europe",
+            14,
+            0.0509,
+            0.014,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "c4a",
+            "c4a-highcpu-16",
+            "Google Axion (Neoverse V2)",
+            16,
+            32,
+            2980,
+            "us-west8",
+            "us-west8-a",
+            "Phoenix, Arizona",
+            "North America",
+            28,
+            0.0673,
+            0.014,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "c4a",
+            "c4a-highcpu-8",
+            "Google Axion (Neoverse V2)",
+            8,
+            16,
+            1635,
+            "us-east5",
+            "us-east5-a",
+            "Columbus, Ohio",
+            "North America",
+            22,
+            0.0691,
+            0.014,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "n4a",
+            "n4a-highcpu-8",
+            "Google Axion (Neoverse N3)",
+            8,
+            16,
+            1472,
+            "us-central1",
+            "us-central1-a",
+            "Council Bluffs, Iowa",
+            "North America",
+            18,
+            0.0998,
+            0.014,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "n4a",
+            "n4a-standard-8",
+            "Google Axion (Neoverse N3)",
+            8,
+            32,
+            1437,
+            "us-central1",
+            "us-central1-a",
+            "Council Bluffs, Iowa",
+            "North America",
+            18,
+            0.1183,
+            0.014,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "t2a",
+            "t2a-standard-8",
+            "Ampere Altra (Neoverse N1)",
+            8,
+            32,
+            1129,
+            "asia-southeast1",
+            "asia-southeast1-a",
+            "Jurong West, Singapore",
+            "Asia Pacific",
+            45,
+            0.1306,
+            0.013,
+            "standard_ssd",
+            "pd-balanced",
+        ),
+    ];
+
+    let builder_arm64_offers = vec![
+        make_arm64_candidate_offer(
+            "rust_builder",
+            "c4a",
+            "c4a-highcpu-16",
+            "Google Axion (Neoverse V2)",
+            16,
+            32,
+            2980,
+            "us-west8",
+            "us-west8-a",
+            "Phoenix, Arizona",
+            "North America",
+            28,
+            0.0673,
+            0.028,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "rust_builder",
+            "c4a",
+            "c4a-standard-16",
+            "Google Axion (Neoverse V2)",
+            16,
+            64,
+            2910,
+            "us-west8",
+            "us-west8-a",
+            "Phoenix, Arizona",
+            "North America",
+            28,
+            0.0798,
+            0.028,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "rust_builder",
+            "c4a",
+            "c4a-highcpu-16",
+            "Google Axion (Neoverse V2)",
+            16,
+            32,
+            2980,
+            "europe-west4",
+            "europe-west4-a",
+            "Eemshaven, Netherlands",
+            "Europe",
+            14,
+            0.0858,
+            0.028,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "rust_builder",
+            "c4a",
+            "c4a-highcpu-16",
+            "Google Axion (Neoverse V2)",
+            16,
+            32,
+            2980,
+            "us-east5",
+            "us-east5-a",
+            "Columbus, Ohio",
+            "North America",
+            22,
+            0.1381,
+            0.028,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "rust_builder",
+            "n4a",
+            "n4a-highcpu-16",
+            "Google Axion (Neoverse N3)",
+            16,
+            32,
+            2720,
+            "us-central1",
+            "us-central1-a",
+            "Council Bluffs, Iowa",
+            "North America",
+            18,
+            0.1996,
+            0.028,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "rust_builder",
+            "t2a",
+            "t2a-standard-16",
+            "Ampere Altra (Neoverse N1)",
+            16,
+            64,
+            2100,
+            "us-central1",
+            "us-central1-a",
+            "Council Bluffs, Iowa",
+            "North America",
+            18,
+            0.3213,
+            0.026,
+            "standard_ssd",
+            "pd-balanced",
+        ),
+    ];
+
+    if let Some(qual) = ov_obj
+        .get_mut("qualifications")
+        .and_then(|v| v.as_object_mut())
+    {
+        for (role_key, extra_offers) in [
+            ("cicd_runner", &cicd_arm64_offers),
+            ("rust_builder", &builder_arm64_offers),
+        ] {
+            if let Some(role_obj) = qual.get_mut(role_key).and_then(|v| v.as_object_mut()) {
+                for list_key in ["spot_price_qualifying", "hardware_qualifying"] {
+                    let mut list = role_obj
+                        .get(list_key)
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    for item in &mut list {
+                        if let Some(obj) = item.as_object_mut() {
+                            let mt = obj
+                                .get("machine_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let item_arch = infer_arch(mt);
+                            obj.insert("arch".to_string(), serde_json::json!(item_arch));
+                        }
+                    }
+
+                    for arm_offer in extra_offers {
+                        let arm_mt = arm_offer
+                            .get("machine_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let arm_reg = arm_offer
+                            .get("region")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let exists = list.iter().any(|x| {
+                            x.get("machine_type").and_then(|v| v.as_str()) == Some(arm_mt)
+                                && x.get("region").and_then(|v| v.as_str()) == Some(arm_reg)
+                        });
+                        if !exists {
+                            list.push(arm_offer.clone());
+                        }
+                    }
+
+                    if arch_filter == "arm64" || arch_filter == "aarch64" {
+                        list.retain(|x| x.get("arch").and_then(|v| v.as_str()) == Some("arm64"));
+                    } else if arch_filter == "x86_64" || arch_filter == "amd64" {
+                        list.retain(|x| x.get("arch").and_then(|v| v.as_str()) != Some("arm64"));
+                    }
+
+                    list.sort_by(|a, b| {
+                        let pa = a
+                            .get("pricing")
+                            .and_then(|p| p.get("compute_hourly_usd"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(999.0);
+                        let pb = b
+                            .get("pricing")
+                            .and_then(|p| p.get("compute_hourly_usd"))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(999.0);
+                        pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    let count = list.len();
+                    role_obj.insert(list_key.to_string(), serde_json::Value::Array(list));
+                    role_obj.insert(format!("{}_count", list_key), serde_json::json!(count));
+                }
+            }
+        }
+    }
+
+    // Enrich vm_templates with ARM64 templates and arch tag
+    if let Some(tpls) = ov_obj
+        .get_mut("vm_templates")
+        .and_then(|v| v.as_array_mut())
+    {
+        for tpl in tpls.iter_mut() {
+            if let Some(obj) = tpl.as_object_mut() {
+                let mt = obj
+                    .get("machine_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                obj.insert("arch".to_string(), serde_json::json!(infer_arch(mt)));
+            }
+        }
+        let default_arm64_tpls = [
+            serde_json::json!({
+                "id": "tpl-runner-c4a-highcpu8",
+                "name": "Runner C4A-HighCPU-8 (Google Axion ARM64 DDR5)",
+                "role": "cicd_runner",
+                "arch": "arm64",
+                "machine_type": "c4a-highcpu-8",
+                "vcpu": 8,
+                "ram_gib": 16,
+                "cpu_platform": "Google Axion (Neoverse V2)",
+                "benchmark_score": 1635,
+                "disk_category": "hyperdrive",
+                "boot_disk_type": "hyperdisk-balanced",
+                "boot_disk_gb": 40,
+                "data_disk_type": "hyperdisk-balanced",
+                "data_disk_gb": 100,
+                "runners_count": 1,
+                "runner_vcpu": 7,
+                "runner_ram_gib": 14,
+                "cloud_init_template_id": "ci-runner-default",
+                "created_at": "2026-10-23T00:00:00Z"
+            }),
+            serde_json::json!({
+                "id": "tpl-runner-c4a-highcpu16",
+                "name": "Runner C4A-HighCPU-16 (Google Axion ARM64 2-Slot)",
+                "role": "cicd_runner",
+                "arch": "arm64",
+                "machine_type": "c4a-highcpu-16",
+                "vcpu": 16,
+                "ram_gib": 32,
+                "cpu_platform": "Google Axion (Neoverse V2)",
+                "benchmark_score": 2980,
+                "disk_category": "hyperdrive",
+                "boot_disk_type": "hyperdisk-balanced",
+                "boot_disk_gb": 40,
+                "data_disk_type": "hyperdisk-balanced",
+                "data_disk_gb": 100,
+                "runners_count": 2,
+                "runner_vcpu": 7,
+                "runner_ram_gib": 14,
+                "cloud_init_template_id": "ci-runner-default",
+                "created_at": "2026-10-23T00:00:00Z"
+            }),
+            serde_json::json!({
+                "id": "tpl-builder-c4a-highcpu16",
+                "name": "Dedicated Rust 1.99 Builder C4A-HighCPU-16 (Native ARM64 Axion)",
+                "role": "rust_builder",
+                "arch": "arm64",
+                "machine_type": "c4a-highcpu-16",
+                "vcpu": 16,
+                "ram_gib": 32,
+                "cpu_platform": "Google Axion (Neoverse V2)",
+                "benchmark_score": 2980,
+                "disk_category": "hyperdrive",
+                "boot_disk_type": "hyperdisk-balanced",
+                "boot_disk_gb": 40,
+                "data_disk_type": "hyperdisk-balanced",
+                "data_disk_gb": 375,
+                "runners_count": 1,
+                "runner_vcpu": 16,
+                "runner_ram_gib": 28,
+                "cloud_init_template_id": "rust-builder-default",
+                "created_at": "2026-10-23T00:00:00Z"
+            }),
+            serde_json::json!({
+                "id": "tpl-builder-n4a-highcpu16",
+                "name": "Dedicated Rust 1.99 Builder N4A-HighCPU-16 (Axion Neoverse N3)",
+                "role": "rust_builder",
+                "arch": "arm64",
+                "machine_type": "n4a-highcpu-16",
+                "vcpu": 16,
+                "ram_gib": 32,
+                "cpu_platform": "Google Axion (Neoverse N3)",
+                "benchmark_score": 2720,
+                "disk_category": "hyperdrive",
+                "boot_disk_type": "hyperdisk-balanced",
+                "boot_disk_gb": 40,
+                "data_disk_type": "hyperdisk-balanced",
+                "data_disk_gb": 375,
+                "runners_count": 1,
+                "runner_vcpu": 16,
+                "runner_ram_gib": 28,
+                "cloud_init_template_id": "rust-builder-default",
+                "created_at": "2026-10-23T00:00:00Z"
+            }),
+        ];
+        for arm_tpl in default_arm64_tpls {
+            let tpl_id = arm_tpl.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if !tpls
+                .iter()
+                .any(|x| x.get("id").and_then(|v| v.as_str()) == Some(tpl_id))
+            {
+                tpls.push(arm_tpl);
+            }
+        }
+    }
+
+    // Enrich regions with ARM64 instance families and CPU platforms
+    if let Some(regions_arr) = ov_obj.get_mut("regions").and_then(|v| v.as_array_mut()) {
+        for reg in regions_arr.iter_mut() {
+            if let Some(reg_obj) = reg.as_object_mut() {
+                if let Some(fams) = reg_obj.get_mut("families").and_then(|v| v.as_array_mut()) {
+                    for fam in ["c4a", "n4a", "t2a"] {
+                        if !fams.iter().any(|x| x.as_str() == Some(fam)) {
+                            fams.push(serde_json::json!(fam));
+                        }
+                    }
+                }
+                if let Some(cpus) = reg_obj
+                    .get_mut("cpu_platforms")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    for cpu in [
+                        "Google Axion (Neoverse V2)",
+                        "Google Axion (Neoverse N3)",
+                        "Ampere Altra (Neoverse N1)",
+                    ] {
+                        if !cpus.iter().any(|x| x.as_str() == Some(cpu)) {
+                            cpus.push(serde_json::json!(cpu));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn apply_dynamic_overview_filtering(
     ov: &mut serde_json::Value,
     query: &OverviewQuery,
@@ -1076,6 +1728,14 @@ pub fn apply_dynamic_overview_filtering(
         Some(obj) => obj,
         None => return,
     };
+
+    let arch_filter = query
+        .arch
+        .as_deref()
+        .unwrap_or("all")
+        .trim()
+        .to_lowercase();
+    enrich_arm64_catalog_and_qualifications(ov_obj, &arch_filter);
 
     let qual_val = ov_obj.get("qualifications").cloned();
     let iv = ov_obj
@@ -1218,6 +1878,20 @@ pub fn apply_dynamic_overview_filtering(
         let total_cost_in_window = ((hours_in_window * hourly_rate) * 100.0).round() / 100.0;
         inst["total_cost_in_window_usd"] = serde_json::json!(total_cost_in_window);
 
+        let inst_mt = inst
+            .get("machine_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let inst_arch = infer_arch(&inst_mt);
+        inst["arch"] = serde_json::json!(inst_arch);
+        if (arch_filter == "arm64" || arch_filter == "aarch64") && inst_arch != "arm64" {
+            continue;
+        }
+        if (arch_filter == "x86_64" || arch_filter == "amd64") && inst_arch != "x86_64" {
+            continue;
+        }
+
         let inst_role = inst.get("role").and_then(|v| v.as_str()).unwrap_or("");
         if !role_filter.is_empty() && role_filter != "all" && inst_role != role_filter {
             continue;
@@ -1234,6 +1908,7 @@ pub fn apply_dynamic_overview_filtering(
                 "display_location",
                 "machine_type",
                 "cpu_platform",
+                "arch",
                 "status",
                 "role",
                 "deletion_trigger",
@@ -1992,8 +2667,22 @@ pub(crate) fn generate_record_id(prefix: &str, now: u64) -> String {
 pub(crate) fn derive_hardware_profile(
     machine_type: &str,
 ) -> Option<(&'static str, &'static str, &'static str)> {
-    let mt = machine_type.trim();
-    if mt.starts_with("c4d-") {
+    let mt = normalize_gce_short_name(machine_type.trim());
+    if mt.starts_with("c4a-") {
+        Some((
+            "Google Axion (Neoverse V2)",
+            "hyperdisk_balanced",
+            "hyperdisk-balanced",
+        ))
+    } else if mt.starts_with("n4a-") {
+        Some((
+            "Google Axion (Neoverse N3)",
+            "hyperdisk_balanced",
+            "hyperdisk-balanced",
+        ))
+    } else if mt.starts_with("t2a-") {
+        Some(("Ampere Altra (Neoverse N1)", "pd_balanced", "pd-balanced"))
+    } else if mt.starts_with("c4d-") {
         Some(("AMD Turin", "pd_balanced", "pd-balanced"))
     } else if mt.starts_with("n4d-") {
         Some(("AMD Turin", "pd_balanced", "pd-balanced"))

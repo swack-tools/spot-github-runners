@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::patch::{
-    classify_rollout_values, compute_canonical_patch_sha256, validate_patch_manifest,
-    RolloutClassification, CONTROLLED_TARGETS,
+    classify_rollout_values, compute_canonical_patch_sha256, is_supported_patch_target,
+    validate_patch_manifest, RolloutClassification, CONTROLLED_TARGETS, ON_DEMAND_TARGETS,
 };
 
 pub const CONFIG_REPO: &str = "swack-tools/spot-runners-config";
@@ -271,7 +271,7 @@ impl GitHubTransport for MockGitHubTransport {
 
 /// Maps controlled repository name to manifest path in `spot-runners-config`.
 pub fn manifest_path_for_target(target: &str) -> Result<String, String> {
-    if !CONTROLLED_TARGETS.contains(&target) {
+    if !is_supported_patch_target(target) {
         return Err(format!("Unsupported repository target: {}", target));
     }
 
@@ -284,6 +284,41 @@ pub fn manifest_path_for_target(target: &str) -> Result<String, String> {
 
 /// Generates valid standard manifest JSON for a target repository.
 pub fn make_valid_manifest_json(repo: &str) -> Value {
+    if repo == "swack-tools/bt-to-all-devices" {
+        return json!({
+            "schema": "spot-runner-patch-v1",
+            "repository": repo,
+            "hardware": {
+                "arch": "arm64",
+                "isa": ["neon", "sve"],
+                "extra_labels": ["type-c4a-highcpu-8", "arm64", "apple-release", "btad"],
+                "min_vcpu": 8,
+                "min_ram_gib": 16,
+                "runners_count": 1,
+                "runner_vcpu": 7,
+                "runner_ram_gib": 14,
+                "host_overhead_gib": 2,
+                "queued_jobs_threshold": 20,
+                "provisioning_mode": "on_demand",
+                "qualify_command": "uname -m | grep -Eq '^(aarch64|arm64)$'"
+            },
+            "host": {
+                "apt_packages": ["git", "curl", "clang", "lld"],
+                "sysctl": {"net.core.somaxconn": "4096"},
+                "files": [],
+                "boot_mkdirs": [],
+                "boot_script": ""
+            },
+            "container": {
+                "apt_packages": ["build-essential", "pkg-config", "clang", "llvm"],
+                "sysctl": {},
+                "mounts": [],
+                "files": [],
+                "dockerfile_run": ""
+            }
+        });
+    }
+
     json!({
         "schema": "spot-runner-patch-v1",
         "repository": repo,
@@ -329,6 +364,9 @@ pub fn resolve_target_from_repo_or_path(repo_or_path: &str) -> String {
     {
         return "swack-tools".to_string();
     }
+    if repo_or_path == "btad" || repo_or_path == "swack-tools/btad" {
+        return "swack-tools/bt-to-all-devices".to_string();
+    }
     if let Some(rest) = repo_or_path
         .strip_prefix("repos/")
         .and_then(|s| s.strip_suffix(".yaml"))
@@ -340,7 +378,7 @@ pub fn resolve_target_from_repo_or_path(repo_or_path: &str) -> String {
 
 /// GET /api/patch-console/bootstrap
 pub fn handle_bootstrap() -> (u16, Value) {
-    let repositories: Vec<Value> = CONTROLLED_TARGETS
+    let mut repositories: Vec<Value> = CONTROLLED_TARGETS
         .iter()
         .filter(|&&t| t != "swack-tools")
         .map(|&t| {
@@ -348,9 +386,20 @@ pub fn handle_bootstrap() -> (u16, Value) {
                 "repository": t,
                 "path": format!("repos/{}.yaml", t),
                 "present": true,
+                "arch": "x86_64",
+                "provisioning_mode": "always_on",
             })
         })
         .collect();
+    for &t in ON_DEMAND_TARGETS {
+        repositories.push(json!({
+            "repository": t,
+            "path": format!("repos/{}.yaml", t),
+            "present": true,
+            "arch": "arm64",
+            "provisioning_mode": "on_demand",
+        }));
+    }
 
     (
         200,
@@ -365,6 +414,7 @@ pub fn handle_bootstrap() -> (u16, Value) {
             },
             "repositories": repositories,
             "controlled_targets": CONTROLLED_TARGETS,
+            "on_demand_targets": ON_DEMAND_TARGETS,
             "executor": {
                 "available": false,
                 "reason": "Serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick.",
@@ -381,7 +431,7 @@ pub async fn handle_manifest(
 ) -> (u16, Value) {
     let resolved_repo = resolve_target_from_repo_or_path(repo);
     let repo_ref = resolved_repo.as_str();
-    if repo_ref.is_empty() || !CONTROLLED_TARGETS.contains(&repo_ref) {
+    if repo_ref.is_empty() || !is_supported_patch_target(repo_ref) {
         return (
             400,
             json!({
@@ -560,7 +610,7 @@ pub async fn handle_save(
         .unwrap_or("");
     let resolved_repo = resolve_target_from_repo_or_path(raw_repo);
     let repo = resolved_repo.as_str();
-    if !CONTROLLED_TARGETS.contains(&repo) {
+    if !is_supported_patch_target(repo) {
         return (
             400,
             json!({

@@ -945,8 +945,10 @@ pub fn build_spot_runner_vm_request(
     project: &str,
     cfg: &RunnerVmConfig,
 ) -> Result<GceInsertInstanceRequest, GcpError> {
-    // 1. Enforce sizing floor: machine type must be allowlisted and >= 16 vCPU / 32 GiB
-    if !crate::patch::PERMITTED_MACHINE_TYPES.contains(&cfg.machine_type) {
+    // 1. Enforce sizing floor: machine type must be allowlisted (x86_64 or arm64)
+    if !crate::patch::PERMITTED_MACHINE_TYPES.contains(&cfg.machine_type)
+        && !crate::patch::PERMITTED_ARM64_MACHINE_TYPES.contains(&cfg.machine_type)
+    {
         return Err(GcpError::Validation(format!(
             "Machine type '{}' is not in permitted list: {:?}",
             cfg.machine_type,
@@ -954,7 +956,13 @@ pub fn build_spot_runner_vm_request(
         )));
     }
 
-    // 2. Resolve Boot Disk Image (Golden Image -> Image Family -> Debian 13 fallback)
+    let is_arm64 = cfg.machine_type.starts_with("c4a-")
+        || cfg.machine_type.starts_with("n4a-")
+        || cfg.machine_type.starts_with("t2a-");
+    let is_hyperdisk_native =
+        cfg.machine_type.starts_with("c4a-") || cfg.machine_type.starts_with("n4a-");
+
+    // 2. Resolve Boot Disk Image (Golden Image -> Image Family -> Debian 13 x86_64/arm64 fallback)
     let source_image = if let Some(img) = cfg.source_image {
         if img.starts_with("projects/") {
             img.to_string()
@@ -967,11 +975,18 @@ pub fn build_spot_runner_vm_request(
         } else {
             format!("projects/{}/global/images/family/{}", project, family)
         }
+    } else if is_arm64 {
+        DEBIAN_13_ARM64_IMAGE_FAMILY.to_string()
     } else {
         DEBIAN_13_IMAGE_FAMILY.to_string()
     };
 
-    let boot_disk_type = cfg.boot_disk_type.unwrap_or("pd-balanced");
+    let default_disk_type = if is_hyperdisk_native {
+        "hyperdisk-balanced"
+    } else {
+        "pd-balanced"
+    };
+    let boot_disk_type = cfg.boot_disk_type.unwrap_or(default_disk_type);
     let full_boot_disk_type = format!("zones/{}/diskTypes/{}", cfg.zone, boot_disk_type);
     let full_machine_type = format!("zones/{}/machineTypes/{}", cfg.zone, cfg.machine_type);
 

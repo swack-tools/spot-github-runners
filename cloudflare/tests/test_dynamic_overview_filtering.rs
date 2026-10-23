@@ -1670,3 +1670,165 @@ async fn test_zero_fleet_inventory_refresh_retires_last_running_instance_in_over
     );
 }
 
+#[tokio::test]
+async fn test_arm64_first_class_catalog_enrichment_and_arch_filtering() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1_792_000_000u64;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    let mut ov = create_sample_overview(now);
+    // Add an ARM64 running instance alongside the existing x86_64 instances
+    ov["instances_view"]["instances"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "inst-arm-1",
+            "instance_id": "inst-arm-1",
+            "name": "oxidex-runners-arm64-axion-1",
+            "status": "RUNNING",
+            "role": "cicd_runner",
+            "zone": "us-central1-a",
+            "region": "us-central1",
+            "display_location": "Council Bluffs, Iowa",
+            "machine_type": "c4a-highcpu-16",
+            "cpu_platform": "Google Axion (Neoverse V2)",
+            "benchmark_score": 2150,
+            "runners_count": 2,
+            "started_epoch": (now - 3600) as f64,
+            "deleted_epoch": serde_json::Value::Null,
+            "deletion_trigger": serde_json::Value::Null,
+            "pricing": {
+                "compute_hourly_usd": 0.1404,
+                "compute_daily_usd": 3.37,
+                "compute_monthly_usd": 101.09,
+                "total_hourly_usd": 0.165,
+                "total_daily_usd": 3.96,
+                "total_monthly_usd": 118.80
+            }
+        }));
+    ov["qualifications"] = serde_json::json!({
+        "cicd_runner": {
+            "hardware_qualifying": [],
+            "spot_price_qualifying": []
+        },
+        "rust_builder": {
+            "hardware_qualifying": [],
+            "spot_price_qualifying": []
+        }
+    });
+    ov["regions"] = serde_json::json!([
+        {
+            "region": "us-central1",
+            "zones": ["us-central1-a", "us-central1-b"],
+            "families": ["c4d", "n4"],
+            "cpu_platforms": ["AMD Turin"],
+            "disk_types": ["hyperdisk-balanced", "pd-balanced"],
+            "running_instances": []
+        }
+    ]);
+    ov["vm_templates"] = serde_json::json!([]);
+    bundle.state.overview = Some(ov);
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    // 1. Default query (`arch = all`) includes both ARM64 and x86_64 instances and enriches ARM64 catalog
+    let (_, resp_all) = handle_api_overview(&kv, OverviewQuery::default(), now)
+        .await
+        .unwrap();
+    let qual_runner = resp_all["qualifications"]["cicd_runner"]["spot_price_qualifying"]
+        .as_array()
+        .unwrap();
+    assert!(qual_runner.iter().any(|o| o["machine_type"] == "c4a-highcpu-16" && o["arch"] == "arm64"));
+    assert!(qual_runner.iter().any(|o| o["machine_type"] == "n4a-highcpu-8" && o["arch"] == "arm64"));
+    assert!(qual_runner.iter().any(|o| o["machine_type"] == "t2a-standard-8" && o["arch"] == "arm64"));
+
+    // Verify VM templates include ARM64 runner and builder presets
+    let vm_tpls = resp_all["vm_templates"].as_array().unwrap();
+    assert!(vm_tpls.iter().any(|t| t["id"] == "tpl-runner-c4a-highcpu16" && t["arch"] == "arm64"));
+    assert!(vm_tpls.iter().any(|t| t["id"] == "tpl-builder-c4a-highcpu16" && t["arch"] == "arm64"));
+
+    // Verify region metadata includes c4a/n4a/t2a families
+    let reg_fams = resp_all["regions"][0]["families"].as_array().unwrap();
+    assert!(reg_fams.iter().any(|f| f == "c4a"));
+    assert!(reg_fams.iter().any(|f| f == "n4a"));
+    assert!(reg_fams.iter().any(|f| f == "t2a"));
+
+    // 2. Query with `?arch=arm64` filters instances and qualification offers to ARM64 only
+    let q_arm = OverviewQuery {
+        arch: Some("arm64".into()),
+        include_deleted: Some(true),
+        ..Default::default()
+    };
+    let (_, resp_arm) = handle_api_overview(&kv, q_arm, now).await.unwrap();
+    let arm_insts = resp_arm["instances_view"]["instances"].as_array().unwrap();
+    assert_eq!(arm_insts.len(), 1);
+    assert_eq!(arm_insts[0]["machine_type"], "c4a-highcpu-16");
+    assert_eq!(arm_insts[0]["arch"], "arm64");
+
+    let arm_offers = resp_arm["qualifications"]["cicd_runner"]["spot_price_qualifying"]
+        .as_array()
+        .unwrap();
+    assert!(!arm_offers.is_empty());
+    for offer in arm_offers {
+        assert_eq!(offer["arch"], "arm64");
+    }
+}
+
+#[test]
+fn test_btad_arm64_manifest_and_gce_vm_request_builder() {
+    use spot_dashboard_edge::gcp::{
+        build_spot_runner_vm_request, RunnerVmConfig, DEBIAN_13_ARM64_IMAGE_FAMILY,
+    };
+    use spot_dashboard_edge::patch::{is_supported_patch_target, validate_patch_manifest};
+    use spot_dashboard_edge::patch_console::make_valid_manifest_json;
+
+    // 1. `swack-tools/bt-to-all-devices` (btad) is supported and defaults to ARM64 on-demand C4A
+    assert!(is_supported_patch_target("swack-tools/bt-to-all-devices"));
+    let btad_manifest = make_valid_manifest_json("swack-tools/bt-to-all-devices");
+    let patch = validate_patch_manifest(&btad_manifest).expect("btad ARM64 manifest must be valid");
+    assert_eq!(patch.hardware.arch, "arm64");
+    assert_eq!(
+        patch.hardware.provisioning_mode.as_deref(),
+        Some("on_demand")
+    );
+    assert!(patch.hardware.isa.contains(&"neon".to_string()));
+    assert!(patch
+        .hardware
+        .extra_labels
+        .contains(&"type-c4a-highcpu-8".to_string()));
+
+    // 2. GCE VM request builder selects debian-13-arm64 and hyperdisk-balanced + GVNIC for C4A/N4A
+    let req = build_spot_runner_vm_request(
+        "test-proj",
+        &RunnerVmConfig {
+            instance_name: "oxidex-runners-btad-arm64-1",
+            machine_type: "c4a-highcpu-16",
+            zone: "us-central1-a",
+            target: "swack-tools/bt-to-all-devices",
+            runner_prefix: "oxidex-runners",
+            startup_script: "#!/bin/bash\necho arm64",
+            patch_sha256: "abc123",
+            patch_json: "{}",
+            runner_1_jitconfig: None,
+            runner_2_jitconfig: None,
+            source_image: None,
+            golden_image_family: None,
+            boot_disk_type: None,
+        },
+    )
+    .expect("c4a-highcpu-16 VM request should succeed");
+
+    let boot_init = req.disks[0].initialize_params.as_ref().unwrap();
+    assert_eq!(
+        boot_init.source_image.as_deref(),
+        Some(DEBIAN_13_ARM64_IMAGE_FAMILY)
+    );
+    assert!(boot_init.disk_type.ends_with("/diskTypes/hyperdisk-balanced"));
+    assert_eq!(
+        req.network_interfaces[0].nic_type.as_deref(),
+        Some("GVNIC")
+    );
+}
+
+
