@@ -303,9 +303,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
     <!-- TAB 1: WORLD MAP & DATA CENTER INSPECTOR                              -->
-    <!-- ===================================================================== -->
     <section id="tab-map" class="tab-pane active">
       <div class="map-layout">
         <div class="panel">
@@ -365,9 +363,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
     <!-- TAB 2: INSTANCE LIST & COST HISTORY (WITH DELETED & TIME WINDOW)      -->
-    <!-- ===================================================================== -->
     <section id="tab-instances" class="tab-pane">
       <div class="panel">
         <div class="panel-header">
@@ -673,9 +669,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
     <!-- TAB 5: CLOUD-INIT & VM INITIALIZATION STUDIO                          -->
-    <!-- ===================================================================== -->
     <section id="tab-cloudinit" class="tab-pane">
       <div class="two-col">
         <!-- Left: Cloud-Init YAML Editor & Save / Save As -->
@@ -752,18 +746,26 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
-    <!-- TAB 6: WORLD REGIONS & DATA CENTER LATENCY / CAPABILITY FILTER        -->
-    <!-- ===================================================================== -->
+    <!-- TAB 6: WORLD REGIONS & DATA CENTER LATENCY / CAPABILITY FILTER -->
     <section id="tab-regions" class="tab-pane">
       <div class="panel">
         <div class="panel-header">
           <div>
             <div class="panel-title">🌐 World Deployment Regions &amp; Data Center Filter</div>
-            <div class="panel-subtitle">Deselect or filter areas of the world based on web-backend-to-datacenter latency (ms), geographic continent, offered instance families, CPU platforms, and disk types.</div>
+            <div class="panel-subtitle">Deselect or filter areas of the world based on web-backend-to-datacenter latency (ms), geographic continent, offered instance families, architectures, CPU platforms, and disk types.</div>
           </div>
-          <div style="display:flex; gap:8px; flex-wrap:wrap;">
-            <button class="btn btn-sm btn-secondary" onclick="probeRegionLatencies()">⚡ Probe Live Backend-to-Region Latency</button>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <button id="reg-update-latency-btn" class="btn btn-sm btn-secondary" onclick="probeRegionLatencies(false)">🔄 Update Latency</button>
+            <div style="display:inline-flex; align-items:center; gap:6px; background:var(--bg-card); border:1px solid var(--border); border-radius:7px; padding:4px 8px;">
+              <span style="font-size:11px; color:var(--text-muted); font-weight:600;">Auto-refresh:</span>
+              <select id="reg-autorefresh-select" onchange="setLatencyAutoRefresh(this.value)" style="width:auto; padding:2px 6px; font-size:11.5px; background:transparent; border:none; color:#f8fafc;">
+                <option value="0">Off</option>
+                <option value="15">15s</option>
+                <option value="30">30s</option>
+                <option value="60" selected>1m</option>
+                <option value="300">5m</option>
+              </select>
+            </div>
             <button class="btn btn-sm btn-danger" onclick="deselectHighLatencyRegions()">Deselect Regions Above Max Latency</button>
             <button class="btn btn-sm btn-emerald" onclick="setAllFilteredRegions(true)">Enable All Shown</button>
             <button class="btn btn-sm btn-secondary" onclick="setAllFilteredRegions(false)">Deselect All Shown</button>
@@ -773,7 +775,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div class="form-grid" style="background:var(--bg-card); padding:12px; border-radius:9px; border:1px solid var(--border); margin-bottom:14px;">
           <div class="field">
             <label>Max Allowed Latency (ms): <span id="reg-lat-val" class="mono">220 ms</span></label>
-            <input type="range" id="reg-max-latency" min="20" max="250" value="220" oninput="document.getElementById('reg-lat-val').textContent=this.value+' ms'; renderRegionsTable();" />
+            <input type="range" id="reg-max-latency" min="20" max="250" value="220" oninput="applyMaxLatencyFilter(this.value, false)" onchange="applyMaxLatencyFilter(this.value, true)" />
           </div>
           <div class="field">
             <label>Continent / World Area</label>
@@ -785,6 +787,14 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               <option value="Africa">Africa (South Africa)</option>
               <option value="Middle East">Middle East</option>
               <option value="Asia Pacific">Asia Pacific</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Required Architecture</label>
+            <select id="reg-arch-filter" onchange="setGlobalArchFilter(this.value)">
+              <option value="all">Any Architecture (x86_64 + ARM64)</option>
+              <option value="x86_64">x86_64 Only (AMD / Intel)</option>
+              <option value="arm64">ARM64 Only (Google Axion / Altra)</option>
             </select>
           </div>
           <div class="field">
@@ -851,9 +861,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
     <!-- TAB 7: RUST REMOTE BUILDERS TELEMETRY, GEOLOCATION & VPN/TOR LOOKUP   -->
-    <!-- ===================================================================== -->
     <section id="tab-rust" class="tab-pane">
       <div class="kpi-grid" id="rust-kpi-grid"></div>
 
@@ -1031,7 +1039,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <h3 style="font-size:14px; margin:16px 0 6px;">Added administrators</h3>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>GitHub user (when added)</th><th>User ID</th><th>Added by</th><th>Added at</th><th></th></tr></thead>
+            <thead><tr><th>GitHub user (when added)</th><th>User ID</th><th>Per-target checks</th><th>Added by</th><th>Added at</th><th></th></tr></thead>
             <tbody id="adm-admins"></tbody>
           </table>
         </div>
@@ -1059,6 +1067,9 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     let INST_SORT_BY = "total_cost_in_window_usd";
     let INST_SORT_DIR = "desc";
     let GLOBAL_ARCH_FILTER = "all";
+    let GLOBAL_MAX_LATENCY_MS = null;
+    let LATENCY_AUTOREFRESH_TIMER = null;
+    let LATENCY_RELOAD_DEBOUNCE = null;
     let KNOWN_TARGETS = ["swack-tools", "swack-tools/bt-to-all-devices", "xbmc4lyfe/newznab-tmux", "xbmc4lyfe/rustnzb", "xbmc4lyfe/nntp-proxy"];
     let SELECTED_TARGETS = null;
     let QUAL_ACTIVE_ROLE = "cicd_runner";
@@ -1448,10 +1459,11 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       document.querySelectorAll(".arch-pill-btn").forEach(btn => {
         btn.classList.toggle("active", btn.getAttribute("data-arch") === GLOBAL_ARCH_FILTER);
       });
-      const instSel = document.getElementById("inst-arch-filter");
-      if (instSel && instSel.value !== GLOBAL_ARCH_FILTER) instSel.value = GLOBAL_ARCH_FILTER;
-      const qualSel = document.getElementById("qual-arch-filter");
-      if (qualSel && qualSel.value !== GLOBAL_ARCH_FILTER) qualSel.value = GLOBAL_ARCH_FILTER;
+      ["inst-arch-filter", "qual-arch-filter", "reg-arch-filter"].forEach(id => {
+        const el = document.getElementById(id);
+        if (el && el.value !== GLOBAL_ARCH_FILTER) el.value = GLOBAL_ARCH_FILTER;
+      });
+      if (APP_STATE) renderRegionsTable();
       loadOverview();
     }
 
@@ -1489,7 +1501,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const targetParam = SELECTED_TARGETS === null
         ? "all"
         : (SELECTED_TARGETS.size === 0 ? "__none__" : Array.from(SELECTED_TARGETS).join(","));
-      const url = `/api/overview?include_deleted=${showDeleted}&window_hours=${INST_WINDOW_HOURS}&include_disk_and_tax=${inclDiskTax}&sort_by=${INST_SORT_BY}&sort_dir=${INST_SORT_DIR}&search=${search}&role=${role}&arch=${arch}&target=${encodeURIComponent(targetParam)}`;
+      const latParam = GLOBAL_MAX_LATENCY_MS !== null ? `&max_latency_ms=${encodeURIComponent(GLOBAL_MAX_LATENCY_MS)}` : "";
+      const url = `/api/overview?include_deleted=${showDeleted}&window_hours=${INST_WINDOW_HOURS}&include_disk_and_tax=${inclDiskTax}&sort_by=${INST_SORT_BY}&sort_dir=${INST_SORT_DIR}&search=${search}&role=${role}&arch=${arch}&target=${encodeURIComponent(targetParam)}${latParam}`;
       const res = await fetch(url);
       APP_STATE = await res.json();
       if (Array.isArray(APP_STATE.available_targets)) {
@@ -1576,9 +1589,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       renderRustBuildsView();
     }
 
-    // =========================================================================
     // WORLD MAP & DATA CENTER INSPECTOR
-    // =========================================================================
     function renderWorldMapPins() {
       const g = document.getElementById("map-pins-group");
       g.innerHTML = "";
@@ -1803,9 +1814,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
-    // =========================================================================
     // TAB 2: INSTANCE LIST & COST HISTORY
-    // =========================================================================
     function applyHoursWindow(hours) {
       INST_WINDOW_HOURS = hours;
       const customVal = document.getElementById("inst-custom-window-val");
@@ -2001,17 +2010,29 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       await loadOverview();
     }
 
+    function getInstanceLatencyMs(inst) {
+      if (typeof inst.latency_ms === "number" && !isNaN(inst.latency_ms)) return inst.latency_ms;
+      const zone = String(inst.zone || "");
+      const regName = inst.region || zone.replace(/-[a-z0-9]+$/, "");
+      const reg = (APP_STATE && APP_STATE.regions || []).find(r => r.region === regName || (r.zones || []).includes(zone));
+      return reg && typeof reg.latency_ms === "number" ? reg.latency_ms : 0;
+    }
+
     function renderInstancesTableRows() {
       const iv = APP_STATE.instances_view;
+      const maxLat = GLOBAL_MAX_LATENCY_MS !== null ? GLOBAL_MAX_LATENCY_MS : Infinity;
+      const visibleInstances = (iv.instances || []).filter(inst => getInstanceLatencyMs(inst) <= maxLat);
+      const badgeEl = document.getElementById("badge-instances-count");
+      if (badgeEl) badgeEl.textContent = `${visibleInstances.length}`;
       const summary = document.getElementById("inst-window-summary");
       const fi = iv.fleet_inventory || APP_STATE.fleet_inventory || {};
       const inventoryNote = fi.source === "gce"
         ? `Source: live Compute Engine inventory${fi.last_success_at ? ", last listed " + esc(formatLocalTime(fi.last_success_at)) : ", not listed yet"}${(fi.stale_reason || fi.last_error) ? ' · <span style="color:#fda4af;">' + esc(fi.stale_reason || fi.last_error) + "</span>" : ""}`
         : `Source: live Compute Engine inventory is not configured on this dashboard (set DASHBOARD_FLEET_INVENTORY=gce); no instances are shown`;
-      summary.innerHTML = `${inventoryNote}<br>Showing <strong>${iv.instances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} stopped or deleted) · Total Window Spend: <strong class="mono" style="color:#34d399;">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
+      summary.innerHTML = `${inventoryNote}<br>Showing <strong>${visibleInstances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} stopped or deleted) · Total Window Spend: <strong class="mono" style="color:#34d399;">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
 
       const tbody = document.getElementById("instances-table-body");
-      tbody.innerHTML = iv.instances.map(inst => {
+      tbody.innerHTML = visibleInstances.map(inst => {
         const isRunning = inst.status === "RUNNING";
         return `
           <tr>
@@ -2067,9 +2088,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }).join("");
     }
 
-    // =========================================================================
     // TAB 3: SIZING & BENCHMARK QUALIFICATION
-    // =========================================================================
     function populateSizingForms() {
       const rp = APP_STATE.profiles.cicd_runner;
       document.getElementById("runner-min-runners").value = rp.min_runners;
@@ -2256,7 +2275,9 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         `<strong style="color:#34d399;">${q.spot_price_qualifying_count}</strong> currently qualify under Spot pricing ($${q.requirements.budget.max_hourly_usd}/hr · $${q.requirements.budget.max_daily_usd}/day · $${q.requirements.budget.max_monthly_usd}/mo).`;
 
       const tbody = document.getElementById("qualification-table-body");
+      const maxLat = GLOBAL_MAX_LATENCY_MS !== null ? GLOBAL_MAX_LATENCY_MS : Infinity;
       const archFilteredRows = rows.filter(r => {
+        if (typeof r.latency_ms === "number" && r.latency_ms > maxLat) return false;
         if (!GLOBAL_ARCH_FILTER || GLOBAL_ARCH_FILTER === "all") return true;
         return inferArchClient(r.machine_type, r.arch) === GLOBAL_ARCH_FILTER;
       });
@@ -2284,9 +2305,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       `).join("");
     }
 
-    // =========================================================================
     // TAB 4: SCALING & OOM DEEP-LINKS
-    // =========================================================================
     function populateScalingView() {
       const sc = APP_STATE.scaling.cicd_runner;
       const st = APP_STATE.scaling_telemetry;
@@ -2550,9 +2569,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       await loadOverview();
     }
 
-    // =========================================================================
     // TAB 5: CLOUD-INIT & VM TEMPLATE STUDIO
-    // =========================================================================
     function populateCloudInitStudio() {
       const sel = document.getElementById("ci-editor-select");
       const currentVal = sel.value || APP_STATE.cloud_init_templates[0]?.id;
@@ -2686,12 +2703,51 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       await loadOverview();
     }
 
-    // =========================================================================
     // TAB 6: WORLD REGIONS & LATENCY FILTER
-    // =========================================================================
+    const ARM64_FAMILIES = ["c4a", "n4a", "t2a"];
+    function applyMaxLatencyFilter(val, reload = false) {
+      const parsed = parseFloat(val);
+      if (!isNaN(parsed) && parsed > 0) {
+        GLOBAL_MAX_LATENCY_MS = parsed;
+        const lbl = document.getElementById("reg-lat-val");
+        if (lbl) lbl.textContent = parsed + " ms";
+        const slider = document.getElementById("reg-max-latency");
+        if (slider && slider.value !== String(parsed)) slider.value = String(parsed);
+      }
+      if (APP_STATE) {
+        renderRegionsTable();
+        renderQualificationTable();
+        renderInstancesTableRows();
+      }
+      if (LATENCY_RELOAD_DEBOUNCE) clearTimeout(LATENCY_RELOAD_DEBOUNCE);
+      if (reload) {
+        loadOverview();
+      } else {
+        LATENCY_RELOAD_DEBOUNCE = setTimeout(() => loadOverview(), 150);
+      }
+    }
+
+    function setLatencyAutoRefresh(secStr, silent = false) {
+      if (LATENCY_AUTOREFRESH_TIMER) {
+        clearInterval(LATENCY_AUTOREFRESH_TIMER);
+        LATENCY_AUTOREFRESH_TIMER = null;
+      }
+      const secs = parseInt(secStr, 10);
+      if (secs > 0) {
+        LATENCY_AUTOREFRESH_TIMER = setInterval(() => {
+          probeRegionLatencies(true);
+        }, secs * 1000);
+        if (!silent) showToast(`Latency auto-refresh set to every ${secs >= 60 ? (secs / 60) + 'm' : secs + 's'}`);
+      } else if (!silent) {
+        showToast("Latency auto-refresh disabled");
+      }
+    }
+
     function getFilteredRegions() {
       const maxLat = parseFloat(document.getElementById("reg-max-latency").value || "250");
       const cont = document.getElementById("reg-continent-filter").value;
+      const regArchEl = document.getElementById("reg-arch-filter");
+      const arch = (regArchEl && regArchEl.value) || GLOBAL_ARCH_FILTER || "all";
       const fam = document.getElementById("reg-family-filter").value;
       const cpu = document.getElementById("reg-cpu-filter").value;
       const disk = document.getElementById("reg-disk-filter").value;
@@ -2699,6 +2755,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       return APP_STATE.regions.filter(r => {
         if (r.latency_ms > maxLat) return false;
         if (cont && r.continent !== cont) return false;
+        if (arch === "arm64" && !(r.families || []).some(f => ARM64_FAMILIES.includes(f))) return false;
+        if (arch === "x86_64" && !(r.families || []).some(f => !ARM64_FAMILIES.includes(f))) return false;
         if (fam && !r.families.includes(fam)) return false;
         if (cpu && !r.cpu_platforms.includes(cpu)) return false;
         if (disk && !r.disk_types.includes(disk)) return false;
@@ -2708,8 +2766,12 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
     function renderRegionsTable() {
       const filtered = getFilteredRegions();
+      const regArchEl = document.getElementById("reg-arch-filter");
+      const arch = (regArchEl && regArchEl.value) || GLOBAL_ARCH_FILTER || "all";
       const tbody = document.getElementById("regions-table-body");
-      tbody.innerHTML = filtered.map(r => `
+      tbody.innerHTML = filtered.map(r => {
+        const runningVms = (r.running_instances || []).filter(i => arch === "all" || inferArchClient(i.machine_type, i.arch) === arch);
+        return `
         <tr>
           <td>
             <label class="toggle-label">
@@ -2731,9 +2793,10 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           <td class="mono" style="font-size:11.5px;">${esc(r.families.join(", "))}</td>
           <td style="font-size:11.5px;">${esc(r.cpu_platforms.join(", "))}</td>
           <td class="mono" style="font-size:11px;">${esc(r.disk_types.join(", "))}</td>
-          <td class="mono">${r.running_instances.length} running</td>
+          <td class="mono">${runningVms.length} running</td>
         </tr>
-      `).join("");
+      `;
+      }).join("");
     }
 
     async function toggleSingleRegion(region, enabled) {
@@ -2786,25 +2849,23 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       await loadOverview();
     }
 
-    async function probeRegionLatencies() {
-      showToast("Probing live TCP latency from backend to GCP regions...");
+    async function probeRegionLatencies(silent = false) {
+      if (!silent) showToast("Probing live TCP latency from backend to GCP regions...");
       const res = await fetch("/api/regions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ measure_latency: true })
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok || data.error) {
-        showToast(`Error probing latencies: ${data.error || res.statusText}`);
+        if (!silent) showToast(`Error probing latencies: ${data.error || res.statusText}`);
         return;
       }
       await loadOverview();
-      showToast("Updated live regional latencies");
+      if (!silent) showToast("Updated live regional latencies");
     }
 
-    // =========================================================================
     // TAB 7: RUST REMOTE BUILDERS TELEMETRY & IP GEOLOCATION / VPN / TOR
-    // =========================================================================
     function renderRustBuildsView() {
       const rb = APP_STATE.rust_builds;
       document.getElementById("rust-kpi-grid").innerHTML = `
@@ -2957,9 +3018,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
-    // =========================================================================
     // ON-THE-FLY BUDGET BAR
-    // =========================================================================
     async function applyTopBudget() {
       const payload = {
         target: "global",
@@ -3157,9 +3216,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     window.RunnerPatches = RunnerPatches;
     // --- end runner patches panel ---
 
-    // --- dashboard administrators panel (owners only; /api/admins answers 403 to everyone else) ---
-    // Renders server data with textContent and createElement only. Each change needs a confirmation, carries
-    // "confirm": true, and reuses its Idempotency-Key until a final answer arrives.
     const DashboardAdmins = (function () {
       const S = { data: null, pending: null, owner: false };
       function el(id) { return document.getElementById(id); }
@@ -3185,7 +3241,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           headers: { "Content-Type": "application/json", "Idempotency-Key": S.pending.key } });
         const [res, d] = result;
         if (!(d && (d.retry_same_key === true || d.pending_retry === true)) && res.status !== 0) {
-          S.pending = null;  // a final answer: the next change gets a new key
+          S.pending = null;
         }
         return result;
       }
@@ -3202,7 +3258,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         clear(admins);
         (data.admins || []).forEach(a => {
           const tr = node("tr");
-          [a.login, a.uid, a.added_by || "", a.added_at ? formatLocalTime(a.added_at) : ""].forEach(v => tr.appendChild(node("td", v)));
+          const chk = a.override_target_check ? "Overridden (exempt)" : "Verified all targets";
+          [a.login, a.uid, chk, a.added_by || "", a.added_at ? formatLocalTime(a.added_at) : ""].forEach(v => tr.appendChild(node("td", v)));
           const td = node("td");
           const b = node("button", "Remove");
           b.type = "button";
@@ -3215,7 +3272,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         if (!(data.admins || []).length) {
           const tr = node("tr");
           const td = node("td", "No administrators added yet.");
-          td.colSpan = 5;
+          td.colSpan = 6;
           tr.appendChild(td);
           admins.appendChild(tr);
         }
@@ -3248,16 +3305,31 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         if (!window.confirm(`Add GitHub user ${login} as a dashboard administrator? They will be able to sign in and change the fleet.`)) return;
         el("adm-add").disabled = true;
         try {
-          setStatus(`Looking up ${login} on GitHub...`);
-          const [res, d] = await postChange("/api/admins/add", { login, confirm: true });
+          setStatus(`Looking up ${login} and checking repository permissions on GitHub...`);
+          let [res, d] = await postChange("/api/admins/add", { login, confirm: true });
           if (d.retry_same_key === true) {
             setStatus((d.error || "GitHub did not answer.") + " Click Add again to retry.");
             return;
           }
-          if (!res.ok) { setStatus(d.error || `Could not add ${login} (HTTP ${res.status})`); return; }
+          if (d && d.requires_target_override === true) {
+            const missing = (d.missing_targets || []).join(", ") || "controlled targets";
+            const targetLogin = d.login || login;
+            if (!window.confirm(`GitHub user ${targetLogin}${d.uid ? ` (ID ${d.uid})` : ""} is not an administrator of every repo/org they will see:\n\nMissing admin access: ${missing}\n\nDo you want to override the per-target check and still add ${targetLogin}?`)) {
+              setStatus(`Cancelled adding ${targetLogin} (missing target admin access: ${missing}).`);
+              return;
+            }
+            setStatus(`Adding ${targetLogin} with per-target check override...`);
+            [res, d] = await postChange("/api/admins/add", {
+              login: targetLogin,
+              uid: d.uid || 0,
+              confirm: true,
+              override_target_check: true
+            });
+          }
+          if (!res.ok) { setStatus(d.error || d.message || `Could not add ${login} (HTTP ${res.status})`); return; }
           el("adm-login").value = "";
           render(d);
-          setStatus(`Added ${d.admin.login} (GitHub user ID ${d.admin.uid}).`);
+          setStatus(`Added ${d.admin.login} (GitHub user ID ${d.admin.uid})${d.admin.override_target_check ? " (per-target check overridden)" : ""}.`);
         } finally {
           el("adm-add").disabled = false;
         }
@@ -3321,6 +3393,10 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const autoRefreshSel = document.getElementById("inst-autorefresh-select");
       if (autoRefreshSel) {
         setInventoryAutoRefresh(autoRefreshSel.value, true);
+      }
+      const regAutoRefreshSel = document.getElementById("reg-autorefresh-select");
+      if (regAutoRefreshSel) {
+        setLatencyAutoRefresh(regAutoRefreshSel.value, true);
       }
       const requestedTab = params.get("tab");
       if (requestedTab) {
@@ -3567,5 +3643,21 @@ mod tests {
         assert!(DASHBOARD_HTML.contains(r#"id="inst-target-all-cb" checked"#));
         assert!(DASHBOARD_HTML.contains(r#"onclick="reverseTargetFilter()""#));
         assert!(DASHBOARD_HTML.contains(r#"onclick="clearTargetFilter()""#));
+    }
+
+    #[test]
+    fn test_dashboard_latency_and_arch_filters() {
+        assert!(
+            DASHBOARD_HTML.len() < 200 * 1024,
+            "DASHBOARD_HTML length {} must stay < 200 KiB",
+            DASHBOARD_HTML.len()
+        );
+        assert!(DASHBOARD_HTML.contains(r#"id="reg-update-latency-btn""#));
+        assert!(DASHBOARD_HTML.contains(r#"id="reg-autorefresh-select""#));
+        assert!(DASHBOARD_HTML.contains(r#"setLatencyAutoRefresh(regAutoRefreshSel.value, true);"#));
+        assert!(DASHBOARD_HTML.contains(r#"oninput="applyMaxLatencyFilter(this.value, false)""#));
+        assert!(DASHBOARD_HTML.contains(r#"id="reg-arch-filter""#));
+        assert!(DASHBOARD_HTML.contains(r#"d.requires_target_override === true"#));
+        assert!(DASHBOARD_HTML.contains(r#"override_target_check: true"#));
     }
 }

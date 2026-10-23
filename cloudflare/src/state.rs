@@ -269,6 +269,8 @@ pub struct AdminRecord {
     pub added_by: String,
     pub added_by_uid: Option<u64>,
     pub added_at: String,
+    #[serde(default)]
+    pub override_target_check: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -422,12 +424,15 @@ pub async fn load_authoritative_state<K: KvStoreBackend>(
 ) -> Result<(DashboardBundle, CacheSource), StateError> {
     match kv.get(KV_STATE_KEY).await? {
         Some(raw) => {
-            let bundle: DashboardBundle = serde_json::from_str(&raw)?;
+            let mut bundle: DashboardBundle = serde_json::from_str(&raw)?;
             if bundle.schema != SNAPSHOT_SCHEMA {
                 return Err(StateError::Validation(format!(
                     "Invalid schema '{}', expected '{}'",
                     bundle.schema, SNAPSHOT_SCHEMA
                 )));
+            }
+            for tpl in &mut bundle.state.cloud_init_templates {
+                tpl.content = sanitize_legacy_oxidex_template_strings(&tpl.content);
             }
             set_cached_state(now, bundle.clone());
             Ok((bundle, CacheSource::KvRead))
@@ -599,15 +604,68 @@ pub struct OverviewQuery {
     pub role: Option<String>,
     pub arch: Option<String>,
     pub target: Option<String>,
+    pub max_latency_ms: Option<f64>,
     pub is_authenticated: Option<bool>,
 }
 
+pub fn sanitize_legacy_oxidex_template_strings(content: &str) -> String {
+    content
+        .replace(
+            "RUNNER_GROUP=\"oxidex-strict\"",
+            "RUNNER_GROUP=\"spot-strict\"",
+        )
+        .replace("RUNNER_GROUP=oxidex-strict", "RUNNER_GROUP=spot-strict")
+        .replace("oxidex-self-hosted-runner:", "spot-self-hosted-runner:")
+        .replace("oxidex.strict-runner=", "spot.strict-runner=")
+        .replace("oxidex-build-entrypoint", "spot-build-entrypoint")
+        .replace("oxidex-build-draining", "spot-build-draining")
+        .replace("oxidex-build.lock", "spot-build.lock")
+        .replace("oxidex-build", "spot-build")
+        .replace("oxidex-uploader", "spot-uploader")
+        .replace("oxidex-remote-build", "spot-remote-build")
+        .replace("oxidex-remote-transaction", "spot-remote-transaction")
+        .replace("oxidex-remote-builder:", "spot-remote-builder:")
+        .replace("oxidex-builder", "spot-builder")
+        .replace("oxidex-remote-source-", "spot-remote-source-")
+        .replace("oxidex.remote-build=", "spot.remote-build=")
+        .replace("oxidex-cache-active-", "spot-cache-active-")
+        .replace("OXIDEX_ACTIVE_LOCK_FD", "SPOT_ACTIVE_LOCK_FD")
+        .replace("oxidex-project-", "spot-project-")
+        .replace(", '--bin', 'oxidex'", "")
+        .replace(" / 'oxidex'", "")
+}
+
 pub fn infer_instance_target(inst: &serde_json::Value, default_org: &str) -> String {
-    for key in &["target", "github_target", "repository", "repo", "org"] {
+    for key in &[
+        "registration_target",
+        "patch_target",
+        "spot-runner-registration-target",
+        "spot-runner-patch-target",
+        "target",
+        "github_target",
+        "repository",
+        "repo",
+        "org",
+    ] {
         if let Some(val) = inst.get(*key).and_then(|v| v.as_str()) {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();
+            }
+        }
+    }
+    if let Some(meta) = inst.get("metadata").and_then(|v| v.as_object()) {
+        for key in &[
+            "spot-runner-registration-target",
+            "spot-runner-patch-target",
+            "spot-target",
+            "spot-runner-target",
+        ] {
+            if let Some(val) = meta.get(*key).and_then(|v| v.as_str()) {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
             }
         }
     }
@@ -620,6 +678,8 @@ pub fn infer_instance_target(inst: &serde_json::Value, default_org: &str) -> Str
         "xbmc4lyfe/newznab-tmux",
         "xbmc4lyfe/rustnzb",
         "xbmc4lyfe/nntp-proxy",
+        "Appz4Fun/nzbget",
+        "Appz4Fun",
         "swack-tools/bt-to-all-devices",
         "swack-tools/oxidex",
         "swack-tools/spot-github-runners",
@@ -1253,9 +1313,9 @@ fn make_arm64_candidate_offer(
     let fleet_floor_monthly =
         ((compute_monthly * instances_needed_for_floor as f64) * 100.0).round() / 100.0;
     let prefix = if is_builder {
-        "builder-oxidex"
+        "spot-builder"
     } else {
-        "oxidex-runners"
+        "spot-runners"
     };
 
     let pricing_json = serde_json::json!({
@@ -1353,6 +1413,7 @@ fn make_arm64_candidate_offer(
 fn enrich_arm64_catalog_and_qualifications(
     ov_obj: &mut serde_json::Map<String, serde_json::Value>,
     arch_filter: &str,
+    max_latency_ms: Option<f64>,
 ) {
     let cicd_arm64_offers = vec![
         make_arm64_candidate_offer(
@@ -1654,6 +1715,19 @@ fn enrich_arm64_catalog_and_qualifications(
                                 .unwrap_or("");
                             let item_arch = infer_arch(mt);
                             obj.insert("arch".to_string(), serde_json::json!(item_arch));
+                            if let Some(ssh) =
+                                obj.get("ssh_command_preview").and_then(|v| v.as_str())
+                            {
+                                let cleaned = ssh
+                                    .replace("oxidex-runners-", "spot-runners-")
+                                    .replace("builder-oxidex-", "spot-builder-");
+                                if cleaned != ssh {
+                                    obj.insert(
+                                        "ssh_command_preview".to_string(),
+                                        serde_json::json!(cleaned),
+                                    );
+                                }
+                            }
                         }
                     }
 
@@ -1680,6 +1754,13 @@ fn enrich_arm64_catalog_and_qualifications(
                     } else if arch_filter == "x86_64" || arch_filter == "amd64" {
                         list.retain(|x| x.get("arch").and_then(|v| v.as_str()) != Some("arm64"));
                     }
+                    if let Some(max_lat) = max_latency_ms.filter(|v| v.is_finite() && *v > 0.0) {
+                        list.retain(|x| {
+                            x.get("latency_ms")
+                                .and_then(|v| v.as_f64())
+                                .map_or(true, |lat| lat <= max_lat)
+                        });
+                    }
 
                     list.sort_by(|a, b| {
                         let pa = a
@@ -1698,6 +1779,39 @@ fn enrich_arm64_catalog_and_qualifications(
                     let count = list.len();
                     role_obj.insert(list_key.to_string(), serde_json::Value::Array(list));
                     role_obj.insert(format!("{}_count", list_key), serde_json::json!(count));
+                }
+            }
+        }
+    }
+
+    // Sanitize legacy hardcoded oxidex strings in cloud_init_templates
+    if let Some(cits) = ov_obj
+        .get_mut("cloud_init_templates")
+        .and_then(|v| v.as_array_mut())
+    {
+        for tpl in cits.iter_mut() {
+            if let Some(obj) = tpl.as_object_mut() {
+                if let Some(content) = obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                {
+                    let sanitized = sanitize_legacy_oxidex_template_strings(&content);
+                    if sanitized != content {
+                        obj.insert("content".to_string(), serde_json::json!(sanitized));
+                    }
+                    if let Some(parsed_val) = obj.get("parsed").cloned() {
+                        if let Ok(parsed_str) = serde_json::to_string(&parsed_val) {
+                            let san_parsed = sanitize_legacy_oxidex_template_strings(&parsed_str);
+                            if san_parsed != parsed_str {
+                                if let Ok(new_parsed) =
+                                    serde_json::from_str::<serde_json::Value>(&san_parsed)
+                                {
+                                    obj.insert("parsed".to_string(), new_parsed);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1859,7 +1973,20 @@ pub fn apply_dynamic_overview_filtering(
     };
 
     let arch_filter = query.arch.as_deref().unwrap_or("all").trim().to_lowercase();
-    enrich_arm64_catalog_and_qualifications(ov_obj, &arch_filter);
+    let max_latency_ms = query.max_latency_ms.filter(|v| v.is_finite() && *v > 0.0);
+    enrich_arm64_catalog_and_qualifications(ov_obj, &arch_filter, max_latency_ms);
+
+    let mut region_latency_map: HashMap<String, f64> = HashMap::new();
+    if let Some(regions_arr) = ov_obj.get("regions").and_then(|v| v.as_array()) {
+        for r in regions_arr {
+            if let (Some(reg), Some(lat)) = (
+                r.get("region").and_then(|v| v.as_str()),
+                r.get("latency_ms").and_then(|v| v.as_f64()),
+            ) {
+                region_latency_map.insert(reg.to_string(), lat);
+            }
+        }
+    }
 
     let default_org = ov_obj
         .get("org")
@@ -2067,6 +2194,20 @@ pub fn apply_dynamic_overview_filtering(
         if let Some(ref sel) = selected_targets {
             let target_lower = inst_target.to_lowercase();
             if !sel.iter().any(|t| t == &target_lower) {
+                continue;
+            }
+        }
+
+        let inst_region = inst.get("region").and_then(|v| v.as_str()).unwrap_or("");
+        let inst_latency = inst
+            .get("latency_ms")
+            .and_then(|v| v.as_f64())
+            .or_else(|| region_latency_map.get(inst_region).copied());
+        if let Some(lat) = inst_latency {
+            inst["latency_ms"] = serde_json::json!(lat);
+        }
+        if let Some(max_lat) = max_latency_ms {
+            if inst_latency.map_or(false, |lat| lat > max_lat) {
                 continue;
             }
         }
@@ -2547,10 +2688,12 @@ pub async fn handle_post_regions<K: KvStoreBackend>(
     now: u64,
 ) -> Result<(u16, serde_json::Value), StateError> {
     let (mut bundle, _) = load_state(kv, now).await?;
+    let mut mutated = false;
     if let Some(map) = body.get("regions_enabled").and_then(|v| v.as_object()) {
         for (region, enabled_val) in map {
             if let Some(en) = enabled_val.as_bool() {
                 bundle.state.regions_enabled.insert(region.clone(), en);
+                mutated = true;
                 if let Some(ref mut ov) = bundle.state.overview {
                     if let Some(regions_arr) = ov.get_mut("regions").and_then(|r| r.as_array_mut())
                     {
@@ -2567,13 +2710,45 @@ pub async fn handle_post_regions<K: KvStoreBackend>(
             }
         }
     }
-    bundle.state.updated_at = now;
-    save_state(kv, &mut bundle, now).await?;
+    if let Some(min_lat) = body
+        .get("deselect_matching")
+        .and_then(|v| v.get("min_latency_ms_to_disable"))
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite())
+    {
+        if let Some(ref mut ov) = bundle.state.overview {
+            if let Some(regions_arr) = ov.get_mut("regions").and_then(|r| r.as_array_mut()) {
+                for r_obj in regions_arr.iter_mut() {
+                    let reg = r_obj
+                        .get("region")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let lat = r_obj
+                        .get("latency_ms")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    if !reg.is_empty() && lat > min_lat {
+                        bundle.state.regions_enabled.insert(reg, false);
+                        if let Some(m) = r_obj.as_object_mut() {
+                            m.insert("enabled".to_string(), serde_json::json!(false));
+                        }
+                        mutated = true;
+                    }
+                }
+            }
+        }
+    }
+    if mutated {
+        bundle.state.updated_at = now;
+        save_state(kv, &mut bundle, now).await?;
+    }
     Ok((
         200,
         serde_json::json!({
             "status": "ok",
             "regions_enabled": bundle.state.regions_enabled,
+            "region_latencies_ms": bundle.state.region_latencies_ms,
         }),
     ))
 }
@@ -2680,13 +2855,72 @@ pub async fn handle_get_admins<K: KvStoreBackend>(
 #[derive(Debug, Deserialize)]
 pub struct AddAdminRequest {
     pub login: String,
+    #[serde(default)]
     pub uid: u64,
     pub confirm: bool,
+}
+
+pub fn collect_visible_dashboard_targets(state: &DashboardState) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    let mut push_unique = |t: &str| {
+        let trimmed = t.trim();
+        if !trimmed.is_empty()
+            && !targets
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+        {
+            targets.push(trimmed.to_string());
+        }
+    };
+
+    for t in &state.controlled_targets {
+        push_unique(t);
+    }
+    for t in crate::patch::CONTROLLED_TARGETS {
+        push_unique(t);
+    }
+    for t in crate::patch::ON_DEMAND_TARGETS {
+        push_unique(t);
+    }
+    let default_org = if state.org.trim().is_empty() {
+        "swack-tools"
+    } else {
+        state.org.trim()
+    };
+    if let Some(ref ov) = state.overview {
+        if let Some(insts) = ov
+            .get("instances_view")
+            .and_then(|iv| iv.get("instances"))
+            .and_then(|v| v.as_array())
+        {
+            for inst in insts {
+                let name = inst.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name.starts_with("oxidex-runners-") || name.starts_with("builder-") {
+                    let inferred = infer_instance_target(inst, default_org);
+                    push_unique(&inferred);
+                }
+            }
+        }
+    }
+    targets
 }
 
 pub async fn handle_post_admins_add<K: KvStoreBackend>(
     kv: &K,
     req: AddAdminRequest,
+    actor_login: &str,
+    actor_uid: u64,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    handle_post_admins_add_with_override(kv, req, false, Vec::new(), actor_login, actor_uid, now)
+        .await
+}
+
+pub async fn handle_post_admins_add_with_override<K: KvStoreBackend>(
+    kv: &K,
+    req: AddAdminRequest,
+    override_target_check: bool,
+    missing_targets: Vec<String>,
     actor_login: &str,
     actor_uid: u64,
     now: u64,
@@ -2731,6 +2965,24 @@ pub async fn handle_post_admins_add<K: KvStoreBackend>(
         )));
     }
 
+    if !missing_targets.is_empty() && !override_target_check {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "target_check_failed",
+                "requires_target_override": true,
+                "login": req.login,
+                "uid": req.uid,
+                "missing_targets": missing_targets,
+                "error": format!(
+                    "GitHub user '{}' is not an administrator of every repository/organization they will see ({})",
+                    req.login,
+                    missing_targets.join(", ")
+                ),
+            }),
+        ));
+    }
+
     let at = chrono_iso(now);
     let record = AdminRecord {
         login: req.login.clone(),
@@ -2738,12 +2990,17 @@ pub async fn handle_post_admins_add<K: KvStoreBackend>(
         added_by: actor_login.to_string(),
         added_by_uid: Some(actor_uid),
         added_at: at.clone(),
+        override_target_check,
     };
 
     let history = AdminHistoryRecord {
         at,
         epoch: now,
-        action: "added".to_string(),
+        action: if override_target_check {
+            "added (override target check)".to_string()
+        } else {
+            "added".to_string()
+        },
         login: req.login,
         uid: req.uid,
         actor: actor_login.to_string(),

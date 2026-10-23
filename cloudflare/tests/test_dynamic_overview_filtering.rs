@@ -1920,3 +1920,134 @@ async fn test_dynamic_overview_filtering_by_org_and_repo_target() {
     );
     assert_eq!(resp_none["instances_view"]["running_count"], 0);
 }
+
+#[tokio::test]
+async fn test_overview_filter_by_max_latency_ms() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    let mut ov = create_sample_overview(now);
+    ov["qualifications"] = serde_json::json!({
+        "cicd_runner": {
+            "hardware_qualifying": [],
+            "spot_price_qualifying": []
+        },
+        "rust_builder": {
+            "hardware_qualifying": [],
+            "spot_price_qualifying": []
+        }
+    });
+    ov["regions"] = serde_json::json!([
+        {
+            "region": "us-central1",
+            "zones": ["us-central1-a", "us-central1-b"],
+            "latency_ms": 18,
+            "enabled": true,
+            "running_instances": []
+        },
+        {
+            "region": "asia-east2",
+            "zones": ["asia-east2-a"],
+            "latency_ms": 148,
+            "enabled": true,
+            "running_instances": []
+        }
+    ]);
+    bundle.state.overview = Some(ov);
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    // Filter with max_latency_ms = 20.0 -> only us-central1 (18 ms) instances and offers qualify
+    let q_20ms = OverviewQuery {
+        max_latency_ms: Some(20.0),
+        include_deleted: Some(false),
+        ..Default::default()
+    };
+    let (_, resp_20ms) = handle_api_overview(&kv, q_20ms, now).await.unwrap();
+    let insts = resp_20ms["instances_view"]["instances"].as_array().unwrap();
+    assert_eq!(insts.len(), 1);
+    assert_eq!(insts[0]["region"], "us-central1");
+    assert_eq!(insts[0]["latency_ms"], 18.0);
+
+    let qual_spot = resp_20ms["qualifications"]["cicd_runner"]["spot_price_qualifying"]
+        .as_array()
+        .unwrap();
+    for offer in qual_spot {
+        let lat = offer["latency_ms"].as_f64().unwrap();
+        assert!(lat <= 20.0, "expected offer latency <= 20ms, got {lat}");
+    }
+}
+
+#[tokio::test]
+async fn test_sanitize_legacy_oxidex_templates_and_ssh_previews() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    let mut ov = create_sample_overview(now);
+    ov["cloud_init_templates"] = serde_json::json!([
+        {
+            "id": "ci-runner-strict-pool",
+            "name": "CI/CD Strict Pool",
+            "role": "cicd_runner",
+            "content": "#!/usr/bin/env bash\nLABELS=\"self-hosted,linux,x64,gcp-spot,oxidex-strict\"\ndocker run --label oxidex.strict-runner=true oxidex-self-hosted-runner:2.337.0\n",
+            "parsed": {
+                "stages": ["docker run --label oxidex.strict-runner=true oxidex-self-hosted-runner:2.337.0"]
+            }
+        }
+    ]);
+    ov["qualifications"] = serde_json::json!({
+        "cicd_runner": {
+            "hardware_qualifying": [],
+            "spot_price_qualifying": [
+                {
+                    "region": "us-central1",
+                    "machine_type": "c4-highcpu-16",
+                    "ssh_command_preview": "gcloud compute ssh oxidex-runners-uscentral1-c4h16 --zone=us-central1-a",
+                    "pricing": { "compute_hourly_usd": 0.14 }
+                }
+            ]
+        },
+        "rust_builder": {
+            "hardware_qualifying": [],
+            "spot_price_qualifying": [
+                {
+                    "region": "us-central1",
+                    "machine_type": "n4-highcpu-16",
+                    "ssh_command_preview": "gcloud compute ssh builder-oxidex-uscentral1-n4h16 --zone=us-central1-a",
+                    "pricing": { "compute_hourly_usd": 0.16 }
+                }
+            ]
+        }
+    });
+    ov["instances_view"]["instances"][0]["registration_target"] =
+        serde_json::json!("xbmc4lyfe/newznab-tmux");
+    bundle.state.overview = Some(ov);
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    let (_, resp) = handle_api_overview(&kv, OverviewQuery::default(), now)
+        .await
+        .unwrap();
+
+    let tpl_str = serde_json::to_string(&resp["cloud_init_templates"]).unwrap();
+    assert!(
+        !tpl_str.contains("oxidex"),
+        "expected cloud_init_templates to have zero oxidex strings, got: {tpl_str}"
+    );
+    let qual_str = serde_json::to_string(&resp["qualifications"]).unwrap();
+    assert!(
+        !qual_str.contains("oxidex"),
+        "expected qualifications to have zero oxidex strings, got: {qual_str}"
+    );
+
+    let insts = resp["instances_view"]["instances"].as_array().unwrap();
+    let newznab_inst = insts
+        .iter()
+        .find(|i| i["name"] == "oxidex-runners-swack-tools-1001")
+        .unwrap();
+    assert_eq!(newznab_inst["target"], "xbmc4lyfe/newznab-tmux");
+}
