@@ -129,19 +129,19 @@ remote-build bin="example-rust-project":
     host="$(~/.local/bin/select-idle-rust-builder)"
     run_id="$(date +%s)-$$"
     echo "✓ Selected idle builder: ${host}"
-    rsync -az --delete \
+    rsync -az --mkpath --delete \
       --exclude 'target/' \
       --exclude '.git/' \
-      ./ "${host}:~/.cache/remote-staging/${run_id}/"
+      ./ "${host}:~/remote-staging-${run_id}/"
     ssh "${host}" "flock -n -E 75 /tmp/{{project}}-tx.lock bash -euo pipefail -c '
-      trap \"rm -rf ~/.cache/remote-staging/${run_id}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup {{project}} >/dev/null 2>&1 || true\" EXIT
+      trap \"rm -rf ~/remote-staging-${run_id}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup {{project}} >/dev/null 2>&1 || true\" EXIT
       sudo -n /usr/local/bin/example-rust-project-remote-build prepare {{project}}
-      rsync -a --delete ~/.cache/remote-staging/${run_id}/ {{remote_root}}/sources/{{project}}/
+      rsync -a --delete ~/remote-staging-${run_id}/ {{remote_root}}/sources/{{project}}/
       sudo -n /usr/local/bin/example-rust-project-remote-build {{project}} cargo build --release --locked --bin {{bin}}
-      install -D -m 0755 {{remote_root}}/targets/{{project}}/release/{{bin}} ~/.cache/remote-exports/${run_id}/{{bin}}
+      install -D -m 0755 {{remote_root}}/targets/{{project}}/release/{{bin}} ~/remote-exports-${run_id}/{{bin}}
     '"
     mkdir -p target/release
-    rsync -az --remove-source-files "${host}:~/.cache/remote-exports/${run_id}/{{bin}}" ./target/release/{{bin}}
+    rsync -az --remove-source-files "${host}:~/remote-exports-${run_id}/{{bin}}" ./target/release/{{bin}}
     echo "✓ Remote release build succeeded on ${host}"
 
 # Build unoptimized debug binary on an idle dedicated builder
@@ -150,17 +150,17 @@ remote-debug bin="example-rust-project":
     set -euo pipefail
     host="$(~/.local/bin/select-idle-rust-builder)"
     run_id="$(date +%s)-$$"
-    rsync -az --delete --exclude 'target/' --exclude '.git/' \
-      ./ "${host}:~/.cache/remote-staging/${run_id}/"
+    rsync -az --mkpath --delete --exclude 'target/' --exclude '.git/' \
+      ./ "${host}:~/remote-staging-${run_id}/"
     ssh "${host}" "flock -n -E 75 /tmp/{{project}}-tx.lock bash -euo pipefail -c '
-      trap \"rm -rf ~/.cache/remote-staging/${run_id}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup {{project}} >/dev/null 2>&1 || true\" EXIT
+      trap \"rm -rf ~/remote-staging-${run_id}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup {{project}} >/dev/null 2>&1 || true\" EXIT
       sudo -n /usr/local/bin/example-rust-project-remote-build prepare {{project}}
-      rsync -a --delete ~/.cache/remote-staging/${run_id}/ {{remote_root}}/sources/{{project}}/
+      rsync -a --delete ~/remote-staging-${run_id}/ {{remote_root}}/sources/{{project}}/
       sudo -n /usr/local/bin/example-rust-project-remote-build {{project}} cargo build --bin {{bin}}
-      install -D -m 0755 {{remote_root}}/targets/{{project}}/debug/{{bin}} ~/.cache/remote-exports/${run_id}/{{bin}}
+      install -D -m 0755 {{remote_root}}/targets/{{project}}/debug/{{bin}} ~/remote-exports-${run_id}/{{bin}}
     '"
     mkdir -p target/debug
-    rsync -az --remove-source-files "${host}:~/.cache/remote-exports/${run_id}/{{bin}}" ./target/debug/{{bin}}
+    rsync -az --remove-source-files "${host}:~/remote-exports-${run_id}/{{bin}}" ./target/debug/{{bin}}
 
 # Run workspace unit and integration tests on an idle dedicated builder
 remote-test *args="--workspace":
@@ -168,12 +168,12 @@ remote-test *args="--workspace":
     set -euo pipefail
     host="$(~/.local/bin/select-idle-rust-builder)"
     run_id="$(date +%s)-$$"
-    rsync -az --delete --exclude 'target/' --exclude '.git/' \
-      ./ "${host}:~/.cache/remote-staging/${run_id}/"
+    rsync -az --mkpath --delete --exclude 'target/' --exclude '.git/' \
+      ./ "${host}:~/remote-staging-${run_id}/"
     ssh "${host}" "flock -n -E 75 /tmp/{{project}}-tx.lock bash -euo pipefail -c '
-      trap \"rm -rf ~/.cache/remote-staging/${run_id}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup {{project}} >/dev/null 2>&1 || true\" EXIT
+      trap \"rm -rf ~/remote-staging-${run_id}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup {{project}} >/dev/null 2>&1 || true\" EXIT
       sudo -n /usr/local/bin/example-rust-project-remote-build prepare {{project}}
-      rsync -a --delete ~/.cache/remote-staging/${run_id}/ {{remote_root}}/sources/{{project}}/
+      rsync -a --delete ~/remote-staging-${run_id}/ {{remote_root}}/sources/{{project}}/
       sudo -n /usr/local/bin/example-rust-project-remote-build {{project}} cargo test {{args}}
     '"
 
@@ -183,12 +183,12 @@ remote-clippy:
     set -euo pipefail
     host="$(~/.local/bin/select-idle-rust-builder)"
     run_id="$(date +%s)-$$"
-    rsync -az --delete --exclude 'target/' --exclude '.git/' \
-      ./ "${host}:~/.cache/remote-staging/${run_id}/"
+    rsync -az --mkpath --delete --exclude 'target/' --exclude '.git/' \
+      ./ "${host}:~/remote-staging-${run_id}/"
     ssh "${host}" "flock -n -E 75 /tmp/{{project}}-tx.lock bash -euo pipefail -c '
-      trap \"rm -rf ~/.cache/remote-staging/${run_id}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup {{project}} >/dev/null 2>&1 || true\" EXIT
+      trap \"rm -rf ~/remote-staging-${run_id}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup {{project}} >/dev/null 2>&1 || true\" EXIT
       sudo -n /usr/local/bin/example-rust-project-remote-build prepare {{project}}
-      rsync -a --delete ~/.cache/remote-staging/${run_id}/ {{remote_root}}/sources/{{project}}/
+      rsync -a --delete ~/remote-staging-${run_id}/ {{remote_root}}/sources/{{project}}/
       sudo -n /usr/local/bin/example-rust-project-remote-build {{project}} cargo clippy --workspace --all-targets -- -D warnings
     '"
 ```
@@ -230,18 +230,18 @@ for arg in "$@"; do
 done
 
 echo "[INFO] Syncing workspace and invoking cargo $* on ${HOST}..." >&2
-rsync -az --delete \
+rsync -az --mkpath --delete \
   --exclude 'target/' \
   --exclude '.git/' \
-  ./ "${HOST}:~/.cache/remote-staging/${RUN_ID}/"
+  ./ "${HOST}:~/remote-staging-${RUN_ID}/"
 
 ssh "${HOST}" "flock -n -E 75 /tmp/${PROJECT}-tx.lock bash -euo pipefail -c '
-  trap \"rm -rf ~/.cache/remote-staging/${RUN_ID}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup ${PROJECT} >/dev/null 2>&1 || true\" EXIT
+  trap \"rm -rf ~/remote-staging-${RUN_ID}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup ${PROJECT} >/dev/null 2>&1 || true\" EXIT
   sudo -n /usr/local/bin/example-rust-project-remote-build prepare ${PROJECT}
-  rsync -a --delete ~/.cache/remote-staging/${RUN_ID}/ ${REMOTE_ROOT}/sources/${PROJECT}/
+  rsync -a --delete ~/remote-staging-${RUN_ID}/ ${REMOTE_ROOT}/sources/${PROJECT}/
   sudo -n /usr/local/bin/example-rust-project-remote-build ${PROJECT} cargo $*
   if [[ \"${1:-}\" == \"build\" ]]; then
-    install -D -m 0755 ${REMOTE_ROOT}/targets/${PROJECT}/${profile_dir}/${PROJECT} ~/.cache/remote-exports/${RUN_ID}/${PROJECT}
+    install -D -m 0755 ${REMOTE_ROOT}/targets/${PROJECT}/${profile_dir}/${PROJECT} ~/remote-exports-${RUN_ID}/${PROJECT}
   fi
 '"
 
@@ -249,7 +249,7 @@ ssh "${HOST}" "flock -n -E 75 /tmp/${PROJECT}-tx.lock bash -euo pipefail -c '
 if [[ "${1:-}" == "build" ]]; then
   mkdir -p "./target/${profile_dir}"
   rsync -az --remove-source-files \
-    "${HOST}:~/.cache/remote-exports/${RUN_ID}/${PROJECT}" "./target/${profile_dir}/${PROJECT}"
+    "${HOST}:~/remote-exports-${RUN_ID}/${PROJECT}" "./target/${profile_dir}/${PROJECT}"
   echo "✓ Synced ${profile_dir} binary -> ./target/${profile_dir}/${PROJECT}" >&2
 fi
 ```
