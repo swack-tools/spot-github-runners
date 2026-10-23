@@ -24,6 +24,7 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     "python3",
     "cbindgen",
     "oxidex-toolchain-probe",
+    "example-rust-project-toolchain-probe",
     "toolchain-probe",
 ];
 
@@ -309,7 +310,10 @@ pub fn container_command(
 ) -> Result<Vec<String>, HostLauncherError> {
     validate_project(project)?;
     let img = image.unwrap_or("oxidex-remote-builder:1.99.0");
-    if img != "oxidex-remote-builder:1.97.1" && img != "oxidex-remote-builder:1.99.0" {
+    if img != "oxidex-remote-builder:1.97.1"
+        && img != "oxidex-remote-builder:1.99.0"
+        && img != "example-rust-project-remote-builder:1.99.0"
+    {
         return Err(HostLauncherError::UnreviewedImage(img.to_string()));
     }
     if command.is_empty() || !is_command_allowed(&command[0]) {
@@ -355,15 +359,27 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         return Ok(1);
     }
 
-    if unsafe { libc::geteuid() } != 0 && std::env::var("OXIDEX_ALLOW_UNPRIVILEGED").is_err() {
+    if unsafe { libc::geteuid() } != 0
+        && std::env::var("OXIDEX_ALLOW_UNPRIVILEGED").is_err()
+        && std::env::var("EXAMPLE_RUST_PROJECT_ALLOW_UNPRIVILEGED").is_err()
+    {
         eprintln!("host-launcher: invoke this root-owned launcher with sudo");
         return Ok(1);
     }
 
-    let root_str = std::env::var("OXIDEX_BUILD_ROOT").unwrap_or_else(|_| DEFAULT_ROOT.to_string());
+    let root_str = std::env::var("OXIDEX_BUILD_ROOT")
+        .or_else(|_| std::env::var("EXAMPLE_RUST_PROJECT_BUILD_ROOT"))
+        .unwrap_or_else(|_| DEFAULT_ROOT.to_string());
     let root = PathBuf::from(root_str);
-    let lock_root =
-        PathBuf::from(std::env::var("OXIDEX_LOCK_ROOT").unwrap_or_else(|_| "/run".to_string()));
+    let lock_root = PathBuf::from(
+        std::env::var("OXIDEX_LOCK_ROOT")
+            .or_else(|_| std::env::var("EXAMPLE_RUST_PROJECT_LOCK_ROOT"))
+            .unwrap_or_else(|_| "/run".to_string()),
+    );
+    let is_draining = |lr: &Path| {
+        lr.join("oxidex-build-draining").exists()
+            || lr.join("example-rust-project-build-draining").exists()
+    };
 
     enum LauncherAction<'a> {
         Prepare {
@@ -430,6 +446,10 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             explicit_uid,
         } => {
             validate_project(project)?;
+            if is_draining(&lock_root) {
+                eprintln!("Builder host is draining");
+                return Ok(75);
+            }
 
             let uploader_uid = resolve_uploader_uid(explicit_uid)?;
 
@@ -556,7 +576,7 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             validate_project(project)?;
 
             // 1. Fast check for draining sentinel
-            if lock_root.join("oxidex-build-draining").exists() {
+            if is_draining(&lock_root) {
                 eprintln!("Builder host is draining");
                 return Ok(75);
             }
@@ -580,7 +600,7 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             }
 
             // 3. Re-check draining sentinel under lock
-            if lock_root.join("oxidex-build-draining").exists() {
+            if is_draining(&lock_root) {
                 eprintln!("Builder host is draining");
                 return Ok(75);
             }

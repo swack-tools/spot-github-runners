@@ -195,6 +195,8 @@ install -d -o0 -g1001 -m0710 "$MOUNT_POINT/remote-build/targets"
 install -d -m0755 /opt/gha-runners /opt/oxidex-builder/image
 install -d -m0700 /var/lib/oxidex-builder
 install -d -o root -g root -m 0755 /opt/oxidex-builder/qualification_trust /etc/oxidex-remote-build
+ln -sfn /opt/oxidex-builder /opt/example-rust-project-builder
+ln -sfn /etc/oxidex-remote-build /etc/example-rust-project-remote-build
 install -d -o root -g root -m 0755 "$MOUNT_POINT/remote-build/qualification-sealed"
 
 # Define fallback handler so unrendered template placeholders do not abort under set -e
@@ -230,6 +232,8 @@ printf '%s\n' "$admission_config_raw" >/etc/gha-admission.json
 printf '%s\n' "$uploader_raw" >/etc/oxidex-builder-uploader.json
 chmod 0600 /etc/oxidex-builder-uploader.json
 chmod 0644 /etc/oxidex-remote-build.json /etc/gha-admission.json
+ln -sfn /etc/oxidex-remote-build.json /etc/example-rust-project-remote-build.json
+ln -sfn /etc/oxidex-builder-uploader.json /etc/example-rust-project-builder-uploader.json
 # Set up host-agent symlinks
 install -d -m 0755 /usr/local/bin
 if [[ -x /usr/local/bin/host-agent ]]; then
@@ -238,7 +242,9 @@ fi
 for alias in clean-target host-admission docker-wrapper docker-admission \
              host-launcher builder-entrypoint worktree-commands toolchain-probe \
              gha-runner-clean-target gha-host-admission oxidex-remote-build \
-             oxidex-build-entrypoint oxidex-worktree-commands oxidex-toolchain-probe docker; do
+             oxidex-build-entrypoint oxidex-worktree-commands oxidex-toolchain-probe \
+             example-rust-project-remote-build example-rust-project-build-entrypoint \
+             example-rust-project-worktree-commands example-rust-project-toolchain-probe docker; do
   ln -sf /usr/local/bin/host-agent "/usr/local/bin/$alias"
 done
 
@@ -246,7 +252,7 @@ done
 /usr/local/bin/host-agent host-admission headroom --check-builder || { echo "Actual host cannot fit 28GiB builder with host reserve" >&2; exit 75; }
 
 # Bound image-build stages too. Classic engine honors these flags; BuildKit may not.
-DOCKER_BUILDKIT=0 /usr/bin/docker build --memory=28g --memory-swap=28g --cpu-period=100000 --cpu-quota=1600000 --iidfile /var/lib/oxidex-builder/image-id -t oxidex-remote-builder:1.99.0 /opt/oxidex-builder/image
+DOCKER_BUILDKIT=0 /usr/bin/docker build --memory=28g --memory-swap=28g --cpu-period=100000 --cpu-quota=1600000 --iidfile /var/lib/oxidex-builder/image-id -t oxidex-remote-builder:1.99.0 -t example-rust-project-remote-builder:1.99.0 /opt/oxidex-builder/image
 
 image=$(tr -d '[:space:]' </var/lib/oxidex-builder/image-id)
 [[ "$image" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Malformed built image ID: $image" >&2; exit 78; }
@@ -360,9 +366,10 @@ jq -n \
     cpu_host_services_share: true
   }' >/var/lib/oxidex-builder-readiness.json
 chmod 0600 /var/lib/oxidex-builder-readiness.json
+ln -sfn /var/lib/oxidex-builder-readiness.json /var/lib/example-rust-project-builder-readiness.json
 
 # Startup enrolls only the root-bound authoritative public SSH mapping.
-printf '%%oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build\n' >/etc/sudoers.d/oxidex-build
+printf '%%oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/local/bin/example-rust-project-remote-build, /usr/local/bin/host-launcher\n' >/etc/sudoers.d/oxidex-build
 chmod 0440 /etc/sudoers.d/oxidex-build
 visudo -cf /etc/sudoers.d/oxidex-build
 
@@ -425,3 +432,4 @@ chmod 0600 /var/lib/oxidex-builder/uploader-observed.json
 
 printf '%s\n' "$deployment_id" >/var/lib/oxidex-builder-bootstrap.complete
 chmod 0444 /var/lib/oxidex-builder-bootstrap.complete
+ln -sfn /var/lib/oxidex-builder-bootstrap.complete /var/lib/example-rust-project-builder-bootstrap.complete

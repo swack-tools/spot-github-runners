@@ -8,7 +8,9 @@ use host_agent::{
 
 fn is_builder_environment() -> bool {
     Path::new("/etc/oxidex-remote-build.json").exists()
+        || Path::new("/etc/example-rust-project-remote-build.json").exists()
         || std::env::var_os("OXIDEX_BUILDER").is_some()
+        || std::env::var_os("EXAMPLE_RUST_PROJECT_BUILDER").is_some()
         || std::env::var_os("OXIDEX_BUILDER_DOCKER_ADMISSION").is_some()
 }
 
@@ -48,10 +50,18 @@ fn main() -> ExitCode {
                 docker_wrapper::run(&args[1..])
             }
         }
-        "oxidex-remote-build" | "host-launcher" => host_launcher::run(&args[1..]),
-        "oxidex-build-entrypoint" | "builder-entrypoint" => builder_entrypoint::run(&args[1..]),
-        "oxidex-worktree-commands" | "worktree-commands" => worktree_commands::run(&args[1..]),
-        "oxidex-toolchain-probe" | "toolchain-probe" => toolchain_probe::run(&args[1..]),
+        "oxidex-remote-build" | "example-rust-project-remote-build" | "host-launcher" => {
+            host_launcher::run(&args[1..])
+        }
+        "oxidex-build-entrypoint"
+        | "example-rust-project-build-entrypoint"
+        | "builder-entrypoint" => builder_entrypoint::run(&args[1..]),
+        "oxidex-worktree-commands"
+        | "example-rust-project-worktree-commands"
+        | "worktree-commands" => worktree_commands::run(&args[1..]),
+        "oxidex-toolchain-probe" | "example-rust-project-toolchain-probe" | "toolchain-probe" => {
+            toolchain_probe::run(&args[1..])
+        }
         _ => {
             if args.len() < 2 {
                 print_usage();
@@ -62,14 +72,18 @@ fn main() -> ExitCode {
                 "admission" | "host-admission" => admission::run(&args[2..]),
                 "docker-wrapper" => docker_wrapper::run(&args[2..]),
                 "docker-admission" => docker_admission::run(&args[2..]),
-                "host-launcher" | "oxidex-remote-build" => host_launcher::run(&args[2..]),
-                "builder-entrypoint" | "oxidex-build-entrypoint" => {
-                    builder_entrypoint::run(&args[2..])
+                "host-launcher" | "oxidex-remote-build" | "example-rust-project-remote-build" => {
+                    host_launcher::run(&args[2..])
                 }
-                "worktree-commands" | "oxidex-worktree-commands" => {
-                    worktree_commands::run(&args[2..])
-                }
-                "toolchain-probe" | "oxidex-toolchain-probe" => toolchain_probe::run(&args[2..]),
+                "builder-entrypoint"
+                | "oxidex-build-entrypoint"
+                | "example-rust-project-build-entrypoint" => builder_entrypoint::run(&args[2..]),
+                "worktree-commands"
+                | "oxidex-worktree-commands"
+                | "example-rust-project-worktree-commands" => worktree_commands::run(&args[2..]),
+                "toolchain-probe"
+                | "oxidex-toolchain-probe"
+                | "example-rust-project-toolchain-probe" => toolchain_probe::run(&args[2..]),
                 "--help" | "-h" | "help" => {
                     print_usage();
                     return ExitCode::SUCCESS;

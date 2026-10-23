@@ -127,16 +127,18 @@ remote-build bin="example-rust-project":
     #!/usr/bin/env bash
     set -euo pipefail
     host="$(~/.local/bin/select-idle-rust-builder)"
-    echo "✓ Selected idle builder: ${host}"
-    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare {{project}}"
+    run_project="{{project}}-$(date +%s)-$$"
+    echo "✓ Selected idle builder: ${host} (run_project=${run_project})"
+    trap 'ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build cleanup ${run_project}" >/dev/null 2>&1 || true' EXIT
+    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare ${run_project}"
     rsync -az --delete \
       --exclude 'target/' \
       --exclude '.git/' \
-      ./ "${host}:{{remote_root}}/sources/{{project}}/"
-    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build {{project}} \
+      ./ "${host}:{{remote_root}}/sources/${run_project}/"
+    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build ${run_project} \
       cargo build --release --locked --bin {{bin}}"
     mkdir -p target/release
-    rsync -az "${host}:{{remote_root}}/targets/{{project}}/release/{{bin}}" ./target/release/{{bin}}
+    rsync -az "${host}:{{remote_root}}/targets/${run_project}/release/{{bin}}" ./target/release/{{bin}}
     echo "✓ Remote release build succeeded on ${host}"
 
 # Build unoptimized debug binary on an idle dedicated builder
@@ -144,23 +146,27 @@ remote-debug bin="example-rust-project":
     #!/usr/bin/env bash
     set -euo pipefail
     host="$(~/.local/bin/select-idle-rust-builder)"
-    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare {{project}}"
+    run_project="{{project}}-$(date +%s)-$$"
+    trap 'ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build cleanup ${run_project}" >/dev/null 2>&1 || true' EXIT
+    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare ${run_project}"
     rsync -az --delete --exclude 'target/' --exclude '.git/' \
-      ./ "${host}:{{remote_root}}/sources/{{project}}/"
-    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build {{project}} \
+      ./ "${host}:{{remote_root}}/sources/${run_project}/"
+    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build ${run_project} \
       cargo build --bin {{bin}}"
     mkdir -p target/debug
-    rsync -az "${host}:{{remote_root}}/targets/{{project}}/debug/{{bin}}" ./target/debug/{{bin}}
+    rsync -az "${host}:{{remote_root}}/targets/${run_project}/debug/{{bin}}" ./target/debug/{{bin}}
 
 # Run workspace unit and integration tests on an idle dedicated builder
 remote-test *args="--workspace":
     #!/usr/bin/env bash
     set -euo pipefail
     host="$(~/.local/bin/select-idle-rust-builder)"
-    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare {{project}}"
+    run_project="{{project}}-$(date +%s)-$$"
+    trap 'ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build cleanup ${run_project}" >/dev/null 2>&1 || true' EXIT
+    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare ${run_project}"
     rsync -az --delete --exclude 'target/' --exclude '.git/' \
-      ./ "${host}:{{remote_root}}/sources/{{project}}/"
-    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build {{project}} \
+      ./ "${host}:{{remote_root}}/sources/${run_project}/"
+    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build ${run_project} \
       cargo test {{args}}"
 
 # Run Clippy lints on an idle dedicated builder
@@ -168,10 +174,12 @@ remote-clippy:
     #!/usr/bin/env bash
     set -euo pipefail
     host="$(~/.local/bin/select-idle-rust-builder)"
-    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare {{project}}"
+    run_project="{{project}}-$(date +%s)-$$"
+    trap 'ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build cleanup ${run_project}" >/dev/null 2>&1 || true' EXIT
+    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare ${run_project}"
     rsync -az --delete --exclude 'target/' --exclude '.git/' \
-      ./ "${host}:{{remote_root}}/sources/{{project}}/"
-    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build {{project}} \
+      ./ "${host}:{{remote_root}}/sources/${run_project}/"
+    ssh "${host}" "sudo -n /usr/local/bin/example-rust-project-remote-build ${run_project} \
       cargo clippy --workspace --all-targets -- -D warnings"
 ```
 
@@ -200,17 +208,20 @@ if [[ "${1:-}" == "remote" ]]; then
 fi
 
 PROJECT="${EXAMPLE_RUST_PROJECT_NAME:-example-rust-project}"
+RUN_PROJECT="${PROJECT}-$(date +%s)-$$"
 REMOTE_ROOT="/mnt/runner-data/remote-build"
 HOST="$(~/.local/bin/select-idle-rust-builder)"
 
-echo "[INFO] Syncing workspace and invoking cargo $* on ${HOST}..." >&2
-ssh "${HOST}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare ${PROJECT}"
+trap 'ssh "${HOST}" "sudo -n /usr/local/bin/example-rust-project-remote-build cleanup ${RUN_PROJECT}" >/dev/null 2>&1 || true' EXIT
+
+echo "[INFO] Syncing workspace (${RUN_PROJECT}) and invoking cargo $* on ${HOST}..." >&2
+ssh "${HOST}" "sudo -n /usr/local/bin/example-rust-project-remote-build prepare ${RUN_PROJECT}"
 rsync -az --delete \
   --exclude 'target/' \
   --exclude '.git/' \
-  ./ "${HOST}:${REMOTE_ROOT}/sources/${PROJECT}/"
+  ./ "${HOST}:${REMOTE_ROOT}/sources/${RUN_PROJECT}/"
 
-ssh "${HOST}" "sudo -n /usr/local/bin/example-rust-project-remote-build ${PROJECT} \
+ssh "${HOST}" "sudo -n /usr/local/bin/example-rust-project-remote-build ${RUN_PROJECT} \
   cargo $*"
 
 # If this was a build command, pull back the compiled binary for the active profile
@@ -225,7 +236,7 @@ if [[ "${1:-}" == "build" ]]; then
   rsync -az \
     --include="${PROJECT}" \
     --exclude="*" \
-    "${HOST}:${REMOTE_ROOT}/targets/${PROJECT}/${profile_dir}/" "./target/${profile_dir}/"
+    "${HOST}:${REMOTE_ROOT}/targets/${RUN_PROJECT}/${profile_dir}/" "./target/${profile_dir}/"
   echo "✓ Synced ${profile_dir} binary -> ./target/${profile_dir}/${PROJECT}" >&2
 fi
 ```
