@@ -23,6 +23,7 @@ These model rules apply when launching Claude subagents. Keep the human-selected
 - Pass both `model` and `effort` explicitly on subagent launches (`--model` and `--effort` for command-line children) with a self-contained brief covering the goal, file paths, constraints, owned files, and verification commands.
 - Select the route by failure impact and state complexity rather than diff size. Escalate with a concrete explanation when a task exceeds its initial tier.
 - Verify that `CLAUDE_CODE_EFFORT_LEVEL` or global subagent model overrides do not silently downgrade the requested route; report any mismatch instead of claiming the requested effort was applied.
+- If a subagent launch or model request fails due to a transient model, capacity, rate-limit, or transport error, always retry until it succeeds.
 
 ## Gemini subagent model routing
 
@@ -45,6 +46,7 @@ These model rules apply when launching Gemini subagents in Google Antigravity, t
 - When invoking Antigravity subagents (`invoke_subagent`), select the matching `Model` tier (`flash_lite`, `flash`, `pro`, or `inherit` when the parent session already runs `gemini-4-argon` at `high`) and set `Workspace` to `inherit` for read-only tasks or `share`/`branch` when isolating concurrent writers.
 - When configuring Gemini API or SDK subagents directly, set both `model` and `thinking_level` (`low`, `medium`, or `high`) explicitly. Never use deprecated `gemini-2.5-*`, `gemini-2.0-*`, or `gemini-1.5-*` models.
 - Give each subagent a self-contained prompt with explicit target paths, invariants to preserve, and verification steps. Keep concurrent writers on disjoint file sets or isolated workspaces.
+- If a subagent launch (`invoke_subagent`, `send_message`) or model request fails due to a transient model, capacity, rate-limit, or transport error, always retry until it succeeds.
 
 ## Codex subagent and review routing
 
