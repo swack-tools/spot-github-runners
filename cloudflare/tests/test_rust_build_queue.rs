@@ -332,3 +332,203 @@ async fn test_validation_rejects_invalid_inputs_and_non_finite_floats() {
             .is_err()
     );
 }
+
+#[test]
+fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_target() {
+    use spot_dashboard_edge::gcp::{build_spot_builder_vm_request, BuilderVmConfig};
+
+    let template = "#!/bin/bash\nINSTANCE={{INSTANCE_NAME}}\nPROJECT={{PROJECT}}\nZONE={{ZONE}}\nDEV=/dev/disk/by-id/google-{{DISK_DEVICE_NAME}}\nDEP={{DEPLOYMENT_ID}}\n";
+    let cfg = BuilderVmConfig {
+        instance_name: "builder-scale-1792000000-abcd1234",
+        machine_type: "n4-highcpu-16",
+        zone: "us-central1-a",
+        deployment_id: "dep-builder-1792000000",
+        cache_disk_name: "builder-scale-1792000000-abcd1234-cache",
+        cache_disk_device_name: "builder-scale-1792000000-abcd1234-cache",
+        startup_script_template: template,
+        boot_disk_type: Some("pd-balanced"),
+        cache_disk_type: Some("pd-balanced"),
+    };
+
+    let req = build_spot_builder_vm_request("example-ci-fleet", &cfg)
+        .expect("build spot builder vm request");
+    assert_eq!(
+        req.disks.len(),
+        2,
+        "Builder VM must attach boot + cache disks"
+    );
+    assert!(req.disks[0].boot);
+    assert!(req.disks[0].auto_delete);
+    assert!(!req.disks[1].boot);
+    assert!(
+        !req.disks[1].auto_delete,
+        "Dedicated builder cache disk must persist (auto_delete = false)"
+    );
+    assert_eq!(
+        req.disks[1].device_name.as_deref(),
+        Some("builder-scale-1792000000-abcd1234-cache")
+    );
+    assert_eq!(
+        req.disks[1]
+            .initialize_params
+            .as_ref()
+            .unwrap()
+            .disk_size_gb,
+        "375"
+    );
+
+    let role_meta = req
+        .metadata
+        .items
+        .iter()
+        .find(|m| m.key == "spot-role")
+        .map(|m| m.value.as_str());
+    assert_eq!(role_meta, Some("rust_builder"));
+    assert!(
+        req.metadata.items.iter().all(|m| m.key != "spot-target"),
+        "Builder VM must not set spot-target metadata used by runner floor accounting"
+    );
+
+    let startup = req
+        .metadata
+        .items
+        .iter()
+        .find(|m| m.key == "startup-script")
+        .map(|m| m.value.as_str())
+        .unwrap();
+    assert!(startup.contains("INSTANCE=builder-scale-1792000000-abcd1234"));
+    assert!(startup.contains("PROJECT=example-ci-fleet"));
+    assert!(startup.contains("ZONE=us-central1-a"));
+    assert!(startup.contains("DEV=/dev/disk/by-id/google-builder-scale-1792000000-abcd1234-cache"));
+    assert!(startup.contains("DEP=dep-builder-1792000000"));
+}
+
+#[tokio::test]
+async fn test_queue_overflow_rejects_when_all_items_unfinished_and_evicts_completed() {
+    use spot_dashboard_edge::state::MAX_RUST_BUILD_QUEUE_ITEMS;
+
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1_792_030_000;
+
+    for i in 0..MAX_RUST_BUILD_QUEUE_ITEMS {
+        let req = EnqueueRustBuildRequest {
+            repo: "example-org/example-rust-project".to_string(),
+            branch: "main".to_string(),
+            commit_sha: format!("abcdef0123456789abcdef0123456789{:08x}", i),
+            command: "cargo test --workspace".to_string(),
+            requested_output: Some("log".to_string()),
+            template_id: None,
+            profile: None,
+            binary_name: None,
+            gcs_bucket: None,
+            origin_ip: None,
+        };
+        handle_post_rust_builds_enqueue(&kv, req, now + (i as u64))
+            .await
+            .expect("enqueue within capacity");
+    }
+
+    // 201st enqueue when all 200 items are unfinished ("queued") must be rejected with Conflict
+    let overflow_req = EnqueueRustBuildRequest {
+        repo: "example-org/example-rust-project".to_string(),
+        branch: "main".to_string(),
+        commit_sha: "abcdef0123456789abcdef0123456789ffffffff".to_string(),
+        command: "cargo test --workspace".to_string(),
+        requested_output: Some("log".to_string()),
+        template_id: None,
+        profile: None,
+        binary_name: None,
+        gcs_bucket: None,
+        origin_ip: None,
+    };
+    let err = handle_post_rust_builds_enqueue(&kv, overflow_req.clone(), now + 500)
+        .await
+        .expect_err("overflow must reject when all builds are unfinished");
+    assert!(
+        matches!(err, StateError::Conflict(_)),
+        "Expected StateError::Conflict on full unfinished queue, got: {err:?}"
+    );
+
+    // Oldest unfinished build (#4553) must still be present
+    let (_, status_first) = handle_get_rust_build_status(&kv, 4553, true, now + 501)
+        .await
+        .expect("build #4553 must not be evicted while unfinished");
+    assert_eq!(status_first["build_status"], "queued");
+
+    // Once build #4553 completes, a new enqueue can evict the finished entry
+    let comp = CompleteRustBuildRequest {
+        build_id: Some(4553),
+        status: "completed".to_string(),
+        exit_code: Some(0),
+        compile_duration_seconds: Some(120.0),
+        delivery_duration_seconds: Some(1.0),
+        instance_name: Some("builder-us-central1-a-01".to_string()),
+        zone: Some("us-central1-a".to_string()),
+        machine_type: None,
+        vcpu: None,
+        cache_hits: None,
+        total_crates: None,
+        peak_ram_gib: None,
+        cpu_time_seconds: None,
+        log_url: None,
+        binary_url: None,
+        target_zip_url: None,
+        log_size_bytes: None,
+        binary_size_bytes: None,
+        target_zip_size_bytes: None,
+        log_sha256: None,
+        binary_sha256: None,
+        target_zip_sha256: None,
+    };
+    handle_post_rust_builds_complete(&kv, 4553, comp, now + 502)
+        .await
+        .expect("complete 4553");
+
+    let (st, body) = handle_post_rust_builds_enqueue(&kv, overflow_req, now + 503)
+        .await
+        .expect("enqueue after completing oldest item");
+    assert_eq!(st, 200);
+    assert_eq!(body["build_id"], 4553 + (MAX_RUST_BUILD_QUEUE_ITEMS as u64));
+}
+
+#[tokio::test]
+async fn test_queue_mutations_bypass_stale_isolate_cache() {
+    use spot_dashboard_edge::state::{default_dashboard_bundle, set_cached_state};
+
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1_792_040_000;
+
+    // Enqueue build #4553 into KV
+    let req = EnqueueRustBuildRequest {
+        repo: "example-org/example-rust-project".to_string(),
+        branch: "main".to_string(),
+        commit_sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+        command: "cargo test".to_string(),
+        requested_output: Some("log".to_string()),
+        template_id: None,
+        profile: None,
+        binary_name: None,
+        gcs_bucket: None,
+        origin_ip: None,
+    };
+    handle_post_rust_builds_enqueue(&kv, req, now)
+        .await
+        .expect("enqueue 1");
+
+    // Poison the in-isolate STATE_CACHE with an empty default bundle at `now + 1`
+    let stale_bundle = default_dashboard_bundle(now + 1).expect("default bundle");
+    set_cached_state(now + 1, stale_bundle);
+
+    // Claiming at `now + 2` (within the 60s cache TTL) must bypass STATE_CACHE and claim #4553 from KV
+    let claim_req = ClaimRustBuildRequest {
+        instance_name: "builder-us-central1-a-01".to_string(),
+        zone: Some("us-central1-a".to_string()),
+    };
+    let (_, claim_body) = handle_post_rust_builds_claim(&kv, claim_req, now + 2)
+        .await
+        .expect("claim must read authoritative KV state");
+    assert_eq!(claim_body["claimed"], true);
+    assert_eq!(claim_body["build"]["build_id"], 4553);
+}

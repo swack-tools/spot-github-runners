@@ -413,6 +413,13 @@ pub async fn load_state<K: KvStoreBackend>(
     }
 
     // 2. Fall back to single consolidated KV read
+    load_authoritative_state(kv, now).await
+}
+
+pub async fn load_authoritative_state<K: KvStoreBackend>(
+    kv: &K,
+    now: u64,
+) -> Result<(DashboardBundle, CacheSource), StateError> {
     match kv.get(KV_STATE_KEY).await? {
         Some(raw) => {
             let bundle: DashboardBundle = serde_json::from_str(&raw)?;
@@ -431,6 +438,88 @@ pub async fn load_state<K: KvStoreBackend>(
             Ok((bundle, CacheSource::DefaultCreated))
         }
     }
+}
+
+struct QueueLockState {
+    locked: bool,
+    wakers: Vec<std::task::Waker>,
+}
+
+static QUEUE_MUTATION_LOCK: std::sync::Mutex<QueueLockState> =
+    std::sync::Mutex::new(QueueLockState {
+        locked: false,
+        wakers: Vec::new(),
+    });
+
+struct QueueMutationGuard;
+
+impl Drop for QueueMutationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = QUEUE_MUTATION_LOCK.lock() {
+            state.locked = false;
+            for waker in state.wakers.drain(..) {
+                waker.wake();
+            }
+        }
+    }
+}
+
+async fn acquire_queue_mutation_guard() -> QueueMutationGuard {
+    std::future::poll_fn(|cx| {
+        let mut state = QUEUE_MUTATION_LOCK.lock().unwrap();
+        if !state.locked {
+            state.locked = true;
+            std::task::Poll::Ready(QueueMutationGuard)
+        } else {
+            state.wakers.push(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+async fn mutate_rust_build_queue<K, F, T>(kv: &K, now: u64, mutator: F) -> Result<T, StateError>
+where
+    K: KvStoreBackend,
+    F: Fn(&mut DashboardBundle) -> Result<(bool, T), StateError>,
+{
+    let _guard = acquire_queue_mutation_guard().await;
+    const MAX_CAS_ATTEMPTS: usize = 5;
+
+    for _attempt in 0..MAX_CAS_ATTEMPTS {
+        let (mut bundle, source) = load_authoritative_state(kv, now).await?;
+        let expected_version = if source == CacheSource::DefaultCreated {
+            None
+        } else {
+            Some((bundle.state_version, bundle.state_fingerprint.clone()))
+        };
+
+        let (should_persist, output) = mutator(&mut bundle)?;
+        if !should_persist {
+            return Ok(output);
+        }
+
+        // Optimistic compare-and-swap check against KV before committing
+        let current_version = match kv.get(KV_STATE_KEY).await? {
+            Some(raw) => {
+                let latest: DashboardBundle = serde_json::from_str(&raw)?;
+                Some((latest.state_version, latest.state_fingerprint))
+            }
+            None => None,
+        };
+
+        if current_version != expected_version {
+            continue;
+        }
+
+        bundle.state.updated_at = now;
+        save_state(kv, &mut bundle, now).await?;
+        return Ok(output);
+    }
+
+    Err(StateError::Conflict(
+        "Concurrent build queue modification detected; retry request".into(),
+    ))
 }
 
 pub async fn save_state<K: KvStoreBackend>(
@@ -3828,68 +3917,80 @@ pub async fn handle_post_rust_builds_enqueue<K: KvStoreBackend>(
         .filter(|s| !s.is_empty())
         .map(String::from);
 
-    let (mut bundle, _) = load_state(kv, now).await?;
-    let mut queue = load_queue_from_state(&bundle.state);
+    let repo_owned = repo.to_string();
+    let branch_owned = branch.to_string();
+    let commit_sha_owned = commit_sha.to_string();
+    let command_owned = command.to_string();
+    let gcs_bucket_owned = gcs_bucket.to_string();
+    let origin_ip = req.origin_ip;
 
-    let max_existing_id = queue.iter().map(|q| q.build_id).max().unwrap_or(0);
-    let stored_next_id = bundle
-        .state
-        .rust_builds
-        .get("next_build_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_INITIAL_BUILD_ID);
-    let build_id = stored_next_id
-        .max(max_existing_id.saturating_add(1))
-        .max(DEFAULT_INITIAL_BUILD_ID);
+    let resp = mutate_rust_build_queue(kv, now, |bundle| {
+        let mut queue = load_queue_from_state(&bundle.state);
 
-    let item = RustBuildQueueItem {
-        build_id,
-        repo: repo.to_string(),
-        branch: branch.to_string(),
-        commit_sha: commit_sha.to_string(),
-        command: command.to_string(),
-        requested_output,
-        template_id,
-        profile,
-        binary_name,
-        status: "queued".to_string(),
-        enqueued_at: chrono_iso(now),
-        enqueued_epoch: now,
-        started_at: None,
-        started_epoch: None,
-        finished_at: None,
-        finished_epoch: None,
-        assigned_instance: None,
-        zone: None,
-        gcs_bucket: gcs_bucket.to_string(),
-        artifacts: None,
-        selected_artifact_url: None,
-        compile_duration_seconds: None,
-        exit_code: None,
-        origin_ip: req.origin_ip,
-    };
-
-    queue.push(item.clone());
-    if queue.len() > MAX_RUST_BUILD_QUEUE_ITEMS {
-        // Evict oldest completed/failed items first when bounding queue history
-        if let Some(done_idx) = queue
-            .iter()
-            .position(|q| q.status == "completed" || q.status == "failed")
-        {
-            queue.remove(done_idx);
-        } else {
-            queue.remove(0);
+        if queue.len() >= MAX_RUST_BUILD_QUEUE_ITEMS {
+            // Evict oldest completed/failed items first when bounding queue history;
+            // never evict unfinished ("queued" or "running") builds.
+            if let Some(done_idx) = queue
+                .iter()
+                .position(|q| q.status == "completed" || q.status == "failed")
+            {
+                queue.remove(done_idx);
+            } else {
+                return Err(StateError::Conflict(format!(
+                    "Build queue is full ({} unfinished builds at capacity {}); wait for active builds to complete",
+                    queue.len(),
+                    MAX_RUST_BUILD_QUEUE_ITEMS
+                )));
+            }
         }
-    }
 
-    save_queue_into_state(&mut bundle.state, &queue, build_id + 1);
-    let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
-    let avg_build_secs = effective_average_build_seconds(&bundle.state);
+        let max_existing_id = queue.iter().map(|q| q.build_id).max().unwrap_or(0);
+        let stored_next_id = bundle
+            .state
+            .rust_builds
+            .get("next_build_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_INITIAL_BUILD_ID);
+        let build_id = stored_next_id
+            .max(max_existing_id.saturating_add(1))
+            .max(DEFAULT_INITIAL_BUILD_ID);
 
-    bundle.state.updated_at = now;
-    save_state(kv, &mut bundle, now).await?;
+        let item = RustBuildQueueItem {
+            build_id,
+            repo: repo_owned.clone(),
+            branch: branch_owned.clone(),
+            commit_sha: commit_sha_owned.clone(),
+            command: command_owned.clone(),
+            requested_output: requested_output.clone(),
+            template_id: template_id.clone(),
+            profile: profile.clone(),
+            binary_name: binary_name.clone(),
+            status: "queued".to_string(),
+            enqueued_at: chrono_iso(now),
+            enqueued_epoch: now,
+            started_at: None,
+            started_epoch: None,
+            finished_at: None,
+            finished_epoch: None,
+            assigned_instance: None,
+            zone: None,
+            gcs_bucket: gcs_bucket_owned.clone(),
+            artifacts: None,
+            selected_artifact_url: None,
+            compile_duration_seconds: None,
+            exit_code: None,
+            origin_ip: origin_ip.clone(),
+        };
 
-    let resp = build_status_response(&item, &queue, &eval, avg_build_secs, now, true);
+        queue.push(item.clone());
+        save_queue_into_state(&mut bundle.state, &queue, build_id + 1);
+        let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
+        let avg_build_secs = effective_average_build_seconds(&bundle.state);
+        let resp = build_status_response(&item, &queue, &eval, avg_build_secs, now, true);
+        Ok((true, resp))
+    })
+    .await?;
+
     Ok((200, resp))
 }
 
@@ -3899,7 +4000,7 @@ pub async fn handle_get_rust_build_status<K: KvStoreBackend>(
     is_authed_admin: bool,
     now: u64,
 ) -> Result<(u16, serde_json::Value), StateError> {
-    let (mut bundle, _) = load_state(kv, now).await?;
+    let (mut bundle, _) = load_authoritative_state(kv, now).await?;
     let queue = load_queue_from_state(&bundle.state);
     let item = queue
         .iter()
@@ -3917,7 +4018,7 @@ pub async fn handle_get_rust_builds_queue<K: KvStoreBackend>(
     is_authed_admin: bool,
     now: u64,
 ) -> Result<(u16, serde_json::Value), StateError> {
-    let (mut bundle, _) = load_state(kv, now).await?;
+    let (mut bundle, _) = load_authoritative_state(kv, now).await?;
     let mut queue = load_queue_from_state(&bundle.state);
     let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
     let avg_build_secs = effective_average_build_seconds(&bundle.state);
@@ -3957,59 +4058,62 @@ pub async fn handle_post_rust_builds_claim<K: KvStoreBackend>(
             "instance_name cannot be empty".into(),
         ));
     }
-
-    let (mut bundle, _) = load_state(kv, now).await?;
-    let mut queue = load_queue_from_state(&bundle.state);
-
-    let next_idx = queue.iter().position(|q| q.status == "queued");
-    let Some(idx) = next_idx else {
-        return Ok((
-            200,
-            serde_json::json!({
-                "status": "empty",
-                "claimed": false,
-                "build": serde_json::Value::Null,
-            }),
-        ));
-    };
-
-    queue[idx].status = "running".to_string();
-    queue[idx].started_at = Some(chrono_iso(now));
-    queue[idx].started_epoch = Some(now);
-    queue[idx].assigned_instance = Some(instance_name.to_string());
-    queue[idx].zone = req
+    let instance_name_owned = instance_name.to_string();
+    let zone_owned = req
         .zone
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
 
-    let claimed_item = queue[idx].clone();
-    let upload_targets =
-        default_artifacts_for_build(&claimed_item.gcs_bucket, claimed_item.build_id);
+    let body = mutate_rust_build_queue(kv, now, |bundle| {
+        let mut queue = load_queue_from_state(&bundle.state);
 
-    let next_build_id = bundle
-        .state
-        .rust_builds
-        .get("next_build_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(claimed_item.build_id + 1);
-    save_queue_into_state(&mut bundle.state, &queue, next_build_id);
-    let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
+        let next_idx = queue.iter().position(|q| q.status == "queued");
+        let Some(idx) = next_idx else {
+            return Ok((
+                false,
+                serde_json::json!({
+                    "status": "empty",
+                    "claimed": false,
+                    "build": serde_json::Value::Null,
+                }),
+            ));
+        };
 
-    bundle.state.updated_at = now;
-    save_state(kv, &mut bundle, now).await?;
+        queue[idx].status = "running".to_string();
+        queue[idx].started_at = Some(chrono_iso(now));
+        queue[idx].started_epoch = Some(now);
+        queue[idx].assigned_instance = Some(instance_name_owned.clone());
+        queue[idx].zone = zone_owned.clone();
 
-    Ok((
-        200,
-        serde_json::json!({
-            "status": "claimed",
-            "claimed": true,
-            "build": claimed_item,
-            "upload_targets": upload_targets,
-            "scaling_evaluation": eval,
-        }),
-    ))
+        let claimed_item = queue[idx].clone();
+        let upload_targets =
+            default_artifacts_for_build(&claimed_item.gcs_bucket, claimed_item.build_id);
+
+        let next_build_id = bundle
+            .state
+            .rust_builds
+            .get("next_build_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(claimed_item.build_id + 1);
+        save_queue_into_state(&mut bundle.state, &queue, next_build_id);
+        let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
+
+        Ok((
+            true,
+            serde_json::json!({
+                "status": "claimed",
+                "claimed": true,
+                "build": claimed_item,
+                "upload_targets": upload_targets,
+                "scaling_evaluation": eval,
+            }),
+        ))
+    })
+    .await?;
+
+    Ok((200, body))
 }
 
 pub async fn handle_post_rust_builds_complete<K: KvStoreBackend>(
@@ -4058,111 +4162,127 @@ pub async fn handle_post_rust_builds_complete<K: KvStoreBackend>(
         }
     }
 
-    let (mut bundle, _) = load_state(kv, now).await?;
-    let mut queue = load_queue_from_state(&bundle.state);
-    let idx = queue
-        .iter()
-        .position(|q| q.build_id == build_id)
-        .ok_or_else(|| StateError::NotFound(format!("Build #{} not found in queue", build_id)))?;
+    let resp = mutate_rust_build_queue(kv, now, |bundle| {
+        let mut queue = load_queue_from_state(&bundle.state);
+        let idx = queue
+            .iter()
+            .position(|q| q.build_id == build_id)
+            .ok_or_else(|| {
+                StateError::NotFound(format!("Build #{} not found in queue", build_id))
+            })?;
 
-    let mut defaults = default_artifacts_for_build(&queue[idx].gcs_bucket, build_id);
-    if let Some(ref u) = req.log_url {
-        let trimmed = u.trim();
-        if !trimmed.is_empty() {
-            defaults.log_url = trimmed.to_string();
+        if let (Some(ref assigned), Some(ref caller)) =
+            (&queue[idx].assigned_instance, &req.instance_name)
+        {
+            let caller_trimmed = caller.trim();
+            if !caller_trimmed.is_empty() && caller_trimmed != assigned {
+                return Err(StateError::Conflict(format!(
+                    "Build #{} is assigned to '{}', not '{}'",
+                    build_id, assigned, caller_trimmed
+                )));
+            }
         }
-    }
-    if let Some(ref u) = req.binary_url {
-        let trimmed = u.trim();
-        if !trimmed.is_empty() {
-            defaults.binary_url = trimmed.to_string();
+
+        let mut defaults = default_artifacts_for_build(&queue[idx].gcs_bucket, build_id);
+        if let Some(ref u) = req.log_url {
+            let trimmed = u.trim();
+            if !trimmed.is_empty() {
+                defaults.log_url = trimmed.to_string();
+            }
         }
-    }
-    if let Some(ref u) = req.target_zip_url {
-        let trimmed = u.trim();
-        if !trimmed.is_empty() {
-            defaults.target_zip_url = trimmed.to_string();
+        if let Some(ref u) = req.binary_url {
+            let trimmed = u.trim();
+            if !trimmed.is_empty() {
+                defaults.binary_url = trimmed.to_string();
+            }
         }
-    }
-    defaults.log_size_bytes = req.log_size_bytes;
-    defaults.binary_size_bytes = req.binary_size_bytes;
-    defaults.target_zip_size_bytes = req.target_zip_size_bytes;
-    defaults.log_sha256 = req.log_sha256.clone();
-    defaults.binary_sha256 = req.binary_sha256.clone();
-    defaults.target_zip_sha256 = req.target_zip_sha256.clone();
-
-    let selected_url = select_artifact_url_for_output(&queue[idx].requested_output, &defaults);
-
-    let compile_sec = req.compile_duration_seconds.unwrap_or_else(|| {
-        let started = queue[idx]
-            .started_epoch
-            .unwrap_or(queue[idx].enqueued_epoch);
-        now.saturating_sub(started) as f64
-    });
-    let delivery_sec = req.delivery_duration_seconds.unwrap_or(2.0);
-
-    queue[idx].status = status_norm.to_string();
-    queue[idx].finished_at = Some(chrono_iso(now));
-    queue[idx].finished_epoch = Some(now);
-    queue[idx].compile_duration_seconds = Some(compile_sec);
-    queue[idx].exit_code = req
-        .exit_code
-        .or(Some(if status_norm == "completed" { 0 } else { 1 }));
-    if let Some(ref inst) = req.instance_name {
-        if !inst.trim().is_empty() {
-            queue[idx].assigned_instance = Some(inst.trim().to_string());
+        if let Some(ref u) = req.target_zip_url {
+            let trimmed = u.trim();
+            if !trimmed.is_empty() {
+                defaults.target_zip_url = trimmed.to_string();
+            }
         }
-    }
-    if let Some(ref z) = req.zone {
-        if !z.trim().is_empty() {
-            queue[idx].zone = Some(z.trim().to_string());
+        defaults.log_size_bytes = req.log_size_bytes;
+        defaults.binary_size_bytes = req.binary_size_bytes;
+        defaults.target_zip_size_bytes = req.target_zip_size_bytes;
+        defaults.log_sha256 = req.log_sha256.clone();
+        defaults.binary_sha256 = req.binary_sha256.clone();
+        defaults.target_zip_sha256 = req.target_zip_sha256.clone();
+
+        let selected_url = select_artifact_url_for_output(&queue[idx].requested_output, &defaults);
+
+        let compile_sec = req.compile_duration_seconds.unwrap_or_else(|| {
+            let started = queue[idx]
+                .started_epoch
+                .unwrap_or(queue[idx].enqueued_epoch);
+            now.saturating_sub(started) as f64
+        });
+        let delivery_sec = req.delivery_duration_seconds.unwrap_or(2.0);
+
+        queue[idx].status = status_norm.to_string();
+        queue[idx].finished_at = Some(chrono_iso(now));
+        queue[idx].finished_epoch = Some(now);
+        queue[idx].compile_duration_seconds = Some(compile_sec);
+        queue[idx].exit_code =
+            req.exit_code
+                .or(Some(if status_norm == "completed" { 0 } else { 1 }));
+        if let Some(ref inst) = req.instance_name {
+            if !inst.trim().is_empty() {
+                queue[idx].assigned_instance = Some(inst.trim().to_string());
+            }
         }
-    }
-    queue[idx].artifacts = Some(defaults.clone());
-    queue[idx].selected_artifact_url = Some(selected_url.clone());
+        if let Some(ref z) = req.zone {
+            if !z.trim().is_empty() {
+                queue[idx].zone = Some(z.trim().to_string());
+            }
+        }
+        queue[idx].artifacts = Some(defaults.clone());
+        queue[idx].selected_artifact_url = Some(selected_url.clone());
 
-    let completed_item = queue[idx].clone();
-    let next_build_id = bundle
-        .state
-        .rust_builds
-        .get("next_build_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(build_id + 1);
-    save_queue_into_state(&mut bundle.state, &queue, next_build_id);
+        let completed_item = queue[idx].clone();
+        let next_build_id = bundle
+            .state
+            .rust_builds
+            .get("next_build_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(build_id + 1);
+        save_queue_into_state(&mut bundle.state, &queue, next_build_id);
 
-    // Also record the finished run into `rust_builds.builds` so rolling average duration and cache KPIs update
-    let record_req = RecordRustBuildRequest {
-        status: if status_norm == "completed" {
-            "succeeded".to_string()
-        } else {
-            "failed".to_string()
-        },
-        project_name: Some(completed_item.repo.clone()),
-        commit_sha: Some(completed_item.commit_sha.clone()),
-        profile: Some(completed_item.profile.clone()),
-        compile_duration_seconds: Some(compile_sec),
-        delivery_duration_seconds: Some(delivery_sec),
-        instance_name: completed_item.assigned_instance.clone(),
-        zone: completed_item.zone.clone(),
-        machine_type: req
-            .machine_type
-            .or_else(|| Some("n4-highcpu-16".to_string())),
-        cpu_platform: Some("Intel Emerald Rapids".to_string()),
-        vcpu: Some(req.vcpu.unwrap_or(16)),
-        origin_ip: completed_item.origin_ip.clone(),
-        cache_hits: req.cache_hits,
-        total_crates: req.total_crates,
-        peak_ram_gib: req.peak_ram_gib,
-        cpu_time_seconds: req.cpu_time_seconds,
-    };
+        // Also record the finished run into `rust_builds.builds` so rolling average duration and cache KPIs update
+        let record_req = RecordRustBuildRequest {
+            status: if status_norm == "completed" {
+                "succeeded".to_string()
+            } else {
+                "failed".to_string()
+            },
+            project_name: Some(completed_item.repo.clone()),
+            commit_sha: Some(completed_item.commit_sha.clone()),
+            profile: Some(completed_item.profile.clone()),
+            compile_duration_seconds: Some(compile_sec),
+            delivery_duration_seconds: Some(delivery_sec),
+            instance_name: completed_item.assigned_instance.clone(),
+            zone: completed_item.zone.clone(),
+            machine_type: req
+                .machine_type
+                .clone()
+                .or_else(|| Some("n4-highcpu-16".to_string())),
+            cpu_platform: Some("Intel Emerald Rapids".to_string()),
+            vcpu: Some(req.vcpu.unwrap_or(16)),
+            origin_ip: completed_item.origin_ip.clone(),
+            cache_hits: req.cache_hits,
+            total_crates: req.total_crates,
+            peak_ram_gib: req.peak_ram_gib,
+            cpu_time_seconds: req.cpu_time_seconds,
+        };
 
-    let _ = append_rust_build_record(&mut bundle.state, record_req, now);
-    let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
-    let avg_build_secs = effective_average_build_seconds(&bundle.state);
-    bundle.state.updated_at = now;
-    save_state(kv, &mut bundle, now).await?;
+        let _ = append_rust_build_record(&mut bundle.state, record_req, now);
+        let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
+        let avg_build_secs = effective_average_build_seconds(&bundle.state);
+        let resp = build_status_response(&completed_item, &queue, &eval, avg_build_secs, now, true);
+        Ok((true, resp))
+    })
+    .await?;
 
-    let resp = build_status_response(&completed_item, &queue, &eval, avg_build_secs, now, true);
     Ok((200, resp))
 }
 

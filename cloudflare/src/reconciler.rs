@@ -1123,6 +1123,11 @@ where
                 if i.status.eq_ignore_ascii_case("TERMINATED") {
                     return false;
                 }
+                if i.name.starts_with("builder-")
+                    || i.metadata.get("spot-role") == Some("rust_builder")
+                {
+                    return false;
+                }
                 if let Some(target_meta) = i
                     .metadata
                     .get("spot-target")
@@ -1287,7 +1292,11 @@ where
     let max_instances = (bundle.state.scaling.cicd_runner.max_runners / RUNNERS_PER_HOST).max(1);
     let current_live = instances
         .iter()
-        .filter(|i| !i.status.eq_ignore_ascii_case("TERMINATED"))
+        .filter(|i| {
+            !i.status.eq_ignore_ascii_case("TERMINATED")
+                && !i.name.starts_with("builder-")
+                && i.metadata.get("spot-role") != Some("rust_builder")
+        })
         .count();
 
     if backlog_known
@@ -1386,6 +1395,12 @@ where
     }
 
     // 9b. Rust Builder Queue Scale-Up Policy (Triggered when queued_rust_builds >= queued_builds_threshold)
+    if let Some(cached) = crate::state::get_cached_state(now) {
+        if cached.state_version > bundle.state_version {
+            bundle.state.rust_builds = cached.state.rust_builds;
+            bundle.state_version = cached.state_version;
+        }
+    }
     let queued_rust_builds = crate::state::count_queued_rust_builds(&bundle.state);
     let builder_policy = &bundle.state.scaling.rust_builder;
     let builder_threshold = builder_policy.queued_builds_threshold.max(1);
@@ -1400,6 +1415,8 @@ where
     {
         let hex_suffix = generate_unique_suffix(now);
         let builder_host = format!("builder-scale-{}-{}", now, hex_suffix);
+        let cache_disk_name = format!("{}-cache", builder_host);
+        let deployment_id = format!("dep-builder-{}", now);
         let builder_script = bundle
             .state
             .cloud_init_templates
@@ -1408,30 +1425,19 @@ where
             .map(|t| t.content.as_str())
             .unwrap_or("#!/bin/bash\nset -euo pipefail\n# Dedicated Rust 1.99.0 Builder\n");
 
-        let vm_cfg = crate::gcp::RunnerVmConfig {
+        let builder_cfg = crate::gcp::BuilderVmConfig {
             instance_name: &builder_host,
             machine_type: "n4-highcpu-16",
             zone: DEFAULT_ZONE,
-            target: &org,
-            runner_prefix: "builder",
-            startup_script: builder_script,
-            patch_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-            patch_json: "{}",
-            runner_1_jitconfig: None,
-            runner_2_jitconfig: None,
-            source_image: None,
-            golden_image_family: None,
+            deployment_id: &deployment_id,
+            cache_disk_name: &cache_disk_name,
+            cache_disk_device_name: &cache_disk_name,
+            startup_script_template: builder_script,
             boot_disk_type: Some("pd-balanced"),
+            cache_disk_type: Some("pd-balanced"),
         };
 
-        if let Ok(mut req) = crate::gcp::build_spot_runner_vm_request(&project, &vm_cfg) {
-            req.labels
-                .insert("spot-role".to_string(), "rust_builder".to_string());
-            for item in &mut req.metadata.items {
-                if item.key == "spot-runner-count" {
-                    item.value = "0".to_string();
-                }
-            }
+        if let Ok(req) = crate::gcp::build_spot_builder_vm_request(&project, &builder_cfg) {
             let _ = gcp
                 .insert_instance(&project, DEFAULT_ZONE, &req, None, now)
                 .await;
@@ -1570,6 +1576,12 @@ where
             .iter()
             .filter(|r| r.status.eq_ignore_ascii_case("online"))
             .count() as u32;
+        if let Some(cached) = crate::state::get_cached_state(now) {
+            if cached.state_version > bundle.state_version {
+                bundle.state.rust_builds = cached.state.rust_builds;
+                bundle.state_version = cached.state_version;
+            }
+        }
         if bundle.state.rust_builds.get("queue").is_some() {
             let _ = crate::state::evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
         }

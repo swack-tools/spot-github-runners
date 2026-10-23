@@ -29,7 +29,8 @@ fn print_usage() {
              builder-entrypoint  Rust 1.99.0 toolchain verification & entrypoint\n    \
              worktree-commands   Dual worktree runner with cgroup v2 metrics\n    \
              toolchain-probe     Toolchain, browser & cgroup verification probe\n    \
-             build-package       Package 3 build artifacts (log, binaries, target) for GCS\n"
+             build-package       Package 3 build artifacts (log, binaries, target) for GCS\n    \
+             queue-worker        Poll, claim, execute, package & complete queued Rust builds\n"
     );
 }
 
@@ -63,7 +64,12 @@ fn main() -> ExitCode {
         "oxidex-toolchain-probe" | "example-rust-project-toolchain-probe" | "toolchain-probe" => {
             toolchain_probe::run(&args[1..])
         }
-        "build-package" | "example-rust-project-build-package" => build_package::run(&args[1..]),
+        "build-package" | "oxidex-build-package" | "example-rust-project-build-package" => {
+            build_package::run(&args[1..])
+        }
+        "queue-worker" | "oxidex-queue-worker" | "example-rust-project-queue-worker" => {
+            build_package::run_worker(&args[1..])
+        }
         _ => {
             if args.len() < 2 {
                 print_usage();
@@ -86,8 +92,11 @@ fn main() -> ExitCode {
                 "toolchain-probe"
                 | "oxidex-toolchain-probe"
                 | "example-rust-project-toolchain-probe" => toolchain_probe::run(&args[2..]),
-                "build-package" | "example-rust-project-build-package" => {
+                "build-package" | "oxidex-build-package" | "example-rust-project-build-package" => {
                     build_package::run(&args[2..])
+                }
+                "queue-worker" | "oxidex-queue-worker" | "example-rust-project-queue-worker" => {
+                    build_package::run_worker(&args[2..])
                 }
                 "--help" | "-h" | "help" => {
                     print_usage();

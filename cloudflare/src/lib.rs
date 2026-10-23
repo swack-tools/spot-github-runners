@@ -880,6 +880,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Err(state::StateError::Validation(msg)) => {
                     error_response(400, "validation_error", &msg)
                 }
+                Err(state::StateError::Conflict(msg)) => error_response(409, "conflict", &msg),
                 Err(err) => error_response(500, "internal_error", &err.to_string()),
             }
         }
@@ -944,6 +945,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Err(state::StateError::Validation(msg)) => {
                     error_response(400, "validation_error", &msg)
                 }
+                Err(state::StateError::Conflict(msg)) => error_response(409, "conflict", &msg),
                 Err(err) => error_response(500, "internal_error", &err.to_string()),
             }
         }
@@ -983,6 +985,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Err(state::StateError::Validation(msg)) => {
                     error_response(400, "validation_error", &msg)
                 }
+                Err(state::StateError::Conflict(msg)) => error_response(409, "conflict", &msg),
                 Err(err) => error_response(500, "internal_error", &err.to_string()),
             }
         }
@@ -1023,6 +1026,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Err(state::StateError::Validation(msg)) => {
                     error_response(400, "validation_error", &msg)
                 }
+                Err(state::StateError::Conflict(msg)) => error_response(409, "conflict", &msg),
                 Err(err) => error_response(500, "internal_error", &err.to_string()),
             }
         }
