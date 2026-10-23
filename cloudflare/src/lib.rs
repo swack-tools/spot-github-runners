@@ -289,8 +289,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     }
                     "window_hours" | "window" => {
                         if let Ok(hours) = v.parse::<f64>() {
-                            if hours.is_finite() && hours > 0.0 {
-                                query.window_hours = Some(hours.clamp(0.1, 744.0));
+                            if hours.is_finite() && hours >= 0.0 {
+                                query.window_hours = Some(hours.clamp(0.0, 744.0));
                             }
                         }
                     }
