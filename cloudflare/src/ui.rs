@@ -1039,7 +1039,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <h3 style="font-size:14px; margin:16px 0 6px;">Added administrators</h3>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>GitHub user (when added)</th><th>User ID</th><th>Added by</th><th>Added at</th><th></th></tr></thead>
+            <thead><tr><th>GitHub user (when added)</th><th>User ID</th><th>Per-target checks</th><th>Added by</th><th>Added at</th><th></th></tr></thead>
             <tbody id="adm-admins"></tbody>
           </table>
         </div>
@@ -3216,9 +3216,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     window.RunnerPatches = RunnerPatches;
     // --- end runner patches panel ---
 
-    // --- dashboard administrators panel (owners only; /api/admins answers 403 to everyone else) ---
-    // Renders server data with textContent and createElement only. Each change needs a confirmation, carries
-    // "confirm": true, and reuses its Idempotency-Key until a final answer arrives.
     const DashboardAdmins = (function () {
       const S = { data: null, pending: null, owner: false };
       function el(id) { return document.getElementById(id); }
@@ -3244,7 +3241,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           headers: { "Content-Type": "application/json", "Idempotency-Key": S.pending.key } });
         const [res, d] = result;
         if (!(d && (d.retry_same_key === true || d.pending_retry === true)) && res.status !== 0) {
-          S.pending = null;  // a final answer: the next change gets a new key
+          S.pending = null;
         }
         return result;
       }
@@ -3261,7 +3258,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         clear(admins);
         (data.admins || []).forEach(a => {
           const tr = node("tr");
-          [a.login, a.uid, a.added_by || "", a.added_at ? formatLocalTime(a.added_at) : ""].forEach(v => tr.appendChild(node("td", v)));
+          const chk = a.override_target_check ? "Overridden (exempt)" : "Verified all targets";
+          [a.login, a.uid, chk, a.added_by || "", a.added_at ? formatLocalTime(a.added_at) : ""].forEach(v => tr.appendChild(node("td", v)));
           const td = node("td");
           const b = node("button", "Remove");
           b.type = "button";
@@ -3274,7 +3272,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         if (!(data.admins || []).length) {
           const tr = node("tr");
           const td = node("td", "No administrators added yet.");
-          td.colSpan = 5;
+          td.colSpan = 6;
           tr.appendChild(td);
           admins.appendChild(tr);
         }
@@ -3307,16 +3305,31 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         if (!window.confirm(`Add GitHub user ${login} as a dashboard administrator? They will be able to sign in and change the fleet.`)) return;
         el("adm-add").disabled = true;
         try {
-          setStatus(`Looking up ${login} on GitHub...`);
-          const [res, d] = await postChange("/api/admins/add", { login, confirm: true });
+          setStatus(`Looking up ${login} and checking repository permissions on GitHub...`);
+          let [res, d] = await postChange("/api/admins/add", { login, confirm: true });
           if (d.retry_same_key === true) {
             setStatus((d.error || "GitHub did not answer.") + " Click Add again to retry.");
             return;
           }
-          if (!res.ok) { setStatus(d.error || `Could not add ${login} (HTTP ${res.status})`); return; }
+          if (d && d.requires_target_override === true) {
+            const missing = (d.missing_targets || []).join(", ") || "controlled targets";
+            const targetLogin = d.login || login;
+            if (!window.confirm(`GitHub user ${targetLogin}${d.uid ? ` (ID ${d.uid})` : ""} is not an administrator of every repo/org they will see:\n\nMissing admin access: ${missing}\n\nDo you want to override the per-target check and still add ${targetLogin}?`)) {
+              setStatus(`Cancelled adding ${targetLogin} (missing target admin access: ${missing}).`);
+              return;
+            }
+            setStatus(`Adding ${targetLogin} with per-target check override...`);
+            [res, d] = await postChange("/api/admins/add", {
+              login: targetLogin,
+              uid: d.uid || 0,
+              confirm: true,
+              override_target_check: true
+            });
+          }
+          if (!res.ok) { setStatus(d.error || d.message || `Could not add ${login} (HTTP ${res.status})`); return; }
           el("adm-login").value = "";
           render(d);
-          setStatus(`Added ${d.admin.login} (GitHub user ID ${d.admin.uid}).`);
+          setStatus(`Added ${d.admin.login} (GitHub user ID ${d.admin.uid})${d.admin.override_target_check ? " (per-target check overridden)" : ""}.`);
         } finally {
           el("adm-add").disabled = false;
         }
@@ -3644,5 +3657,7 @@ mod tests {
         assert!(DASHBOARD_HTML.contains(r#"setLatencyAutoRefresh(regAutoRefreshSel.value, true);"#));
         assert!(DASHBOARD_HTML.contains(r#"oninput="applyMaxLatencyFilter(this.value, false)""#));
         assert!(DASHBOARD_HTML.contains(r#"id="reg-arch-filter""#));
+        assert!(DASHBOARD_HTML.contains(r#"d.requires_target_override === true"#));
+        assert!(DASHBOARD_HTML.contains(r#"override_target_check: true"#));
     }
 }
