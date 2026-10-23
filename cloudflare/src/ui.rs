@@ -127,6 +127,12 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     .stage-chip { background: #0b1120; border: 1px solid #28354e; border-radius: 5px; padding: 2px 7px; font-family: var(--font-mono); font-size: 11px; color: #cbd5e1; }
     #toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
     .toast { background: #1e1f20; color: #f8fafc; border: 1px solid var(--border); border-left: 4px solid var(--accent-text); padding: 10px 14px; border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55); font-size: 12.5px; font-weight: 600; }
+    .target-dd { position: relative; display: inline-block; }
+    .target-dd-menu { position: absolute; top: calc(100% + 4px); left: 0; min-width: 265px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px; z-index: 300; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6); }
+    .target-dd-hdr { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid var(--border); }
+    .target-dd-list { display: flex; flex-direction: column; gap: 4px; max-height: 210px; overflow-y: auto; }
+    .target-dd-item { display: flex; align-items: center; gap: 7px; padding: 3px 5px; border-radius: 5px; cursor: pointer; font-size: 12px; user-select: none; }
+    .target-dd-item:hover { background: var(--bg-card); }
   </style>
 </head>
 <body>
@@ -411,6 +417,22 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               <option value="cicd_runner">CI/CD Runners Only</option>
               <option value="rust_builder">Rust Builders Only</option>
             </select>
+            <div class="target-dd" id="inst-target-dd">
+              <button type="button" class="btn btn-sm btn-secondary" id="inst-target-dd-btn" onclick="toggleTargetDropdown(event)">Org / Repo: All ▾</button>
+              <div class="target-dd-menu" id="inst-target-dd-menu" hidden onclick="event.stopPropagation()">
+                <div class="target-dd-hdr">
+                  <label class="toggle-label" style="font-size:12px;">
+                    <input type="checkbox" id="inst-target-all-cb" checked onchange="toggleAllTargets(this.checked)" />
+                    <strong>All</strong>
+                  </label>
+                  <div style="display:flex; gap:4px;">
+                    <button type="button" class="btn btn-sm btn-secondary" id="inst-target-reverse-btn" style="padding:2px 7px; font-size:11px;" onclick="reverseTargetFilter()">⇄ Reverse</button>
+                    <button type="button" class="btn btn-sm btn-secondary" id="inst-target-clear-btn" style="padding:2px 7px; font-size:11px;" onclick="clearTargetFilter()">↺ Clear</button>
+                  </div>
+                </div>
+                <div id="inst-target-list" class="target-dd-list"></div>
+              </div>
+            </div>
             <input type="text" id="inst-search-input" placeholder="Filter by instance, region, spec, trigger..." style="width:240px;" oninput="refreshInstancesTable()" onkeydown="if(event.key==='Enter'){event.preventDefault();refreshInstancesTable();}" />
             <select id="inst-sort-by" onchange="applySort(this.value)" style="padding:4px 8px; font-size:12px;">
               <option value="total_cost_in_window_usd" selected>Sort by Total Cost ($)</option>
@@ -1037,6 +1059,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     let INST_SORT_BY = "total_cost_in_window_usd";
     let INST_SORT_DIR = "desc";
     let GLOBAL_ARCH_FILTER = "all";
+    let KNOWN_TARGETS = ["swack-tools", "swack-tools/bt-to-all-devices", "xbmc4lyfe/newznab-tmux", "xbmc4lyfe/rustnzb", "xbmc4lyfe/nntp-proxy"];
+    let SELECTED_TARGETS = null;
     let QUAL_ACTIVE_ROLE = "cicd_runner";
     let LAST_QUAL_DATA = { cicd_runner: null, rust_builder: null };
     const AUTH_STORAGE_KEY = "dashboard_auth_token";
@@ -1462,9 +1486,17 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const roleFilter = document.getElementById("inst-role-filter");
       const role = encodeURIComponent(roleFilter ? roleFilter.value : "all");
       const arch = encodeURIComponent(GLOBAL_ARCH_FILTER || "all");
-      const url = `/api/overview?include_deleted=${showDeleted}&window_hours=${INST_WINDOW_HOURS}&include_disk_and_tax=${inclDiskTax}&sort_by=${INST_SORT_BY}&sort_dir=${INST_SORT_DIR}&search=${search}&role=${role}&arch=${arch}`;
+      const targetParam = SELECTED_TARGETS === null
+        ? "all"
+        : (SELECTED_TARGETS.size === 0 ? "__none__" : Array.from(SELECTED_TARGETS).join(","));
+      const url = `/api/overview?include_deleted=${showDeleted}&window_hours=${INST_WINDOW_HOURS}&include_disk_and_tax=${inclDiskTax}&sort_by=${INST_SORT_BY}&sort_dir=${INST_SORT_DIR}&search=${search}&role=${role}&arch=${arch}&target=${encodeURIComponent(targetParam)}`;
       const res = await fetch(url);
       APP_STATE = await res.json();
+      if (Array.isArray(APP_STATE.available_targets)) {
+        APP_STATE.available_targets.forEach(t => {
+          if (t && !KNOWN_TARGETS.includes(t)) KNOWN_TARGETS.push(t);
+        });
+      }
       LAST_QUAL_DATA.cicd_runner = APP_STATE.qualifications.cicd_runner;
       LAST_QUAL_DATA.rust_builder = APP_STATE.qualifications.rust_builder;
       renderAll();
@@ -1534,6 +1566,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
       renderWorldMapPins();
       renderMapInspector();
+      renderTargetDropdown();
       renderInstancesTableRows();
       populateSizingForms();
       renderQualificationTable();
@@ -1807,6 +1840,66 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       refreshInstancesTable();
     }
 
+    function toggleTargetDropdown(e) {
+      if (e) e.stopPropagation();
+      const menu = document.getElementById("inst-target-dd-menu");
+      if (menu) menu.toggleAttribute("hidden");
+    }
+
+    document.addEventListener("click", () => {
+      const menu = document.getElementById("inst-target-dd-menu");
+      if (menu && !menu.hasAttribute("hidden")) menu.setAttribute("hidden", "");
+    });
+
+    function renderTargetDropdown() {
+      const listEl = document.getElementById("inst-target-list");
+      const allCb = document.getElementById("inst-target-all-cb");
+      const btn = document.getElementById("inst-target-dd-btn");
+      if (!listEl || !allCb || !btn) return;
+      const allChecked = SELECTED_TARGETS === null || KNOWN_TARGETS.every(t => SELECTED_TARGETS.has(t));
+      allCb.checked = allChecked;
+      allCb.indeterminate = !allChecked && SELECTED_TARGETS !== null && SELECTED_TARGETS.size > 0;
+      listEl.innerHTML = KNOWN_TARGETS.map(t => {
+        const checked = SELECTED_TARGETS === null || SELECTED_TARGETS.has(t);
+        return `<label class="target-dd-item"><input type="checkbox" class="inst-target-cb" value="${esc(t)}" ${checked ? "checked" : ""} onchange="onTargetItemChange()" /><span class="mono">${esc(t)}</span></label>`;
+      }).join("");
+      if (allChecked) {
+        btn.textContent = "Org / Repo: All ▾";
+      } else if (SELECTED_TARGETS.size === 0) {
+        btn.textContent = "Org / Repo: None (0) ▾";
+      } else if (SELECTED_TARGETS.size === 1) {
+        btn.textContent = `Org / Repo: ${Array.from(SELECTED_TARGETS)[0]} ▾`;
+      } else {
+        btn.textContent = `Org / Repo: ${SELECTED_TARGETS.size}/${KNOWN_TARGETS.length} ▾`;
+      }
+    }
+
+    function onTargetItemChange() {
+      const checked = Array.from(document.querySelectorAll("#inst-target-list .inst-target-cb:checked")).map(cb => cb.value);
+      SELECTED_TARGETS = checked.length === KNOWN_TARGETS.length ? null : new Set(checked);
+      renderTargetDropdown();
+      refreshInstancesTable();
+    }
+
+    function toggleAllTargets(checked) {
+      SELECTED_TARGETS = checked ? null : new Set();
+      renderTargetDropdown();
+      refreshInstancesTable();
+    }
+
+    function reverseTargetFilter() {
+      const next = KNOWN_TARGETS.filter(t => !(SELECTED_TARGETS === null || SELECTED_TARGETS.has(t)));
+      SELECTED_TARGETS = next.length === KNOWN_TARGETS.length ? null : new Set(next);
+      renderTargetDropdown();
+      refreshInstancesTable();
+    }
+
+    function clearTargetFilter() {
+      SELECTED_TARGETS = null;
+      renderTargetDropdown();
+      refreshInstancesTable();
+    }
+
     function applySort(field) {
       if (field) {
         INST_SORT_BY = field;
@@ -1924,7 +2017,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           <tr>
             <td>
               <div class="mono" style="font-weight:700; color:#f8fafc;">${esc(inst.name)}</div>
-              <div class="mono" style="font-size:11px; color:var(--text-muted);">ID: ${esc(inst.instance_id || inst.id)}</div>
+              <div class="mono" style="font-size:11px; color:var(--text-muted);">ID: ${esc(inst.instance_id || inst.id)} · ${esc(inst.target || APP_STATE.org || "swack-tools")}</div>
             </td>
             <td>
               <span class="badge ${isRunning ? 'badge-running' : 'badge-deleted'}">${esc(inst.status)}</span>
@@ -3466,5 +3559,13 @@ mod tests {
     fn test_dashboard_defaults_autorefresh_to_1m() {
         assert!(DASHBOARD_HTML.contains(r#"<option value="60" selected>1m</option>"#));
         assert!(DASHBOARD_HTML.contains(r#"setInventoryAutoRefresh(autoRefreshSel.value, true);"#));
+    }
+
+    #[test]
+    fn test_dashboard_org_repo_multiselect_filter() {
+        assert!(DASHBOARD_HTML.contains(r#"id="inst-target-dd""#));
+        assert!(DASHBOARD_HTML.contains(r#"id="inst-target-all-cb" checked"#));
+        assert!(DASHBOARD_HTML.contains(r#"onclick="reverseTargetFilter()""#));
+        assert!(DASHBOARD_HTML.contains(r#"onclick="clearTargetFilter()""#));
     }
 }

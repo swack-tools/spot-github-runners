@@ -324,6 +324,12 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                             query.arch = Some(trimmed.to_string());
                         }
                     }
+                    "target" | "targets" => {
+                        let trimmed = v.trim();
+                        if !trimmed.is_empty() {
+                            query.target = Some(trimmed.to_string());
+                        }
+                    }
                     _ => {}
                 }
             }

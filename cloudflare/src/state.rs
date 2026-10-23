@@ -509,7 +509,47 @@ pub struct OverviewQuery {
     pub search: Option<String>,
     pub role: Option<String>,
     pub arch: Option<String>,
+    pub target: Option<String>,
     pub is_authenticated: Option<bool>,
+}
+
+pub fn infer_instance_target(inst: &serde_json::Value, default_org: &str) -> String {
+    for key in &["target", "github_target", "repository", "repo", "org"] {
+        if let Some(val) = inst.get(*key).and_then(|v| v.as_str()) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    let name_lower = inst
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    for repo_target in [
+        "xbmc4lyfe/newznab-tmux",
+        "xbmc4lyfe/rustnzb",
+        "xbmc4lyfe/nntp-proxy",
+        "swack-tools/bt-to-all-devices",
+        "swack-tools/oxidex",
+        "swack-tools/spot-github-runners",
+    ] {
+        let slug = repo_target.replace('/', "-").to_lowercase();
+        let safe_slug = if slug.len() > 24 { &slug[..24] } else { &slug };
+        if name_lower.contains(safe_slug) {
+            return repo_target.to_string();
+        }
+    }
+    if name_lower.contains("bt-to-all-devices") || name_lower.contains("btad") {
+        return "swack-tools/bt-to-all-devices".to_string();
+    }
+    let fallback = default_org.trim();
+    if fallback.is_empty() {
+        "swack-tools".to_string()
+    } else {
+        fallback.to_string()
+    }
 }
 
 pub fn infer_arch(machine_type: &str) -> &'static str {
@@ -1737,6 +1777,13 @@ pub fn apply_dynamic_overview_filtering(
         .to_lowercase();
     enrich_arm64_catalog_and_qualifications(ov_obj, &arch_filter);
 
+    let default_org = ov_obj
+        .get("org")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("swack-tools")
+        .to_string();
+
     let qual_val = ov_obj.get("qualifications").cloned();
     let iv = ov_obj
         .get_mut("instances_view")
@@ -1749,6 +1796,25 @@ pub fn apply_dynamic_overview_filtering(
         .cloned()
         .unwrap_or_default();
 
+    let mut available_targets: Vec<String> = crate::patch::CONTROLLED_TARGETS
+        .iter()
+        .chain(crate::patch::ON_DEMAND_TARGETS.iter())
+        .map(|s| s.to_string())
+        .collect();
+    for inst_ref in &base_instances {
+        let name = inst_ref.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if !name.starts_with("oxidex-runners-") && !name.starts_with("builder-") {
+            continue;
+        }
+        let t = infer_instance_target(inst_ref, &default_org);
+        if !available_targets
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&t))
+        {
+            available_targets.push(t);
+        }
+    }
+
     let include_deleted = query.include_deleted.unwrap_or(true);
     let window_hours = query
         .window_hours
@@ -1757,6 +1823,21 @@ pub fn apply_dynamic_overview_filtering(
         .clamp(0.0, 744.0);
     let include_disk_and_tax = query.include_disk_and_tax.unwrap_or(true);
     let role_filter = query.role.as_deref().unwrap_or("all").trim();
+    let target_filter = query.target.as_deref().unwrap_or("all").trim();
+    let selected_targets: Option<Vec<String>> =
+        if target_filter.is_empty() || target_filter.eq_ignore_ascii_case("all") {
+            None
+        } else if target_filter.eq_ignore_ascii_case("none") || target_filter == "__none__" {
+            Some(Vec::new())
+        } else {
+            Some(
+                target_filter
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            )
+        };
     let search_filter = query.search.as_deref().unwrap_or("").trim().to_lowercase();
     let sort_by = query
         .sort_by
@@ -1897,6 +1978,15 @@ pub fn apply_dynamic_overview_filtering(
             continue;
         }
 
+        let inst_target = infer_instance_target(&inst, &default_org);
+        inst["target"] = serde_json::json!(inst_target);
+        if let Some(ref sel) = selected_targets {
+            let target_lower = inst_target.to_lowercase();
+            if !sel.iter().any(|t| t == &target_lower) {
+                continue;
+            }
+        }
+
         if !search_filter.is_empty() {
             let mut match_found = false;
             for field in &[
@@ -1911,6 +2001,7 @@ pub fn apply_dynamic_overview_filtering(
                 "arch",
                 "status",
                 "role",
+                "target",
                 "deletion_trigger",
             ] {
                 if let Some(val_str) = inst.get(*field).and_then(|v| v.as_str()) {
@@ -1935,6 +2026,11 @@ pub fn apply_dynamic_overview_filtering(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or("")),
+            "target" => a
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("target").and_then(|v| v.as_str()).unwrap_or("")),
             "status" => a
                 .get("status")
                 .and_then(|v| v.as_str())
@@ -2065,6 +2161,10 @@ pub fn apply_dynamic_overview_filtering(
     iv.insert("window_hours".to_string(), serde_json::json!(window_hours));
     iv.insert("sort_by".to_string(), serde_json::json!(sort_by));
     iv.insert("sort_dir".to_string(), serde_json::json!(sort_dir));
+    ov_obj.insert(
+        "available_targets".to_string(),
+        serde_json::json!(available_targets),
+    );
 
     // Synchronize fleet_summary and regions with refreshed live inventory
     let all_running: Vec<&serde_json::Value> = base_instances
