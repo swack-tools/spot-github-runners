@@ -20,6 +20,7 @@ pub const OAUTH_STATE_COOKIE_NAME: &str = "__Host-spot_oauth_state";
 pub const SESSION_PURPOSE_LABEL: &str = "spot-dashboard/session/v1";
 pub const BUILDER_QUEUE_PURPOSE: &str = "builder-queue";
 pub const BUILDER_QUEUE_TOKEN_TTL_SECONDS: u64 = 7 * 86_400; // 7 days
+pub const BUILDER_QUEUE_TOKEN_RENEWAL_THRESHOLD_SECONDS: u64 = 3 * 86_400; // Renew when < 3 days remain
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuilderQueueTokenPayload {
@@ -27,6 +28,10 @@ pub struct BuilderQueueTokenPayload {
     pub iat: u64,
     pub inst: String,
     pub v: u32,
+}
+
+pub fn should_renew_builder_queue_token(payload: &BuilderQueueTokenPayload, now: u64) -> bool {
+    payload.exp.saturating_sub(now) <= BUILDER_QUEUE_TOKEN_RENEWAL_THRESHOLD_SECONDS
 }
 
 pub fn mint_builder_queue_token(

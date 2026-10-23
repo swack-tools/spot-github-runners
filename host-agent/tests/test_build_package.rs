@@ -302,9 +302,18 @@ fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
     fs::set_permissions(&mock_launcher, perms).expect("chmod +x mock launcher");
 
     // 3. Seed a claimed build response in the mock control-plane directory
+    let env_file = temp.path().join("queue-worker.env");
+    fs::write(
+        &env_file,
+        "BUILDER_INSTANCE_NAME=builder-scale-1792000000-abcd1234\nSPOT_BEARER_TOKEN=initial-token-v1\n",
+    )
+    .expect("write env file");
+    std::env::set_var("SPOT_QUEUE_WORKER_ENV_FILE", &env_file);
+
     let claim_response = serde_json::json!({
         "status": "claimed",
         "claimed": true,
+        "renewed_queue_token": "renewed-token-v2",
         "build": {
             "build_id": 4553,
             "repo": format!("file://{}/example-rust-project", upstream_repo.parent().unwrap().display()),
@@ -361,6 +370,11 @@ fn test_queue_worker_claims_executes_packages_and_completes_queued_build() {
     assert!(
         complete_file.exists(),
         "Expected queue-worker to POST completion payload to complete_4553.json"
+    );
+    let updated_env = fs::read_to_string(&env_file).expect("read updated env file");
+    assert!(
+        updated_env.contains("SPOT_BEARER_TOKEN=renewed-token-v2"),
+        "Expected queue-worker to persist renewed_queue_token into SPOT_QUEUE_WORKER_ENV_FILE, got: {updated_env}"
     );
     let complete_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&complete_file).unwrap()).unwrap();

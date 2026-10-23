@@ -716,15 +716,70 @@ async fn test_recover_orphaned_running_builds_on_preempted_builder_or_expired_le
     assert_eq!(b1["claimed"], true);
     assert_eq!(b1["build"]["build_id"], 4553);
 
-    // After RUST_BUILD_CLAIM_LEASE_SECS expires, a replacement builder can reclaim #4553
+    // Before lease expiry, if builder-preempted-01 sends a heartbeat at `now + 3600`,
+    // the lease is renewed so `now + 1 + RUST_BUILD_CLAIM_LEASE_SECS` does NOT requeue #4553!
+    let hb_req = spot_dashboard_edge::state::HeartbeatRustBuildRequest {
+        build_id: Some(4553),
+        instance_name: "builder-preempted-01".to_string(),
+    };
+    let (hb_st, hb_body) = spot_dashboard_edge::state::handle_post_rust_builds_heartbeat(
+        &kv,
+        4553,
+        hb_req,
+        now + 3600,
+    )
+    .await
+    .expect("heartbeat renews lease");
+    assert_eq!(hb_st, 200);
+    assert_eq!(hb_body["status"], "renewed");
+
+    // At `now + 1 + RUST_BUILD_CLAIM_LEASE_SECS` (before the renewed lease expires),
+    // another builder attempting to claim sees an empty queue because #4553's lease is still active
+    let claim_early = ClaimRustBuildRequest {
+        instance_name: "builder-replacement-02".to_string(),
+        zone: Some("us-central1-a".to_string()),
+    };
+    let (_, b_early) =
+        handle_post_rust_builds_claim(&kv, claim_early, now + 1 + RUST_BUILD_CLAIM_LEASE_SECS)
+            .await
+            .expect("claim before renewed lease expiry");
+    assert_eq!(b_early["claimed"], false);
+
+    // After the renewed lease (`now + 3600 + RUST_BUILD_CLAIM_LEASE_SECS`) expires without further heartbeats,
+    // a replacement builder can reclaim #4553
     let claim2 = ClaimRustBuildRequest {
         instance_name: "builder-replacement-02".to_string(),
         zone: Some("us-central1-a".to_string()),
     };
-    let (_, b2) = handle_post_rust_builds_claim(&kv, claim2, now + 1 + RUST_BUILD_CLAIM_LEASE_SECS)
-        .await
-        .expect("claim 2 after lease expiry");
+    let (_, b2) =
+        handle_post_rust_builds_claim(&kv, claim2, now + 3600 + RUST_BUILD_CLAIM_LEASE_SECS)
+            .await
+            .expect("claim 2 after renewed lease expiry");
     assert_eq!(b2["claimed"], true);
     assert_eq!(b2["build"]["build_id"], 4553);
     assert_eq!(b2["build"]["assigned_instance"], "builder-replacement-02");
+
+    // Also verify builder queue token renewal threshold detection
+    let tok = spot_dashboard_edge::auth::mint_builder_queue_token(
+        b"test-secret",
+        "builder-replacement-02",
+        now,
+    )
+    .expect("mint token");
+    let verified_fresh =
+        spot_dashboard_edge::auth::verify_builder_queue_token(&tok, b"test-secret", now + 86_400)
+            .expect("verify fresh");
+    assert!(
+        !spot_dashboard_edge::auth::should_renew_builder_queue_token(&verified_fresh, now + 86_400)
+    );
+    let verified_near_expiry = spot_dashboard_edge::auth::verify_builder_queue_token(
+        &tok,
+        b"test-secret",
+        now + 5 * 86_400,
+    )
+    .expect("verify near expiry");
+    assert!(spot_dashboard_edge::auth::should_renew_builder_queue_token(
+        &verified_near_expiry,
+        now + 5 * 86_400
+    ));
 }

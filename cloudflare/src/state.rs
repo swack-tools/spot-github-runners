@@ -3413,6 +3413,13 @@ pub struct ClaimRustBuildRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRustBuildRequest {
+    #[serde(default)]
+    pub build_id: Option<u64>,
+    pub instance_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteRustBuildRequest {
     #[serde(default)]
     pub build_id: Option<u64>,
@@ -4203,6 +4210,77 @@ pub async fn handle_post_rust_builds_claim<K: KvStoreBackend>(
                 "build": claimed_item,
                 "upload_targets": upload_targets,
                 "scaling_evaluation": eval,
+            }),
+        ))
+    })
+    .await?;
+
+    Ok((200, body))
+}
+
+pub async fn handle_post_rust_builds_heartbeat<K: KvStoreBackend>(
+    kv: &K,
+    build_id: u64,
+    req: HeartbeatRustBuildRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let caller_trimmed = req.instance_name.trim();
+    if caller_trimmed.is_empty() {
+        return Err(StateError::Validation(
+            "instance_name is required for build lease heartbeat".into(),
+        ));
+    }
+    let caller_owned = caller_trimmed.to_string();
+
+    let body = mutate_rust_build_queue(kv, now, |bundle| {
+        let mut queue = load_queue_from_state(&bundle.state);
+        let idx = queue
+            .iter()
+            .position(|q| q.build_id == build_id)
+            .ok_or_else(|| {
+                StateError::NotFound(format!("Build #{} not found in queue", build_id))
+            })?;
+
+        if queue[idx].status != "running" {
+            return Err(StateError::Conflict(format!(
+                "Build #{} is in state '{}', not 'running'",
+                build_id, queue[idx].status
+            )));
+        }
+        match queue[idx].assigned_instance.as_deref() {
+            Some(assigned) if assigned == caller_owned => {}
+            Some(assigned) => {
+                return Err(StateError::Conflict(format!(
+                    "Build #{} is assigned to '{}', not '{}'",
+                    build_id, assigned, caller_owned
+                )));
+            }
+            None => {
+                return Err(StateError::Conflict(format!(
+                    "Build #{} is unclaimed; cannot renew lease for '{}'",
+                    build_id, caller_owned
+                )));
+            }
+        }
+
+        queue[idx].started_epoch = Some(now);
+        let expires_at_epoch = now + RUST_BUILD_CLAIM_LEASE_SECS;
+
+        let next_build_id = bundle
+            .state
+            .rust_builds
+            .get("next_build_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(build_id + 1);
+        save_queue_into_state(&mut bundle.state, &queue, next_build_id);
+
+        Ok((
+            true,
+            serde_json::json!({
+                "status": "renewed",
+                "build_id": build_id,
+                "instance_name": caller_owned,
+                "lease_expires_epoch": expires_at_epoch,
             }),
         ))
     })

@@ -982,7 +982,104 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 }
             }
             match state::handle_post_rust_builds_claim(&kv, claim_req, now).await {
-                Ok((status_code, body)) => json_response(status_code, &body),
+                Ok((status_code, mut body)) => {
+                    if let Some(ref btok) = verified_builder_token {
+                        if auth::should_renew_builder_queue_token(btok, now) {
+                            if let Ok(new_tok) =
+                                auth::mint_builder_queue_token(session_secret, &btok.inst, now)
+                            {
+                                if let Some(obj) = body.as_object_mut() {
+                                    obj.insert(
+                                        "renewed_queue_token".to_string(),
+                                        Value::String(new_tok),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    json_response(status_code, &body)
+                }
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(state::StateError::Conflict(msg)) => error_response(409, "conflict", &msg),
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        (Method::Post, p) if p.starts_with("/api/rust-builds/") && p.ends_with("/heartbeat") => {
+            if verified_session.is_none()
+                && verified_builder_token.is_none()
+                && !has_static_builder_secret
+            {
+                return error_response(401, "unauthorized", "Sign in required");
+            }
+            if let Some(ref session) = verified_session {
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
+                if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                    return error_response(403, "forbidden", "Administrator permissions required");
+                }
+            }
+
+            let id_str = p
+                .trim_start_matches("/api/rust-builds/")
+                .trim_end_matches("/heartbeat")
+                .trim_matches('/')
+                .trim_start_matches('#');
+            let Ok(build_id) = id_str.parse::<u64>() else {
+                return error_response(400, "bad_request", "Invalid numeric build_id in path");
+            };
+            let mut hb_req: state::HeartbeatRustBuildRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            if verified_session.is_none() {
+                if let Some(ref btok) = verified_builder_token {
+                    if !hb_req.instance_name.trim().is_empty()
+                        && hb_req.instance_name.trim() != btok.inst
+                    {
+                        return error_response(
+                            403,
+                            "forbidden",
+                            "Builder queue token instance_name mismatch",
+                        );
+                    }
+                    hb_req.instance_name = btok.inst.clone();
+                } else if hb_req.instance_name.trim().is_empty() {
+                    return error_response(
+                        400,
+                        "validation_error",
+                        "instance_name is required for machine heartbeat",
+                    );
+                }
+            }
+            match state::handle_post_rust_builds_heartbeat(&kv, build_id, hb_req, now).await {
+                Ok((status_code, mut body)) => {
+                    if let Some(ref btok) = verified_builder_token {
+                        if auth::should_renew_builder_queue_token(btok, now) {
+                            if let Ok(new_tok) =
+                                auth::mint_builder_queue_token(session_secret, &btok.inst, now)
+                            {
+                                if let Some(obj) = body.as_object_mut() {
+                                    obj.insert(
+                                        "renewed_queue_token".to_string(),
+                                        Value::String(new_tok),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    json_response(status_code, &body)
+                }
+                Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
                 Err(state::StateError::Validation(msg)) => {
                     error_response(400, "validation_error", &msg)
                 }
@@ -1051,7 +1148,23 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 }
             }
             match state::handle_post_rust_builds_complete(&kv, build_id, complete_req, now).await {
-                Ok((status_code, body)) => json_response(status_code, &body),
+                Ok((status_code, mut body)) => {
+                    if let Some(ref btok) = verified_builder_token {
+                        if auth::should_renew_builder_queue_token(btok, now) {
+                            if let Ok(new_tok) =
+                                auth::mint_builder_queue_token(session_secret, &btok.inst, now)
+                            {
+                                if let Some(obj) = body.as_object_mut() {
+                                    obj.insert(
+                                        "renewed_queue_token".to_string(),
+                                        Value::String(new_tok),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    json_response(status_code, &body)
+                }
                 Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
                 Err(state::StateError::Validation(msg)) => {
                     error_response(400, "validation_error", &msg)
@@ -1122,7 +1235,23 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 }
             }
             match state::handle_post_rust_builds_complete(&kv, build_id, complete_req, now).await {
-                Ok((status_code, body)) => json_response(status_code, &body),
+                Ok((status_code, mut body)) => {
+                    if let Some(ref btok) = verified_builder_token {
+                        if auth::should_renew_builder_queue_token(btok, now) {
+                            if let Ok(new_tok) =
+                                auth::mint_builder_queue_token(session_secret, &btok.inst, now)
+                            {
+                                if let Some(obj) = body.as_object_mut() {
+                                    obj.insert(
+                                        "renewed_queue_token".to_string(),
+                                        Value::String(new_tok),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    json_response(status_code, &body)
+                }
                 Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
                 Err(state::StateError::Validation(msg)) => {
                     error_response(400, "validation_error", &msg)

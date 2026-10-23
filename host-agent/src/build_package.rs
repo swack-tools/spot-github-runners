@@ -1061,6 +1061,111 @@ pub fn materialize_repository_checkout(
     Ok(())
 }
 
+static RENEWED_BEARER_TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub const WORKER_LEASE_HEARTBEAT_INTERVAL_SECS: u64 = 300; // 5 minutes
+
+fn active_bearer_token() -> Option<String> {
+    if let Ok(guard) = RENEWED_BEARER_TOKEN.lock() {
+        if let Some(ref tok) = *guard {
+            if !tok.trim().is_empty() {
+                return Some(tok.clone());
+            }
+        }
+    }
+    std::env::var("SPOT_BEARER_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn persist_renewed_queue_token(new_token: &str) {
+    let trimmed = new_token.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+        return;
+    }
+    if let Ok(mut guard) = RENEWED_BEARER_TOKEN.lock() {
+        *guard = Some(trimmed.to_string());
+    }
+    let env_file_path = std::env::var("SPOT_QUEUE_WORKER_ENV_FILE")
+        .unwrap_or_else(|_| "/etc/default/example-rust-project-queue-worker".to_string());
+    let path = Path::new(&env_file_path);
+    if let Ok(existing) = fs::read_to_string(path) {
+        let mut updated_lines = Vec::new();
+        let mut replaced = false;
+        for line in existing.lines() {
+            if line.starts_with("SPOT_BEARER_TOKEN=") {
+                updated_lines.push(format!("SPOT_BEARER_TOKEN={trimmed}"));
+                replaced = true;
+            } else {
+                updated_lines.push(line.to_string());
+            }
+        }
+        if !replaced {
+            updated_lines.push(format!("SPOT_BEARER_TOKEN={trimmed}"));
+        }
+        let new_content = format!("{}\n", updated_lines.join("\n"));
+        let _ = fs::write(path, new_content);
+    }
+}
+
+fn capture_renewed_token_from_response(resp: &serde_json::Value) {
+    if let Some(new_tok) = resp.get("renewed_queue_token").and_then(|v| v.as_str()) {
+        persist_renewed_queue_token(new_tok);
+    }
+}
+
+struct ActiveBuildHeartbeatGuard {
+    stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ActiveBuildHeartbeatGuard {
+    fn start(
+        dashboard_url: String,
+        build_id: u64,
+        instance_name: String,
+        interval_secs: u64,
+    ) -> Self {
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_clone = std::sync::Arc::clone(&stop_flag);
+        let handle = std::thread::spawn(move || {
+            let step_ms = 200u64;
+            let total_wait_ms = interval_secs.max(1).saturating_mul(1000);
+            let mut waited_ms = 0u64;
+            while !flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(step_ms));
+                if flag_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                waited_ms = waited_ms.saturating_add(step_ms);
+                if waited_ms >= total_wait_ms {
+                    waited_ms = 0;
+                    let endpoint = format!("/api/rust-builds/{build_id}/heartbeat");
+                    let payload = serde_json::json!({
+                        "build_id": build_id,
+                        "instance_name": instance_name,
+                    });
+                    let _ = post_control_plane_json(&dashboard_url, &endpoint, &payload);
+                }
+            }
+        });
+        Self {
+            stop_flag,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for ActiveBuildHeartbeatGuard {
+    fn drop(&mut self) {
+        self.stop_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 fn post_control_plane_json(
     base_url: &str,
     endpoint_path: &str,
@@ -1086,8 +1191,24 @@ fn post_control_plane_json(
             }
             let raw = fs::read_to_string(&resp_file)
                 .map_err(|e| format!("Failed reading '{}': {e}", resp_file.display()))?;
-            return serde_json::from_str(&raw)
-                .map_err(|e| format!("Invalid JSON in '{}': {e}", resp_file.display()));
+            let parsed: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| format!("Invalid JSON in '{}': {e}", resp_file.display()))?;
+            capture_renewed_token_from_response(&parsed);
+            return Ok(parsed);
+        } else if endpoint_path.starts_with("/api/rust-builds/")
+            && endpoint_path.ends_with("/heartbeat")
+        {
+            let id_part = endpoint_path
+                .trim_start_matches("/api/rust-builds/")
+                .trim_end_matches("/heartbeat")
+                .trim_matches('/');
+            let hb_path = root_path.join(format!("heartbeat_{id_part}.json"));
+            fs::write(&hb_path, &body_str)
+                .map_err(|e| format!("Failed writing '{}': {e}", hb_path.display()))?;
+            return Ok(serde_json::json!({
+                "status": "renewed",
+                "build_id": id_part.parse::<u64>().unwrap_or(0)
+            }));
         } else if endpoint_path.starts_with("/api/rust-builds/")
             && endpoint_path.ends_with("/complete")
         {
@@ -1127,12 +1248,9 @@ fn post_control_plane_json(
             cmd.arg("-H").arg(header);
         }
     }
-    if let Ok(token) = std::env::var("SPOT_BEARER_TOKEN") {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() {
-            cmd.arg("-H")
-                .arg(format!("Authorization: Bearer {trimmed}"));
-        }
+    if let Some(trimmed) = active_bearer_token() {
+        cmd.arg("-H")
+            .arg(format!("Authorization: Bearer {trimmed}"));
     }
     cmd.arg("-d").arg(&body_str).arg(&url);
 
@@ -1148,7 +1266,10 @@ fn post_control_plane_json(
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout).map_err(|e| format!("Invalid JSON response from {url}: {e}"))
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("Invalid JSON response from {url}: {e}"))?;
+    capture_renewed_token_from_response(&parsed);
+    Ok(parsed)
 }
 
 pub fn process_next_queued_build(
@@ -1180,6 +1301,14 @@ pub fn process_next_queued_build(
         .ok_or("Claim response marked claimed=true but missing 'build' object")?;
     let job: ClaimedBuildJob = serde_json::from_value(build_val.clone())
         .map_err(|e| format!("Failed parsing claimed build job: {e}"))?;
+
+    // Maintain a background lease heartbeat for the duration of checkout, compilation, and GCS upload
+    let _heartbeat_guard = ActiveBuildHeartbeatGuard::start(
+        cfg.dashboard_url.clone(),
+        job.build_id,
+        cfg.instance_name.clone(),
+        WORKER_LEASE_HEARTBEAT_INTERVAL_SECS,
+    );
 
     let project_slug = sanitize_project_slug(&job.repo)?;
     let workspace = cfg.sources_root.join(&project_slug);
