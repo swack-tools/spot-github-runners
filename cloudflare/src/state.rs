@@ -510,6 +510,7 @@ pub struct OverviewQuery {
     pub role: Option<String>,
     pub arch: Option<String>,
     pub target: Option<String>,
+    pub max_latency_ms: Option<f64>,
     pub is_authenticated: Option<bool>,
 }
 
@@ -1264,6 +1265,7 @@ fn make_arm64_candidate_offer(
 fn enrich_arm64_catalog_and_qualifications(
     ov_obj: &mut serde_json::Map<String, serde_json::Value>,
     arch_filter: &str,
+    max_latency_ms: Option<f64>,
 ) {
     let cicd_arm64_offers = vec![
         make_arm64_candidate_offer(
@@ -1591,6 +1593,13 @@ fn enrich_arm64_catalog_and_qualifications(
                     } else if arch_filter == "x86_64" || arch_filter == "amd64" {
                         list.retain(|x| x.get("arch").and_then(|v| v.as_str()) != Some("arm64"));
                     }
+                    if let Some(max_lat) = max_latency_ms.filter(|v| v.is_finite() && *v > 0.0) {
+                        list.retain(|x| {
+                            x.get("latency_ms")
+                                .and_then(|v| v.as_f64())
+                                .map_or(true, |lat| lat <= max_lat)
+                        });
+                    }
 
                     list.sort_by(|a, b| {
                         let pa = a
@@ -1775,7 +1784,22 @@ pub fn apply_dynamic_overview_filtering(
         .unwrap_or("all")
         .trim()
         .to_lowercase();
-    enrich_arm64_catalog_and_qualifications(ov_obj, &arch_filter);
+    let max_latency_ms = query
+        .max_latency_ms
+        .filter(|v| v.is_finite() && *v > 0.0);
+    enrich_arm64_catalog_and_qualifications(ov_obj, &arch_filter, max_latency_ms);
+
+    let mut region_latency_map: HashMap<String, f64> = HashMap::new();
+    if let Some(regions_arr) = ov_obj.get("regions").and_then(|v| v.as_array()) {
+        for r in regions_arr {
+            if let (Some(reg), Some(lat)) = (
+                r.get("region").and_then(|v| v.as_str()),
+                r.get("latency_ms").and_then(|v| v.as_f64()),
+            ) {
+                region_latency_map.insert(reg.to_string(), lat);
+            }
+        }
+    }
 
     let default_org = ov_obj
         .get("org")
@@ -1983,6 +2007,20 @@ pub fn apply_dynamic_overview_filtering(
         if let Some(ref sel) = selected_targets {
             let target_lower = inst_target.to_lowercase();
             if !sel.iter().any(|t| t == &target_lower) {
+                continue;
+            }
+        }
+
+        let inst_region = inst.get("region").and_then(|v| v.as_str()).unwrap_or("");
+        let inst_latency = inst
+            .get("latency_ms")
+            .and_then(|v| v.as_f64())
+            .or_else(|| region_latency_map.get(inst_region).copied());
+        if let Some(lat) = inst_latency {
+            inst["latency_ms"] = serde_json::json!(lat);
+        }
+        if let Some(max_lat) = max_latency_ms {
+            if inst_latency.map_or(false, |lat| lat > max_lat) {
                 continue;
             }
         }
@@ -2455,10 +2493,12 @@ pub async fn handle_post_regions<K: KvStoreBackend>(
     now: u64,
 ) -> Result<(u16, serde_json::Value), StateError> {
     let (mut bundle, _) = load_state(kv, now).await?;
+    let mut mutated = false;
     if let Some(map) = body.get("regions_enabled").and_then(|v| v.as_object()) {
         for (region, enabled_val) in map {
             if let Some(en) = enabled_val.as_bool() {
                 bundle.state.regions_enabled.insert(region.clone(), en);
+                mutated = true;
                 if let Some(ref mut ov) = bundle.state.overview {
                     if let Some(regions_arr) = ov.get_mut("regions").and_then(|r| r.as_array_mut())
                     {
@@ -2475,13 +2515,45 @@ pub async fn handle_post_regions<K: KvStoreBackend>(
             }
         }
     }
-    bundle.state.updated_at = now;
-    save_state(kv, &mut bundle, now).await?;
+    if let Some(min_lat) = body
+        .get("deselect_matching")
+        .and_then(|v| v.get("min_latency_ms_to_disable"))
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite())
+    {
+        if let Some(ref mut ov) = bundle.state.overview {
+            if let Some(regions_arr) = ov.get_mut("regions").and_then(|r| r.as_array_mut()) {
+                for r_obj in regions_arr.iter_mut() {
+                    let reg = r_obj
+                        .get("region")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let lat = r_obj
+                        .get("latency_ms")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    if !reg.is_empty() && lat > min_lat {
+                        bundle.state.regions_enabled.insert(reg, false);
+                        if let Some(m) = r_obj.as_object_mut() {
+                            m.insert("enabled".to_string(), serde_json::json!(false));
+                        }
+                        mutated = true;
+                    }
+                }
+            }
+        }
+    }
+    if mutated {
+        bundle.state.updated_at = now;
+        save_state(kv, &mut bundle, now).await?;
+    }
     Ok((
         200,
         serde_json::json!({
             "status": "ok",
             "regions_enabled": bundle.state.regions_enabled,
+            "region_latencies_ms": bundle.state.region_latencies_ms,
         }),
     ))
 }

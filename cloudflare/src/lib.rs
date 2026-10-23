@@ -330,6 +330,13 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                             query.target = Some(trimmed.to_string());
                         }
                     }
+                    "max_latency_ms" | "max_latency" => {
+                        if let Ok(lat) = v.parse::<f64>() {
+                            if lat.is_finite() && lat > 0.0 {
+                                query.max_latency_ms = Some(lat);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }

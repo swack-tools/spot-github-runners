@@ -1912,4 +1912,64 @@ async fn test_dynamic_overview_filtering_by_org_and_repo_target() {
     assert_eq!(resp_none["instances_view"]["running_count"], 0);
 }
 
+#[tokio::test]
+async fn test_overview_filter_by_max_latency_ms() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    let mut ov = create_sample_overview(now);
+    ov["qualifications"] = serde_json::json!({
+        "cicd_runner": {
+            "hardware_qualifying": [],
+            "spot_price_qualifying": []
+        },
+        "rust_builder": {
+            "hardware_qualifying": [],
+            "spot_price_qualifying": []
+        }
+    });
+    ov["regions"] = serde_json::json!([
+        {
+            "region": "us-central1",
+            "zones": ["us-central1-a", "us-central1-b"],
+            "latency_ms": 18,
+            "enabled": true,
+            "running_instances": []
+        },
+        {
+            "region": "asia-east2",
+            "zones": ["asia-east2-a"],
+            "latency_ms": 148,
+            "enabled": true,
+            "running_instances": []
+        }
+    ]);
+    bundle.state.overview = Some(ov);
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    // Filter with max_latency_ms = 20.0 -> only us-central1 (18 ms) instances and offers qualify
+    let q_20ms = OverviewQuery {
+        max_latency_ms: Some(20.0),
+        include_deleted: Some(false),
+        ..Default::default()
+    };
+    let (_, resp_20ms) = handle_api_overview(&kv, q_20ms, now).await.unwrap();
+    let insts = resp_20ms["instances_view"]["instances"].as_array().unwrap();
+    assert_eq!(insts.len(), 1);
+    assert_eq!(insts[0]["region"], "us-central1");
+    assert_eq!(insts[0]["latency_ms"], 18.0);
+
+    let qual_spot = resp_20ms["qualifications"]["cicd_runner"]["spot_price_qualifying"]
+        .as_array()
+        .unwrap();
+    for offer in qual_spot {
+        let lat = offer["latency_ms"].as_f64().unwrap();
+        assert!(lat <= 20.0, "expected offer latency <= 20ms, got {lat}");
+    }
+}
+
+
 
