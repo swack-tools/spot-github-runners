@@ -134,3 +134,59 @@ disk to make a failed bootstrap retry succeed.
 Builder drains deny new builds while active builds, units, leases, and cache or upload and export locks finish.
 Preserve foreign or uncertain work, and record why a drain is blocked. Runner drains and builder drains have
 different completion tests. See [Fleet and autoscaler](fleet-and-autoscaler.md).
+
+## Remote build queue and three-artifact offload
+
+When a test suite or multi-crate workspace build takes up to an hour on a laptop—or when multiple developers and AI subagents submit builds concurrently—use the Edge Worker build queue instead of contending for a single SSH lock.
+
+### 1. Enqueue and poll build requests
+
+Submit a build request to `POST /api/rust-builds/enqueue` with the repository, branch, hexadecimal commit SHA, command, and `requested_output` (`log`, `binary`, or `target_zip`):
+
+```bash
+curl -sS -X POST https://spot.swacktech.com/api/rust-builds/enqueue \
+  -H "Content-Type: application/json" \
+  -H "Cookie: $SPOT_SESSION_COOKIE" \
+  -d '{
+    "repo": "example-org/example-rust-project",
+    "branch": "feat/new-parser",
+    "commit_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "command": "cargo test --workspace --locked",
+    "requested_output": "target_zip",
+    "template_id": "rust-builder-default"
+  }' | jq
+```
+
+The Worker assigns a monotonic build identifier (starting at `#4553`), appends the request to the first-in, first-out (FIFO) queue, evaluates the `rust_builder` scaling policy, and returns:
+
+- `build_id`: numeric build identifier (for example `4553`).
+- `queue_position`: position in line (`1`, `2`, and so on while `queued`, or `0` once `running`).
+- `eta_seconds`, `eta_hours`, and `eta_human`: estimated wait time calculated from the rolling `average_duration_seconds` of prior builds and the active builder count.
+- `scaling_up` and `scaling_summary`: whether the queue depth reached `queued_builds_threshold` and triggered a `SCALE_UP` decision to provision additional `builder-*` Spot VMs up to `max_instances`.
+
+Poll `GET /api/rust-builds/4553` to check the live queue position, remaining ETA, scaling state, and artifact URLs.
+
+### 2. Always-upload three-artifact storage in same-region GCP object storage
+
+Because a Spot `builder-*` VM can shut down or be preempted immediately after a build finishes—and because an operator might inspect the log first and later download the compiled binary or full `target/` directory—the builder packages and uploads all three artifacts before calling `POST /api/rust-builds/{id}/complete`:
+
+| Artifact | Path in bucket (`gs://<bucket>/builds/<id>/`) | Contents |
+| --- | --- | --- |
+| Build log | `build.log` | Combined `stdout` and `stderr` output from the build or test suite |
+| Compiled binaries | `binaries.tar.zst` | Compressed executable binaries from `target/release/` and `target/debug/` |
+| Full target archive | `target.tar.zst` | Compressed `target/` directory including `build.log` and build outputs |
+
+Run `host-agent build-package` on the builder VM to stage and upload all three files to a GCP storage bucket in the same region (`us-central1`), where ingress from Compute Engine VMs in the same region incurs zero network transfer charges:
+
+```bash
+host-agent build-package \
+  --build-id 4553 \
+  --workspace /mnt/runner-data/remote-build/sources/example-rust-project \
+  --log-file /tmp/build-4553.log \
+  --out-dir /mnt/runner-data/remote-build/exports \
+  --bucket example-rust-project-build-artifacts \
+  --profile release \
+  --upload
+```
+
+When the build completes, `GET /api/rust-builds/4553` returns `selected_artifact_url` pointing to the artifact that matches `requested_output` (`log`, `binary`, or `target_zip`), while `artifacts` retains all three URLs (`log_url`, `binary_url`, and `target_zip_url`) together with their byte sizes and SHA-256 digests.

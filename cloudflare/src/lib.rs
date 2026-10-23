@@ -804,6 +804,17 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                         }
                     }
                 }
+                if let Some(queue_arr) = builds_val.get_mut("queue").and_then(|v| v.as_array_mut())
+                {
+                    for q in queue_arr.iter_mut() {
+                        if let Some(obj) = q.as_object_mut() {
+                            obj.remove("origin_ip");
+                            obj.remove("origin_hostname");
+                            obj.remove("ip");
+                            obj.remove("client_ip");
+                        }
+                    }
+                }
             }
             let resp = serde_json::json!({
                 "builds": builds_val
@@ -838,6 +849,221 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Err(state::StateError::Validation(msg)) => {
                     error_response(400, "validation_error", &msg)
                 }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        (Method::Post, "/api/rust-builds/enqueue") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+
+            let enqueue_req: state::EnqueueRustBuildRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            match state::handle_post_rust_builds_enqueue(&kv, enqueue_req, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        (Method::Get, "/api/rust-builds/queue") => {
+            if is_production_oauth_configured(&env) && verified_session.is_none() {
+                return error_response(401, "unauthorized", "Sign in required");
+            }
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            let global_admins = is_global_admins_enabled(&env);
+            let is_authed_admin = if let Some(ref session) = verified_session {
+                matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                )
+            } else {
+                false
+            };
+            match state::handle_get_rust_builds_queue(&kv, is_authed_admin, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        (Method::Post, "/api/rust-builds/claim") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+
+            let claim_req: state::ClaimRustBuildRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            match state::handle_post_rust_builds_claim(&kv, claim_req, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        (Method::Post, "/api/rust-builds/complete") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+
+            let complete_req: state::CompleteRustBuildRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            let Some(build_id) = complete_req.build_id else {
+                return error_response(
+                    400,
+                    "validation_error",
+                    "build_id is required when posting to /api/rust-builds/complete",
+                );
+            };
+            match state::handle_post_rust_builds_complete(&kv, build_id, complete_req, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        (Method::Post, p) if p.starts_with("/api/rust-builds/") && p.ends_with("/complete") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+
+            let id_str = p
+                .trim_start_matches("/api/rust-builds/")
+                .trim_end_matches("/complete")
+                .trim_matches('/')
+                .trim_start_matches('#');
+            let Ok(build_id) = id_str.parse::<u64>() else {
+                return error_response(400, "bad_request", "Invalid numeric build_id in path");
+            };
+            let complete_req: state::CompleteRustBuildRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            match state::handle_post_rust_builds_complete(&kv, build_id, complete_req, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        (Method::Get, p) if p.starts_with("/api/rust-builds/") => {
+            if is_production_oauth_configured(&env) && verified_session.is_none() {
+                return error_response(401, "unauthorized", "Sign in required");
+            }
+            let id_str = p
+                .trim_start_matches("/api/rust-builds/")
+                .trim_matches('/')
+                .trim_start_matches('#');
+            let Ok(build_id) = id_str.parse::<u64>() else {
+                return error_response(400, "bad_request", "Invalid numeric build_id in path");
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            let global_admins = is_global_admins_enabled(&env);
+            let is_authed_admin = if let Some(ref session) = verified_session {
+                matches!(
+                    auth::check_session(
+                        session,
+                        &bundle.state.controlled_targets,
+                        &added_admins,
+                        global_admins,
+                    ),
+                    auth::SessionCheckStatus::Ok
+                )
+            } else {
+                false
+            };
+            match state::handle_get_rust_build_status(&kv, build_id, is_authed_admin, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
                 Err(err) => error_response(500, "internal_error", &err.to_string()),
             }
         }

@@ -1769,12 +1769,7 @@ pub fn apply_dynamic_overview_filtering(
         None => return,
     };
 
-    let arch_filter = query
-        .arch
-        .as_deref()
-        .unwrap_or("all")
-        .trim()
-        .to_lowercase();
+    let arch_filter = query.arch.as_deref().unwrap_or("all").trim().to_lowercase();
     enrich_arm64_catalog_and_qualifications(ov_obj, &arch_filter);
 
     let default_org = ov_obj
@@ -2312,6 +2307,14 @@ pub fn apply_dynamic_overview_filtering(
             if let Some(builds) = rb.get_mut("builds").and_then(|v| v.as_array_mut()) {
                 for b in builds {
                     if let Some(obj) = b.as_object_mut() {
+                        obj.remove("origin_ip");
+                        obj.remove("origin_hostname");
+                    }
+                }
+            }
+            if let Some(queue) = rb.get_mut("queue").and_then(|v| v.as_array_mut()) {
+                for q in queue {
+                    if let Some(obj) = q.as_object_mut() {
                         obj.remove("origin_ip");
                         obj.remove("origin_hostname");
                     }
@@ -3021,24 +3024,22 @@ pub struct RecordRustBuildRequest {
     pub cpu_time_seconds: Option<f64>,
 }
 
-pub async fn handle_post_rust_builds<K: KvStoreBackend>(
-    kv: &K,
+fn append_rust_build_record(
+    state: &mut DashboardState,
     req: RecordRustBuildRequest,
     now: u64,
-) -> Result<(u16, serde_json::Value), StateError> {
-    if req.status.trim().is_empty() {
-        return Err(StateError::Validation(
-            "Build status cannot be empty".into(),
-        ));
-    }
-
-    let (mut bundle, _) = load_state(kv, now).await?;
-
+) -> serde_json::Value {
     let build_id = generate_record_id("build", now);
     let iso_now = chrono_iso(now);
 
-    let compile_sec = req.compile_duration_seconds.unwrap_or(0.0);
-    let delivery_sec = req.delivery_duration_seconds.unwrap_or(0.0);
+    let compile_sec = req
+        .compile_duration_seconds
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0);
+    let delivery_sec = req
+        .delivery_duration_seconds
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0);
     let total_duration = compile_sec + delivery_sec;
 
     let hits = req.cache_hits.unwrap_or(0);
@@ -3049,12 +3050,15 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
         0.0
     };
 
+    let cpu_time_sec = req.cpu_time_seconds.filter(|v| v.is_finite() && *v >= 0.0);
+    let peak_ram = req.peak_ram_gib.filter(|v| v.is_finite() && *v >= 0.0);
+
     let bench = req.vcpu.map(|v| v * 120);
-    let cpu_pts = match (req.cpu_time_seconds, bench) {
+    let cpu_pts = match (cpu_time_sec, bench) {
         (Some(sec), Some(b)) => Some(((sec * b as f64) / 1000.0).round() as u64),
         _ => None,
     };
-    let cpu_formula = match (req.cpu_time_seconds, bench) {
+    let cpu_formula = match (cpu_time_sec, bench) {
         (Some(sec), Some(b)) => Some(format!("{:.1}s CPU × bench {} / 1000", sec, b)),
         _ => None,
     };
@@ -3108,15 +3112,14 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
         "origin_hostname": origin_hostname,
         "geolocation": geo,
         "network_security": net_sec,
-        "peak_ram_gib": req.peak_ram_gib,
+        "peak_ram_gib": peak_ram,
         "container_ram_cap_gib": 28,
-        "cpu_time_seconds": req.cpu_time_seconds,
+        "cpu_time_seconds": cpu_time_sec,
         "cpu_points": cpu_pts,
         "cpu_points_formula": cpu_formula,
     });
 
-    let mut builds_vec: Vec<serde_json::Value> = bundle
-        .state
+    let mut builds_vec: Vec<serde_json::Value> = state
         .rust_builds
         .get("builds")
         .and_then(|v| v.as_array())
@@ -3133,6 +3136,7 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
         let sum_dur: f64 = builds_vec
             .iter()
             .filter_map(|b| b.get("total_duration_seconds").and_then(|v| v.as_f64()))
+            .filter(|v| v.is_finite())
             .sum();
         (sum_dur / total_builds as f64).round()
     } else {
@@ -3156,6 +3160,7 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
     let max_peak_ram = builds_vec
         .iter()
         .filter_map(|b| b.get("peak_ram_gib").and_then(|v| v.as_f64()))
+        .filter(|v| v.is_finite())
         .fold(0.0, f64::max);
 
     let total_pts: u64 = builds_vec
@@ -3165,9 +3170,13 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
     let total_cpu_time: f64 = builds_vec
         .iter()
         .filter_map(|b| b.get("cpu_time_seconds").and_then(|v| v.as_f64()))
+        .filter(|v| v.is_finite())
         .sum();
 
-    bundle.state.rust_builds = serde_json::json!({
+    let existing_queue = state.rust_builds.get("queue").cloned();
+    let existing_next_id = state.rust_builds.get("next_build_id").cloned();
+
+    let mut new_rb = serde_json::json!({
         "total_builds": total_builds,
         "average_duration_seconds": avg_duration,
         "total_cache_hits": total_hits,
@@ -3178,6 +3187,31 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
         "vpn_or_tor_count": 0,
         "builds": builds_vec
     });
+    if let Some(obj) = new_rb.as_object_mut() {
+        if let Some(q) = existing_queue {
+            obj.insert("queue".to_string(), q);
+        }
+        if let Some(nid) = existing_next_id {
+            obj.insert("next_build_id".to_string(), nid);
+        }
+    }
+    state.rust_builds = new_rb;
+    single_build
+}
+
+pub async fn handle_post_rust_builds<K: KvStoreBackend>(
+    kv: &K,
+    req: RecordRustBuildRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    if req.status.trim().is_empty() {
+        return Err(StateError::Validation(
+            "Build status cannot be empty".into(),
+        ));
+    }
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+    let single_build = append_rust_build_record(&mut bundle.state, req, now);
 
     bundle.state.updated_at = now;
     save_state(kv, &mut bundle, now).await?;
@@ -3190,6 +3224,946 @@ pub async fn handle_post_rust_builds<K: KvStoreBackend>(
             "build": single_build
         }),
     ))
+}
+
+// ============================================================================
+// Remote Rust Build Queue, ETA, Autoscaling & 3-Artifact GCS Offload
+// ============================================================================
+
+pub const DEFAULT_INITIAL_BUILD_ID: u64 = 4553;
+pub const DEFAULT_BUILD_DURATION_SECS: f64 = 600.0;
+pub const MAX_RUST_BUILD_QUEUE_ITEMS: usize = 200;
+pub const DEFAULT_GCS_ARTIFACTS_BUCKET: &str = "example-rust-project-build-artifacts";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RustBuildArtifacts {
+    pub gcs_bucket: String,
+    pub gcs_prefix: String,
+    pub log_url: String,
+    pub binary_url: String,
+    pub target_zip_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_zip_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_zip_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RustBuildQueueItem {
+    pub build_id: u64,
+    pub repo: String,
+    pub branch: String,
+    pub commit_sha: String,
+    pub command: String,
+    pub requested_output: String,
+    pub template_id: String,
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_name: Option<String>,
+    pub status: String,
+    pub enqueued_at: String,
+    pub enqueued_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_instance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    pub gcs_bucket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<RustBuildArtifacts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_artifact_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_duration_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_ip: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnqueueRustBuildRequest {
+    pub repo: String,
+    pub branch: String,
+    pub commit_sha: String,
+    pub command: String,
+    #[serde(default)]
+    pub requested_output: Option<String>,
+    #[serde(default)]
+    pub template_id: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub binary_name: Option<String>,
+    #[serde(default)]
+    pub gcs_bucket: Option<String>,
+    #[serde(default)]
+    pub origin_ip: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimRustBuildRequest {
+    pub instance_name: String,
+    #[serde(default)]
+    pub zone: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteRustBuildRequest {
+    #[serde(default)]
+    pub build_id: Option<u64>,
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub compile_duration_seconds: Option<f64>,
+    #[serde(default)]
+    pub delivery_duration_seconds: Option<f64>,
+    #[serde(default)]
+    pub instance_name: Option<String>,
+    #[serde(default)]
+    pub zone: Option<String>,
+    #[serde(default)]
+    pub machine_type: Option<String>,
+    #[serde(default)]
+    pub vcpu: Option<u32>,
+    #[serde(default)]
+    pub cache_hits: Option<u32>,
+    #[serde(default)]
+    pub total_crates: Option<u32>,
+    #[serde(default)]
+    pub peak_ram_gib: Option<f64>,
+    #[serde(default)]
+    pub cpu_time_seconds: Option<f64>,
+    #[serde(default)]
+    pub log_url: Option<String>,
+    #[serde(default)]
+    pub binary_url: Option<String>,
+    #[serde(default)]
+    pub target_zip_url: Option<String>,
+    #[serde(default)]
+    pub log_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub binary_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub target_zip_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub log_sha256: Option<String>,
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
+    #[serde(default)]
+    pub target_zip_sha256: Option<String>,
+}
+
+fn normalize_requested_output(raw: Option<&str>) -> Result<String, StateError> {
+    let val = raw.unwrap_or("log").trim().to_lowercase();
+    match val.as_str() {
+        "" | "log" | "logs" => Ok("log".to_string()),
+        "binary" | "bin" | "binaries" => Ok("binary".to_string()),
+        "target_zip" | "target" | "zip" | "archive" => Ok("target_zip".to_string()),
+        other => Err(StateError::Validation(format!(
+            "Unsupported requested_output '{}'; must be 'log', 'binary', or 'target_zip'",
+            other
+        ))),
+    }
+}
+
+pub fn default_artifacts_for_build(gcs_bucket: &str, build_id: u64) -> RustBuildArtifacts {
+    let prefix = format!("gs://{}/builds/{}", gcs_bucket, build_id);
+    RustBuildArtifacts {
+        gcs_bucket: gcs_bucket.to_string(),
+        gcs_prefix: prefix.clone(),
+        log_url: format!("{}/build.log", prefix),
+        binary_url: format!("{}/binaries.tar.zst", prefix),
+        target_zip_url: format!("{}/target.tar.zst", prefix),
+        log_size_bytes: None,
+        binary_size_bytes: None,
+        target_zip_size_bytes: None,
+        log_sha256: None,
+        binary_sha256: None,
+        target_zip_sha256: None,
+    }
+}
+
+fn select_artifact_url_for_output(
+    requested_output: &str,
+    artifacts: &RustBuildArtifacts,
+) -> String {
+    match requested_output {
+        "binary" => artifacts.binary_url.clone(),
+        "target_zip" => artifacts.target_zip_url.clone(),
+        _ => artifacts.log_url.clone(),
+    }
+}
+
+pub fn format_eta_human(eta_seconds: u64) -> String {
+    if eta_seconds == 0 {
+        return "0m 0s".to_string();
+    }
+    let hours = eta_seconds / 3600;
+    let minutes = (eta_seconds % 3600) / 60;
+    let seconds = eta_seconds % 60;
+    if hours > 0 {
+        format!("{}h {}m {}s", hours, minutes, seconds)
+    } else {
+        format!("{}m {}s", minutes, seconds)
+    }
+}
+
+pub fn count_queued_rust_builds(state: &DashboardState) -> u32 {
+    state
+        .rust_builds
+        .get("queue")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|item| item.get("status").and_then(|s| s.as_str()) == Some("queued"))
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
+pub fn count_running_rust_builds(state: &DashboardState) -> u32 {
+    state
+        .rust_builds
+        .get("queue")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|item| item.get("status").and_then(|s| s.as_str()) == Some("running"))
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
+pub fn count_active_builder_instances(state: &DashboardState) -> u32 {
+    let source = if !state.instances_view.is_empty() {
+        &state.instances_view
+    } else {
+        &state.instances
+    };
+    let live = source
+        .iter()
+        .filter(|i| i.role == "rust_builder" && !i.status.eq_ignore_ascii_case("TERMINATED"))
+        .count() as u32;
+    if live > 0 {
+        live
+    } else {
+        state.scaling.rust_builder.min_instances.max(1)
+    }
+}
+
+pub fn effective_average_build_seconds(state: &DashboardState) -> f64 {
+    let avg = state
+        .rust_builds
+        .get("average_duration_seconds")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v > 0.0);
+    if let Some(a) = avg {
+        return a;
+    }
+    if let Some(builds) = state.rust_builds.get("builds").and_then(|v| v.as_array()) {
+        let valid: Vec<f64> = builds
+            .iter()
+            .filter_map(|b| b.get("total_duration_seconds").and_then(|v| v.as_f64()))
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .collect();
+        if !valid.is_empty() {
+            let sum: f64 = valid.iter().sum();
+            return (sum / valid.len() as f64).round();
+        }
+    }
+    DEFAULT_BUILD_DURATION_SECS
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BuilderQueueEvaluation {
+    pub queued_builds: u32,
+    pub running_builds: u32,
+    pub active_builders: u32,
+    pub target_builders: u32,
+    pub queued_builds_threshold: u32,
+    pub scaling_up: bool,
+    pub decision: String,
+    pub summary: String,
+}
+
+pub fn evaluate_rust_builder_queue_scaling(
+    state: &mut DashboardState,
+    now: u64,
+) -> BuilderQueueEvaluation {
+    let queued_builds = count_queued_rust_builds(state);
+    let running_builds = count_running_rust_builds(state);
+    let active_builders = count_active_builder_instances(state);
+    let policy = &state.scaling.rust_builder;
+    let threshold = policy.queued_builds_threshold.max(1);
+
+    let should_scale_up = policy.enable_queue_trigger
+        && queued_builds >= threshold
+        && active_builders < policy.max_instances;
+
+    let target_builders = if should_scale_up {
+        let extra = ((queued_builds - threshold) / threshold) + 1;
+        (active_builders + extra).min(policy.max_instances)
+    } else {
+        active_builders
+    };
+
+    let (decision, summary) = if should_scale_up {
+        (
+            "SCALE_UP".to_string(),
+            format!(
+                "Scale up from {} to {} builders ({} queued builds >= threshold {})",
+                active_builders, target_builders, queued_builds, threshold
+            ),
+        )
+    } else if policy.enable_queue_trigger && queued_builds >= threshold {
+        (
+            "HOLD".to_string(),
+            format!(
+                "Hold at max_instances {} ({} queued builds >= threshold {})",
+                policy.max_instances, queued_builds, threshold
+            ),
+        )
+    } else {
+        (
+            "HOLD".to_string(),
+            format!(
+                "Hold at {} builders ({} queued builds < threshold {})",
+                active_builders, queued_builds, threshold
+            ),
+        )
+    };
+
+    let eval_json = serde_json::json!({
+        "decision": decision,
+        "current_instances": active_builders,
+        "target_instances": target_builders,
+        "queued_builds": queued_builds,
+        "running_builds": running_builds,
+        "queued_builds_threshold": threshold,
+        "evaluated_at": chrono_iso(now),
+        "summary": summary,
+        "scale_up_triggers": if should_scale_up {
+            serde_json::json!([format!("queued_builds: {} >= {}", queued_builds, threshold)])
+        } else {
+            serde_json::json!([])
+        }
+    });
+
+    if !state.scaling_evaluations.is_object() {
+        state.scaling_evaluations = serde_json::json!({});
+    }
+    if let Some(obj) = state.scaling_evaluations.as_object_mut() {
+        obj.insert("rust_builder".to_string(), eval_json.clone());
+    }
+    if let Some(ref mut ov) = state.overview {
+        if let Some(ov_obj) = ov.as_object_mut() {
+            if !ov_obj.contains_key("scaling_evaluations")
+                || !ov_obj["scaling_evaluations"].is_object()
+            {
+                ov_obj.insert("scaling_evaluations".to_string(), serde_json::json!({}));
+            }
+            if let Some(se) = ov_obj
+                .get_mut("scaling_evaluations")
+                .and_then(|v| v.as_object_mut())
+            {
+                se.insert("rust_builder".to_string(), eval_json);
+            }
+        }
+    }
+
+    BuilderQueueEvaluation {
+        queued_builds,
+        running_builds,
+        active_builders,
+        target_builders,
+        queued_builds_threshold: threshold,
+        scaling_up: should_scale_up,
+        decision,
+        summary,
+    }
+}
+
+fn load_queue_from_state(state: &DashboardState) -> Vec<RustBuildQueueItem> {
+    state
+        .rust_builds
+        .get("queue")
+        .and_then(|v| serde_json::from_value::<Vec<RustBuildQueueItem>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn save_queue_into_state(
+    state: &mut DashboardState,
+    queue: &[RustBuildQueueItem],
+    next_build_id: u64,
+) {
+    if !state.rust_builds.is_object() {
+        state.rust_builds = serde_json::json!({
+            "total_builds": 0,
+            "average_duration_seconds": 0.0,
+            "total_cache_hits": 0,
+            "overall_cache_hit_rate_percent": 0.0,
+            "max_peak_ram_gib": 0.0,
+            "total_cpu_points": 0,
+            "total_cpu_time_seconds": 0.0,
+            "vpn_or_tor_count": 0,
+            "builds": []
+        });
+    }
+    if let Some(obj) = state.rust_builds.as_object_mut() {
+        obj.insert(
+            "queue".to_string(),
+            serde_json::to_value(queue).unwrap_or_else(|_| serde_json::json!([])),
+        );
+        obj.insert(
+            "next_build_id".to_string(),
+            serde_json::json!(next_build_id),
+        );
+    }
+}
+
+fn build_status_response(
+    item: &RustBuildQueueItem,
+    queue: &[RustBuildQueueItem],
+    eval: &BuilderQueueEvaluation,
+    avg_build_secs: f64,
+    now: u64,
+    include_origin_ip: bool,
+) -> serde_json::Value {
+    let queue_position: u32 = if item.status == "queued" {
+        queue
+            .iter()
+            .filter(|q| q.status == "queued")
+            .position(|q| q.build_id == item.build_id)
+            .map(|idx| (idx as u32) + 1)
+            .unwrap_or(1)
+    } else {
+        0
+    };
+
+    let effective_builders = eval.active_builders.max(1) as f64;
+    let eta_seconds: u64 = match item.status.as_str() {
+        "queued" => {
+            let waves = (queue_position as f64 / effective_builders).ceil();
+            (waves * avg_build_secs).round().max(0.0) as u64
+        }
+        "running" => {
+            let started = item.started_epoch.unwrap_or(now);
+            let elapsed = now.saturating_sub(started) as f64;
+            (avg_build_secs - elapsed).max(0.0).round() as u64
+        }
+        _ => 0,
+    };
+
+    let eta_hours = ((eta_seconds as f64 / 3600.0) * 100.0).round() / 100.0;
+    let eta_human = format_eta_human(eta_seconds);
+    let avg_human = format_eta_human(avg_build_secs.round() as u64);
+
+    let message = match item.status.as_str() {
+        "queued" => {
+            if eval.scaling_up {
+                format!(
+                    "Build #{} is #{} in line. ETA based on previous builds' average time ({}) is {:.2} hours ({}) until compilation; however, we are scaling up right now ({} -> {} builders).",
+                    item.build_id,
+                    queue_position,
+                    avg_human,
+                    eta_hours,
+                    eta_human,
+                    eval.active_builders,
+                    eval.target_builders
+                )
+            } else {
+                format!(
+                    "Build #{} is #{} in line. ETA based on previous builds' average time ({}) is {:.2} hours ({}) until compilation.",
+                    item.build_id, queue_position, avg_human, eta_hours, eta_human
+                )
+            }
+        }
+        "running" => format!(
+            "Build #{} is actively compiling on {}. Estimated remaining time: {}.",
+            item.build_id,
+            item.assigned_instance.as_deref().unwrap_or("builder"),
+            eta_human
+        ),
+        "completed" => {
+            let url = item
+                .selected_artifact_url
+                .as_deref()
+                .unwrap_or("artifact ready");
+            format!(
+                "Build #{} completed. Here is the link to your requested '{}' output: {}",
+                item.build_id, item.requested_output, url
+            )
+        }
+        "failed" => {
+            let log_url = item
+                .artifacts
+                .as_ref()
+                .map(|a| a.log_url.as_str())
+                .unwrap_or("log unavailable");
+            format!(
+                "Build #{} failed. Build log is available at: {}",
+                item.build_id, log_url
+            )
+        }
+        other => format!("Build #{} is in state '{}'.", item.build_id, other),
+    };
+
+    let mut sanitized_item = item.clone();
+    if !include_origin_ip {
+        sanitized_item.origin_ip = None;
+    }
+
+    serde_json::json!({
+        "status": "ok",
+        "build_id": item.build_id,
+        "build_status": item.status,
+        "queue_position": queue_position,
+        "queued_builds": eval.queued_builds,
+        "running_builds": eval.running_builds,
+        "active_builders": eval.active_builders,
+        "target_builders": eval.target_builders,
+        "scaling_up": eval.scaling_up,
+        "scaling_decision": eval.decision,
+        "scaling_summary": eval.summary,
+        "average_build_duration_seconds": avg_build_secs,
+        "eta_seconds": eta_seconds,
+        "eta_hours": eta_hours,
+        "eta_human": eta_human,
+        "requested_output": item.requested_output,
+        "selected_artifact_url": item.selected_artifact_url,
+        "artifacts": item.artifacts,
+        "poll_url": format!("/api/rust-builds/{}", item.build_id),
+        "message": message,
+        "build": sanitized_item,
+    })
+}
+
+pub async fn handle_post_rust_builds_enqueue<K: KvStoreBackend>(
+    kv: &K,
+    req: EnqueueRustBuildRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let repo = req.repo.trim();
+    if repo.is_empty() || repo.len() > 128 || repo.contains("..") {
+        return Err(StateError::Validation(
+            "repo must be a non-empty repository identifier (<= 128 chars)".into(),
+        ));
+    }
+    let branch = req.branch.trim();
+    if branch.is_empty() || branch.len() > 128 || branch.contains("..") {
+        return Err(StateError::Validation(
+            "branch must be a non-empty branch name (<= 128 chars)".into(),
+        ));
+    }
+    let commit_sha = req.commit_sha.trim();
+    if commit_sha.len() < 7
+        || commit_sha.len() > 64
+        || !commit_sha.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(StateError::Validation(
+            "commit_sha must be a 7..64 character hexadecimal Git commit SHA".into(),
+        ));
+    }
+    let command = req.command.trim();
+    if command.is_empty() || command.len() > 512 {
+        return Err(StateError::Validation(
+            "command must be a non-empty build or test command (<= 512 chars)".into(),
+        ));
+    }
+    let requested_output = normalize_requested_output(req.requested_output.as_deref())?;
+
+    let gcs_bucket = req
+        .gcs_bucket
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_GCS_ARTIFACTS_BUCKET);
+    if gcs_bucket.len() > 128
+        || gcs_bucket.contains("..")
+        || gcs_bucket.contains('/')
+        || !gcs_bucket
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(StateError::Validation(
+            "gcs_bucket contains invalid characters".into(),
+        ));
+    }
+
+    let template_id = req
+        .template_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("rust-builder-default")
+        .to_string();
+    let profile = req
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("test")
+        .to_string();
+    let binary_name = req
+        .binary_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+    let mut queue = load_queue_from_state(&bundle.state);
+
+    let max_existing_id = queue.iter().map(|q| q.build_id).max().unwrap_or(0);
+    let stored_next_id = bundle
+        .state
+        .rust_builds
+        .get("next_build_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_INITIAL_BUILD_ID);
+    let build_id = stored_next_id
+        .max(max_existing_id.saturating_add(1))
+        .max(DEFAULT_INITIAL_BUILD_ID);
+
+    let item = RustBuildQueueItem {
+        build_id,
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        commit_sha: commit_sha.to_string(),
+        command: command.to_string(),
+        requested_output,
+        template_id,
+        profile,
+        binary_name,
+        status: "queued".to_string(),
+        enqueued_at: chrono_iso(now),
+        enqueued_epoch: now,
+        started_at: None,
+        started_epoch: None,
+        finished_at: None,
+        finished_epoch: None,
+        assigned_instance: None,
+        zone: None,
+        gcs_bucket: gcs_bucket.to_string(),
+        artifacts: None,
+        selected_artifact_url: None,
+        compile_duration_seconds: None,
+        exit_code: None,
+        origin_ip: req.origin_ip,
+    };
+
+    queue.push(item.clone());
+    if queue.len() > MAX_RUST_BUILD_QUEUE_ITEMS {
+        // Evict oldest completed/failed items first when bounding queue history
+        if let Some(done_idx) = queue
+            .iter()
+            .position(|q| q.status == "completed" || q.status == "failed")
+        {
+            queue.remove(done_idx);
+        } else {
+            queue.remove(0);
+        }
+    }
+
+    save_queue_into_state(&mut bundle.state, &queue, build_id + 1);
+    let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
+    let avg_build_secs = effective_average_build_seconds(&bundle.state);
+
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+
+    let resp = build_status_response(&item, &queue, &eval, avg_build_secs, now, true);
+    Ok((200, resp))
+}
+
+pub async fn handle_get_rust_build_status<K: KvStoreBackend>(
+    kv: &K,
+    build_id: u64,
+    is_authed_admin: bool,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let (mut bundle, _) = load_state(kv, now).await?;
+    let queue = load_queue_from_state(&bundle.state);
+    let item = queue
+        .iter()
+        .find(|q| q.build_id == build_id)
+        .ok_or_else(|| StateError::NotFound(format!("Build #{} not found in queue", build_id)))?;
+
+    let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
+    let avg_build_secs = effective_average_build_seconds(&bundle.state);
+    let resp = build_status_response(item, &queue, &eval, avg_build_secs, now, is_authed_admin);
+    Ok((200, resp))
+}
+
+pub async fn handle_get_rust_builds_queue<K: KvStoreBackend>(
+    kv: &K,
+    is_authed_admin: bool,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let (mut bundle, _) = load_state(kv, now).await?;
+    let mut queue = load_queue_from_state(&bundle.state);
+    let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
+    let avg_build_secs = effective_average_build_seconds(&bundle.state);
+
+    if !is_authed_admin {
+        for q in &mut queue {
+            q.origin_ip = None;
+        }
+    }
+
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "queued_builds": eval.queued_builds,
+            "running_builds": eval.running_builds,
+            "active_builders": eval.active_builders,
+            "target_builders": eval.target_builders,
+            "queued_builds_threshold": eval.queued_builds_threshold,
+            "scaling_up": eval.scaling_up,
+            "scaling_decision": eval.decision,
+            "scaling_summary": eval.summary,
+            "average_build_duration_seconds": avg_build_secs,
+            "queue": queue,
+        }),
+    ))
+}
+
+pub async fn handle_post_rust_builds_claim<K: KvStoreBackend>(
+    kv: &K,
+    req: ClaimRustBuildRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let instance_name = req.instance_name.trim();
+    if instance_name.is_empty() {
+        return Err(StateError::Validation(
+            "instance_name cannot be empty".into(),
+        ));
+    }
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+    let mut queue = load_queue_from_state(&bundle.state);
+
+    let next_idx = queue.iter().position(|q| q.status == "queued");
+    let Some(idx) = next_idx else {
+        return Ok((
+            200,
+            serde_json::json!({
+                "status": "empty",
+                "claimed": false,
+                "build": serde_json::Value::Null,
+            }),
+        ));
+    };
+
+    queue[idx].status = "running".to_string();
+    queue[idx].started_at = Some(chrono_iso(now));
+    queue[idx].started_epoch = Some(now);
+    queue[idx].assigned_instance = Some(instance_name.to_string());
+    queue[idx].zone = req
+        .zone
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let claimed_item = queue[idx].clone();
+    let upload_targets =
+        default_artifacts_for_build(&claimed_item.gcs_bucket, claimed_item.build_id);
+
+    let next_build_id = bundle
+        .state
+        .rust_builds
+        .get("next_build_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(claimed_item.build_id + 1);
+    save_queue_into_state(&mut bundle.state, &queue, next_build_id);
+    let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
+
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "claimed",
+            "claimed": true,
+            "build": claimed_item,
+            "upload_targets": upload_targets,
+            "scaling_evaluation": eval,
+        }),
+    ))
+}
+
+pub async fn handle_post_rust_builds_complete<K: KvStoreBackend>(
+    kv: &K,
+    build_id: u64,
+    req: CompleteRustBuildRequest,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    let status_norm = match req.status.trim().to_lowercase().as_str() {
+        "completed" | "succeeded" | "ok" | "passed" => "completed",
+        "failed" | "error" => "failed",
+        other => {
+            return Err(StateError::Validation(format!(
+                "Invalid completion status '{}'; expected 'completed' or 'failed'",
+                other
+            )));
+        }
+    };
+
+    if let Some(c) = req.compile_duration_seconds {
+        if !c.is_finite() || c < 0.0 {
+            return Err(StateError::Validation(
+                "compile_duration_seconds must be a finite non-negative number".into(),
+            ));
+        }
+    }
+    if let Some(d) = req.delivery_duration_seconds {
+        if !d.is_finite() || d < 0.0 {
+            return Err(StateError::Validation(
+                "delivery_duration_seconds must be a finite non-negative number".into(),
+            ));
+        }
+    }
+    if let Some(r) = req.peak_ram_gib {
+        if !r.is_finite() || r < 0.0 {
+            return Err(StateError::Validation(
+                "peak_ram_gib must be a finite non-negative number".into(),
+            ));
+        }
+    }
+    if let Some(cpu) = req.cpu_time_seconds {
+        if !cpu.is_finite() || cpu < 0.0 {
+            return Err(StateError::Validation(
+                "cpu_time_seconds must be a finite non-negative number".into(),
+            ));
+        }
+    }
+
+    let (mut bundle, _) = load_state(kv, now).await?;
+    let mut queue = load_queue_from_state(&bundle.state);
+    let idx = queue
+        .iter()
+        .position(|q| q.build_id == build_id)
+        .ok_or_else(|| StateError::NotFound(format!("Build #{} not found in queue", build_id)))?;
+
+    let mut defaults = default_artifacts_for_build(&queue[idx].gcs_bucket, build_id);
+    if let Some(ref u) = req.log_url {
+        let trimmed = u.trim();
+        if !trimmed.is_empty() {
+            defaults.log_url = trimmed.to_string();
+        }
+    }
+    if let Some(ref u) = req.binary_url {
+        let trimmed = u.trim();
+        if !trimmed.is_empty() {
+            defaults.binary_url = trimmed.to_string();
+        }
+    }
+    if let Some(ref u) = req.target_zip_url {
+        let trimmed = u.trim();
+        if !trimmed.is_empty() {
+            defaults.target_zip_url = trimmed.to_string();
+        }
+    }
+    defaults.log_size_bytes = req.log_size_bytes;
+    defaults.binary_size_bytes = req.binary_size_bytes;
+    defaults.target_zip_size_bytes = req.target_zip_size_bytes;
+    defaults.log_sha256 = req.log_sha256.clone();
+    defaults.binary_sha256 = req.binary_sha256.clone();
+    defaults.target_zip_sha256 = req.target_zip_sha256.clone();
+
+    let selected_url = select_artifact_url_for_output(&queue[idx].requested_output, &defaults);
+
+    let compile_sec = req.compile_duration_seconds.unwrap_or_else(|| {
+        let started = queue[idx]
+            .started_epoch
+            .unwrap_or(queue[idx].enqueued_epoch);
+        now.saturating_sub(started) as f64
+    });
+    let delivery_sec = req.delivery_duration_seconds.unwrap_or(2.0);
+
+    queue[idx].status = status_norm.to_string();
+    queue[idx].finished_at = Some(chrono_iso(now));
+    queue[idx].finished_epoch = Some(now);
+    queue[idx].compile_duration_seconds = Some(compile_sec);
+    queue[idx].exit_code = req
+        .exit_code
+        .or(Some(if status_norm == "completed" { 0 } else { 1 }));
+    if let Some(ref inst) = req.instance_name {
+        if !inst.trim().is_empty() {
+            queue[idx].assigned_instance = Some(inst.trim().to_string());
+        }
+    }
+    if let Some(ref z) = req.zone {
+        if !z.trim().is_empty() {
+            queue[idx].zone = Some(z.trim().to_string());
+        }
+    }
+    queue[idx].artifacts = Some(defaults.clone());
+    queue[idx].selected_artifact_url = Some(selected_url.clone());
+
+    let completed_item = queue[idx].clone();
+    let next_build_id = bundle
+        .state
+        .rust_builds
+        .get("next_build_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(build_id + 1);
+    save_queue_into_state(&mut bundle.state, &queue, next_build_id);
+
+    // Also record the finished run into `rust_builds.builds` so rolling average duration and cache KPIs update
+    let record_req = RecordRustBuildRequest {
+        status: if status_norm == "completed" {
+            "succeeded".to_string()
+        } else {
+            "failed".to_string()
+        },
+        project_name: Some(completed_item.repo.clone()),
+        commit_sha: Some(completed_item.commit_sha.clone()),
+        profile: Some(completed_item.profile.clone()),
+        compile_duration_seconds: Some(compile_sec),
+        delivery_duration_seconds: Some(delivery_sec),
+        instance_name: completed_item.assigned_instance.clone(),
+        zone: completed_item.zone.clone(),
+        machine_type: req
+            .machine_type
+            .or_else(|| Some("n4-highcpu-16".to_string())),
+        cpu_platform: Some("Intel Emerald Rapids".to_string()),
+        vcpu: Some(req.vcpu.unwrap_or(16)),
+        origin_ip: completed_item.origin_ip.clone(),
+        cache_hits: req.cache_hits,
+        total_crates: req.total_crates,
+        peak_ram_gib: req.peak_ram_gib,
+        cpu_time_seconds: req.cpu_time_seconds,
+    };
+
+    let _ = append_rust_build_record(&mut bundle.state, record_req, now);
+    let eval = evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
+    let avg_build_secs = effective_average_build_seconds(&bundle.state);
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+
+    let resp = build_status_response(&completed_item, &queue, &eval, avg_build_secs, now, true);
+    Ok((200, resp))
 }
 
 // ============================================================================

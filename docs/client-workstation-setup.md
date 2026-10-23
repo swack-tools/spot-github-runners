@@ -191,6 +191,31 @@ remote-clippy:
       rsync -a --delete ~/remote-staging-${run_id}/ {{remote_root}}/sources/{{project}}/
       sudo -n /usr/local/bin/example-rust-project-remote-build {{project}} cargo clippy --workspace --all-targets -- -D warnings
     '"
+
+# Enqueue a long-running test suite on the remote build queue, poll ETA, and fetch log, binary, or target_zip
+test-remote output="log" command="cargo test --workspace --locked":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    api_base="${SPOT_DASHBOARD_URL:-https://spot.swacktech.com}"
+    repo="$(git config --get remote.origin.url | sed -E 's#.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')"
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    commit_sha="$(git rev-parse HEAD)"
+    resp="$(curl -fsSL -X POST "${api_base}/api/rust-builds/enqueue" \
+      -H "Content-Type: application/json" \
+      -H "Cookie: ${SPOT_SESSION_COOKIE}" \
+      -d "{\"repo\":\"${repo}\",\"branch\":\"${branch}\",\"commit_sha\":\"${commit_sha}\",\"command\":\"{{command}}\",\"requested_output\":\"{{output}}\"}")"
+    build_id="$(printf '%s' "$resp" | jq -r '.build_id')"
+    printf '%s\n' "$resp" | jq -r '.message'
+    while true; do
+      status_json="$(curl -fsSL "${api_base}/api/rust-builds/${build_id}" -H "Cookie: ${SPOT_SESSION_COOKIE}")"
+      bstatus="$(printf '%s' "$status_json" | jq -r '.build_status')"
+      printf '%s\n' "$status_json" | jq -r '.message'
+      if [[ "$bstatus" == "completed" || "$bstatus" == "failed" ]]; then
+        printf '%s\n' "$status_json" | jq '{selected_artifact_url, artifacts}'
+        break
+      fi
+      sleep 10
+    done
 ```
 
 <figure class="shot" markdown>
