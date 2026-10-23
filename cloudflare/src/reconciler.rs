@@ -593,6 +593,59 @@ pub async fn reconcile_worker_fleet<K: KvStoreBackend>(
     run_reconciliation(kv, &sim, &sim, now).await
 }
 
+fn apply_gce_instance_targets_to_overview(
+    ov: &mut serde_json::Value,
+    instances: &[SimpleGceInstance],
+) -> bool {
+    let mut gce_targets: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    for inst in instances {
+        let target_opt = inst
+            .metadata
+            .get("spot-runner-registration-target")
+            .or_else(|| inst.metadata.get("spot-runner-patch-target"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(t) = target_opt {
+            gce_targets.insert(inst.name.as_str(), t.to_string());
+        }
+    }
+    if gce_targets.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(arr) = ov
+        .get_mut("instances_view")
+        .and_then(|iv| iv.get_mut("instances"))
+        .and_then(|v| v.as_array_mut())
+    {
+        for item in arr.iter_mut() {
+            if let Some(obj) = item.as_object_mut() {
+                if let Some(name) = obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                {
+                    if let Some(target) = gce_targets.get(name.as_str()) {
+                        let existing = obj
+                            .get("registration_target")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if existing != target {
+                            obj.insert(
+                                "registration_target".to_string(),
+                                serde_json::json!(target),
+                            );
+                            obj.insert("target".to_string(), serde_json::json!(target));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
 pub async fn run_inventory_refresh<K, G>(
     kv: &K,
     gcp: &G,
@@ -734,14 +787,16 @@ where
         .collect();
 
     let overview_changed = if let Some(ref mut ov) = fresh_bundle.state.overview {
-        crate::state::reconcile_overview_instances_ledger(
+        let ledger_changed = crate::state::reconcile_overview_instances_ledger(
             ov,
             &fresh_bundle.state.instances,
             &new_instances_view,
             &gce_stop_epochs,
             true,
             now,
-        )
+        );
+        let targets_changed = apply_gce_instance_targets_to_overview(ov, &instances);
+        ledger_changed || targets_changed
     } else {
         false
     };
@@ -1478,14 +1533,16 @@ where
 
     let overview_changed = if gcp_list_succeeded {
         if let Some(ref mut ov) = bundle.state.overview {
-            crate::state::reconcile_overview_instances_ledger(
+            let ledger_changed = crate::state::reconcile_overview_instances_ledger(
                 ov,
                 &bundle.state.instances,
                 &new_instances_view,
                 &gce_stop_epochs,
                 true,
                 now,
-            )
+            );
+            let targets_changed = apply_gce_instance_targets_to_overview(ov, &instances);
+            ledger_changed || targets_changed
         } else {
             false
         }

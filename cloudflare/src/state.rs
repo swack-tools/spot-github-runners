@@ -415,12 +415,15 @@ pub async fn load_state<K: KvStoreBackend>(
     // 2. Fall back to single consolidated KV read
     match kv.get(KV_STATE_KEY).await? {
         Some(raw) => {
-            let bundle: DashboardBundle = serde_json::from_str(&raw)?;
+            let mut bundle: DashboardBundle = serde_json::from_str(&raw)?;
             if bundle.schema != SNAPSHOT_SCHEMA {
                 return Err(StateError::Validation(format!(
                     "Invalid schema '{}', expected '{}'",
                     bundle.schema, SNAPSHOT_SCHEMA
                 )));
+            }
+            for tpl in &mut bundle.state.cloud_init_templates {
+                tpl.content = sanitize_legacy_oxidex_template_strings(&tpl.content);
             }
             set_cached_state(now, bundle.clone());
             Ok((bundle, CacheSource::KvRead))
@@ -514,12 +517,64 @@ pub struct OverviewQuery {
     pub is_authenticated: Option<bool>,
 }
 
+pub fn sanitize_legacy_oxidex_template_strings(content: &str) -> String {
+    content
+        .replace(
+            "RUNNER_GROUP=\"oxidex-strict\"",
+            "RUNNER_GROUP=\"spot-strict\"",
+        )
+        .replace("RUNNER_GROUP=oxidex-strict", "RUNNER_GROUP=spot-strict")
+        .replace("oxidex-self-hosted-runner:", "spot-self-hosted-runner:")
+        .replace("oxidex.strict-runner=", "spot.strict-runner=")
+        .replace("oxidex-build-entrypoint", "spot-build-entrypoint")
+        .replace("oxidex-build-draining", "spot-build-draining")
+        .replace("oxidex-build.lock", "spot-build.lock")
+        .replace("oxidex-build", "spot-build")
+        .replace("oxidex-uploader", "spot-uploader")
+        .replace("oxidex-remote-build", "spot-remote-build")
+        .replace("oxidex-remote-transaction", "spot-remote-transaction")
+        .replace("oxidex-remote-builder:", "spot-remote-builder:")
+        .replace("oxidex-builder", "spot-builder")
+        .replace("oxidex-remote-source-", "spot-remote-source-")
+        .replace("oxidex.remote-build=", "spot.remote-build=")
+        .replace("oxidex-cache-active-", "spot-cache-active-")
+        .replace("OXIDEX_ACTIVE_LOCK_FD", "SPOT_ACTIVE_LOCK_FD")
+        .replace("oxidex-project-", "spot-project-")
+        .replace(", '--bin', 'oxidex'", "")
+        .replace(" / 'oxidex'", "")
+}
+
 pub fn infer_instance_target(inst: &serde_json::Value, default_org: &str) -> String {
-    for key in &["target", "github_target", "repository", "repo", "org"] {
+    for key in &[
+        "registration_target",
+        "patch_target",
+        "spot-runner-registration-target",
+        "spot-runner-patch-target",
+        "target",
+        "github_target",
+        "repository",
+        "repo",
+        "org",
+    ] {
         if let Some(val) = inst.get(*key).and_then(|v| v.as_str()) {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();
+            }
+        }
+    }
+    if let Some(meta) = inst.get("metadata").and_then(|v| v.as_object()) {
+        for key in &[
+            "spot-runner-registration-target",
+            "spot-runner-patch-target",
+            "spot-target",
+            "spot-runner-target",
+        ] {
+            if let Some(val) = meta.get(*key).and_then(|v| v.as_str()) {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
             }
         }
     }
@@ -532,6 +587,8 @@ pub fn infer_instance_target(inst: &serde_json::Value, default_org: &str) -> Str
         "xbmc4lyfe/newznab-tmux",
         "xbmc4lyfe/rustnzb",
         "xbmc4lyfe/nntp-proxy",
+        "Appz4Fun/nzbget",
+        "Appz4Fun",
         "swack-tools/bt-to-all-devices",
         "swack-tools/oxidex",
         "swack-tools/spot-github-runners",
@@ -1165,9 +1222,9 @@ fn make_arm64_candidate_offer(
     let fleet_floor_monthly =
         ((compute_monthly * instances_needed_for_floor as f64) * 100.0).round() / 100.0;
     let prefix = if is_builder {
-        "builder-oxidex"
+        "spot-builder"
     } else {
-        "oxidex-runners"
+        "spot-runners"
     };
 
     let pricing_json = serde_json::json!({
@@ -1567,6 +1624,19 @@ fn enrich_arm64_catalog_and_qualifications(
                                 .unwrap_or("");
                             let item_arch = infer_arch(mt);
                             obj.insert("arch".to_string(), serde_json::json!(item_arch));
+                            if let Some(ssh) =
+                                obj.get("ssh_command_preview").and_then(|v| v.as_str())
+                            {
+                                let cleaned = ssh
+                                    .replace("oxidex-runners-", "spot-runners-")
+                                    .replace("builder-oxidex-", "spot-builder-");
+                                if cleaned != ssh {
+                                    obj.insert(
+                                        "ssh_command_preview".to_string(),
+                                        serde_json::json!(cleaned),
+                                    );
+                                }
+                            }
                         }
                     }
 
@@ -1618,6 +1688,39 @@ fn enrich_arm64_catalog_and_qualifications(
                     let count = list.len();
                     role_obj.insert(list_key.to_string(), serde_json::Value::Array(list));
                     role_obj.insert(format!("{}_count", list_key), serde_json::json!(count));
+                }
+            }
+        }
+    }
+
+    // Sanitize legacy hardcoded oxidex strings in cloud_init_templates
+    if let Some(cits) = ov_obj
+        .get_mut("cloud_init_templates")
+        .and_then(|v| v.as_array_mut())
+    {
+        for tpl in cits.iter_mut() {
+            if let Some(obj) = tpl.as_object_mut() {
+                if let Some(content) = obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                {
+                    let sanitized = sanitize_legacy_oxidex_template_strings(&content);
+                    if sanitized != content {
+                        obj.insert("content".to_string(), serde_json::json!(sanitized));
+                    }
+                    if let Some(parsed_val) = obj.get("parsed").cloned() {
+                        if let Ok(parsed_str) = serde_json::to_string(&parsed_val) {
+                            let san_parsed = sanitize_legacy_oxidex_template_strings(&parsed_str);
+                            if san_parsed != parsed_str {
+                                if let Ok(new_parsed) =
+                                    serde_json::from_str::<serde_json::Value>(&san_parsed)
+                                {
+                                    obj.insert("parsed".to_string(), new_parsed);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
