@@ -131,6 +131,34 @@ fn is_global_admins_enabled(env: &Env) -> bool {
     }
 }
 
+fn is_user_exempt_from_target_checks(env: &Env, state: &state::DashboardState, uid: u64) -> bool {
+    if is_global_admins_enabled(env) {
+        return true;
+    }
+    state
+        .dashboard_admins
+        .iter()
+        .any(|a| a.uid == uid && a.override_target_check)
+}
+
+async fn github_get_json(url: &str, gh_token: Option<&str>) -> Result<(u16, Value)> {
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get);
+    let headers = Headers::new();
+    if let Some(tok) = gh_token.filter(|s| !s.trim().is_empty()) {
+        headers.set("Authorization", &format!("Bearer {}", tok.trim()))?;
+    }
+    headers.set("Accept", "application/vnd.github+json")?;
+    headers.set("User-Agent", "spot-dashboard-edge")?;
+    headers.set("X-GitHub-Api-Version", "2022-11-28")?;
+    init.with_headers(headers);
+    let req = Request::new_with_init(url, &init)?;
+    let mut resp = Fetch::Request(req).send().await?;
+    let status = resp.status_code();
+    let json_val: Value = resp.json().await.unwrap_or(Value::Null);
+    Ok((status, json_val))
+}
+
 fn is_production_oauth_configured(env: &Env) -> bool {
     let secret = env
         .secret("GITHUB_OAUTH_CLIENT_SECRET")
@@ -221,7 +249,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     .iter()
                     .map(|a| a.uid)
                     .collect();
-                let global_admins = is_global_admins_enabled(&env);
+                let global_admins =
+                    is_user_exempt_from_target_checks(&env, &bundle.state, session.uid);
                 let status = auth::check_session(
                     session,
                     &bundle.state.controlled_targets,
@@ -268,7 +297,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     .iter()
                     .map(|a| a.uid)
                     .collect();
-                let global_admins = is_global_admins_enabled(&env);
+                let global_admins =
+                    is_user_exempt_from_target_checks(&env, &bundle.state, session.uid);
                 matches!(
                     auth::check_session(
                         session,
@@ -469,8 +499,174 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Some(s) => s,
                 None => return error_response(401, "unauthorized", "Sign in required"),
             };
-            let add_req: state::AddAdminRequest = req.json().await?;
-            match state::handle_post_admins_add(&kv, add_req, &session.sub, session.uid, now).await
+            if session.uid != state::OWNER_UID {
+                return error_response(403, "forbidden", "Owner access required");
+            }
+            let raw_val: Value = req.json().await?;
+            let raw_login = raw_val
+                .get("login")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches('@')
+                .to_string();
+            let mut uid = raw_val.get("uid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let confirm = raw_val
+                .get("confirm")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let override_target_check = raw_val
+                .get("override_target_check")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let check_targets = raw_val
+                .get("check_targets")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(uid == 0);
+
+            if !confirm {
+                return error_response(
+                    400,
+                    "bad_request",
+                    "Changing dashboard administrators needs \"confirm\": true",
+                );
+            }
+            if !auth::is_valid_github_login(&raw_login) {
+                return error_response(400, "bad_request", "Invalid GitHub username");
+            }
+
+            let gh_token = env
+                .secret("SPOT_CONFIG_GH_TOKEN")
+                .map(|s| s.to_string())
+                .or_else(|_| env.var("SPOT_CONFIG_GH_TOKEN").map(|v| v.to_string()))
+                .ok();
+
+            let mut resolved_login = raw_login.clone();
+            if uid == 0 {
+                let user_url = format!("https://api.github.com/users/{}", raw_login);
+                match github_get_json(&user_url, gh_token.as_deref()).await {
+                    Ok((200, user_json)) => {
+                        if let Some(l) = user_json.get("login").and_then(|v| v.as_str()) {
+                            resolved_login = l.to_string();
+                        }
+                        uid = user_json.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                    }
+                    Ok((404, _)) => {
+                        return error_response(
+                            404,
+                            "not_found",
+                            &format!("GitHub user '{}' was not found", raw_login),
+                        );
+                    }
+                    Ok((st, _)) => {
+                        return error_response(
+                            502,
+                            "github_error",
+                            &format!(
+                                "GitHub returned HTTP {} while looking up '{}'",
+                                st, raw_login
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        return error_response(
+                            502,
+                            "github_error",
+                            &format!("Could not contact GitHub to look up '{}': {}", raw_login, e),
+                        );
+                    }
+                }
+            }
+
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            if uid == state::OWNER_UID {
+                return error_response(
+                    409,
+                    "conflict",
+                    &format!("'{}' is a dashboard owner already", resolved_login),
+                );
+            }
+            if bundle.state.dashboard_admins.iter().any(|a| a.uid == uid) {
+                return error_response(
+                    409,
+                    "conflict",
+                    &format!("'{}' is already an administrator", resolved_login),
+                );
+            }
+
+            let mut missing_targets: Vec<String> = Vec::new();
+            if check_targets && !override_target_check {
+                let visible_targets = state::collect_visible_dashboard_targets(&bundle.state);
+                for target in &visible_targets {
+                    if let Some((owner, repo)) = target.split_once('/') {
+                        if owner.eq_ignore_ascii_case(&resolved_login) {
+                            continue;
+                        }
+                        let mut is_admin = false;
+                        if gh_token.as_deref().map_or(false, |t| !t.trim().is_empty()) {
+                            let perm_url = format!(
+                                "https://api.github.com/repos/{}/{}/collaborators/{}/permission",
+                                owner, repo, resolved_login
+                            );
+                            if let Ok((200, perm_json)) =
+                                github_get_json(&perm_url, gh_token.as_deref()).await
+                            {
+                                is_admin = perm_json.get("permission").and_then(|v| v.as_str())
+                                    == Some("admin")
+                                    || perm_json
+                                        .get("user")
+                                        .and_then(|u| u.get("permissions"))
+                                        .and_then(|p| p.get("admin"))
+                                        .and_then(|v| v.as_bool())
+                                        == Some(true);
+                            }
+                        }
+                        if !is_admin {
+                            missing_targets.push(target.clone());
+                        }
+                    } else {
+                        if target.eq_ignore_ascii_case(&resolved_login) {
+                            continue;
+                        }
+                        let mut is_admin = false;
+                        if gh_token.as_deref().map_or(false, |t| !t.trim().is_empty()) {
+                            let org_url = format!(
+                                "https://api.github.com/orgs/{}/memberships/{}",
+                                target, resolved_login
+                            );
+                            if let Ok((200, org_json)) =
+                                github_get_json(&org_url, gh_token.as_deref()).await
+                            {
+                                is_admin = org_json.get("role").and_then(|v| v.as_str())
+                                    == Some("admin")
+                                    && org_json.get("state").and_then(|v| v.as_str())
+                                        == Some("active");
+                            }
+                        }
+                        if !is_admin {
+                            missing_targets.push(target.clone());
+                        }
+                    }
+                }
+            }
+
+            let add_req = state::AddAdminRequest {
+                login: resolved_login,
+                uid,
+                confirm,
+            };
+            match state::handle_post_admins_add_with_override(
+                &kv,
+                add_req,
+                override_target_check,
+                missing_targets,
+                &session.sub,
+                session.uid,
+                now,
+            )
+            .await
             {
                 Ok((status_code, body)) => json_response(status_code, &body),
                 Err(state::StateError::Forbidden(msg)) => error_response(403, "forbidden", &msg),
@@ -783,8 +979,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 .iter()
                 .map(|a| a.uid)
                 .collect();
-            let global_admins = is_global_admins_enabled(&env);
             let is_authed_admin = if let Some(ref session) = verified_session {
+                let global_admins =
+                    is_user_exempt_from_target_checks(&env, &bundle.state, session.uid);
                 matches!(
                     auth::check_session(
                         session,
@@ -870,7 +1067,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     .iter()
                     .map(|a| a.uid)
                     .collect();
-                let global_admins = is_global_admins_enabled(&env);
+                let global_admins =
+                    is_user_exempt_from_target_checks(&env, &bundle.state, session.uid);
                 let status_enum = auth::check_session(
                     session,
                     &bundle.state.controlled_targets,
@@ -1341,7 +1539,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     .iter()
                     .map(|a| a.uid)
                     .collect();
-                let global_admins = is_global_admins_enabled(&env);
+                let global_admins =
+                    is_user_exempt_from_target_checks(&env, &bundle.state, session.uid);
                 if !matches!(
                     auth::check_session(
                         session,
@@ -1382,7 +1581,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     .iter()
                     .map(|a| a.uid)
                     .collect();
-                let global_admins = is_global_admins_enabled(&env);
+                let global_admins =
+                    is_user_exempt_from_target_checks(&env, &bundle.state, session.uid);
                 if !matches!(
                     auth::check_session(
                         session,

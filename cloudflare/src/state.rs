@@ -269,6 +269,8 @@ pub struct AdminRecord {
     pub added_by: String,
     pub added_by_uid: Option<u64>,
     pub added_at: String,
+    #[serde(default)]
+    pub override_target_check: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1881,15 +1883,8 @@ pub fn apply_dynamic_overview_filtering(
         None => return,
     };
 
-    let arch_filter = query
-        .arch
-        .as_deref()
-        .unwrap_or("all")
-        .trim()
-        .to_lowercase();
-    let max_latency_ms = query
-        .max_latency_ms
-        .filter(|v| v.is_finite() && *v > 0.0);
+    let arch_filter = query.arch.as_deref().unwrap_or("all").trim().to_lowercase();
+    let max_latency_ms = query.max_latency_ms.filter(|v| v.is_finite() && *v > 0.0);
     enrich_arm64_catalog_and_qualifications(ov_obj, &arch_filter, max_latency_ms);
 
     let mut region_latency_map: HashMap<String, f64> = HashMap::new();
@@ -2763,13 +2758,72 @@ pub async fn handle_get_admins<K: KvStoreBackend>(
 #[derive(Debug, Deserialize)]
 pub struct AddAdminRequest {
     pub login: String,
+    #[serde(default)]
     pub uid: u64,
     pub confirm: bool,
+}
+
+pub fn collect_visible_dashboard_targets(state: &DashboardState) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    let mut push_unique = |t: &str| {
+        let trimmed = t.trim();
+        if !trimmed.is_empty()
+            && !targets
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+        {
+            targets.push(trimmed.to_string());
+        }
+    };
+
+    for t in &state.controlled_targets {
+        push_unique(t);
+    }
+    for t in crate::patch::CONTROLLED_TARGETS {
+        push_unique(t);
+    }
+    for t in crate::patch::ON_DEMAND_TARGETS {
+        push_unique(t);
+    }
+    let default_org = if state.org.trim().is_empty() {
+        "swack-tools"
+    } else {
+        state.org.trim()
+    };
+    if let Some(ref ov) = state.overview {
+        if let Some(insts) = ov
+            .get("instances_view")
+            .and_then(|iv| iv.get("instances"))
+            .and_then(|v| v.as_array())
+        {
+            for inst in insts {
+                let name = inst.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name.starts_with("oxidex-runners-") || name.starts_with("builder-") {
+                    let inferred = infer_instance_target(inst, default_org);
+                    push_unique(&inferred);
+                }
+            }
+        }
+    }
+    targets
 }
 
 pub async fn handle_post_admins_add<K: KvStoreBackend>(
     kv: &K,
     req: AddAdminRequest,
+    actor_login: &str,
+    actor_uid: u64,
+    now: u64,
+) -> Result<(u16, serde_json::Value), StateError> {
+    handle_post_admins_add_with_override(kv, req, false, Vec::new(), actor_login, actor_uid, now)
+        .await
+}
+
+pub async fn handle_post_admins_add_with_override<K: KvStoreBackend>(
+    kv: &K,
+    req: AddAdminRequest,
+    override_target_check: bool,
+    missing_targets: Vec<String>,
     actor_login: &str,
     actor_uid: u64,
     now: u64,
@@ -2814,6 +2868,24 @@ pub async fn handle_post_admins_add<K: KvStoreBackend>(
         )));
     }
 
+    if !missing_targets.is_empty() && !override_target_check {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "target_check_failed",
+                "requires_target_override": true,
+                "login": req.login,
+                "uid": req.uid,
+                "missing_targets": missing_targets,
+                "error": format!(
+                    "GitHub user '{}' is not an administrator of every repository/organization they will see ({})",
+                    req.login,
+                    missing_targets.join(", ")
+                ),
+            }),
+        ));
+    }
+
     let at = chrono_iso(now);
     let record = AdminRecord {
         login: req.login.clone(),
@@ -2821,12 +2893,17 @@ pub async fn handle_post_admins_add<K: KvStoreBackend>(
         added_by: actor_login.to_string(),
         added_by_uid: Some(actor_uid),
         added_at: at.clone(),
+        override_target_check,
     };
 
     let history = AdminHistoryRecord {
         at,
         epoch: now,
-        action: "added".to_string(),
+        action: if override_target_check {
+            "added (override target check)".to_string()
+        } else {
+            "added".to_string()
+        },
         login: req.login,
         uid: req.uid,
         actor: actor_login.to_string(),

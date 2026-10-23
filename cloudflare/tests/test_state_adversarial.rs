@@ -557,6 +557,56 @@ async fn test_kv_write_gating_stress_invalid_admin_payloads_zero_writes() {
         .unwrap();
     assert_eq!(st_rem, 200);
     assert_eq!(kv.put_count.load(Ordering::SeqCst), puts_after_alice + 1);
+    let puts_after_remove = kv.put_count.load(Ordering::SeqCst);
+
+    // 11. Add admin with missing target admin permissions and override_target_check = false -> 409 prompt, 0 writes
+    let bob_req = AddAdminRequest {
+        login: "bob".into(),
+        uid: 10002,
+        confirm: true,
+    };
+    let (st_prompt, body_prompt) = handle_post_admins_add_with_override(
+        &kv,
+        bob_req,
+        false,
+        vec![
+            "xbmc4lyfe/newznab-tmux".to_string(),
+            "Appz4Fun/nzbget".to_string(),
+        ],
+        OWNER_LOGIN,
+        OWNER_UID,
+        now + 11,
+    )
+    .await
+    .unwrap();
+    assert_eq!(st_prompt, 409);
+    assert_eq!(body_prompt["requires_target_override"], true);
+    assert_eq!(
+        body_prompt["missing_targets"],
+        serde_json::json!(["xbmc4lyfe/newznab-tmux", "Appz4Fun/nzbget"])
+    );
+    assert_eq!(kv.put_count.load(Ordering::SeqCst), puts_after_remove);
+
+    // 12. Add admin with override_target_check = true -> 200 added, 1 write
+    let bob_override_req = AddAdminRequest {
+        login: "bob".into(),
+        uid: 10002,
+        confirm: true,
+    };
+    let (st_override, body_override) = handle_post_admins_add_with_override(
+        &kv,
+        bob_override_req,
+        true,
+        vec!["xbmc4lyfe/newznab-tmux".to_string()],
+        OWNER_LOGIN,
+        OWNER_UID,
+        now + 12,
+    )
+    .await
+    .unwrap();
+    assert_eq!(st_override, 200);
+    assert_eq!(body_override["admin"]["override_target_check"], true);
+    assert_eq!(kv.put_count.load(Ordering::SeqCst), puts_after_remove + 1);
 }
 
 // ============================================================================
