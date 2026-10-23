@@ -427,7 +427,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               Auto-refresh:
               <select id="inst-autorefresh-select" onchange="setInventoryAutoRefresh(this.value)" style="padding:2px 6px; font-size:11.5px;">
                 <option value="0">Off</option>
-                <option value="60">1m</option>
+                <option value="60" selected>1m</option>
                 <option value="300">5m</option>
                 <option value="900">15m</option>
               </select>
@@ -1842,7 +1842,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     let INVENTORY_AUTOREFRESH_TIMER = null;
-    function setInventoryAutoRefresh(secStr) {
+    function setInventoryAutoRefresh(secStr, silent = false) {
       if (INVENTORY_AUTOREFRESH_TIMER) {
         clearInterval(INVENTORY_AUTOREFRESH_TIMER);
         INVENTORY_AUTOREFRESH_TIMER = null;
@@ -1852,9 +1852,9 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         INVENTORY_AUTOREFRESH_TIMER = setInterval(() => {
           triggerLiveInventoryRefresh(true);
         }, secs * 1000);
-        showToast(`Auto-refresh set to every ${secs >= 60 ? (secs / 60) + 'm' : secs + 's'}`);
+        if (!silent) showToast(`Auto-refresh set to every ${secs >= 60 ? (secs / 60) + 'm' : secs + 's'}`);
       } else {
-        showToast("Auto-refresh disabled");
+        if (!silent) showToast("Auto-refresh disabled");
       }
     }
 
@@ -3225,6 +3225,10 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
       }
       await loadOverview();
+      const autoRefreshSel = document.getElementById("inst-autorefresh-select");
+      if (autoRefreshSel) {
+        setInventoryAutoRefresh(autoRefreshSel.value, true);
+      }
       const requestedTab = params.get("tab");
       if (requestedTab) {
         const normalized = requestedTab === "rustbuilders"
@@ -3456,5 +3460,11 @@ mod tests {
         let gate = render_login_gate_html(true, true, false, "", "");
         assert!(gate.contains("/auth/github/login"));
         assert!(gate.contains("device-start"));
+    }
+
+    #[test]
+    fn test_dashboard_defaults_autorefresh_to_1m() {
+        assert!(DASHBOARD_HTML.contains(r#"<option value="60" selected>1m</option>"#));
+        assert!(DASHBOARD_HTML.contains(r#"setInventoryAutoRefresh(autoRefreshSel.value, true);"#));
     }
 }
