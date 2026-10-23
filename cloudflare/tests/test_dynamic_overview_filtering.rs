@@ -1831,4 +1831,85 @@ fn test_btad_arm64_manifest_and_gce_vm_request_builder() {
     );
 }
 
+#[tokio::test]
+async fn test_dynamic_overview_filtering_by_org_and_repo_target() {
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 2_000_000_000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    let mut ov = create_sample_overview(now);
+    if let Some(arr) = ov["instances_view"]["instances"].as_array_mut() {
+        arr.push(serde_json::json!({
+            "id": "inst-rustnzb-1",
+            "name": "oxidex-runners-xbmc4lyfe-rustnzb-2000000000-abcd",
+            "zone": "us-central1-a",
+            "region": "us-central1",
+            "display_location": "Iowa",
+            "machine_type": "c4d-highcpu-16",
+            "status": "RUNNING",
+            "role": "cicd_runner",
+            "vcpu": 16,
+            "ram_gib": 32,
+            "runners_count": 2,
+            "started_epoch": (now - 3600) as f64,
+            "active_hourly_usd": 0.18
+        }));
+    }
+    bundle.state.overview = Some(ov);
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    // 1. Default ("all") returns all instances and populates available_targets + inst.target
+    let (_, resp_all) = handle_api_overview(&kv, OverviewQuery::default(), now)
+        .await
+        .unwrap();
+    let avail = resp_all["available_targets"].as_array().unwrap();
+    assert!(avail.iter().any(|t| t == "swack-tools"));
+    assert!(avail.iter().any(|t| t == "xbmc4lyfe/rustnzb"));
+    let all_insts = resp_all["instances_view"]["instances"].as_array().unwrap();
+    assert_eq!(all_insts.len(), 4);
+
+    // 2. Single repo filter ("xbmc4lyfe/rustnzb")
+    let q_rustnzb = OverviewQuery {
+        target: Some("xbmc4lyfe/rustnzb".into()),
+        ..Default::default()
+    };
+    let (_, resp_rustnzb) = handle_api_overview(&kv, q_rustnzb, now).await.unwrap();
+    let rustnzb_insts = resp_rustnzb["instances_view"]["instances"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rustnzb_insts.len(), 1);
+    assert_eq!(rustnzb_insts[0]["target"], "xbmc4lyfe/rustnzb");
+
+    // 3. Multi-select filter ("swack-tools,xbmc4lyfe/rustnzb")
+    let q_multi = OverviewQuery {
+        target: Some("swack-tools,xbmc4lyfe/rustnzb".into()),
+        ..Default::default()
+    };
+    let (_, resp_multi) = handle_api_overview(&kv, q_multi, now).await.unwrap();
+    assert_eq!(
+        resp_multi["instances_view"]["instances"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+
+    // 4. Empty selection ("__none__" when user reverses from all-checked or unchecks All)
+    let q_none = OverviewQuery {
+        target: Some("__none__".into()),
+        ..Default::default()
+    };
+    let (_, resp_none) = handle_api_overview(&kv, q_none, now).await.unwrap();
+    assert_eq!(
+        resp_none["instances_view"]["instances"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(resp_none["instances_view"]["running_count"], 0);
+}
+
 
