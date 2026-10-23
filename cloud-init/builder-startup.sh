@@ -242,10 +242,13 @@ if [[ -x /usr/local/bin/host-agent ]]; then
 fi
 for alias in clean-target host-admission docker-wrapper docker-admission \
              host-launcher builder-entrypoint worktree-commands toolchain-probe \
+             build-package queue-worker \
              gha-runner-clean-target gha-host-admission oxidex-remote-build \
              oxidex-build-entrypoint oxidex-worktree-commands oxidex-toolchain-probe \
+             oxidex-build-package oxidex-queue-worker \
              example-rust-project-remote-build example-rust-project-build-entrypoint \
-             example-rust-project-worktree-commands example-rust-project-toolchain-probe docker; do
+             example-rust-project-worktree-commands example-rust-project-toolchain-probe \
+             example-rust-project-build-package example-rust-project-queue-worker docker; do
   ln -sf /usr/local/bin/host-agent "/usr/local/bin/$alias"
 done
 
@@ -368,6 +371,35 @@ jq -n \
   }' >/var/lib/oxidex-builder-readiness.json
 chmod 0600 /var/lib/oxidex-builder-readiness.json
 ln -sfn /var/lib/oxidex-builder-readiness.json /var/lib/example-rust-project-builder-readiness.json
+
+queue_token='{{QUEUE_BEARER_TOKEN}}'
+if [[ "$queue_token" =~ ^\{\{.*\}\}$ || -z "$queue_token" ]]; then
+  queue_token=$(metadata instance/attributes/spot-queue-token 2>/dev/null || true)
+fi
+install -d -m 0755 /etc/default
+cat >/etc/default/example-rust-project-queue-worker <<EOF
+BUILDER_INSTANCE_NAME={{INSTANCE_NAME}}
+BUILDER_ZONE={{ZONE}}
+SPOT_BEARER_TOKEN=$queue_token
+EOF
+chmod 0600 /etc/default/example-rust-project-queue-worker
+ln -sfn /etc/default/example-rust-project-queue-worker /etc/default/oxidex-queue-worker
+
+cat >/etc/systemd/system/example-rust-project-queue-worker.service <<'QUEUE_WORKER_SERVICE'
+[Unit]
+Description=Dedicated builder remote Rust queue consumer (host-agent queue-worker)
+After=gha-admission.service docker.service network-online.target
+Requires=gha-admission.service docker.service
+[Service]
+EnvironmentFile=/etc/default/example-rust-project-queue-worker
+ExecStart=/usr/local/bin/host-agent queue-worker --instance-name {{INSTANCE_NAME}} --zone {{ZONE}} --upload
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target
+QUEUE_WORKER_SERVICE
+systemctl daemon-reload
+systemctl enable --now example-rust-project-queue-worker.service
 
 # Startup enrolls only the root-bound authoritative public SSH mapping.
 printf '%%oxidex-build ALL=(root) NOPASSWD: /usr/local/bin/oxidex-remote-build, /usr/local/bin/example-rust-project-remote-build, /usr/local/bin/host-launcher\n' >/etc/sudoers.d/oxidex-build

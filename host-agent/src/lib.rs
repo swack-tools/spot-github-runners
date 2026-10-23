@@ -1,4 +1,5 @@
 pub mod admission;
+pub mod build_package;
 pub mod builder_entrypoint;
 pub mod clean_target;
 pub mod docker_admission;

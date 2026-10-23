@@ -1739,14 +1739,24 @@ async fn test_arm64_first_class_catalog_enrichment_and_arch_filtering() {
     let qual_runner = resp_all["qualifications"]["cicd_runner"]["spot_price_qualifying"]
         .as_array()
         .unwrap();
-    assert!(qual_runner.iter().any(|o| o["machine_type"] == "c4a-highcpu-16" && o["arch"] == "arm64"));
-    assert!(qual_runner.iter().any(|o| o["machine_type"] == "n4a-highcpu-8" && o["arch"] == "arm64"));
-    assert!(qual_runner.iter().any(|o| o["machine_type"] == "t2a-standard-8" && o["arch"] == "arm64"));
+    assert!(qual_runner
+        .iter()
+        .any(|o| o["machine_type"] == "c4a-highcpu-16" && o["arch"] == "arm64"));
+    assert!(qual_runner
+        .iter()
+        .any(|o| o["machine_type"] == "n4a-highcpu-8" && o["arch"] == "arm64"));
+    assert!(qual_runner
+        .iter()
+        .any(|o| o["machine_type"] == "t2a-standard-8" && o["arch"] == "arm64"));
 
     // Verify VM templates include ARM64 runner and builder presets
     let vm_tpls = resp_all["vm_templates"].as_array().unwrap();
-    assert!(vm_tpls.iter().any(|t| t["id"] == "tpl-runner-c4a-highcpu16" && t["arch"] == "arm64"));
-    assert!(vm_tpls.iter().any(|t| t["id"] == "tpl-builder-c4a-highcpu16" && t["arch"] == "arm64"));
+    assert!(vm_tpls
+        .iter()
+        .any(|t| t["id"] == "tpl-runner-c4a-highcpu16" && t["arch"] == "arm64"));
+    assert!(vm_tpls
+        .iter()
+        .any(|t| t["id"] == "tpl-builder-c4a-highcpu16" && t["arch"] == "arm64"));
 
     // Verify region metadata includes c4a/n4a/t2a families
     let reg_fams = resp_all["regions"][0]["families"].as_array().unwrap();
@@ -1824,11 +1834,10 @@ fn test_btad_arm64_manifest_and_gce_vm_request_builder() {
         boot_init.source_image.as_deref(),
         Some(DEBIAN_13_ARM64_IMAGE_FAMILY)
     );
-    assert!(boot_init.disk_type.ends_with("/diskTypes/hyperdisk-balanced"));
-    assert_eq!(
-        req.network_interfaces[0].nic_type.as_deref(),
-        Some("GVNIC")
-    );
+    assert!(boot_init
+        .disk_type
+        .ends_with("/diskTypes/hyperdisk-balanced"));
+    assert_eq!(req.network_interfaces[0].nic_type.as_deref(), Some("GVNIC"));
 }
 
 #[tokio::test]
@@ -2042,7 +2051,3 @@ async fn test_sanitize_legacy_oxidex_templates_and_ssh_previews() {
         .unwrap();
     assert_eq!(newznab_inst["target"], "xbmc4lyfe/newznab-tmux");
 }
-
-
-
-

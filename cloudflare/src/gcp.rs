@@ -306,6 +306,14 @@ impl GceDisk {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GceServiceAccount {
+    pub email: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GceInsertInstanceRequest {
@@ -318,6 +326,12 @@ pub struct GceInsertInstanceRequest {
     pub network_interfaces: Vec<GceNetworkInterface>,
     pub metadata: GceMetadata,
     pub labels: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        alias = "service_accounts"
+    )]
+    pub service_accounts: Vec<GceServiceAccount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1084,5 +1098,196 @@ pub fn build_spot_runner_vm_request(
             items: metadata_items,
         },
         labels,
+        service_accounts: Vec::new(),
+    })
+}
+
+pub const DEFAULT_BUILDER_CACHE_DISK_SIZE_GB: u64 = 375;
+pub const DEFAULT_BUILDER_STORAGE_SCOPE: &str =
+    "https://www.googleapis.com/auth/devstorage.read_write";
+pub const RAW_BUILDER_STARTUP_SCRIPT: &str = include_str!("../../cloud-init/builder-startup.sh");
+
+pub struct BuilderVmConfig<'a> {
+    pub instance_name: &'a str,
+    pub machine_type: &'a str, // e.g. "n4-highcpu-16"
+    pub zone: &'a str,
+    pub deployment_id: &'a str,
+    pub cache_disk_name: &'a str,
+    pub cache_disk_device_name: &'a str,
+    pub startup_script_template: &'a str,
+    pub queue_bearer_token: Option<&'a str>,
+    pub boot_disk_type: Option<&'a str>,
+    pub cache_disk_type: Option<&'a str>,
+}
+
+pub fn is_functional_builder_startup_template(script: &str) -> bool {
+    let trimmed = script.trim();
+    !trimmed.is_empty()
+        && trimmed.contains("{{DISK_DEVICE_NAME}}")
+        && trimmed.contains("host-agent")
+        && trimmed.contains("queue-worker")
+}
+
+pub fn build_spot_builder_vm_request(
+    project: &str,
+    cfg: &BuilderVmConfig,
+) -> Result<GceInsertInstanceRequest, GcpError> {
+    if !is_functional_builder_startup_template(cfg.startup_script_template) {
+        return Err(GcpError::Validation(
+            "Builder startup_script_template is incomplete or missing required host-agent queue-worker and cache disk bootstrap".to_string(),
+        ));
+    }
+    if !crate::patch::PERMITTED_MACHINE_TYPES.contains(&cfg.machine_type)
+        && !crate::patch::PERMITTED_ARM64_MACHINE_TYPES.contains(&cfg.machine_type)
+    {
+        return Err(GcpError::Validation(format!(
+            "Builder machine type '{}' is not in permitted list",
+            cfg.machine_type
+        )));
+    }
+
+    let is_arm64 = cfg.machine_type.starts_with("c4a-")
+        || cfg.machine_type.starts_with("n4a-")
+        || cfg.machine_type.starts_with("t2a-");
+    let is_hyperdisk_native = cfg.machine_type.starts_with("n4-")
+        || cfg.machine_type.starts_with("c4-")
+        || cfg.machine_type.starts_with("c4a-")
+        || cfg.machine_type.starts_with("n4a-");
+
+    let source_image = if is_arm64 {
+        DEBIAN_13_ARM64_IMAGE_FAMILY.to_string()
+    } else {
+        DEBIAN_13_IMAGE_FAMILY.to_string()
+    };
+
+    let default_disk_type = if is_hyperdisk_native {
+        "hyperdisk-balanced"
+    } else {
+        "pd-balanced"
+    };
+    let boot_disk_type = cfg.boot_disk_type.unwrap_or(default_disk_type);
+    let cache_disk_type = cfg.cache_disk_type.unwrap_or(default_disk_type);
+    if is_hyperdisk_native
+        && (boot_disk_type != "hyperdisk-balanced" || cache_disk_type != "hyperdisk-balanced")
+    {
+        return Err(GcpError::Validation(format!(
+            "Machine type '{}' requires hyperdisk-balanced for boot and cache disks (got boot='{}', cache='{}')",
+            cfg.machine_type, boot_disk_type, cache_disk_type
+        )));
+    }
+    let full_boot_disk_type = format!("zones/{}/diskTypes/{}", cfg.zone, boot_disk_type);
+    let full_cache_disk_type = format!("zones/{}/diskTypes/{}", cfg.zone, cache_disk_type);
+    let full_machine_type = format!("zones/{}/machineTypes/{}", cfg.zone, cfg.machine_type);
+
+    let boot_disk = GceAttachedDisk {
+        boot: true,
+        auto_delete: true,
+        device_name: Some(cfg.instance_name.to_string()),
+        source: None,
+        disk_size_gb: Some(DEFAULT_BOOT_DISK_SIZE_GB.to_string()),
+        r#type: Some("PERSISTENT".to_string()),
+        mode: Some("READ_WRITE".to_string()),
+        interface: Some("NVME".to_string()),
+        initialize_params: Some(GceDiskInitializeParams {
+            disk_name: format!("{}-boot", cfg.instance_name),
+            disk_size_gb: DEFAULT_BOOT_DISK_SIZE_GB.to_string(),
+            disk_type: full_boot_disk_type,
+            source_image: Some(source_image),
+        }),
+    };
+
+    // Dedicated builders require a separate persistent cache disk with auto_delete=false
+    // exposed at /dev/disk/by-id/google-{{DISK_DEVICE_NAME}}
+    let cache_disk = GceAttachedDisk {
+        boot: false,
+        auto_delete: false,
+        device_name: Some(cfg.cache_disk_device_name.to_string()),
+        source: None,
+        disk_size_gb: Some(DEFAULT_BUILDER_CACHE_DISK_SIZE_GB.to_string()),
+        r#type: Some("PERSISTENT".to_string()),
+        mode: Some("READ_WRITE".to_string()),
+        interface: Some("NVME".to_string()),
+        initialize_params: Some(GceDiskInitializeParams {
+            disk_name: cfg.cache_disk_name.to_string(),
+            disk_size_gb: DEFAULT_BUILDER_CACHE_DISK_SIZE_GB.to_string(),
+            disk_type: full_cache_disk_type,
+            source_image: None,
+        }),
+    };
+
+    let queue_bearer_token = cfg
+        .queue_bearer_token
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let rendered_startup = cfg
+        .startup_script_template
+        .replace("{{INSTANCE_NAME}}", cfg.instance_name)
+        .replace("{{PROJECT}}", project)
+        .replace("{{ZONE}}", cfg.zone)
+        .replace("{{DISK_DEVICE_NAME}}", cfg.cache_disk_device_name)
+        .replace("{{DEPLOYMENT_ID}}", cfg.deployment_id)
+        .replace(
+            "{{QUEUE_BEARER_TOKEN}}",
+            queue_bearer_token.unwrap_or_default(),
+        );
+
+    let mut metadata_items = vec![
+        GceMetadataItem {
+            key: "startup-script".into(),
+            value: rendered_startup,
+        },
+        GceMetadataItem {
+            key: "spot-role".into(),
+            value: "rust_builder".into(),
+        },
+        GceMetadataItem {
+            key: "spot-runner-count".into(),
+            value: "0".into(),
+        },
+        GceMetadataItem {
+            key: "spot-cache-disk-device".into(),
+            value: cfg.cache_disk_device_name.into(),
+        },
+    ];
+    if let Some(tok) = queue_bearer_token {
+        metadata_items.push(GceMetadataItem {
+            key: "spot-queue-token".into(),
+            value: tok.into(),
+        });
+    }
+
+    let mut labels = BTreeMap::new();
+    labels.insert("spot-role".into(), "rust_builder".into());
+
+    let nic_type = if boot_disk_type == "hyperdisk-balanced" {
+        Some("GVNIC".to_string())
+    } else {
+        None
+    };
+
+    let network = GceNetworkInterface {
+        network: "global/networks/default".to_string(),
+        nic_type,
+        access_configs: vec![GceAccessConfig {
+            name: "External NAT".to_string(),
+            r#type: "ONE_TO_ONE_NAT".to_string(),
+        }],
+    };
+
+    Ok(GceInsertInstanceRequest {
+        name: cfg.instance_name.to_string(),
+        machine_type: full_machine_type,
+        scheduling: GceScheduling::default(),
+        disks: vec![boot_disk, cache_disk],
+        network_interfaces: vec![network],
+        metadata: GceMetadata {
+            fingerprint: None,
+            items: metadata_items,
+        },
+        labels,
+        service_accounts: vec![GceServiceAccount {
+            email: "default".to_string(),
+            scopes: vec![DEFAULT_BUILDER_STORAGE_SCOPE.to_string()],
+        }],
     })
 }

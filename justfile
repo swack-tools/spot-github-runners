@@ -70,6 +70,58 @@ clean:
 gcp-project:
     @gcloud config get-value project 2>/dev/null
 
+# Enqueue a remote Rust build or full test suite on the Spot builder queue, poll queue position and ETA, and retrieve the requested output ("log", "binary", or "target_zip").
+test-remote output="log" command="cargo test --workspace --locked" template_id="rust-builder-default" binary_name="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    api_base="${SPOT_DASHBOARD_URL:-https://spot.swacktech.com}"
+    cookie_header=()
+    if [ -n "${SPOT_SESSION_COOKIE:-}" ]; then
+        cookie_header=(-H "Cookie: ${SPOT_SESSION_COOKIE}")
+    fi
+    repo="${SPOT_REMOTE_REPO:-$(git config --get remote.origin.url 2>/dev/null | sed -E 's#.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#' || echo "example-org/example-rust-project")}"
+    branch="${SPOT_REMOTE_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")}"
+    commit_sha="${SPOT_REMOTE_COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo "0000000000000000000000000000000000000000")}"
+    payload="$(jq -nc \
+        --arg repo "$repo" \
+        --arg branch "$branch" \
+        --arg sha "$commit_sha" \
+        --arg cmd "{{command}}" \
+        --arg out "{{output}}" \
+        --arg tpl "{{template_id}}" \
+        --arg bin "{{binary_name}}" \
+        '{repo: $repo, branch: $branch, commit_sha: $sha, command: $cmd, requested_output: $out, template_id: $tpl, binary_name: (if $bin == "" then null else $bin end)}')"
+    echo "Enqueuing remote Rust build for ${repo}@${branch} (${commit_sha:0:12})..."
+    resp="$(curl -fsSL -X POST "${api_base}/api/rust-builds/enqueue" \
+        -H "Content-Type: application/json" \
+        "${cookie_header[@]}" \
+        -d "$payload")"
+    build_id="$(printf '%s' "$resp" | jq -r '.build_id')"
+    msg="$(printf '%s' "$resp" | jq -r '.message')"
+    echo "✓ Acked Build #${build_id}: ${msg}"
+    if [ "${SPOT_QUEUE_NO_POLL:-0}" = "1" ]; then
+        printf '%s\n' "$resp" | jq .
+        exit 0
+    fi
+    poll_interval="${SPOT_POLL_INTERVAL_SECS:-10}"
+    while true; do
+        status_json="$(curl -fsSL "${api_base}/api/rust-builds/${build_id}" "${cookie_header[@]}")"
+        bstatus="$(printf '%s' "$status_json" | jq -r '.build_status')"
+        bmsg="$(printf '%s' "$status_json" | jq -r '.message')"
+        echo "[Build #${build_id} · ${bstatus}] ${bmsg}"
+        if [ "$bstatus" = "completed" ]; then
+            selected_url="$(printf '%s' "$status_json" | jq -r '.selected_artifact_url')"
+            echo "✓ Build #${build_id} completed. Requested ({{output}}) artifact URL: ${selected_url}"
+            printf '%s\n' "$status_json" | jq '.artifacts'
+            break
+        elif [ "$bstatus" = "failed" ]; then
+            log_url="$(printf '%s' "$status_json" | jq -r '.artifacts.log_url')"
+            echo "✗ Build #${build_id} failed. Log artifact URL: ${log_url}" >&2
+            exit 1
+        fi
+        sleep "$poll_interval"
+    done
+
 # This changes the live Worker: run it only when you intend a production deploy.
 # Deploy the Cloudflare Worker with GCP_PROJECT taken from the active gcloud configuration.
 deploy-worker:
