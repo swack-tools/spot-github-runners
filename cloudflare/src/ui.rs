@@ -12,451 +12,104 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   <title>Spot GitHub Runners &amp; Rust Builders — Control Plane Dashboard</title>
   <style>
     :root {
-      --bg-base: #0b0f19;
-      --bg-panel: #111827;
-      --bg-card: #161f33;
-      --bg-card-hover: #1e293b;
-      --bg-input: #0f172a;
-      --border: #26334d;
-      --border-hi: #3b82f6;
-      --text-main: #f1f5f9;
-      --text-muted: #94a3b8;
-      --text-dim: #64748b;
-      --accent: #3b82f6;
-      --accent-hover: #2563eb;
-      --cyan: #06b6d4;
-      --emerald: #10b981;
-      --amber: #f59e0b;
-      --rose: #f43f5e;
-      --purple: #8b5cf6;
-      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
-      --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      --bg-base: #131314; --bg-panel: #1e1f20; --bg-card: #282a2c; --bg-card-hover: #333537;
+      --bg-input: #131314; --border: #3c4043; --border-hi: #8ab4f8; --text-main: #e8eaed;
+      --text-muted: #9aa0a6; --text-dim: #767c82; --accent: #1a73e8; --accent-hover: #1765cc;
+      --accent-soft: rgba(138, 180, 248, 0.14); --accent-text: #8ab4f8;
+      --cyan: #24c1e0; --emerald: #34a853; --amber: #fbbc04; --rose: #ea4335; --purple: #a142f4;
+      --sidebar-w: 258px;
+      --font-sans: "Google Sans", Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+      --font-mono: "Roboto Mono", "SFMono-Regular", Consolas, Menlo, monospace;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: var(--bg-base);
-      color: var(--text-main);
-      font-family: var(--font-sans);
-      font-size: 13.5px;
-      line-height: 1.45;
-      min-height: 100vh;
-    }
-    a { color: #60a5fa; text-decoration: none; }
+    body { background: var(--bg-base); color: var(--text-main); font-family: var(--font-sans); font-size: 13px; line-height: 1.45; min-height: 100vh; display: flex; flex-direction: column; }
+    a { color: var(--accent-text); text-decoration: none; }
     a:hover { text-decoration: underline; }
-
-    /* Top Control Header */
-    .topbar {
-      background: linear-gradient(180deg, #111827 0%, #0d1322 100%);
-      border-bottom: 1px solid var(--border);
-      padding: 12px 20px;
-      position: sticky;
-      top: 0;
-      z-index: 100;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.45);
-    }
-    .topbar-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 12px;
-      max-width: 1960px;
-      margin: 0 auto;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .brand-logo {
-      width: 36px;
-      height: 36px;
-      border-radius: 9px;
-      background: linear-gradient(135deg, #3b82f6, #06b6d4);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 800;
-      font-size: 17px;
-      color: #fff;
-      box-shadow: 0 0 14px rgba(59, 130, 246, 0.45);
-    }
-    .brand-title {
-      font-size: 16px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-    }
-    .brand-sub {
-      font-size: 11.5px;
-      color: var(--text-muted);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .tz-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      background: rgba(6, 182, 212, 0.14);
-      color: #67e8f9;
-      border: 1px solid rgba(6, 182, 212, 0.35);
-      padding: 1px 8px;
-      border-radius: 999px;
-      font-family: var(--font-mono);
-      font-size: 11px;
-    }
-
-    /* Live Budget Strip */
-    .budget-bar {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 10px;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      padding: 7px 12px;
-      border-radius: 10px;
-    }
-    .budget-bar label {
-      font-size: 11px;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      font-weight: 600;
-    }
-    .budget-input-group {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      background: var(--bg-input);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 3px 7px;
-    }
-    .budget-input-group span {
-      color: var(--text-muted);
-      font-size: 12px;
-      font-family: var(--font-mono);
-    }
-    .budget-input-group input {
-      width: 64px;
-      background: transparent;
-      border: none;
-      color: var(--text-main);
-      font-family: var(--font-mono);
-      font-size: 12.5px;
-      font-weight: 600;
-      outline: none;
-    }
-
-    /* Navigation Tabs */
-    .nav-tabs {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      max-width: 1960px;
-      margin: 10px auto 0;
-      padding-bottom: 2px;
-    }
-    .tab-btn {
-      background: rgba(22, 31, 51, 0.7);
-      color: var(--text-muted);
-      border: 1px solid var(--border);
-      padding: 7px 13px;
-      border-radius: 8px;
-      cursor: pointer;
-      font-size: 12.5px;
-      font-weight: 600;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      transition: all 0.15s ease;
-      white-space: nowrap;
-    }
-    .tab-btn:hover {
-      background: var(--bg-card-hover);
-      color: var(--text-main);
-    }
-    .tab-btn.active {
-      background: linear-gradient(135deg, rgba(59, 130, 246, 0.25), rgba(6, 182, 212, 0.2));
-      color: #fff;
-      border-color: var(--accent);
-      box-shadow: 0 0 12px rgba(59, 130, 246, 0.25);
-    }
-    .tab-badge {
-      background: rgba(255, 255, 255, 0.12);
-      color: #e2e8f0;
-      padding: 1px 6px;
-      border-radius: 99px;
-      font-size: 10.5px;
-      font-family: var(--font-mono);
-    }
-
-    /* Main Content Container */
-    .main-container {
-      max-width: 1960px;
-      margin: 0 auto;
-      padding: 18px 20px 48px;
-    }
+    .topbar { background: #1e1f20; border-bottom: 1px solid var(--border); padding: 6px 16px; position: sticky; top: 0; z-index: 200; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45); }
+    .topbar-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .drawer-btn { width: 36px; height: 36px; border-radius: 50%; border: none; background: transparent; color: var(--text-main); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; font-size: 18px; transition: background 0.15s; }
+    .drawer-btn:hover { background: var(--bg-card-hover); }
+    .brand-logo { width: 30px; height: 30px; border-radius: 6px; background: #282a2c; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; }
+    .brand-title { font-size: 15px; font-weight: 600; letter-spacing: 0.01em; color: #fff; display: flex; align-items: center; gap: 8px; }
+    .gcp-project-pill { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 12px; color: var(--text-main); margin-left: 6px; }
+    .brand-sub { font-size: 11.5px; color: var(--text-muted); display: flex; align-items: center; gap: 8px; }
+    .tz-pill { display: inline-flex; align-items: center; gap: 4px; background: rgba(138, 180, 248, 0.12); color: var(--accent-text); border: 1px solid rgba(138, 180, 248, 0.3); padding: 2px 8px; border-radius: 4px; font-family: var(--font-mono); font-size: 11px; }
+    .budget-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; background: var(--bg-card); border: 1px solid var(--border); padding: 4px 10px; border-radius: 6px; }
+    .budget-bar label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+    .budget-input-group { display: flex; align-items: center; gap: 3px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
+    .budget-input-group span { color: var(--text-muted); font-size: 11.5px; font-family: var(--font-mono); }
+    .budget-input-group input { width: 56px; background: transparent; border: none; color: var(--text-main); font-family: var(--font-mono); font-size: 12px; font-weight: 600; outline: none; }
+    .gcp-shell { display: flex; flex: 1; min-height: calc(100vh - 53px); position: relative; }
+    .gcp-sidebar { width: var(--sidebar-w); min-width: var(--sidebar-w); background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; justify-content: space-between; padding: 10px 0 14px; transition: width 0.18s ease, min-width 0.18s ease, transform 0.18s ease; z-index: 150; user-select: none; }
+    body.sidebar-collapsed .gcp-sidebar { width: 0; min-width: 0; overflow: hidden; border-right: none; padding: 0; }
+    .nav-cat-label { padding: 12px 18px 4px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); }
+    .nav-cat-label:first-child { padding-top: 4px; }
+    .nav-tabs { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
+    .tab-btn { background: transparent; color: var(--text-main); border: none; border-left: 3px solid transparent; padding: 8px 12px; border-radius: 0 20px 20px 0; cursor: pointer; font-size: 13px; font-weight: 500; display: flex; align-items: center; justify-content: space-between; gap: 8px; transition: background 0.12s ease, color 0.12s ease; text-align: left; width: 100%; }
+    .tab-btn-label { display: inline-flex; align-items: center; gap: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tab-btn:hover { background: var(--bg-card); }
+    .tab-btn.active { background: var(--accent-soft); color: var(--accent-text); border-left-color: var(--accent-text); font-weight: 600; }
+    .tab-badge { background: rgba(255, 255, 255, 0.08); color: var(--text-muted); padding: 1px 7px; border-radius: 99px; font-size: 10.5px; font-family: var(--font-mono); flex-shrink: 0; }
+    .tab-btn.active .tab-badge { background: rgba(138, 180, 248, 0.22); color: var(--accent-text); }
+    .sidebar-footer { margin: 12px 12px 0; padding: 10px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; font-size: 11px; color: var(--text-muted); }
+    .main-container { flex: 1; min-width: 0; max-width: 1920px; padding: 14px 22px 48px; }
+    .gcp-action-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding-bottom: 12px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+    .gcp-breadcrumb { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text-muted); }
+    .gcp-breadcrumb strong { color: #fff; font-size: 16px; font-weight: 600; }
+    .arch-pill-group { display: inline-flex; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .arch-pill-btn { background: transparent; color: var(--text-muted); border: none; border-right: 1px solid var(--border); padding: 5px 11px; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .arch-pill-btn:last-child { border-right: none; }
+    .arch-pill-btn:hover { background: var(--bg-card); color: #fff; }
+    .arch-pill-btn.active { background: var(--accent-soft); color: var(--accent-text); }
     .tab-pane { display: none; }
     .tab-pane.active { display: block; }
-    /* Keeps owner-only controls (the Admins tab) hidden despite the display rules above. */
     [hidden] { display: none !important; }
-
-    /* Grid & Cards */
-    .kpi-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-      gap: 12px;
-      margin-bottom: 16px;
-    }
-    .kpi-card {
-      background: var(--bg-panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 13px 15px;
-    }
-    .kpi-label {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
-      margin-bottom: 4px;
-    }
-    .kpi-value {
-      font-size: 21px;
-      font-weight: 700;
-      font-family: var(--font-mono);
-      color: var(--text-main);
-    }
-    .kpi-sub {
-      font-size: 11.5px;
-      color: var(--text-muted);
-      margin-top: 3px;
-    }
-
-    .panel {
-      background: var(--bg-panel);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px 18px;
-      margin-bottom: 16px;
-    }
-    .panel-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 14px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid var(--border);
-    }
-    .panel-title {
-      font-size: 15px;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .panel-subtitle {
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-
-    .two-col {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-    }
-    .map-layout {
-      display: grid;
-      grid-template-columns: 1.55fr 1fr;
-      gap: 16px;
-      align-items: start;
-    }
-    @media (max-width: 1150px) {
-      .two-col, .map-layout { grid-template-columns: 1fr; }
-    }
-
-    /* Buttons & Inputs */
-    .btn {
-      background: var(--accent);
-      color: #fff;
-      border: 1px solid transparent;
-      padding: 6px 12px;
-      border-radius: 7px;
-      font-size: 12.5px;
-      font-weight: 600;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      transition: all 0.15s;
-    }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .kpi-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; }
+    .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 4px; }
+    .kpi-value { font-size: 21px; font-weight: 700; font-family: var(--font-mono); color: var(--text-main); }
+    .kpi-sub { font-size: 11.5px; color: var(--text-muted); margin-top: 3px; }
+    .panel { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
+    .panel-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+    .panel-title { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+    .panel-subtitle { font-size: 12px; color: var(--text-muted); }
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .map-layout { display: grid; grid-template-columns: 1.55fr 1fr; gap: 16px; align-items: start; }
+    @media (max-width: 1150px) { .two-col, .map-layout { grid-template-columns: 1fr; } }
+    .btn { background: var(--accent); color: #fff; border: 1px solid transparent; padding: 6px 12px; border-radius: 7px; font-size: 12.5px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: all 0.15s; }
     .btn:hover { background: var(--accent-hover); }
     .btn-sm { padding: 4px 9px; font-size: 11.5px; border-radius: 6px; }
-    .btn-secondary {
-      background: var(--bg-card);
-      color: var(--text-main);
-      border-color: var(--border);
-    }
+    .btn-secondary { background: var(--bg-card); color: var(--text-main); border-color: var(--border); }
     .btn-secondary:hover { background: var(--bg-card-hover); border-color: #475569; }
-    .btn-emerald { background: #059669; }
-    .btn-emerald:hover { background: #047857; }
-    .btn-danger { background: #e11d48; }
-    .btn-danger:hover { background: #be123c; }
-    .btn-purple { background: #7c3aed; }
-    .btn-purple:hover { background: #6d28d9; }
-
-    input[type="text"], input[type="number"], select, textarea {
-      background: var(--bg-input);
-      color: var(--text-main);
-      border: 1px solid var(--border);
-      border-radius: 7px;
-      padding: 6px 10px;
-      font-size: 12.5px;
-      font-family: inherit;
-      outline: none;
-    }
-    input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
-    }
-    .form-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
-      gap: 11px;
-      margin-bottom: 12px;
-    }
-    .field {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-    }
-    .field label {
-      font-size: 11.5px;
-      color: var(--text-muted);
-      font-weight: 600;
-    }
-    .toggle-label {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      cursor: pointer;
-      font-size: 12.5px;
-      user-select: none;
-    }
-    .toggle-label input[type="checkbox"] {
-      width: 15px;
-      height: 15px;
-      accent-color: var(--accent);
-    }
-
-    /* World Map Canvas */
-    .world-map-box {
-      position: relative;
-      background: radial-gradient(circle at 50% 45%, #132038 0%, #09101d 100%);
-      border: 1px solid var(--border);
-      border-radius: 11px;
-      overflow: hidden;
-      min-height: 450px;
-    }
-    .world-svg {
-      width: 100%;
-      height: 450px;
-      display: block;
-    }
-    .continent-shape {
-      fill: #1c2c4c;
-      stroke: #2e4775;
-      stroke-width: 1.2;
-    }
-    .map-grid-line {
-      stroke: rgba(148, 163, 184, 0.08);
-      stroke-width: 1;
-      stroke-dasharray: 3 3;
-    }
-    .dc-pin {
-      cursor: pointer;
-      transition: transform 0.15s ease;
-    }
-    .dc-pin:hover {
-      filter: brightness(1.25);
-    }
-    .pin-pulse {
-      animation: pulseRing 2.2s infinite ease-out;
-      transform-origin: center;
-      transform-box: fill-box;
-    }
-    @keyframes pulseRing {
-      0% { transform: scale(0.9); opacity: 0.85; }
-      70% { transform: scale(2.1); opacity: 0; }
-      100% { transform: scale(2.1); opacity: 0; }
-    }
-
-    /* SSH Code Block */
-    .ssh-block {
-      background: #070b12;
-      border: 1px solid #1e293b;
-      border-radius: 8px;
-      padding: 9px 11px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      font-family: var(--font-mono);
-      font-size: 12px;
-      color: #38bdf8;
-      margin-top: 8px;
-    }
-    .ssh-block code {
-      overflow-x: auto;
-      white-space: nowrap;
-    }
-
-    /* Tables */
-    .table-wrap {
-      overflow-x: auto;
-      border: 1px solid var(--border);
-      border-radius: 9px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12.5px;
-    }
-    th, td {
-      padding: 9px 11px;
-      text-align: left;
-      border-bottom: 1px solid rgba(38, 51, 77, 0.65);
-    }
-    th {
-      background: #0f172a;
-      color: var(--text-muted);
-      font-weight: 600;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      cursor: pointer;
-      user-select: none;
-      white-space: nowrap;
-    }
+    .btn-emerald { background: #059669; } .btn-emerald:hover { background: #047857; }
+    .btn-danger { background: #e11d48; } .btn-danger:hover { background: #be123c; }
+    .btn-purple { background: #7c3aed; } .btn-purple:hover { background: #6d28d9; }
+    input[type="text"], input[type="number"], select, textarea { background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; font-size: 12.5px; font-family: inherit; outline: none; }
+    input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 11px; margin-bottom: 12px; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 11.5px; color: var(--text-muted); font-weight: 600; }
+    .toggle-label { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12.5px; user-select: none; }
+    .toggle-label input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
+    .world-map-box { position: relative; background: radial-gradient(circle at 50% 45%, #132038 0%, #09101d 100%); border: 1px solid var(--border); border-radius: 11px; overflow: hidden; min-height: 450px; }
+    .world-svg { width: 100%; height: 450px; display: block; }
+    .continent-shape { fill: #1c2c4c; stroke: #2e4775; stroke-width: 1.2; }
+    .map-grid-line { stroke: rgba(148, 163, 184, 0.08); stroke-width: 1; stroke-dasharray: 3 3; }
+    .dc-pin { cursor: pointer; transition: transform 0.15s ease; }
+    .dc-pin:hover { filter: brightness(1.25); }
+    .pin-pulse { animation: pulseRing 2.2s infinite ease-out; transform-origin: center; transform-box: fill-box; }
+    @keyframes pulseRing { 0% { transform: scale(0.9); opacity: 0.85; } 70% { transform: scale(2.1); opacity: 0; } 100% { transform: scale(2.1); opacity: 0; } }
+    .ssh-block { background: #070b12; border: 1px solid #1e293b; border-radius: 8px; padding: 9px 11px; display: flex; align-items: center; justify-content: space-between; gap: 10px; font-family: var(--font-mono); font-size: 12px; color: #38bdf8; margin-top: 8px; }
+    .ssh-block code { overflow-x: auto; white-space: nowrap; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 9px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th, td { padding: 9px 11px; text-align: left; border-bottom: 1px solid rgba(38, 51, 77, 0.65); }
+    th { background: #0f172a; color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer; user-select: none; white-space: nowrap; }
     th:hover { color: #fff; background: #162238; }
     tr:hover td { background: rgba(30, 41, 59, 0.45); }
     .mono { font-family: var(--font-mono); }
-
-    /* Status & Security Badges */
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 600;
-      white-space: nowrap;
-    }
+    .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; }
     .badge-running { background: rgba(16, 185, 129, 0.16); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); }
     .badge-deleted { background: rgba(244, 63, 94, 0.15); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.35); }
     .badge-runner { background: rgba(59, 130, 246, 0.16); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.35); }
@@ -465,84 +118,43 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     .badge-tor { background: rgba(244, 63, 94, 0.2); color: #fda4af; border: 1px solid rgba(244, 63, 94, 0.5); }
     .badge-vpn { background: rgba(245, 158, 11, 0.18); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.45); }
     .badge-direct { background: rgba(16, 185, 129, 0.14); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.3); }
-
-    /* Cloud-Init Visualizer Stages */
-    .stage-list {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .stage-card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-left: 4px solid var(--accent);
-      border-radius: 8px;
-      padding: 10px 12px;
-    }
-    .stage-card-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-weight: 700;
-      font-size: 13px;
-      margin-bottom: 4px;
-    }
-    .stage-items {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px;
-      margin-top: 6px;
-    }
-    .stage-chip {
-      background: #0b1120;
-      border: 1px solid #28354e;
-      border-radius: 5px;
-      padding: 2px 7px;
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: #cbd5e1;
-    }
-
-    /* Toast feedback */
-    #toast-container {
-      position: fixed;
-      bottom: 20px;
-      right: 20px;
-      z-index: 9999;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .toast {
-      background: #0f172a;
-      color: #f8fafc;
-      border: 1px solid var(--accent);
-      border-left: 4px solid var(--emerald);
-      padding: 10px 14px;
-      border-radius: 8px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-      font-size: 12.5px;
-      font-weight: 600;
-    }
+    .badge-arm64 { background: rgba(36, 193, 224, 0.18); color: #5eead4; border: 1px solid rgba(36, 193, 224, 0.45); }
+    .badge-x86 { background: rgba(148, 163, 184, 0.14); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.32); }
+    .stage-list { display: flex; flex-direction: column; gap: 10px; }
+    .stage-card { background: var(--bg-card); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 8px; padding: 10px 12px; }
+    .stage-card-header { display: flex; justify-content: space-between; align-items: center; font-weight: 700; font-size: 13px; margin-bottom: 4px; }
+    .stage-items { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+    .stage-chip { background: #0b1120; border: 1px solid #28354e; border-radius: 5px; padding: 2px 7px; font-family: var(--font-mono); font-size: 11px; color: #cbd5e1; }
+    #toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
+    .toast { background: #1e1f20; color: #f8fafc; border: 1px solid var(--border); border-left: 4px solid var(--accent-text); padding: 10px 14px; border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55); font-size: 12.5px; font-weight: 600; }
   </style>
 </head>
 <body>
   <header class="topbar">
     <div class="topbar-row">
       <div class="brand">
-        <div class="brand-logo">⚡</div>
-        <div>
-          <div class="brand-title">Spot GitHub Runners &amp; Rust Remote Builders Control Plane</div>
-          <div class="brand-sub">
+        <button class="drawer-btn" id="sidebar-toggle-btn" onclick="toggleSidebar()" title="Toggle Left Navigation Drawer ([)">☰</button>
+        <div class="brand-logo" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+            <path d="M12 3L4 7.5V16.5L12 21L20 16.5V7.5L12 3Z" stroke="#4285F4" stroke-width="2"/>
+            <circle cx="12" cy="12" r="3.5" fill="#34A853"/>
+            <path d="M12 3L20 7.5L12 12L4 7.5L12 3Z" fill="#EA4335" fill-opacity="0.75"/>
+            <path d="M12 12L20 7.5V16.5L12 21V12Z" fill="#FBBC04" fill-opacity="0.75"/>
+          </svg>
+        </div>
+        <div class="brand-title">
+          <span>Google Cloud · Spot Fleet Console</span>
+          <div class="gcp-project-pill">
+            <span>▾</span>
             <span id="hdr-project-org">GCP Project: not configured · GitHub Org: not configured</span>
-            <span class="tz-pill" id="browser-tz-pill">🕒 TZ: Detecting...</span>
           </div>
+          <span class="tz-pill" id="browser-tz-pill">🕒 TZ: Detecting...</span>
         </div>
       </div>
 
       <!-- On-the-Fly Billing Budget Editor -->
       <div class="budget-bar" id="live-budget-bar">
-        <label>Live Max Budget:</label>
+        <label>Max Budget:</label>
         <div class="budget-input-group" title="Maximum scale-up budget per hour">
           <span>$/hr</span>
           <input type="number" id="top-budget-hour" step="0.25" min="0.05" value="5.00" />
@@ -559,46 +171,105 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           <input type="checkbox" id="top-budget-disk" checked />
           Incl. Disk &amp; Tax
         </label>
-        <button class="btn btn-sm btn-emerald" onclick="applyTopBudget()">Apply Budget On-the-Fly</button>
+        <button class="btn btn-sm btn-emerald" onclick="applyTopBudget()">Apply Budget</button>
         <button class="btn btn-sm btn-secondary" id="top-auth-btn" onclick="configureDashboardAuthToken()" title="Configure Bearer / Session Authentication Token">🔒 Auth Token</button>
       </div>
     </div>
-
-    <!-- Navigation Tabs -->
-    <nav class="nav-tabs" role="tablist">
-      <button class="tab-btn active" data-tab="tab-map" onclick="switchTab('tab-map')">
-        🌍 World Map &amp; Fleet Inspector <span class="tab-badge" id="badge-map-count">5 live</span>
-      </button>
-      <button class="tab-btn" data-tab="tab-instances" onclick="switchTab('tab-instances')">
-        📋 Instances &amp; Cost History <span class="tab-badge" id="badge-instances-count">9</span>
-      </button>
-      <button class="tab-btn" data-tab="tab-sizing" onclick="switchTab('tab-sizing')">
-        ⚙️ Sizing &amp; Benchmark Qualifier <span class="tab-badge" id="badge-qual-count">Spot</span>
-      </button>
-      <button class="tab-btn" data-tab="tab-scaling" onclick="switchTab('tab-scaling')">
-        📈 Scaling &amp; OOM Deep-Links <span class="tab-badge" id="badge-oom-count">2 OOM</span>
-      </button>
-      <button class="tab-btn" data-tab="tab-cloudinit" onclick="switchTab('tab-cloudinit')">
-        📜 Cloud-Init &amp; VM Templates <span class="tab-badge" id="badge-tpl-count">3</span>
-      </button>
-      <button class="tab-btn" data-tab="tab-regions" onclick="switchTab('tab-regions')">
-        🌐 Regions &amp; Latency Filter <span class="tab-badge" id="badge-reg-count">14</span>
-      </button>
-      <button class="tab-btn" data-tab="tab-rust" onclick="switchTab('tab-rust')">
-        🦀 Rust Builders Telemetry &amp; IP Intel <span class="tab-badge" id="badge-rust-count">5 builds</span>
-      </button>
-      <button class="tab-btn" data-tab="tab-patches" onclick="switchTab('tab-patches')">
-        🧩 Runner Patches <span class="tab-badge" id="badge-patches">config repo</span>
-      </button>
-      <button class="tab-btn" data-tab="tab-admins" id="tab-btn-admins" onclick="switchTab('tab-admins')" hidden>
-        🔑 Admins <span class="tab-badge" id="badge-admins">owner</span>
-      </button>
-    </nav>
   </header>
 
-  <main class="main-container">
-    <!-- Top KPI Summary Row -->
-    <section class="kpi-grid">
+  <div class="gcp-shell">
+    <!-- Google Cloud Console Categorized Left Navigation Drawer -->
+    <aside class="gcp-sidebar" id="gcp-sidebar" aria-label="Primary navigation">
+      <div>
+        <div class="nav-cat-label">Overview</div>
+        <nav class="nav-tabs" role="tablist">
+          <button class="tab-btn active" data-tab="tab-map" data-title="Fleet Overview &amp; World Map" onclick="switchTab('tab-map')">
+            <span class="tab-btn-label">🌍 Fleet Overview &amp; Map</span>
+            <span class="tab-badge" id="badge-map-count">5 live</span>
+          </button>
+        </nav>
+
+        <div class="nav-cat-label">Compute Engine</div>
+        <nav class="nav-tabs" role="tablist">
+          <button class="tab-btn" data-tab="tab-instances" data-title="VM Instances &amp; Cost Ledger" onclick="switchTab('tab-instances')">
+            <span class="tab-btn-label">📋 VM Instances &amp; Cost</span>
+            <span class="tab-badge" id="badge-instances-count">9</span>
+          </button>
+          <button class="tab-btn" data-tab="tab-sizing" data-title="Machine Sizing &amp; ARM64/x86 Qualifier" onclick="switchTab('tab-sizing')">
+            <span class="tab-btn-label">⚙️ Machine Qualification</span>
+            <span class="tab-badge" id="badge-qual-count">Spot</span>
+          </button>
+          <button class="tab-btn" data-tab="tab-regions" data-title="Regions &amp; Latency Filter" onclick="switchTab('tab-regions')">
+            <span class="tab-btn-label">🌐 Regions &amp; Latency</span>
+            <span class="tab-badge" id="badge-reg-count">14</span>
+          </button>
+        </nav>
+
+        <div class="nav-cat-label">Autoscaling &amp; Templates</div>
+        <nav class="nav-tabs" role="tablist">
+          <button class="tab-btn" data-tab="tab-scaling" data-title="Autoscaling &amp; OOM Diagnostics" onclick="switchTab('tab-scaling')">
+            <span class="tab-btn-label">📈 Autoscaling &amp; OOM</span>
+            <span class="tab-badge" id="badge-oom-count">2 OOM</span>
+          </button>
+          <button class="tab-btn" data-tab="tab-cloudinit" data-title="Cloud-Init &amp; VM Instance Templates" onclick="switchTab('tab-cloudinit')">
+            <span class="tab-btn-label">📜 Cloud-Init &amp; Templates</span>
+            <span class="tab-badge" id="badge-tpl-count">3</span>
+          </button>
+        </nav>
+
+        <div class="nav-cat-label">CI/CD &amp; Builds</div>
+        <nav class="nav-tabs" role="tablist">
+          <button class="tab-btn" data-tab="tab-patches" data-title="Runner Patches (spot-runner-patch-v1)" onclick="switchTab('tab-patches')">
+            <span class="tab-btn-label">🧩 Runner Patches</span>
+            <span class="tab-badge" id="badge-patches">config</span>
+          </button>
+          <button class="tab-btn" data-tab="tab-rust" data-title="Rust 1.99 Builders &amp; IP Telemetry" onclick="switchTab('tab-rust')">
+            <span class="tab-btn-label">🦀 Rust Build Telemetry</span>
+            <span class="tab-badge" id="badge-rust-count">5 builds</span>
+          </button>
+        </nav>
+
+        <div class="nav-cat-label">IAM &amp; Admin</div>
+        <nav class="nav-tabs" role="tablist">
+          <button class="tab-btn" data-tab="tab-admins" data-title="Dashboard Administrators" id="tab-btn-admins" onclick="switchTab('tab-admins')" hidden>
+            <span class="tab-btn-label">🔑 Administrators</span>
+            <span class="tab-badge" id="badge-admins">owner</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="sidebar-footer">
+        <div style="font-weight:600; color:#e8eaed; margin-bottom:4px;">First-Class Multi-Arch</div>
+        <div><span class="badge badge-arm64" style="font-size:10px;">ARM64</span> C4A · N4A · T2A</div>
+        <div style="margin-top:3px;"><span class="badge badge-x86" style="font-size:10px;">x86_64</span> C4D · N4D · N4 · C2D</div>
+        <div style="margin-top:6px; font-size:10.5px;">Press <code class="mono">[</code> to toggle drawer</div>
+      </div>
+    </aside>
+
+    <main class="main-container">
+      <!-- Google Cloud Console Action & Breadcrumb Sub-header -->
+      <div class="gcp-action-bar">
+        <div class="gcp-breadcrumb">
+          <span>Compute Engine</span>
+          <span>›</span>
+          <span>Spot Fleet</span>
+          <span>›</span>
+          <strong id="breadcrumb-current">Fleet Overview &amp; World Map</strong>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <span style="font-size:11.5px; color:var(--text-muted); font-weight:600;">Architecture:</span>
+          <div class="arch-pill-group" role="group" aria-label="Architecture filter">
+            <button class="arch-pill-btn active" data-arch="all" onclick="setGlobalArchFilter('all')">All (ARM64 + x86_64)</button>
+            <button class="arch-pill-btn" data-arch="arm64" onclick="setGlobalArchFilter('arm64')">ARM64 (Axion C4A/N4A · Altra T2A)</button>
+            <button class="arch-pill-btn" data-arch="x86_64" onclick="setGlobalArchFilter('x86_64')">x86_64 (Turin / Milan / Emerald)</button>
+          </div>
+          <button class="btn btn-sm btn-secondary" onclick="toggleKpiRibbon()" id="kpi-toggle-btn">▾ Hide KPIs</button>
+          <button class="btn btn-sm btn-secondary" onclick="triggerLiveInventoryRefresh()">🔄 Refresh</button>
+        </div>
+      </div>
+
+      <!-- Top KPI Summary Row -->
+      <section class="kpi-grid" id="kpi-summary-ribbon">
       <div class="kpi-card">
         <div class="kpi-label">Active Spot Fleet Burn Rate</div>
         <div class="kpi-value" id="kpi-burn-rate">$1.12/hr · $26.88/day</div>
@@ -730,6 +401,11 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           </div>
 
           <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <select id="inst-arch-filter" onchange="setGlobalArchFilter(this.value)">
+              <option value="all">All Architectures (ARM64 + x86_64)</option>
+              <option value="arm64">ARM64 Only (Axion C4A / N4A · Altra T2A)</option>
+              <option value="x86_64">x86_64 Only (AMD Turin / Milan · Intel)</option>
+            </select>
             <select id="inst-role-filter" onchange="applyRoleFilter()">
               <option value="all">All Roles (Runners + Builders)</option>
               <option value="cicd_runner">CI/CD Runners Only</option>
@@ -786,12 +462,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
-    <!-- TAB 3: SIZING, DISK & CPU BENCHMARK QUALIFICATION                     -->
-    <!-- ===================================================================== -->
     <section id="tab-sizing" class="tab-pane">
       <div class="two-col">
-        <!-- Left: CI/CD Runners Profile -->
         <div class="panel">
           <div class="panel-header">
             <div>
@@ -800,84 +472,26 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </div>
             <span class="badge badge-runner">CI/CD Runner Fleet</span>
           </div>
-
           <div class="form-grid">
-            <div class="field">
-              <label>Minimum # of GitHub Runners</label>
-              <input type="number" id="runner-min-runners" min="1" max="200" value="4" oninput="previewQualification('cicd_runner')" />
-            </div>
-            <div class="field">
-              <label>Per-Runner vCPU Requirement</label>
-              <input type="number" id="runner-unit-vcpu" min="1" max="64" value="4" oninput="previewQualification('cicd_runner')" />
-            </div>
-            <div class="field">
-              <label>Per-Runner RAM (GiB)</label>
-              <input type="number" id="runner-unit-ram" min="1" max="256" value="16" oninput="previewQualification('cicd_runner')" />
-            </div>
-            <div class="field">
-              <label>Min CPU Benchmark Score</label>
-              <input type="number" id="runner-min-bench" min="100" max="6000" step="50" value="1000" oninput="previewQualification('cicd_runner')" />
-            </div>
-            <div class="field">
-              <label>Min Host vCPU (e.g. 2 runners = 8)</label>
-              <input type="number" id="runner-min-inst-vcpu" min="2" max="128" value="8" oninput="previewQualification('cicd_runner')" />
-            </div>
-            <div class="field">
-              <label>Min Host RAM GiB (e.g. 2 runners = 32)</label>
-              <input type="number" id="runner-min-inst-ram" min="4" max="512" value="32" oninput="previewQualification('cicd_runner')" />
-            </div>
-            <div class="field">
-              <label>Drive Category (Hyperdrive vs Normal)</label>
-              <select id="runner-disk-cat" onchange="previewQualification('cicd_runner')">
-                <option value="hyperdrive">Hyperdrives Only (Hyperdisk NVMe)</option>
-                <option value="normal">Normal Drives (PD-SSD / PD-Balanced)</option>
-                <option value="any">Any Compatible Drive</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>Preferred Data Disk Type</label>
-              <select id="runner-disk-type" onchange="previewQualification('cicd_runner')">
-                <option value="hyperdisk-balanced">hyperdisk-balanced (NVMe)</option>
-                <option value="hyperdisk-throughput">hyperdisk-throughput</option>
-                <option value="pd-ssd">pd-ssd</option>
-                <option value="pd-balanced">pd-balanced</option>
-                <option value="pd-standard">pd-standard</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>Data Disk Size (GiB)</label>
-              <input type="number" id="runner-disk-gb" min="40" max="4096" value="100" oninput="previewQualification('cicd_runner')" />
-            </div>
-            <div class="field">
-              <label>Max Spot Budget ($/Hour / $/Day / $/Mo)</label>
-              <div style="display:flex; gap:4px;">
-                <input type="number" id="runner-max-hour" step="0.25" value="5.00" title="Max $/hr" style="width:33%;" oninput="previewQualification('cicd_runner')" />
-                <input type="number" id="runner-max-day" step="0.50" value="10.00" title="Max $/day" style="width:33%;" oninput="previewQualification('cicd_runner')" />
-                <input type="number" id="runner-max-month" step="5.0" value="50.00" title="Max $/mo" style="width:34%;" oninput="previewQualification('cicd_runner')" />
-              </div>
-            </div>
-            <div class="field">
-              <label>Cloud-Init Template Dropdown</label>
-              <select id="runner-cloudinit-select"></select>
-            </div>
-            <div class="field">
-              <label>VM Instance Template</label>
-              <div style="display:flex; gap:6px; align-items:center;">
-                <input type="checkbox" id="runner-use-vmtpl" checked title="Use VM Template" />
-                <select id="runner-vmtpl-select" style="flex:1;"></select>
-              </div>
-            </div>
+            <div class="field"><label>Minimum # of GitHub Runners</label><input type="number" id="runner-min-runners" min="1" max="200" value="4" oninput="previewQualification('cicd_runner')" /></div>
+            <div class="field"><label>Per-Runner vCPU Requirement</label><input type="number" id="runner-unit-vcpu" min="1" max="64" value="4" oninput="previewQualification('cicd_runner')" /></div>
+            <div class="field"><label>Per-Runner RAM (GiB)</label><input type="number" id="runner-unit-ram" min="1" max="256" value="16" oninput="previewQualification('cicd_runner')" /></div>
+            <div class="field"><label>Min CPU Benchmark Score</label><input type="number" id="runner-min-bench" min="100" max="6000" step="50" value="1000" oninput="previewQualification('cicd_runner')" /></div>
+            <div class="field"><label>Min Host vCPU (e.g. 2 runners = 8)</label><input type="number" id="runner-min-inst-vcpu" min="2" max="128" value="8" oninput="previewQualification('cicd_runner')" /></div>
+            <div class="field"><label>Min Host RAM GiB (e.g. 2 runners = 32)</label><input type="number" id="runner-min-inst-ram" min="4" max="512" value="32" oninput="previewQualification('cicd_runner')" /></div>
+            <div class="field"><label>Drive Category (Hyperdrive vs Normal)</label><select id="runner-disk-cat" onchange="previewQualification('cicd_runner')"><option value="hyperdrive">Hyperdrives Only (Hyperdisk NVMe)</option><option value="normal">Normal Drives (PD-SSD / PD-Balanced)</option><option value="any">Any Compatible Drive</option></select></div>
+            <div class="field"><label>Preferred Data Disk Type</label><select id="runner-disk-type" onchange="previewQualification('cicd_runner')"><option value="hyperdisk-balanced">hyperdisk-balanced (NVMe)</option><option value="hyperdisk-throughput">hyperdisk-throughput</option><option value="pd-ssd">pd-ssd</option><option value="pd-balanced">pd-balanced</option><option value="pd-standard">pd-standard</option></select></div>
+            <div class="field"><label>Data Disk Size (GiB)</label><input type="number" id="runner-disk-gb" min="40" max="4096" value="100" oninput="previewQualification('cicd_runner')" /></div>
+            <div class="field"><label>Max Spot Budget ($/Hour / $/Day / $/Mo)</label><div style="display:flex; gap:4px;"><input type="number" id="runner-max-hour" step="0.25" value="5.00" title="Max $/hr" style="width:33%;" oninput="previewQualification('cicd_runner')" /><input type="number" id="runner-max-day" step="0.50" value="10.00" title="Max $/day" style="width:33%;" oninput="previewQualification('cicd_runner')" /><input type="number" id="runner-max-month" step="5.0" value="50.00" title="Max $/mo" style="width:34%;" oninput="previewQualification('cicd_runner')" /></div></div>
+            <div class="field"><label>Cloud-Init Template Dropdown</label><select id="runner-cloudinit-select"></select></div>
+            <div class="field"><label>VM Instance Template</label><div style="display:flex; gap:6px; align-items:center;"><input type="checkbox" id="runner-use-vmtpl" checked title="Use VM Template" /><select id="runner-vmtpl-select" style="flex:1;"></select></div></div>
           </div>
-
           <div id="runner-sizing-math-banner" style="background:var(--bg-card); border:1px solid var(--border); padding:9px 12px; border-radius:8px; margin-bottom:12px; font-size:12px; color:#93c5fd;"></div>
-
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
             <button class="btn" onclick="saveProfile('cicd_runner')">Save CI/CD Runner Profile</button>
             <button class="btn btn-secondary" onclick="openSelectedCloudInit('cicd_runner')">Edit Selected Cloud-Init Template</button>
           </div>
         </div>
-
-        <!-- Right: Rust Remote Builders Profile -->
         <div class="panel">
           <div class="panel-header">
             <div>
@@ -886,76 +500,21 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </div>
             <span class="badge badge-builder">Rust Remote Builder</span>
           </div>
-
           <div class="form-grid">
-            <div class="field">
-              <label>Minimum # of Builder Instances</label>
-              <input type="number" id="builder-min-instances" min="1" max="32" value="1" oninput="previewQualification('rust_builder')" />
-            </div>
-            <div class="field">
-              <label>Builder vCPU Requirement</label>
-              <input type="number" id="builder-unit-vcpu" min="4" max="64" value="16" oninput="previewQualification('rust_builder')" />
-            </div>
-            <div class="field">
-              <label>Builder Container RAM (GiB)</label>
-              <input type="number" id="builder-unit-ram" min="8" max="256" value="28" oninput="previewQualification('rust_builder')" />
-            </div>
-            <div class="field">
-              <label>Min CPU Benchmark Score (Rust)</label>
-              <input type="number" id="builder-min-bench" min="100" max="6000" step="50" value="1400" oninput="previewQualification('rust_builder')" />
-            </div>
-            <div class="field">
-              <label>Min Host vCPU</label>
-              <input type="number" id="builder-min-inst-vcpu" min="4" max="128" value="16" oninput="previewQualification('rust_builder')" />
-            </div>
-            <div class="field">
-              <label>Min Host RAM (GiB)</label>
-              <input type="number" id="builder-min-inst-ram" min="8" max="512" value="32" oninput="previewQualification('rust_builder')" />
-            </div>
-            <div class="field">
-              <label>Drive Category (Hyperdrive vs Normal)</label>
-              <select id="builder-disk-cat" onchange="previewQualification('rust_builder')">
-                <option value="hyperdrive">Hyperdrives Only (Hyperdisk NVMe)</option>
-                <option value="normal">Normal Drives (PD-SSD / PD-Balanced)</option>
-                <option value="any">Any Compatible Drive</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>Preferred Cache Disk Type</label>
-              <select id="builder-disk-type" onchange="previewQualification('rust_builder')">
-                <option value="hyperdisk-balanced">hyperdisk-balanced (NVMe)</option>
-                <option value="hyperdisk-throughput">hyperdisk-throughput</option>
-                <option value="pd-ssd">pd-ssd</option>
-                <option value="pd-balanced">pd-balanced</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>Cache Disk Size (GiB)</label>
-              <input type="number" id="builder-disk-gb" min="40" max="4096" value="100" oninput="previewQualification('rust_builder')" />
-            </div>
-            <div class="field">
-              <label>Max Spot Budget ($/Hour / $/Day / $/Mo)</label>
-              <div style="display:flex; gap:4px;">
-                <input type="number" id="builder-max-hour" step="0.25" value="3.50" style="width:33%;" oninput="previewQualification('rust_builder')" />
-                <input type="number" id="builder-max-day" step="0.50" value="12.00" style="width:33%;" oninput="previewQualification('rust_builder')" />
-                <input type="number" id="builder-max-month" step="5.0" value="80.00" style="width:34%;" oninput="previewQualification('rust_builder')" />
-              </div>
-            </div>
-            <div class="field">
-              <label>Cloud-Init Template Dropdown</label>
-              <select id="builder-cloudinit-select"></select>
-            </div>
-            <div class="field">
-              <label>VM Instance Template</label>
-              <div style="display:flex; gap:6px; align-items:center;">
-                <input type="checkbox" id="builder-use-vmtpl" checked />
-                <select id="builder-vmtpl-select" style="flex:1;"></select>
-              </div>
-            </div>
+            <div class="field"><label>Minimum # of Builder Instances</label><input type="number" id="builder-min-instances" min="1" max="32" value="1" oninput="previewQualification('rust_builder')" /></div>
+            <div class="field"><label>Builder vCPU Requirement</label><input type="number" id="builder-unit-vcpu" min="4" max="64" value="16" oninput="previewQualification('rust_builder')" /></div>
+            <div class="field"><label>Builder Container RAM (GiB)</label><input type="number" id="builder-unit-ram" min="8" max="256" value="28" oninput="previewQualification('rust_builder')" /></div>
+            <div class="field"><label>Min CPU Benchmark Score (Rust)</label><input type="number" id="builder-min-bench" min="100" max="6000" step="50" value="1400" oninput="previewQualification('rust_builder')" /></div>
+            <div class="field"><label>Min Host vCPU</label><input type="number" id="builder-min-inst-vcpu" min="4" max="128" value="16" oninput="previewQualification('rust_builder')" /></div>
+            <div class="field"><label>Min Host RAM (GiB)</label><input type="number" id="builder-min-inst-ram" min="8" max="512" value="32" oninput="previewQualification('rust_builder')" /></div>
+            <div class="field"><label>Drive Category (Hyperdrive vs Normal)</label><select id="builder-disk-cat" onchange="previewQualification('rust_builder')"><option value="hyperdrive">Hyperdrives Only (Hyperdisk NVMe)</option><option value="normal">Normal Drives (PD-SSD / PD-Balanced)</option><option value="any">Any Compatible Drive</option></select></div>
+            <div class="field"><label>Preferred Cache Disk Type</label><select id="builder-disk-type" onchange="previewQualification('rust_builder')"><option value="hyperdisk-balanced">hyperdisk-balanced (NVMe)</option><option value="hyperdisk-throughput">hyperdisk-throughput</option><option value="pd-ssd">pd-ssd</option><option value="pd-balanced">pd-balanced</option></select></div>
+            <div class="field"><label>Cache Disk Size (GiB)</label><input type="number" id="builder-disk-gb" min="40" max="4096" value="100" oninput="previewQualification('rust_builder')" /></div>
+            <div class="field"><label>Max Spot Budget ($/Hour / $/Day / $/Mo)</label><div style="display:flex; gap:4px;"><input type="number" id="builder-max-hour" step="0.25" value="3.50" style="width:33%;" oninput="previewQualification('rust_builder')" /><input type="number" id="builder-max-day" step="0.50" value="12.00" style="width:33%;" oninput="previewQualification('rust_builder')" /><input type="number" id="builder-max-month" step="5.0" value="80.00" style="width:34%;" oninput="previewQualification('rust_builder')" /></div></div>
+            <div class="field"><label>Cloud-Init Template Dropdown</label><select id="builder-cloudinit-select"></select></div>
+            <div class="field"><label>VM Instance Template</label><div style="display:flex; gap:6px; align-items:center;"><input type="checkbox" id="builder-use-vmtpl" checked /><select id="builder-vmtpl-select" style="flex:1;"></select></div></div>
           </div>
-
           <div id="builder-sizing-math-banner" style="background:var(--bg-card); border:1px solid var(--border); padding:9px 12px; border-radius:8px; margin-bottom:12px; font-size:12px; color:#c4b5fd;"></div>
-
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
             <button class="btn btn-purple" onclick="saveProfile('rust_builder')">Save Rust Builder Profile</button>
             <button class="btn btn-secondary" onclick="openSelectedCloudInit('rust_builder')">Edit Selected Cloud-Init Template</button>
@@ -963,39 +522,27 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Qualification Results Panel -->
       <div class="panel">
         <div class="panel-header">
           <div>
             <div class="panel-title">🔍 Qualifying Instances Matrix (Hardware + Benchmark vs. Current Spot Price)</div>
             <div class="panel-subtitle" id="qual-summary-subtitle">Showing instances that meet vCPU, RAM, CPU benchmark score, and enabled region filters, and highlighting which currently qualify under Spot pricing.</div>
           </div>
-          <div style="display:flex; gap:8px; align-items:center;">
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
             <button class="btn btn-sm" id="qual-role-btn-runner" onclick="switchQualRole('cicd_runner')">CI/CD Runner Candidates</button>
             <button class="btn btn-sm btn-secondary" id="qual-role-btn-builder" onclick="switchQualRole('rust_builder')">Rust Builder Candidates</button>
-            <label class="toggle-label">
-              <input type="checkbox" id="qual-only-spot-affordable" onchange="renderQualificationTable()" />
-              Show Only Spot-Price-Qualifying
-            </label>
+            <select id="qual-arch-filter" onchange="setGlobalArchFilter(this.value)">
+              <option value="all">All Arch (ARM64 + x86_64)</option>
+              <option value="arm64">ARM64 Only (C4A / N4A / T2A)</option>
+              <option value="x86_64">x86_64 Only</option>
+            </select>
+            <label class="toggle-label"><input type="checkbox" id="qual-only-spot-affordable" onchange="renderQualificationTable()" /> Show Only Spot-Price-Qualifying</label>
           </div>
         </div>
-
         <div class="table-wrap">
           <table>
             <thead>
-              <tr>
-                <th>Machine Shape</th>
-                <th>Region / Zone</th>
-                <th>CPU Platform</th>
-                <th>CPU Benchmark</th>
-                <th>Host vCPU / RAM</th>
-                <th>Runners / Host</th>
-                <th>Hosts for Floor</th>
-                <th>Disk Type</th>
-                <th>Compute ($/hr · $/day)</th>
-                <th>All-In w/ Disk ($/hr · $/day · $/mo)</th>
-                <th>Spot Price Qualifies?</th>
-              </tr>
+              <tr><th>Machine Shape</th><th>Region / Zone</th><th>CPU Platform</th><th>CPU Benchmark</th><th>Host vCPU / RAM</th><th>Runners / Host</th><th>Hosts for Floor</th><th>Disk Type</th><th>Compute ($/hr · $/day)</th><th>All-In w/ Disk ($/hr · $/day · $/mo)</th><th>Spot Price Qualifies?</th></tr>
             </thead>
             <tbody id="qualification-table-body"></tbody>
           </table>
@@ -1003,12 +550,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
-    <!-- TAB 4: SCALING RULES, HOURLY DEMAND & OOM DEEP-LINKS                  -->
-    <!-- ===================================================================== -->
     <section id="tab-scaling" class="tab-pane">
       <div class="two-col">
-        <!-- Left: Scale-Up & Scale-Down Policy Configuration -->
         <div class="panel">
           <div class="panel-header">
             <div>
@@ -1016,58 +559,18 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               <div class="panel-subtitle">Configure how CI/CD runners scale up and scale down based on queued jobs, active provisioned jobs, hourly run volume, CPU utilization across all/majority of runners, and OOM events.</div>
             </div>
           </div>
-
           <div class="form-grid">
-            <div class="field">
-              <label>Minimum CI/CD Runners</label>
-              <input type="number" id="sc-min-runners" min="1" max="100" value="4" />
-            </div>
-            <div class="field">
-              <label>Maximum CI/CD Runners</label>
-              <input type="number" id="sc-max-runners" min="1" max="200" value="24" />
-            </div>
-            <div class="field">
-              <label>Scale-Up Queued Jobs Waiting (&gt;=)</label>
-              <input type="number" id="sc-queued-thresh" min="1" max="100" value="20" />
-            </div>
-            <div class="field">
-              <label>Scale-Up Provisioned Jobs (&gt;=)</label>
-              <input type="number" id="sc-prov-thresh" min="1" max="100" value="6" />
-            </div>
-            <div class="field">
-              <label>Scale-Up Runs in Past Hour (&gt;=)</label>
-              <input type="number" id="sc-hourly-up-thresh" min="1" max="500" value="20" />
-            </div>
-            <div class="field">
-              <label>CPU Scale-Up Threshold (%)</label>
-              <input type="number" id="sc-cpu-thresh" min="10" max="99" value="50" />
-            </div>
-            <div class="field">
-              <label>CPU Trigger Fleet Scope</label>
-              <select id="sc-cpu-scope">
-                <option value="majority">Majority of Runners/Instances (&gt;50%)</option>
-                <option value="all">ALL Runners/Instances (100%)</option>
-                <option value="any">Any Single Instance</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>Scale-Down If Runs in Past Hour (&lt;=)</label>
-              <input type="number" id="sc-hourly-down-max" min="0" max="100" value="5" />
-            </div>
-            <div class="field">
-              <label>Scale-Down Target CI/CD Runners</label>
-              <input type="number" id="sc-hourly-down-target" min="1" max="50" value="2" />
-            </div>
-            <div class="field">
-              <label>Max Scale-Up Budget ($/hr · $/day · $/mo)</label>
-              <div style="display:flex; gap:4px;">
-                <input type="number" id="sc-budget-hr" step="0.25" value="5.00" style="width:33%;" />
-                <input type="number" id="sc-budget-day" step="0.50" value="10.00" style="width:33%;" />
-                <input type="number" id="sc-budget-mo" step="5.00" value="50.00" style="width:34%;" />
-              </div>
-            </div>
+            <div class="field"><label>Minimum CI/CD Runners</label><input type="number" id="sc-min-runners" min="1" max="100" value="4" /></div>
+            <div class="field"><label>Maximum CI/CD Runners</label><input type="number" id="sc-max-runners" min="1" max="200" value="24" /></div>
+            <div class="field"><label>Scale-Up Queued Jobs Waiting (&gt;=)</label><input type="number" id="sc-queued-thresh" min="1" max="100" value="20" /></div>
+            <div class="field"><label>Scale-Up Provisioned Jobs (&gt;=)</label><input type="number" id="sc-prov-thresh" min="1" max="100" value="6" /></div>
+            <div class="field"><label>Scale-Up Runs in Past Hour (&gt;=)</label><input type="number" id="sc-hourly-up-thresh" min="1" max="500" value="20" /></div>
+            <div class="field"><label>CPU Scale-Up Threshold (%)</label><input type="number" id="sc-cpu-thresh" min="10" max="99" value="50" /></div>
+            <div class="field"><label>CPU Trigger Fleet Scope</label><select id="sc-cpu-scope"><option value="majority">Majority of Runners/Instances (&gt;50%)</option><option value="all">ALL Runners/Instances (100%)</option><option value="any">Any Single Instance</option></select></div>
+            <div class="field"><label>Scale-Down If Runs in Past Hour (&lt;=)</label><input type="number" id="sc-hourly-down-max" min="0" max="100" value="5" /></div>
+            <div class="field"><label>Scale-Down Target CI/CD Runners</label><input type="number" id="sc-hourly-down-target" min="1" max="50" value="2" /></div>
+            <div class="field"><label>Max Scale-Up Budget ($/hr · $/day · $/mo)</label><div style="display:flex; gap:4px;"><input type="number" id="sc-budget-hr" step="0.25" value="5.00" style="width:33%;" /><input type="number" id="sc-budget-day" step="0.50" value="10.00" style="width:33%;" /><input type="number" id="sc-budget-mo" step="5.00" value="50.00" style="width:34%;" /></div></div>
           </div>
-
           <div style="display:flex; gap:14px; flex-wrap:wrap; margin: 10px 0 14px;">
             <label class="toggle-label"><input type="checkbox" id="sc-en-queued" checked /> Queued Jobs Trigger</label>
             <label class="toggle-label"><input type="checkbox" id="sc-en-prov" checked /> Provisioned Jobs Trigger</label>
@@ -1077,33 +580,19 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <label class="toggle-label"><input type="checkbox" id="sc-en-journal-oom" checked /> VM Journal OOM Trigger</label>
             <label class="toggle-label"><input type="checkbox" id="sc-en-gh-oom" checked /> GitHub CI OOM Run Trigger</label>
           </div>
-
-          <!-- Live Telemetry Simulator Bar -->
           <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:9px; padding:11px 13px; margin-bottom:12px;">
             <div style="font-weight:700; font-size:12px; margin-bottom:8px; color:#93c5fd;">Live Telemetry &amp; Scenario Simulator (Test Scale-Up or Scale-Down Live)</div>
             <div class="form-grid" style="margin-bottom:8px;">
-              <div class="field">
-                <label>Jobs Ran in Past Hour</label>
-                <input type="number" id="sim-jobs-hour" min="0" max="500" value="14" />
-              </div>
-              <div class="field">
-                <label>Currently Provisioned Jobs</label>
-                <input type="number" id="sim-jobs-prov" min="0" max="100" value="7" />
-              </div>
-              <div class="field">
-                <label>Queued Jobs Waiting</label>
-                <input type="number" id="sim-jobs-queued" min="0" max="100" value="3" />
-              </div>
+              <div class="field"><label>Jobs Ran in Past Hour</label><input type="number" id="sim-jobs-hour" min="0" max="500" value="14" /></div>
+              <div class="field"><label>Currently Provisioned Jobs</label><input type="number" id="sim-jobs-prov" min="0" max="100" value="7" /></div>
+              <div class="field"><label>Queued Jobs Waiting</label><input type="number" id="sim-jobs-queued" min="0" max="100" value="3" /></div>
             </div>
             <div style="display:flex; gap:8px; flex-wrap:wrap;">
               <button class="btn btn-sm" onclick="saveAndEvaluateScaling()">Save Policy &amp; Evaluate Scaling</button>
               <button class="btn btn-sm btn-secondary" onclick="simulateLowDemandScaleDown()">Simulate &lt;=5 Jobs/hr Scale-Down (5 jobs -&gt; 2 runners)</button>
             </div>
           </div>
-
           <div id="scaling-decision-box" style="background:#0c1424; border:1px solid var(--border); border-radius:9px; padding:12px; margin-bottom:14px;"></div>
-
-          <!-- Rust Remote Builders Autoscaling & Idle Scale-Down Policy -->
           <div style="border-top:1px solid var(--border); padding-top:14px; margin-top:6px;">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
               <div>
@@ -1113,46 +602,14 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               <span class="badge badge-builder">rust_builder</span>
             </div>
             <div class="form-grid">
-              <div class="field">
-                <label>Min Builder Instances</label>
-                <input type="number" id="sc-builder-min-inst" min="1" max="32" value="1" />
-              </div>
-              <div class="field">
-                <label>Max Builder Instances</label>
-                <input type="number" id="sc-builder-max-inst" min="1" max="64" value="6" />
-              </div>
-              <div class="field">
-                <label>Scale-Up Queued Builds (&gt;=)</label>
-                <input type="number" id="sc-builder-queued-thresh" min="1" max="50" value="2" />
-              </div>
-              <div class="field">
-                <label>CPU Scale-Up Threshold (%)</label>
-                <input type="number" id="sc-builder-cpu-thresh" min="10" max="99" value="60" />
-              </div>
-              <div class="field">
-                <label>Scale-Down If Builds/1h (&lt;=)</label>
-                <input type="number" id="sc-builder-down-max" min="0" max="100" value="2" />
-              </div>
-              <div class="field">
-                <label>Scale-Down Target Builders</label>
-                <input type="number" id="sc-builder-down-target" min="1" max="32" value="1" />
-              </div>
-              <div class="field">
-                <label>Max Builder Scale-Up Budget ($/hr · $/day · $/mo)</label>
-                <div style="display:flex; gap:4px;">
-                  <input type="number" id="sc-builder-budget-hr" step="0.25" value="3.50" style="width:33%;" />
-                  <input type="number" id="sc-builder-budget-day" step="0.50" value="12.00" style="width:33%;" />
-                  <input type="number" id="sc-builder-budget-mo" step="5.00" value="80.00" style="width:34%;" />
-                </div>
-              </div>
-              <div class="field">
-                <label>Live Builds (Past 1h / Active / Queued)</label>
-                <div style="display:flex; gap:4px;">
-                  <input type="number" id="sim-builds-hour" min="0" max="500" value="6" title="Builds ran in past hour" style="width:33%;" />
-                  <input type="number" id="sim-builds-active" min="0" max="100" value="1" title="Active builds" style="width:33%;" />
-                  <input type="number" id="sim-builds-queued" min="0" max="100" value="0" title="Queued builds" style="width:34%;" />
-                </div>
-              </div>
+              <div class="field"><label>Min Builder Instances</label><input type="number" id="sc-builder-min-inst" min="1" max="32" value="1" /></div>
+              <div class="field"><label>Max Builder Instances</label><input type="number" id="sc-builder-max-inst" min="1" max="64" value="6" /></div>
+              <div class="field"><label>Scale-Up Queued Builds (&gt;=)</label><input type="number" id="sc-builder-queued-thresh" min="1" max="50" value="2" /></div>
+              <div class="field"><label>CPU Scale-Up Threshold (%)</label><input type="number" id="sc-builder-cpu-thresh" min="10" max="99" value="60" /></div>
+              <div class="field"><label>Scale-Down If Builds/1h (&lt;=)</label><input type="number" id="sc-builder-down-max" min="0" max="100" value="2" /></div>
+              <div class="field"><label>Scale-Down Target Builders</label><input type="number" id="sc-builder-down-target" min="1" max="32" value="1" /></div>
+              <div class="field"><label>Max Builder Scale-Up Budget ($/hr · $/day · $/mo)</label><div style="display:flex; gap:4px;"><input type="number" id="sc-builder-budget-hr" step="0.25" value="3.50" style="width:33%;" /><input type="number" id="sc-builder-budget-day" step="0.50" value="12.00" style="width:33%;" /><input type="number" id="sc-builder-budget-mo" step="5.00" value="80.00" style="width:34%;" /></div></div>
+              <div class="field"><label>Live Builds (Past 1h / Active / Queued)</label><div style="display:flex; gap:4px;"><input type="number" id="sim-builds-hour" min="0" max="500" value="6" title="Builds ran in past hour" style="width:33%;" /><input type="number" id="sim-builds-active" min="0" max="100" value="1" title="Active builds" style="width:33%;" /><input type="number" id="sim-builds-queued" min="0" max="100" value="0" title="Queued builds" style="width:34%;" /></div></div>
             </div>
             <div style="display:flex; gap:14px; flex-wrap:wrap; margin: 10px 0;">
               <label class="toggle-label"><input type="checkbox" id="sc-builder-en-queue" checked /> Queued Builds Trigger</label>
@@ -1167,7 +624,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Right: GitHub Actions CI OOM Deep-Links & VM Journal OOM Feed -->
         <div class="panel">
           <div class="panel-header">
             <div>
@@ -1175,44 +631,19 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               <div class="panel-subtitle">Click any failing GitHub Actions CI run below to jump directly to the exact build step and log line where the OOM occurred.</div>
             </div>
           </div>
-
           <div style="font-weight:700; font-size:12.5px; margin-bottom:8px; color:#fda4af;">GitHub Actions CI Runs Dying from OOM (Exact Step &amp; Line Deep-Links)</div>
           <div id="github-oom-runs-list" style="display:flex; flex-direction:column; gap:10px; margin-bottom:16px;"></div>
-
           <div style="font-weight:700; font-size:12.5px; margin-bottom:8px; color:#fcd34d;">VM Instance Journal (<code>journalctl</code>) Kernel / Cgroup OOM Events</div>
           <div id="journal-oom-events-list" style="display:flex; flex-direction:column; gap:10px; margin-bottom:16px;"></div>
-
-          <!-- Add / Test Custom GitHub OOM Run Deep-Link -->
           <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:9px; padding:11px 13px;">
             <div style="font-weight:700; font-size:12px; margin-bottom:8px;">Record / Test GitHub Actions OOM Deep-Link</div>
             <div class="form-grid" style="margin-bottom:8px;">
-              <div class="field">
-                <label>Repository</label>
-                <input type="text" id="new-oom-repo" placeholder="owner/repo" />
-              </div>
-              <div class="field">
-                <label>Run ID</label>
-                <input type="number" id="new-oom-runid" min="1" />
-              </div>
-              <div class="field">
-                <label>Job ID</label>
-                <input type="number" id="new-oom-jobid" min="1" />
-              </div>
-              <div class="field">
-                <label>Step # : Line #</label>
-                <div style="display:flex; gap:4px;">
-                  <input type="number" id="new-oom-step" min="1" placeholder="step" style="width:50%;" />
-                  <input type="number" id="new-oom-line" min="1" placeholder="line" style="width:50%;" />
-                </div>
-              </div>
-              <div class="field">
-                <label>Runner Name</label>
-                <input type="text" id="new-oom-runner" placeholder="as shown in the job log (optional)" />
-              </div>
-              <div class="field">
-                <label>Failing Log Line</label>
-                <input type="text" id="new-oom-excerpt" placeholder="copied from the job log" />
-              </div>
+              <div class="field"><label>Repository</label><input type="text" id="new-oom-repo" placeholder="owner/repo" /></div>
+              <div class="field"><label>Run ID</label><input type="number" id="new-oom-runid" min="1" /></div>
+              <div class="field"><label>Job ID</label><input type="number" id="new-oom-jobid" min="1" /></div>
+              <div class="field"><label>Step # : Line #</label><div style="display:flex; gap:4px;"><input type="number" id="new-oom-step" min="1" placeholder="step" style="width:50%;" /><input type="number" id="new-oom-line" min="1" placeholder="line" style="width:50%;" /></div></div>
+              <div class="field"><label>Runner Name</label><input type="text" id="new-oom-runner" placeholder="as shown in the job log (optional)" /></div>
+              <div class="field"><label>Failing Log Line</label><input type="text" id="new-oom-excerpt" placeholder="copied from the job log" /></div>
             </div>
             <button class="btn btn-sm btn-danger" onclick="addGithubOomRun()">Add OOM CI Run Deep-Link</button>
           </div>
@@ -1338,6 +769,9 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <label>Required Instance Family</label>
             <select id="reg-family-filter" onchange="renderRegionsTable()">
               <option value="">Any Instance Family</option>
+              <option value="c4a">c4a (ARM64 Google Axion Neoverse V2)</option>
+              <option value="n4a">n4a (ARM64 Google Axion Neoverse N3)</option>
+              <option value="t2a">t2a (ARM64 Ampere Altra)</option>
               <option value="c4d">c4d (AMD Turin Hyperdisk)</option>
               <option value="n4d">n4d (AMD Turin)</option>
               <option value="c4">c4 (Intel Granite/Emerald)</option>
@@ -1352,6 +786,9 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <label>Required CPU Platform</label>
             <select id="reg-cpu-filter" onchange="renderRegionsTable()">
               <option value="">Any CPU Platform</option>
+              <option value="Google Axion (Neoverse V2)">Google Axion (Neoverse V2)</option>
+              <option value="Google Axion (Neoverse N3)">Google Axion (Neoverse N3)</option>
+              <option value="Ampere Altra (Neoverse N1)">Ampere Altra (Neoverse N1)</option>
               <option value="AMD Turin">AMD Turin</option>
               <option value="Intel Granite Rapids">Intel Granite Rapids</option>
               <option value="Intel Emerald Rapids">Intel Emerald Rapids</option>
@@ -1587,7 +1024,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <ul id="adm-history" style="font-size:12.5px; padding-left:18px;"></ul>
       </div>
     </section>
-  </main>
+    </main>
+  </div>
 
   <div id="toast-container"></div>
 
@@ -1598,6 +1036,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     let INST_WINDOW_HOURS = 24;
     let INST_SORT_BY = "total_cost_in_window_usd";
     let INST_SORT_DIR = "desc";
+    let GLOBAL_ARCH_FILTER = "all";
     let QUAL_ACTIVE_ROLE = "cicd_runner";
     let LAST_QUAL_DATA = { cicd_runner: null, rust_builder: null };
     const AUTH_STORAGE_KEY = "dashboard_auth_token";
@@ -1949,11 +1388,66 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
+    function toggleSidebar() {
+      document.body.classList.toggle("sidebar-collapsed");
+    }
+
+    function toggleKpiRibbon() {
+      const rib = document.getElementById("kpi-summary-ribbon");
+      const btn = document.getElementById("kpi-toggle-btn");
+      if (!rib) return;
+      const hidden = rib.hasAttribute("hidden");
+      if (hidden) {
+        rib.removeAttribute("hidden");
+        if (btn) btn.textContent = "▾ Hide KPIs";
+      } else {
+        rib.setAttribute("hidden", "");
+        if (btn) btn.textContent = "▸ Show KPIs";
+      }
+    }
+
+    function inferArchClient(mt, explicitArch) {
+      if (explicitArch === "arm64" || explicitArch === "aarch64") return "arm64";
+      const s = String(mt || "").toLowerCase();
+      return (s.startsWith("c4a-") || s.startsWith("n4a-") || s.startsWith("t2a-")) ? "arm64" : "x86_64";
+    }
+
+    function archBadgeHtml(mt, explicitArch) {
+      const arch = inferArchClient(mt, explicitArch);
+      return arch === "arm64"
+        ? '<span class="badge badge-arm64">ARM64</span>'
+        : '<span class="badge badge-x86">x86_64</span>';
+    }
+
+    function setGlobalArchFilter(arch) {
+      GLOBAL_ARCH_FILTER = arch || "all";
+      document.querySelectorAll(".arch-pill-btn").forEach(btn => {
+        btn.classList.toggle("active", btn.getAttribute("data-arch") === GLOBAL_ARCH_FILTER);
+      });
+      const instSel = document.getElementById("inst-arch-filter");
+      if (instSel && instSel.value !== GLOBAL_ARCH_FILTER) instSel.value = GLOBAL_ARCH_FILTER;
+      const qualSel = document.getElementById("qual-arch-filter");
+      if (qualSel && qualSel.value !== GLOBAL_ARCH_FILTER) qualSel.value = GLOBAL_ARCH_FILTER;
+      loadOverview();
+    }
+
+    document.addEventListener("keydown", e => {
+      if (e.key === "[" && !["INPUT", "TEXTAREA", "SELECT"].includes((e.target && e.target.tagName) || "")) {
+        e.preventDefault();
+        toggleSidebar();
+      }
+    });
+
     function switchTab(tabId) {
       document.querySelectorAll(".tab-pane").forEach(el => el.classList.remove("active"));
+      let activeTitle = "";
       document.querySelectorAll(".tab-btn").forEach(btn => {
-        btn.classList.toggle("active", btn.getAttribute("data-tab") === tabId);
+        const isMatch = btn.getAttribute("data-tab") === tabId;
+        btn.classList.toggle("active", isMatch);
+        if (isMatch) activeTitle = btn.getAttribute("data-title") || btn.textContent.trim();
       });
+      const bc = document.getElementById("breadcrumb-current");
+      if (bc && activeTitle) bc.textContent = activeTitle;
       const target = document.getElementById(tabId);
       if (target) target.classList.add("active");
     }
@@ -1967,7 +1461,8 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const search = encodeURIComponent(searchInput ? searchInput.value.trim() : "");
       const roleFilter = document.getElementById("inst-role-filter");
       const role = encodeURIComponent(roleFilter ? roleFilter.value : "all");
-      const url = `/api/overview?include_deleted=${showDeleted}&window_hours=${INST_WINDOW_HOURS}&include_disk_and_tax=${inclDiskTax}&sort_by=${INST_SORT_BY}&sort_dir=${INST_SORT_DIR}&search=${search}&role=${role}`;
+      const arch = encodeURIComponent(GLOBAL_ARCH_FILTER || "all");
+      const url = `/api/overview?include_deleted=${showDeleted}&window_hours=${INST_WINDOW_HOURS}&include_disk_and_tax=${inclDiskTax}&sort_by=${INST_SORT_BY}&sort_dir=${INST_SORT_DIR}&search=${search}&role=${role}&arch=${arch}`;
       const res = await fetch(url);
       APP_STATE = await res.json();
       LAST_QUAL_DATA.cicd_runner = APP_STATE.qualifications.cicd_runner;
@@ -2442,7 +1937,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               <div class="mono" style="font-size:11px; color:var(--text-muted);">${esc(inst.zone)}</div>
             </td>
             <td>
-              <div class="mono" style="font-weight:600;">${esc(inst.machine_type)} (${inst.vcpu} vCPU / ${inst.ram_gib} GiB)</div>
+              <div class="mono" style="font-weight:600;">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)} (${inst.vcpu} vCPU / ${inst.ram_gib} GiB)</div>
               <div style="font-size:11px; color:var(--text-muted);">${esc(inst.cpu_platform)} · ${inst.data_disk_gb}GB ${esc(inst.data_disk_type)} (${esc(inst.disk_category)})</div>
             </td>
             <td class="mono" style="font-weight:700; color:#38bdf8;">${inst.benchmark_score}</td>
@@ -2668,9 +2163,13 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         `<strong style="color:#34d399;">${q.spot_price_qualifying_count}</strong> currently qualify under Spot pricing ($${q.requirements.budget.max_hourly_usd}/hr · $${q.requirements.budget.max_daily_usd}/day · $${q.requirements.budget.max_monthly_usd}/mo).`;
 
       const tbody = document.getElementById("qualification-table-body");
-      tbody.innerHTML = rows.slice(0, 45).map(r => `
+      const archFilteredRows = rows.filter(r => {
+        if (!GLOBAL_ARCH_FILTER || GLOBAL_ARCH_FILTER === "all") return true;
+        return inferArchClient(r.machine_type, r.arch) === GLOBAL_ARCH_FILTER;
+      });
+      tbody.innerHTML = archFilteredRows.slice(0, 60).map(r => `
         <tr>
-          <td class="mono" style="font-weight:700; color:#fff;">${esc(r.machine_type)}</td>
+          <td class="mono" style="font-weight:700; color:#fff;">${esc(r.machine_type)} ${archBadgeHtml(r.machine_type, r.arch)}</td>
           <td>
             <div style="font-weight:600;">${esc(r.display_location)}</div>
             <div class="mono" style="font-size:11px; color:var(--text-muted);">${esc(r.zone)} (${r.latency_ms} ms)</div>
@@ -2979,7 +2478,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       document.getElementById("vm-templates-list").innerHTML = APP_STATE.vm_templates.map(tpl => `
         <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:10px 12px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
           <div>
-            <div style="font-weight:700; color:#fff;">${esc(tpl.name)} <span class="mono" style="font-size:11px; color:var(--text-muted);">(${esc(tpl.id)})</span></div>
+            <div style="font-weight:700; color:#fff;">${esc(tpl.name)} ${archBadgeHtml(tpl.machine_type, tpl.arch)} <span class="mono" style="font-size:11px; color:var(--text-muted);">(${esc(tpl.id)})</span></div>
             <div style="font-size:11.5px; color:var(--text-muted);">Shape: <code class="mono">${esc(tpl.machine_type)}</code> (${tpl.vcpu} vCPU / ${tpl.ram_gib} GiB · ${esc(tpl.cpu_platform)} · Bench ${tpl.benchmark_score}) · Disk: <code class="mono">${tpl.data_disk_gb}GB ${esc(tpl.data_disk_type)}</code> (${esc(tpl.disk_category)}) · ${tpl.source_instance ? `Source: <code class="mono">${esc(tpl.source_instance)}</code>` : 'Preset shape'}</div>
           </div>
           <span class="badge ${tpl.role === 'cicd_runner' ? 'badge-runner' : 'badge-builder'}">${tpl.role === 'cicd_runner' ? 'Runner Template' : 'Builder Template'}</span>

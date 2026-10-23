@@ -46,12 +46,31 @@ pub const PERMITTED_MACHINE_TYPES: &[&str] = &[
     "c2d-highcpu-16",
 ];
 
+pub const PERMITTED_ARM64_MACHINE_TYPES: &[&str] = &[
+    "c4a-highcpu-16",
+    "c4a-standard-16",
+    "c4a-highcpu-8",
+    "c4a-standard-8",
+    "n4a-highcpu-16",
+    "n4a-standard-16",
+    "n4a-highcpu-8",
+    "n4a-standard-8",
+    "t2a-standard-16",
+    "t2a-standard-8",
+];
+
 pub const CONTROLLED_TARGETS: &[&str] = &[
     "swack-tools",
     "xbmc4lyfe/newznab-tmux",
     "xbmc4lyfe/rustnzb",
     "xbmc4lyfe/nntp-proxy",
 ];
+
+pub const ON_DEMAND_TARGETS: &[&str] = &["swack-tools/bt-to-all-devices"];
+
+pub fn is_supported_patch_target(target: &str) -> bool {
+    CONTROLLED_TARGETS.contains(&target) || ON_DEMAND_TARGETS.contains(&target)
+}
 
 pub const FORBIDDEN_MOUNTS: &[&str] = &[
     "/var/run/docker.sock",
@@ -172,6 +191,8 @@ pub struct HardwarePatch {
     pub golden_image_family: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub source_instance_template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provisioning_mode: Option<String>,
 }
 
 pub type HardwareConfig = HardwarePatch;
@@ -193,6 +214,7 @@ impl Default for HardwarePatch {
             source_image: None,
             golden_image_family: None,
             source_instance_template: None,
+            provisioning_mode: None,
         }
     }
 }
@@ -389,6 +411,7 @@ pub fn canonicalize_manifest_value(val: &Value) -> Value {
             "source_image",
             "golden_image_family",
             "source_instance_template",
+            "provisioning_mode",
         ] {
             if let Some(v) = hw.get(*opt_hw) {
                 if v.is_null() {
@@ -485,11 +508,21 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
     // Hardware checks
     match root.get("hardware") {
         Some(Value::Object(hw)) => {
+            let arch_str = hw.get("arch").and_then(|v| v.as_str()).unwrap_or("x86_64");
+            let is_arm64 =
+                arch_str.eq_ignore_ascii_case("arm64") || arch_str.eq_ignore_ascii_case("aarch64");
+            let min_vcpu_floor = if is_arm64 { 8 } else { MIN_HOST_VCPU as u64 };
+            let min_ram_floor = if is_arm64 {
+                16
+            } else {
+                MIN_HOST_RAM_GIB as u64
+            };
+
             // Floor checks
             if let Some(v) = hw.get("min_vcpu") {
                 if let Some(n) = v.as_u64() {
-                    if n < MIN_HOST_VCPU as u64 {
-                        errors.push(format!("min_vcpu_below_floor: {} < {}", n, MIN_HOST_VCPU));
+                    if n < min_vcpu_floor {
+                        errors.push(format!("min_vcpu_below_floor: {} < {}", n, min_vcpu_floor));
                     }
                 } else if !v.is_null() {
                     errors.push("hardware.min_vcpu must be a positive integer".to_string());
@@ -498,10 +531,10 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
 
             if let Some(v) = hw.get("min_ram_gib") {
                 if let Some(n) = v.as_u64() {
-                    if n < MIN_HOST_RAM_GIB as u64 {
+                    if n < min_ram_floor {
                         errors.push(format!(
                             "min_ram_gib_below_floor: {} < {}",
-                            n, MIN_HOST_RAM_GIB
+                            n, min_ram_floor
                         ));
                     }
                 } else if !v.is_null() {
@@ -511,7 +544,11 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
 
             if let Some(v) = hw.get("runners_count") {
                 if let Some(n) = v.as_u64() {
-                    if n != REQUIRED_RUNNERS_COUNT as u64 {
+                    if is_arm64 {
+                        if !(1..=2).contains(&n) {
+                            errors.push(format!("runners_count_must_be_1_or_2: got {}", n));
+                        }
+                    } else if n != REQUIRED_RUNNERS_COUNT as u64 {
                         errors.push(format!("runners_count_must_be_2: got {}", n));
                     }
                 } else if !v.is_null() {
@@ -521,7 +558,11 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
 
             if let Some(v) = hw.get("runner_vcpu") {
                 if let Some(n) = v.as_u64() {
-                    if n != REQUIRED_RUNNER_VCPU as u64 {
+                    if is_arm64 {
+                        if !(6..=14).contains(&n) {
+                            errors.push(format!("runner_vcpu_must_be_6_to_14: got {}", n));
+                        }
+                    } else if n != REQUIRED_RUNNER_VCPU as u64 {
                         errors.push(format!("runner_vcpu_must_be_7: got {}", n));
                     }
                 } else if !v.is_null() {
@@ -531,7 +572,11 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
 
             if let Some(v) = hw.get("runner_ram_gib") {
                 if let Some(n) = v.as_u64() {
-                    if n != REQUIRED_RUNNER_RAM_GIB as u64 {
+                    if is_arm64 {
+                        if !(12..=28).contains(&n) {
+                            errors.push(format!("runner_ram_gib_must_be_12_to_28: got {}", n));
+                        }
+                    } else if n != REQUIRED_RUNNER_RAM_GIB as u64 {
                         errors.push(format!("runner_ram_gib_must_be_14: got {}", n));
                     }
                 } else if !v.is_null() {
@@ -541,13 +586,27 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
 
             if let Some(v) = hw.get("host_overhead_gib") {
                 if let Some(n) = v.as_u64() {
-                    if n != REQUIRED_HOST_OVERHEAD_GIB as u64 {
+                    if is_arm64 {
+                        if !(2..=4).contains(&n) {
+                            errors.push(format!("host_overhead_gib_must_be_2_to_4: got {}", n));
+                        }
+                    } else if n != REQUIRED_HOST_OVERHEAD_GIB as u64 {
                         errors.push(format!("host_overhead_gib_must_be_4: got {}", n));
                     }
                 } else if !v.is_null() {
                     errors.push(
                         "hardware.host_overhead_gib must be a non-negative integer".to_string(),
                     );
+                }
+            }
+
+            if let Some(v) = hw.get("provisioning_mode") {
+                if let Some(s) = v.as_str() {
+                    if !matches!(s, "always_on" | "on_demand" | "scale_from_zero") {
+                        errors.push(format!("invalid_provisioning_mode: {}", s));
+                    }
+                } else if !v.is_null() {
+                    errors.push("hardware.provisioning_mode must be a string".to_string());
                 }
             }
 
@@ -571,7 +630,12 @@ pub fn validate_patch_manifest(manifest: &Value) -> Result<RunnerPatch, Vec<Stri
                 for lbl in labels {
                     if let Some(s) = lbl.as_str() {
                         if let Some(mtype) = s.strip_prefix("type-") {
-                            if !PERMITTED_MACHINE_TYPES.contains(&mtype) {
+                            let allowed = if is_arm64 {
+                                PERMITTED_ARM64_MACHINE_TYPES.contains(&mtype)
+                            } else {
+                                PERMITTED_MACHINE_TYPES.contains(&mtype)
+                            };
+                            if !allowed {
                                 errors.push(format!("unpermitted_machine_type: {}", mtype));
                             }
                         }
@@ -735,6 +799,11 @@ pub fn merge_patches(defaults: &RunnerPatch, override_patch: &RunnerPatch) -> Ru
                 .source_instance_template
                 .clone()
                 .or_else(|| defaults.hardware.source_instance_template.clone()),
+            provisioning_mode: override_patch
+                .hardware
+                .provisioning_mode
+                .clone()
+                .or_else(|| defaults.hardware.provisioning_mode.clone()),
         },
         host: HostPatch {
             apt_packages: {
@@ -1301,6 +1370,7 @@ pub fn make_test_manifest() -> RunnerPatch {
             source_image: None,
             golden_image_family: None,
             source_instance_template: None,
+            provisioning_mode: None,
         },
         host: HostPatch {
             apt_packages: vec!["git".to_string(), "curl".to_string()],

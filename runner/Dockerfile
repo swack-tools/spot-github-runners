@@ -26,7 +26,7 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
     && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.99.0 \
     && rm /tmp/rustup-init.sh \
     && rustup component add rustfmt clippy --toolchain 1.99.0 \
-    && rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin \
+    && rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim \
     && rustc --version | grep '^rustc 1.99.0 ' \
     && cargo --version | grep '^cargo 1.99.0 '
 USER root

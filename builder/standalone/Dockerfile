@@ -10,10 +10,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner
 RUN apt-get update && apt-get install -y --no-install-recommends rsync time llvm \
     && rm -rf /var/lib/apt/lists/*
-# Official Node distribution checksum, resolved once and pinned in source.
-RUN curl --proto '=https' --tlsv1.2 -fsS \
-      https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz -o /tmp/node.tar.xz \
-    && echo 'fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6  /tmp/node.tar.xz' | sha256sum -c - \
+# Official Node distribution checksums for x64 and arm64, resolved once and pinned in source.
+RUN ARCH="$(uname -m)" \
+    && case "$ARCH" in \
+         x86_64) NODE_ARCH="x64"; NODE_SHA256="fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6" ;; \
+         aarch64|arm64) NODE_ARCH="arm64"; NODE_SHA256="6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2" ;; \
+         *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl --proto '=https' --tlsv1.2 -fsS \
+      "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-${NODE_ARCH}.tar.xz" -o /tmp/node.tar.xz \
+    && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - \
     && install -d -m 0755 /opt/node \
     && tar -xJf /tmp/node.tar.xz --no-same-owner --strip-components=1 -C /opt/node \
     && chown -hR 0:0 /opt/node \
@@ -34,11 +40,16 @@ RUN cd /opt/playwright \
     && test "$(./node_modules/.bin/playwright --version)" = 'Version 1.63.0'
 # Primary release checksums: https://ziglang.org/download/index.json and
 # https://index.crates.io/ca/rg/cargo-zigbuild. Verify both archives before use.
-# Zig supplies target musl headers/libraries and compiles zip's C-backed codecs;
-# the host's x86_64 musl-tools alone cannot cross-compile those for ARM64.
-RUN curl --proto '=https' --tlsv1.2 -fsS \
-      https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o /tmp/zig.tar.xz \
-    && echo '02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  /tmp/zig.tar.xz' | sha256sum -c - \
+# Supports both native x86_64 and native aarch64 (ARM64) Linux container builds.
+RUN ARCH="$(uname -m)" \
+    && case "$ARCH" in \
+         x86_64) ZIG_ARCH="x86_64"; ZIG_SHA256="02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239" ;; \
+         aarch64|arm64) ZIG_ARCH="aarch64"; ZIG_SHA256="958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f" ;; \
+         *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl --proto '=https' --tlsv1.2 -fsS \
+      "https://ziglang.org/download/0.15.2/zig-${ZIG_ARCH}-linux-0.15.2.tar.xz" -o /tmp/zig.tar.xz \
+    && echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - \
     && mkdir -p /opt/zig \
     && tar -xJf /tmp/zig.tar.xz --strip-components=1 -C /opt/zig \
     && rm /tmp/zig.tar.xz \
@@ -114,7 +125,7 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
     && rm /tmp/rustup-init.sh \
     && rustup component add rustfmt clippy --toolchain 1.99.0 \
     && rustup target add --toolchain 1.99.0 x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
-    && rustup target add --toolchain 1.99.0 aarch64-apple-darwin x86_64-apple-darwin \
+    && rustup target add --toolchain 1.99.0 aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim \
     && cargo install --locked -j4 just \
     && cargo install --locked -j4 cargo-nextest \
     && cargo install --locked -j4 --version 0.29.2 cbindgen \

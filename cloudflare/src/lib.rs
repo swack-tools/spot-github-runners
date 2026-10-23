@@ -318,6 +318,12 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                             query.role = Some(trimmed.to_string());
                         }
                     }
+                    "arch" => {
+                        let trimmed = v.trim();
+                        if !trimmed.is_empty() {
+                            query.arch = Some(trimmed.to_string());
+                        }
+                    }
                     _ => {}
                 }
             }
