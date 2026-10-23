@@ -128,6 +128,35 @@ impl SimpleGceInstance {
             .next()
             .unwrap_or(&self.machine_type)
     }
+
+    pub fn started_epoch(&self) -> Option<u64> {
+        if let Ok(guard) = GCE_INSTANCE_TIMESTAMPS.lock() {
+            if let Some(ref map) = *guard {
+                if let Some((Some(start_ep), _)) = map.get(&self.name) {
+                    return Some(*start_ep);
+                }
+            }
+        }
+        crate::state::parse_launch_epoch_from_name(&self.name)
+    }
+
+    pub fn stopped_epoch(&self) -> Option<u64> {
+        if let Ok(guard) = GCE_INSTANCE_TIMESTAMPS.lock() {
+            if let Some(ref map) = *guard {
+                if let Some((_, Some(stop_ep))) = map.get(&self.name) {
+                    return Some(*stop_ep);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn parse_rfc3339_epoch(ts: Option<&str>) -> Option<u64> {
+    let raw = ts?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .and_then(|dt| u64::try_from(dt.timestamp()).ok())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,18 +236,31 @@ impl<T: crate::gcp::GcpHttpTransport> GcpReconcilerClient for crate::gcp::GceCom
             .list_instances(now)
             .await
             .map_err(|e| ReconcilerError::Gcp(e.to_string()))?;
-        Ok(list
+        let mut ts_map = std::collections::HashMap::new();
+        let out = list
             .into_iter()
-            .map(|i| SimpleGceInstance {
-                id: i.id,
-                name: i.name,
-                zone: i.zone,
-                machine_type: i.machine_type,
-                status: i.status,
-                metadata: i.metadata,
-                disks: i.disks,
+            .map(|i| {
+                let start_ep = parse_rfc3339_epoch(i.last_start_timestamp.as_deref())
+                    .or_else(|| parse_rfc3339_epoch(i.creation_timestamp.as_deref()));
+                let stop_ep = parse_rfc3339_epoch(i.last_stop_timestamp.as_deref());
+                if start_ep.is_some() || stop_ep.is_some() {
+                    ts_map.insert(i.name.clone(), (start_ep, stop_ep));
+                }
+                SimpleGceInstance {
+                    id: i.id,
+                    name: i.name,
+                    zone: i.zone,
+                    machine_type: i.machine_type,
+                    status: i.status,
+                    metadata: i.metadata,
+                    disks: i.disks,
+                }
             })
-            .collect())
+            .collect();
+        if let Ok(mut guard) = GCE_INSTANCE_TIMESTAMPS.lock() {
+            *guard = Some(ts_map);
+        }
+        Ok(out)
     }
 
     async fn insert_instance(
@@ -325,6 +367,9 @@ static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 static RECONCILER_LEASE: Mutex<Option<u64>> = Mutex::new(None);
 static LAST_FLEET_FINGERPRINT: Mutex<Option<String>> = Mutex::new(None);
 static ACTIVE_LAUNCHES: Mutex<Vec<LaunchOperation>> = Mutex::new(Vec::new());
+static GCE_INSTANCE_TIMESTAMPS: Mutex<
+    Option<std::collections::HashMap<String, (Option<u64>, Option<u64>)>>,
+> = Mutex::new(None);
 
 // Test injection stores for E2E and unit test harnesses
 static INJECTED_TERMINATED_VMS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -374,6 +419,7 @@ pub fn reset_reconciler_state() {
     INJECTED_STALE_RUNNERS.lock().unwrap().clear();
     SIMULATED_INSTANCES.lock().unwrap().clear();
     SIMULATED_RUNNERS.lock().unwrap().clear();
+    *GCE_INSTANCE_TIMESTAMPS.lock().unwrap() = None;
     TOTAL_KV_PUTS.store(0, Ordering::SeqCst);
     TOTAL_KV_GETS.store(0, Ordering::SeqCst);
     ISOLATE_CACHE_HITS.store(0, Ordering::SeqCst);
@@ -616,6 +662,11 @@ where
         .map(|inst| (inst.name.clone(), inst.clone()))
         .collect();
 
+    let gce_stop_epochs: std::collections::HashMap<String, u64> = instances
+        .iter()
+        .filter_map(|i| i.stopped_epoch().map(|ep| (i.name.clone(), ep)))
+        .collect();
+
     let new_instances_view: Vec<InstanceRecord> = instances
         .iter()
         .filter(|i| {
@@ -640,6 +691,12 @@ where
                     rec.zone = norm_zone.clone();
                     rec.region = norm_region.clone();
                     rec.machine_type = norm_machine_type.clone();
+                    if rec.created_epoch.is_none() {
+                        if let Some(ep) = i.started_epoch() {
+                            rec.created_epoch = Some(ep);
+                            rec.created_at = Some(crate::state::chrono_iso(ep));
+                        }
+                    }
                     if is_builder {
                         rec.role = "rust_builder".to_string();
                         rec.vcpu = 16;
@@ -651,7 +708,7 @@ where
                     return rec;
                 }
             }
-            let launch_epoch = crate::state::parse_launch_epoch_from_name(&i.name);
+            let launch_epoch = i.started_epoch();
             let created_at = launch_epoch.map(crate::state::chrono_iso);
             InstanceRecord {
                 id: gce_id,
@@ -676,8 +733,21 @@ where
         })
         .collect();
 
+    let overview_changed = if let Some(ref mut ov) = fresh_bundle.state.overview {
+        crate::state::reconcile_overview_instances_ledger(
+            ov,
+            &fresh_bundle.state.instances,
+            &new_instances_view,
+            &gce_stop_epochs,
+            true,
+            now,
+        )
+    } else {
+        false
+    };
+
     let instances_changed = fresh_bundle.state.instances_view != new_instances_view;
-    let snapshot_written = if instances_changed || initial_refresh {
+    let snapshot_written = if instances_changed || overview_changed || initial_refresh {
         fresh_bundle.state.instances_view = new_instances_view.clone();
         fresh_bundle.state.instances = new_instances_view;
         fresh_bundle.state.updated_at = now;
@@ -842,7 +912,7 @@ where
     let org = bundle.state.org.clone();
 
     // 2. Query Current GCP & GitHub Fleet State
-    let instances = match gcp.list_instances(&project, now).await {
+    let (instances, gcp_list_succeeded) = match gcp.list_instances(&project, now).await {
         Ok(inst) => {
             let fi = serde_json::json!({
                 "source": "gce",
@@ -864,9 +934,9 @@ where
                     }
                 }
             }
-            inst
+            (inst, true)
         }
-        Err(_) => Vec::new(),
+        Err(_) => (Vec::new(), false),
     };
 
     let controlled_targets = if bundle.state.controlled_targets.is_empty() {
@@ -1321,23 +1391,20 @@ where
         compute_fleet_fingerprint(&instances, &runners, queued_jobs, &active_launches);
     let mut last_fp_guard = LAST_FLEET_FINGERPRINT.lock().unwrap();
 
-    let has_mutations = !cleaned_vms.is_empty()
-        || !cleaned_runners.is_empty()
-        || !launched_hosts.is_empty()
-        || (last_fp_guard.as_ref() != Some(&current_fingerprint));
+    let existing_by_name: std::collections::HashMap<String, InstanceRecord> = bundle
+        .state
+        .instances
+        .iter()
+        .map(|inst| (inst.name.clone(), inst.clone()))
+        .collect();
 
-    let heartbeat_elapsed = now.saturating_sub(bundle.written_at) >= HEARTBEAT_INTERVAL_SECS;
+    let gce_stop_epochs: std::collections::HashMap<String, u64> = instances
+        .iter()
+        .filter_map(|i| i.stopped_epoch().map(|ep| (i.name.clone(), ep)))
+        .collect();
 
-    let snapshot_written = if has_mutations || heartbeat_elapsed {
-        // Sync instances_view with active instances while preserving dedicated builders
-        let existing_by_name: std::collections::HashMap<String, InstanceRecord> = bundle
-            .state
-            .instances
-            .iter()
-            .map(|inst| (inst.name.clone(), inst.clone()))
-            .collect();
-
-        bundle.state.instances_view = instances
+    let new_instances_view: Vec<InstanceRecord> = if gcp_list_succeeded {
+        instances
             .iter()
             .filter(|i| {
                 let is_runner = i.name.starts_with("oxidex-runners-");
@@ -1345,25 +1412,50 @@ where
                 (is_runner || is_builder) && !i.status.eq_ignore_ascii_case("TERMINATED")
             })
             .map(|i| {
+                let is_builder = i.name.starts_with("builder-");
+                let norm_zone = i.zone_short().to_string();
+                let norm_region = norm_zone.split('-').take(2).collect::<Vec<_>>().join("-");
+                let norm_machine_type = i.machine_type_short().to_string();
+                let gce_id = i.id.clone().unwrap_or_else(|| i.name.clone());
+
                 if let Some(existing) = existing_by_name.get(&i.name) {
-                    if existing.role == "rust_builder" || i.name.starts_with("builder-") {
+                    let id_changed =
+                        !existing.id.is_empty() && !gce_id.is_empty() && existing.id != gce_id;
+                    if !id_changed {
                         let mut rec = existing.clone();
                         rec.status = i.status.clone();
-                        rec.zone = i.zone.clone();
-                        rec.region = i.zone.split('-').take(2).collect::<Vec<_>>().join("-");
-                        rec.machine_type = i.machine_type.clone();
+                        rec.zone = norm_zone;
+                        rec.region = norm_region;
+                        rec.machine_type = norm_machine_type;
+                        if rec.created_epoch.is_none() {
+                            if let Some(ep) = i.started_epoch() {
+                                rec.created_epoch = Some(ep);
+                                rec.created_at = Some(crate::state::chrono_iso(ep));
+                            }
+                        }
+                        if existing.role == "rust_builder" || is_builder {
+                            rec.role = "rust_builder".to_string();
+                            rec.vcpu = 16;
+                            rec.ram_gib = 32;
+                            rec.runners_count = 0;
+                            rec.runners_count_known = true;
+                            rec.runner_limits_known = true;
+                        } else {
+                            rec.runners_count = RUNNERS_PER_HOST;
+                            rec.runners_count_known = true;
+                            rec.runner_limits_known = true;
+                        }
                         return rec;
                     }
                 }
-                let is_builder = i.name.starts_with("builder-");
-                let launch_epoch = crate::state::parse_launch_epoch_from_name(&i.name);
+                let launch_epoch = i.started_epoch();
                 let created_at = launch_epoch.map(crate::state::chrono_iso);
                 InstanceRecord {
-                    id: i.id.clone().unwrap_or_else(|| i.name.clone()),
+                    id: gce_id,
                     name: i.name.clone(),
-                    zone: i.zone.clone(),
-                    region: i.zone.split('-').take(2).collect::<Vec<_>>().join("-"),
-                    machine_type: i.machine_type.clone(),
+                    zone: norm_zone,
+                    region: norm_region,
+                    machine_type: norm_machine_type,
                     status: i.status.clone(),
                     role: if is_builder {
                         "rust_builder".to_string()
@@ -1379,10 +1471,43 @@ where
                     created_epoch: launch_epoch,
                 }
             })
-            .collect();
+            .collect()
+    } else {
+        bundle.state.instances_view.clone()
+    };
 
-        // Synchronize state.instances with live instances_view for unified action inventory
-        bundle.state.instances = bundle.state.instances_view.clone();
+    let overview_changed = if gcp_list_succeeded {
+        if let Some(ref mut ov) = bundle.state.overview {
+            crate::state::reconcile_overview_instances_ledger(
+                ov,
+                &bundle.state.instances,
+                &new_instances_view,
+                &gce_stop_epochs,
+                true,
+                now,
+            )
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let has_mutations = !cleaned_vms.is_empty()
+        || !cleaned_runners.is_empty()
+        || !launched_hosts.is_empty()
+        || overview_changed
+        || (last_fp_guard.as_ref() != Some(&current_fingerprint));
+
+    let heartbeat_elapsed = now.saturating_sub(bundle.written_at) >= HEARTBEAT_INTERVAL_SECS;
+
+    let snapshot_written = if has_mutations || heartbeat_elapsed {
+        if gcp_list_succeeded {
+            // Sync instances_view with active instances while preserving dedicated builders
+            bundle.state.instances_view = new_instances_view.clone();
+            // Synchronize state.instances with live instances_view for unified action inventory
+            bundle.state.instances = new_instances_view;
+        }
 
         if backlog_known {
             bundle.state.scaling_telemetry.queued_jobs = queued_jobs;

@@ -714,13 +714,14 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:14px; background:var(--bg-card); padding:10px 12px; border-radius:9px; border:1px solid var(--border);">
           <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
             <span style="font-size:12px; color:var(--text-muted); font-weight:600;">Time Scale:</span>
+            <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(0)">Now (0h)</button>
             <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(1)">1h</button>
             <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(6)">6h</button>
             <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(24)">24h</button>
             <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(168)">7d</button>
             <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(720)">30d</button>
             <div style="display:inline-flex; align-items:center; gap:5px; margin-left:4px;">
-              <input type="number" id="inst-custom-window-val" value="24" min="0.1" max="744" step="any" style="width:72px;" oninput="applyCustomWindow()" onchange="applyCustomWindow()" onkeydown="if(event.key==='Enter'){event.preventDefault();applyCustomWindow();}" />
+              <input type="number" id="inst-custom-window-val" value="24" min="0" max="744" step="any" style="width:72px;" oninput="applyCustomWindow()" onchange="applyCustomWindow()" onkeydown="if(event.key==='Enter'){event.preventDefault();applyCustomWindow();}" />
               <select id="inst-custom-window-unit" onchange="applyCustomWindow()">
                 <option value="hours" selected>Hours</option>
                 <option value="days">Days</option>
@@ -2301,9 +2302,9 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const valEl = document.getElementById("inst-custom-window-val");
       const unitEl = document.getElementById("inst-custom-window-unit");
       const raw = parseFloat(valEl ? valEl.value : "24");
-      if (isNaN(raw) || raw <= 0) return;
+      if (isNaN(raw) || raw < 0) return;
       const unit = unitEl ? unitEl.value : "hours";
-      INST_WINDOW_HOURS = Math.min(744, Math.max(0.1, unit === "days" ? raw * 24 : raw));
+      INST_WINDOW_HOURS = Math.min(744, Math.max(0, unit === "days" ? raw * 24 : raw));
       refreshInstancesTable();
     }
 
@@ -3707,10 +3708,10 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           cb.checked = params.get("show_deleted") === "1" || params.get("show_deleted") === "true";
         }
       }
-      if (params.get("window")) {
-        const w = parseFloat(params.get("window"));
-        if (!isNaN(w) && w > 0) {
-          INST_WINDOW_HOURS = w;
+      if (params.get("window") !== null || params.get("window_hours") !== null) {
+        const w = parseFloat(params.get("window") ?? params.get("window_hours"));
+        if (!isNaN(w) && w >= 0) {
+          INST_WINDOW_HOURS = Math.min(744, w);
           const customVal = document.getElementById("inst-custom-window-val");
           const customUnit = document.getElementById("inst-custom-window-unit");
           if (customVal && customUnit) {

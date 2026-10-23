@@ -519,8 +519,70 @@ pub fn parse_launch_epoch_from_name(name: &str) -> Option<u64> {
                 return Some(epoch);
             }
         }
+        // Support 11-char base36-suffixed names (`<6-char-base36-epoch><5-char-rand>`,
+        // e.g. `oxidex-runners-uswest1-b-awwi-tna9fanbqld`).
+        if tokens.len() >= 5 {
+            let last = tokens[tokens.len() - 1];
+            if last.len() == 11
+                && last
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                && last.bytes().any(|b| b.is_ascii_digit())
+            {
+                if let Ok(epoch) = u64::from_str_radix(&last[..6], 36) {
+                    if epoch >= 1_000_000_000 && epoch <= 4_000_000_000 {
+                        return Some(epoch);
+                    }
+                }
+            }
+        }
     }
     None
+}
+
+fn normalize_gce_short_name(raw: &str) -> &str {
+    raw.rsplit('/').next().unwrap_or(raw)
+}
+
+fn normalize_region_from_zone(raw_region: &str, norm_zone: &str) -> String {
+    if !norm_zone.is_empty()
+        && (raw_region.is_empty()
+            || raw_region.contains('/')
+            || raw_region.contains(':')
+            || !norm_zone.starts_with(raw_region))
+    {
+        norm_zone.split('-').take(2).collect::<Vec<_>>().join("-")
+    } else {
+        raw_region.to_string()
+    }
+}
+
+fn lookup_display_location(
+    regions: Option<&serde_json::Value>,
+    base_instances: &[serde_json::Value],
+    region: &str,
+) -> String {
+    if let Some(regs) = regions.and_then(|v| v.as_array()) {
+        for reg in regs {
+            if reg.get("region").and_then(|v| v.as_str()) == Some(region) {
+                if let Some(dl) = reg.get("display_location").and_then(|v| v.as_str()) {
+                    if !dl.is_empty() {
+                        return dl.to_string();
+                    }
+                }
+            }
+        }
+    }
+    for inst in base_instances {
+        if inst.get("region").and_then(|v| v.as_str()) == Some(region) {
+            if let Some(dl) = inst.get("display_location").and_then(|v| v.as_str()) {
+                if !dl.is_empty() && dl != region && !dl.contains('/') {
+                    return dl.to_string();
+                }
+            }
+        }
+    }
+    region.to_string()
 }
 
 fn lookup_instance_pricing(
@@ -603,15 +665,17 @@ fn lookup_instance_pricing(
     None
 }
 
-pub fn apply_dynamic_overview_filtering(
+pub fn reconcile_overview_instances_ledger(
     ov: &mut serde_json::Value,
-    query: &OverviewQuery,
+    previous_live_instances: &[InstanceRecord],
     live_instances_view: &[InstanceRecord],
+    gce_stop_epochs: &std::collections::HashMap<String, u64>,
+    inventory_is_authoritative: bool,
     now: u64,
-) {
+) -> bool {
     let ov_obj = match ov.as_object_mut() {
         Some(obj) => obj,
-        None => return,
+        None => return false,
     };
 
     let qual_val = ov_obj.get("qualifications").cloned();
@@ -625,16 +689,87 @@ pub fn apply_dynamic_overview_filtering(
         .and_then(|v| v.as_object_mut())
         .unwrap();
 
-    let mut base_instances: Vec<serde_json::Value> = iv
+    let original_instances: Vec<serde_json::Value> = iv
         .get("instances")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
 
+    let mut base_instances: Vec<serde_json::Value> = original_instances
+        .iter()
+        .filter(|inst| {
+            let name = inst.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            name.starts_with("oxidex-runners-") || name.starts_with("builder-")
+        })
+        .cloned()
+        .collect();
+
+    // Normalize any existing raw GCE self-link URLs (`zone`, `region`, `machine_type`, `display_location`)
+    let lookup_snapshot = base_instances.clone();
+    for inst in &mut base_instances {
+        if let Some(obj) = inst.as_object_mut() {
+            let raw_zone = obj
+                .get("zone")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !raw_zone.is_empty() {
+                let norm_zone = normalize_gce_short_name(&raw_zone).to_string();
+                if norm_zone != raw_zone {
+                    obj.insert("zone".to_string(), serde_json::json!(norm_zone));
+                }
+                let raw_region = obj
+                    .get("region")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let norm_region = normalize_region_from_zone(&raw_region, &norm_zone);
+                if norm_region != raw_region {
+                    obj.insert("region".to_string(), serde_json::json!(norm_region));
+                }
+                let raw_dl = obj
+                    .get("display_location")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if raw_dl.is_empty() || raw_dl.contains('/') || raw_dl == norm_region {
+                    let resolved_dl = lookup_display_location(
+                        regions_val.as_ref(),
+                        &lookup_snapshot,
+                        &norm_region,
+                    );
+                    if resolved_dl != raw_dl {
+                        obj.insert(
+                            "display_location".to_string(),
+                            serde_json::json!(resolved_dl),
+                        );
+                    }
+                }
+            }
+            let raw_mt = obj
+                .get("machine_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !raw_mt.is_empty() {
+                let norm_mt = normalize_gce_short_name(&raw_mt).to_string();
+                if norm_mt != raw_mt {
+                    obj.insert("machine_type".to_string(), serde_json::json!(norm_mt));
+                }
+            }
+        }
+    }
+
     for rec in live_instances_view {
         if !rec.name.starts_with("oxidex-runners-") && !rec.name.starts_with("builder-") {
             continue;
         }
+        let norm_zone = normalize_gce_short_name(&rec.zone).to_string();
+        let norm_region = normalize_region_from_zone(&rec.region, &norm_zone);
+        let norm_machine_type = normalize_gce_short_name(&rec.machine_type).to_string();
+        let display_location =
+            lookup_display_location(regions_val.as_ref(), &base_instances, &norm_region);
+
         if let Some(existing) = base_instances
             .iter_mut()
             .find(|inst| inst.get("name").and_then(|v| v.as_str()) == Some(&rec.name))
@@ -670,20 +805,32 @@ pub fn apply_dynamic_overview_filtering(
                     obj.insert("started_at".to_string(), serde_json::json!(started_at));
                 }
                 obj.insert("status".to_string(), serde_json::json!(rec.status));
-                obj.insert("zone".to_string(), serde_json::json!(rec.zone));
-                obj.insert("region".to_string(), serde_json::json!(rec.region));
+                obj.insert("zone".to_string(), serde_json::json!(norm_zone));
+                obj.insert("region".to_string(), serde_json::json!(norm_region));
+                let cur_dl = obj
+                    .get("display_location")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if cur_dl.is_empty() || cur_dl.contains('/') || cur_dl == norm_region {
+                    obj.insert(
+                        "display_location".to_string(),
+                        serde_json::json!(display_location),
+                    );
+                }
                 obj.insert(
                     "machine_type".to_string(),
-                    serde_json::json!(rec.machine_type),
+                    serde_json::json!(norm_machine_type),
                 );
                 obj.insert(
                     "runners_count".to_string(),
                     serde_json::json!(rec.runners_count),
                 );
                 if !rec.status.eq_ignore_ascii_case("TERMINATED") || id_changed {
-                    obj.remove("deleted_epoch");
-                    obj.remove("deleted_at");
-                    obj.remove("deletion_trigger");
+                    for key in &["deleted_epoch", "deleted_at", "deletion_trigger"] {
+                        if obj.get(*key).map_or(false, |v| !v.is_null()) {
+                            obj.insert((*key).to_string(), serde_json::Value::Null);
+                        }
+                    }
                 }
             }
         } else {
@@ -692,9 +839,9 @@ pub fn apply_dynamic_overview_filtering(
                 qual_val.as_ref(),
                 regions_val.as_ref(),
                 &base_instances,
-                &rec.machine_type,
-                &rec.zone,
-                &rec.region,
+                &norm_machine_type,
+                &norm_zone,
+                &norm_region,
                 is_builder,
             );
             let pricing_known = pricing_opt.is_some();
@@ -737,7 +884,7 @@ pub fn apply_dynamic_overview_filtering(
                 let mut disk_cat = serde_json::Value::Null;
 
                 if let Some(existing) = base_instances.iter().find(|i| {
-                    i.get("machine_type").and_then(|m| m.as_str()) == Some(&rec.machine_type)
+                    i.get("machine_type").and_then(|m| m.as_str()) == Some(&norm_machine_type)
                 }) {
                     if let Some(c) = existing.get("cpu_platform").and_then(|v| v.as_str()) {
                         cpu = c.to_string();
@@ -763,7 +910,7 @@ pub fn apply_dynamic_overview_filtering(
                         if let Some(types) = reg.get("qualified_types").and_then(|t| t.as_array()) {
                             for qt in types {
                                 if qt.get("machine_type").and_then(|m| m.as_str())
-                                    == Some(&rec.machine_type)
+                                    == Some(&norm_machine_type)
                                 {
                                     if let Some(c) = qt.get("cpu_platform").and_then(|v| v.as_str())
                                     {
@@ -798,10 +945,10 @@ pub fn apply_dynamic_overview_filtering(
                 "id": rec.id,
                 "name": rec.name,
                 "instance_id": rec.id,
-                "zone": rec.zone,
-                "region": rec.region,
-                "display_location": rec.region,
-                "machine_type": rec.machine_type,
+                "zone": norm_zone,
+                "region": norm_region,
+                "display_location": display_location,
+                "machine_type": norm_machine_type,
                 "cpu_platform": observed_cpu,
                 "status": rec.status,
                 "role": rec.role,
@@ -823,7 +970,7 @@ pub fn apply_dynamic_overview_filtering(
                 "deletion_trigger": serde_json::Value::Null,
                 "pricing": pricing,
                 "pricing_known": pricing_known,
-                "runtime_hours": ((now as f64 - started_epoch) / 3600.0).max(0.0),
+                "runtime_hours": 0.0,
                 "hours_in_window": 0.0,
                 "active_hourly_usd": total_hourly,
                 "total_cost_in_window_usd": 0.0,
@@ -832,29 +979,57 @@ pub fn apply_dynamic_overview_filtering(
         }
     }
 
-    if !live_instances_view.is_empty() {
+    if inventory_is_authoritative || !live_instances_view.is_empty() {
         let live_names: std::collections::HashSet<&str> = live_instances_view
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        let prev_live_names: std::collections::HashSet<&str> = previous_live_instances
             .iter()
             .map(|r| r.name.as_str())
             .collect();
 
         for inst in &mut base_instances {
-            if let Some(name) = inst.get("name").and_then(|v| v.as_str()) {
-                if !live_names.contains(name) {
-                    let current_status = inst.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                    if !current_status.eq_ignore_ascii_case("TERMINATED") {
-                        if let Some(obj) = inst.as_object_mut() {
+            let name_opt = inst
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(name) = name_opt {
+                if !live_names.contains(name.as_str()) {
+                    if let Some(obj) = inst.as_object_mut() {
+                        let current_status = obj
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !current_status.eq_ignore_ascii_case("TERMINATED") {
                             obj.insert("status".to_string(), serde_json::json!("TERMINATED"));
-                            if obj.get("deleted_epoch").map_or(true, |v| v.is_null()) {
-                                obj.insert(
-                                    "deleted_epoch".to_string(),
-                                    serde_json::json!(now as f64),
-                                );
-                                obj.insert(
-                                    "deleted_at".to_string(),
-                                    serde_json::json!(chrono_iso(now)),
-                                );
-                            }
+                        }
+                        if obj.get("deleted_epoch").map_or(true, |v| v.is_null()) {
+                            let started_epoch = obj
+                                .get("started_epoch")
+                                .and_then(|v| v.as_f64())
+                                .filter(|v| v.is_finite() && *v > 0.0)
+                                .unwrap_or(0.0);
+                            let already_gone_prior_tick = !prev_live_names.is_empty()
+                                && !prev_live_names.contains(name.as_str());
+                            let stale_untimestamped_zombie =
+                                started_epoch > 0.0 && (now as f64 - started_epoch) > 86400.0;
+
+                            let del_epoch = if let Some(&stop_ep) = gce_stop_epochs.get(&name) {
+                                stop_ep as f64
+                            } else if (already_gone_prior_tick || stale_untimestamped_zombie)
+                                && started_epoch > 0.0
+                            {
+                                started_epoch
+                            } else {
+                                now as f64
+                            };
+                            obj.insert("deleted_epoch".to_string(), serde_json::json!(del_epoch));
+                            obj.insert(
+                                "deleted_at".to_string(),
+                                serde_json::json!(chrono_iso(del_epoch as u64)),
+                            );
                         }
                     }
                 }
@@ -862,12 +1037,64 @@ pub fn apply_dynamic_overview_filtering(
         }
     }
 
+    if inventory_is_authoritative {
+        let retention_cutoff = (now as f64) - (744.0 * 3600.0);
+        base_instances.retain(|inst| {
+            let status = inst.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let is_term = status.eq_ignore_ascii_case("TERMINATED")
+                || inst.get("deleted_epoch").and_then(|v| v.as_f64()).is_some();
+            if !is_term {
+                return true;
+            }
+            let del_ep = inst
+                .get("deleted_epoch")
+                .and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite())
+                .unwrap_or(now as f64);
+            del_ep >= retention_cutoff
+        });
+    }
+
+    let changed = base_instances != original_instances;
+    iv.insert(
+        "instances".to_string(),
+        serde_json::Value::Array(base_instances),
+    );
+    changed
+}
+
+pub fn apply_dynamic_overview_filtering(
+    ov: &mut serde_json::Value,
+    query: &OverviewQuery,
+    live_instances_view: &[InstanceRecord],
+    now: u64,
+) {
+    let empty_stops = std::collections::HashMap::new();
+    reconcile_overview_instances_ledger(ov, &[], live_instances_view, &empty_stops, false, now);
+
+    let ov_obj = match ov.as_object_mut() {
+        Some(obj) => obj,
+        None => return,
+    };
+
+    let qual_val = ov_obj.get("qualifications").cloned();
+    let iv = ov_obj
+        .get_mut("instances_view")
+        .and_then(|v| v.as_object_mut())
+        .unwrap();
+
+    let base_instances: Vec<serde_json::Value> = iv
+        .get("instances")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
     let include_deleted = query.include_deleted.unwrap_or(true);
     let window_hours = query
         .window_hours
-        .filter(|w| w.is_finite() && *w > 0.0)
+        .filter(|w| w.is_finite() && *w >= 0.0)
         .unwrap_or(24.0)
-        .clamp(0.1, 744.0);
+        .clamp(0.0, 744.0);
     let include_disk_and_tax = query.include_disk_and_tax.unwrap_or(true);
     let role_filter = query.role.as_deref().unwrap_or("all").trim();
     let search_filter = query.search.as_deref().unwrap_or("").trim().to_lowercase();
@@ -912,7 +1139,7 @@ pub fn apply_dynamic_overview_filtering(
             .filter(|v| v.is_finite());
         let end_ts = deleted_epoch.unwrap_or(now_f64);
 
-        if is_terminated && end_ts < window_start {
+        if is_terminated && (end_ts < window_start || window_hours == 0.0) {
             continue;
         }
 

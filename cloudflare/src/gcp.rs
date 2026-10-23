@@ -240,8 +240,12 @@ pub struct GceInstance {
     pub status: String,
     #[serde(default, alias = "cpu_platform")]
     pub cpu_platform: Option<String>,
+    #[serde(default, alias = "creation_timestamp")]
+    pub creation_timestamp: Option<String>,
     #[serde(default, alias = "last_start_timestamp")]
     pub last_start_timestamp: Option<String>,
+    #[serde(default, alias = "last_stop_timestamp")]
+    pub last_stop_timestamp: Option<String>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     #[serde(default)]

@@ -1308,3 +1308,365 @@ fn test_dynamic_overview_filtering_resets_reused_vm_id_and_start_time() {
     assert_eq!(ov["pricing"]["running_runner_slots"], 2);
     assert_eq!(ov["pricing"]["active_instances_count"], 1);
 }
+
+#[test]
+fn test_parse_launch_epoch_from_name_decodes_base36_suffix() {
+    assert_eq!(
+        parse_launch_epoch_from_name("oxidex-runners-useast1-c-rkcv-tn5zecc6cas"),
+        Some(1_792_429_428)
+    );
+    assert_eq!(
+        parse_launch_epoch_from_name("oxidex-runners-uswest1-a-grks-tn7iyfbjr5l"),
+        Some(1_792_501_431)
+    );
+    assert_eq!(
+        parse_launch_epoch_from_name("oxidex-runners-uswest1-b-awwi-tna9fanbqld"),
+        Some(1_792_629_046)
+    );
+    // Plain words must not be misidentified as base36 epochs
+    assert_eq!(
+        parse_launch_epoch_from_name("oxidex-runners-c4d-staging"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn test_reconciler_persists_deleted_epoch_in_overview_and_ages_out_of_window() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    set_reconciler_lease(None);
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let t0 = 1_792_629_046u64;
+
+    let (mut bundle, _) = load_state(&kv, t0).await.unwrap();
+    bundle.state.instances = vec![
+        InstanceRecord {
+            id: "1".into(),
+            name: "oxidex-runners-useast1-c-rkcv-tn5zecc6cas".into(),
+            zone: "us-east1-c".into(),
+            region: "us-east1".into(),
+            machine_type: "n4d-standard-4".into(),
+            status: "RUNNING".into(),
+            role: "cicd_runner".into(),
+            vcpu: 4,
+            ram_gib: 16,
+            runners_count: 2,
+            runners_count_known: true,
+            runner_limits_known: true,
+            created_at: Some(chrono_iso(t0 - 36000)),
+            created_epoch: Some(t0 - 36000),
+        },
+        InstanceRecord {
+            id: "2".into(),
+            name: "oxidex-runners-uswest1-b-awwi-tna9fanbqld".into(),
+            zone: "us-west1-b".into(),
+            region: "us-west1".into(),
+            machine_type: "n4d-standard-4".into(),
+            status: "RUNNING".into(),
+            role: "cicd_runner".into(),
+            vcpu: 4,
+            ram_gib: 16,
+            runners_count: 2,
+            runners_count_known: true,
+            runner_limits_known: true,
+            created_at: Some(chrono_iso(t0)),
+            created_epoch: Some(t0),
+        },
+    ];
+    bundle.state.instances_view = bundle.state.instances.clone();
+    bundle.state.overview = Some(serde_json::json!({
+        "instances_view": {
+            "instances": [
+                {
+                    "id": "1",
+                    "instance_id": "1",
+                    "name": "oxidex-runners-useast1-c-rkcv-tn5zecc6cas",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "zone": "us-east1-c",
+                    "region": "us-east1",
+                    "display_location": "Moncks Corner, South Carolina, USA",
+                    "machine_type": "n4d-standard-4",
+                    "started_epoch": (t0 - 36000) as f64,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.0691 }
+                },
+                {
+                    "id": "2",
+                    "instance_id": "2",
+                    "name": "oxidex-runners-uswest1-b-awwi-tna9fanbqld",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "zone": "us-west1-b",
+                    "region": "us-west1",
+                    "display_location": "The Dalles, Oregon, USA",
+                    "machine_type": "n4d-standard-4",
+                    "started_epoch": t0 as f64,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.0675 }
+                }
+            ]
+        }
+    }));
+    save_state(&kv, &mut bundle, t0).await.unwrap();
+
+    // At t_del = t0 + 3600 (1h after start), awwi is preempted and gone from GCE
+    let t_del = t0 + 3600;
+    let gcp = MockGcpFloorClient {
+        instances: vec![SimpleGceInstance {
+            id: Some("1".into()),
+            name: "oxidex-runners-useast1-c-rkcv-tn5zecc6cas".into(),
+            zone: "zones/us-east1-c".into(),
+            machine_type: "machineTypes/n4d-standard-4".into(),
+            status: "RUNNING".into(),
+            metadata: spot_dashboard_edge::gcp::GceMetadata {
+                fingerprint: None,
+                items: vec![],
+            },
+            disks: vec![],
+        }],
+    };
+    let report = run_inventory_refresh(&kv, &gcp, t_del).await.unwrap();
+    assert!(report.snapshot_written);
+
+    // Verify deleted_epoch was persisted in bundle.state.overview in KV
+    let (saved_bundle, _) = load_state(&kv, t_del).await.unwrap();
+    let saved_ov = saved_bundle.state.overview.as_ref().unwrap();
+    let saved_awwi = saved_ov["instances_view"]["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == "oxidex-runners-uswest1-b-awwi-tna9fanbqld")
+        .unwrap();
+    assert_eq!(saved_awwi["status"], "TERMINATED");
+    assert_eq!(saved_awwi["deleted_epoch"], t_del as f64);
+
+    // 2 hours after deletion (t_later = t_del + 7200), query a 1h window with include_deleted = true:
+    // awwi must be excluded because deleted_epoch < window_start!
+    let t_later = t_del + 7200;
+    let q_1h = OverviewQuery {
+        include_deleted: Some(true),
+        window_hours: Some(1.0),
+        ..Default::default()
+    };
+    let (_, resp_1h) = handle_api_overview(&kv, q_1h, t_later).await.unwrap();
+    let iv_1h = &resp_1h["instances_view"];
+    assert_eq!(iv_1h["running_count"], 1);
+    assert_eq!(iv_1h["deleted_count"], 0);
+    assert_eq!(iv_1h["instances"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        iv_1h["instances"][0]["name"],
+        "oxidex-runners-useast1-c-rkcv-tn5zecc6cas"
+    );
+
+    // Query a 24h window at t_later: awwi is included and its runtime is frozen at 1.0h (not 3.0h!)
+    let q_24h = OverviewQuery {
+        include_deleted: Some(true),
+        window_hours: Some(24.0),
+        ..Default::default()
+    };
+    let (_, resp_24h) = handle_api_overview(&kv, q_24h, t_later).await.unwrap();
+    let awwi_24h = resp_24h["instances_view"]["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == "oxidex-runners-uswest1-b-awwi-tna9fanbqld")
+        .unwrap();
+    assert_eq!(awwi_24h["runtime_hours"], 1.0);
+}
+
+#[tokio::test]
+async fn test_self_heals_untimestamped_zombie_and_normalizes_urls_and_supports_zero_window() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    set_reconciler_lease(None);
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1_792_718_740u64;
+    let awwi_start = 1_792_629_113u64; // > 24.8h ago
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    // Simulate KV state where instances_view has raw GCE URLs for 2 running VMs and awwi is already gone from instances,
+    // but overview still has awwi as RUNNING with deleted_epoch = null
+    bundle.state.instances = vec![
+        InstanceRecord {
+            id: "6471737508688692579".into(),
+            name: "oxidex-runners-useast1-c-rkcv-tn5zecc6cas".into(),
+            zone: "https://www.googleapis.com/compute/v1/projects/homelab-424523/zones/us-east1-c"
+                .into(),
+            region: "https://www.googleapis.com/compute/v1/projects/homelab-424523/zones/us".into(),
+            machine_type: "https://www.googleapis.com/compute/v1/projects/homelab-424523/zones/us-east1-c/machineTypes/n4d-standard-4".into(),
+            status: "RUNNING".into(),
+            role: "cicd_runner".into(),
+            vcpu: 4,
+            ram_gib: 16,
+            runners_count: 2,
+            runners_count_known: true,
+            runner_limits_known: true,
+            created_at: None,
+            created_epoch: None,
+        },
+        InstanceRecord {
+            id: "6484907347288971327".into(),
+            name: "oxidex-runners-uswest1-a-grks-tn7iyfbjr5l".into(),
+            zone: "https://www.googleapis.com/compute/v1/projects/homelab-424523/zones/us-west1-a"
+                .into(),
+            region: "https://www.googleapis.com/compute/v1/projects/homelab-424523/zones/us".into(),
+            machine_type: "https://www.googleapis.com/compute/v1/projects/homelab-424523/zones/us-west1-a/machineTypes/n4d-standard-4".into(),
+            status: "RUNNING".into(),
+            role: "cicd_runner".into(),
+            vcpu: 4,
+            ram_gib: 16,
+            runners_count: 2,
+            runners_count_known: true,
+            runner_limits_known: true,
+            created_at: None,
+            created_epoch: None,
+        },
+    ];
+    bundle.state.instances_view = bundle.state.instances.clone();
+    bundle.state.overview = Some(serde_json::json!({
+        "regions": [
+            {
+                "region": "us-east1",
+                "display_location": "Moncks Corner, South Carolina, USA"
+            },
+            {
+                "region": "us-west1",
+                "display_location": "The Dalles, Oregon, USA"
+            }
+        ],
+        "instances_view": {
+            "instances": [
+                {
+                    "id": "6471737508688692579",
+                    "name": "oxidex-runners-useast1-c-rkcv-tn5zecc6cas",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "zone": "https://www.googleapis.com/compute/v1/projects/homelab-424523/zones/us-east1-c",
+                    "region": "us-east1",
+                    "display_location": "Moncks Corner, South Carolina, USA",
+                    "machine_type": "https://www.googleapis.com/compute/v1/projects/homelab-424523/zones/us-east1-c/machineTypes/n4d-standard-4",
+                    "started_epoch": (now - 289000) as f64,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.0691 }
+                },
+                {
+                    "id": "2715653080635285543",
+                    "name": "oxidex-runners-uswest1-b-awwi-tna9fanbqld",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "zone": "us-west1-b",
+                    "region": "us-west1",
+                    "display_location": "us-west1",
+                    "machine_type": "n4d-standard-4",
+                    "started_epoch": awwi_start as f64,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.0675 }
+                }
+            ]
+        }
+    }));
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    // 1. Immediate read with 1h window excludes the stale awwi zombie and normalizes URLs
+    let q_1h = OverviewQuery {
+        include_deleted: Some(true),
+        window_hours: Some(1.0),
+        ..Default::default()
+    };
+    let (_, resp_1h) = handle_api_overview(&kv, q_1h, now).await.unwrap();
+    let insts_1h = resp_1h["instances_view"]["instances"].as_array().unwrap();
+    assert_eq!(insts_1h.len(), 2);
+    for inst in insts_1h {
+        assert_ne!(inst["name"], "oxidex-runners-uswest1-b-awwi-tna9fanbqld");
+        assert_eq!(inst["machine_type"], "n4d-standard-4");
+        assert!(!inst["zone"].as_str().unwrap().contains('/'));
+        assert!(!inst["region"].as_str().unwrap().contains('/'));
+    }
+    let grks = insts_1h
+        .iter()
+        .find(|i| i["name"] == "oxidex-runners-uswest1-a-grks-tn7iyfbjr5l")
+        .unwrap();
+    assert_eq!(grks["zone"], "us-west1-a");
+    assert_eq!(grks["region"], "us-west1");
+    assert_eq!(grks["display_location"], "The Dalles, Oregon, USA");
+
+    // 2. Window of 0.0 hours ("Now (0h)") strictly excludes all terminated instances
+    let q_0h = OverviewQuery {
+        include_deleted: Some(true),
+        window_hours: Some(0.0),
+        ..Default::default()
+    };
+    let (_, resp_0h) = handle_api_overview(&kv, q_0h, now).await.unwrap();
+    assert_eq!(resp_0h["instances_view"]["window_hours"], 0.0);
+    assert_eq!(resp_0h["instances_view"]["deleted_count"], 0);
+    assert_eq!(resp_0h["instances_view"]["running_count"], 2);
+}
+
+#[tokio::test]
+async fn test_zero_fleet_inventory_refresh_retires_last_running_instance_in_overview() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    set_reconciler_lease(None);
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1_792_000_000u64;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    bundle.state.instances = vec![InstanceRecord {
+        id: "last-1".into(),
+        name: "oxidex-runners-last-standing".into(),
+        zone: "us-central1-a".into(),
+        region: "us-central1".into(),
+        machine_type: "c4d-standard-16".into(),
+        status: "RUNNING".into(),
+        role: "cicd_runner".into(),
+        vcpu: 16,
+        ram_gib: 32,
+        runners_count: 2,
+        runners_count_known: true,
+        runner_limits_known: true,
+        created_at: Some(chrono_iso(now - 3600)),
+        created_epoch: Some(now - 3600),
+    }];
+    bundle.state.instances_view = bundle.state.instances.clone();
+    bundle.state.overview = Some(serde_json::json!({
+        "instances_view": {
+            "instances": [
+                {
+                    "id": "last-1",
+                    "name": "oxidex-runners-last-standing",
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "zone": "us-central1-a",
+                    "region": "us-central1",
+                    "machine_type": "c4d-standard-16",
+                    "started_epoch": (now - 3600) as f64,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.18 }
+                }
+            ]
+        }
+    }));
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    // GCE returns 0 instances (last VM was deleted)
+    let gcp = MockGcpFloorClient { instances: vec![] };
+    let report = run_inventory_refresh(&kv, &gcp, now + 600).await.unwrap();
+    assert!(report.snapshot_written);
+
+    // Query overview with include_deleted = false: 0 running instances
+    let q_active = OverviewQuery {
+        include_deleted: Some(false),
+        ..Default::default()
+    };
+    let (_, resp_active) = handle_api_overview(&kv, q_active, now + 600).await.unwrap();
+    assert_eq!(resp_active["instances_view"]["running_count"], 0);
+    assert_eq!(
+        resp_active["instances_view"]["instances"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
