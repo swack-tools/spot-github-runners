@@ -2051,3 +2051,93 @@ async fn test_sanitize_legacy_oxidex_templates_and_ssh_previews() {
         .unwrap();
     assert_eq!(newznab_inst["target"], "xbmc4lyfe/newznab-tmux");
 }
+
+#[tokio::test]
+async fn test_multi_arch_newznab_fleet_metadata_and_target_breakdown() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    set_reconciler_lease(None);
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1792000000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.unwrap();
+    bundle.state.instances = vec![];
+    bundle.state.instances_view = vec![];
+    save_state(&kv, &mut bundle, now).await.unwrap();
+
+    let gcp = MockGcpFloorClient {
+        instances: vec![
+            SimpleGceInstance {
+                id: Some("101".into()),
+                name: "oxidex-runners-xbmc4lyfe-newznab-tmux-x86-1".to_string(),
+                zone: "us-central1-a".to_string(),
+                machine_type: "n4d-standard-16".to_string(),
+                status: "RUNNING".to_string(),
+                metadata: spot_dashboard_edge::gcp::GceMetadata {
+                    fingerprint: None,
+                    items: vec![
+                        spot_dashboard_edge::gcp::GceMetadataItem {
+                            key: "spot-target".to_string(),
+                            value: "xbmc4lyfe/newznab-tmux".to_string(),
+                        },
+                        spot_dashboard_edge::gcp::GceMetadataItem {
+                            key: "spot-runner-count".to_string(),
+                            value: "4".to_string(),
+                        },
+                    ],
+                },
+                disks: vec![],
+            },
+            SimpleGceInstance {
+                id: Some("102".into()),
+                name: "oxidex-runners-xbmc4lyfe-newznab-tmux-arm-01".to_string(),
+                zone: "us-central1-b".to_string(),
+                machine_type: "c4a-standard-4".to_string(),
+                status: "RUNNING".to_string(),
+                metadata: spot_dashboard_edge::gcp::GceMetadata {
+                    fingerprint: None,
+                    items: vec![
+                        spot_dashboard_edge::gcp::GceMetadataItem {
+                            key: "spot-target".to_string(),
+                            value: "xbmc4lyfe/newznab-tmux".to_string(),
+                        },
+                        spot_dashboard_edge::gcp::GceMetadataItem {
+                            key: "spot-runner-count".to_string(),
+                            value: "1".to_string(),
+                        },
+                    ],
+                },
+                disks: vec![],
+            },
+        ],
+    };
+
+    let report = run_inventory_refresh(&kv, &gcp, now).await.unwrap();
+    assert_eq!(report.status, "inventory_refresh_success");
+
+    let (_, resp) = handle_api_overview(&kv, OverviewQuery::default(), now)
+        .await
+        .unwrap();
+
+    let fs = &resp["fleet_summary"];
+    assert_eq!(fs["running_runner_vms"], 2);
+    assert_eq!(fs["running_runner_slots"], 5);
+    assert_eq!(fs["x86_64_runner_vms"], 1);
+    assert_eq!(fs["x86_64_runner_slots"], 4);
+    assert_eq!(fs["arm64_runner_vms"], 1);
+    assert_eq!(fs["arm64_runner_slots"], 1);
+
+    let breakdown = resp["target_fleet_breakdown"].as_array().unwrap();
+    let newznab = breakdown
+        .iter()
+        .find(|b| b["target"] == "xbmc4lyfe/newznab-tmux")
+        .expect("expected xbmc4lyfe/newznab-tmux in target_fleet_breakdown");
+    assert_eq!(newznab["total_vms"], 2);
+    assert_eq!(newznab["total_runner_slots"], 5);
+    assert_eq!(newznab["x86_64_vms"], 1);
+    assert_eq!(newznab["x86_64_runner_slots"], 4);
+    assert_eq!(newznab["arm64_vms"], 1);
+    assert_eq!(newznab["arm64_runner_slots"], 1);
+    assert_eq!(newznab["total_vcpus"], 20);
+    assert_eq!(newznab["total_ram_gib"], 80);
+}

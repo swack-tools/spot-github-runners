@@ -303,7 +303,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </section>
 
-    <!-- TAB 1: WORLD MAP & DATA CENTER INSPECTOR                              -->
     <section id="tab-map" class="tab-pane active">
       <div class="map-layout">
         <div class="panel">
@@ -322,29 +321,18 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
           <div class="world-map-box">
             <svg id="world-map-svg" class="world-svg" viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet">
-              <!-- Latitude / Longitude Grid -->
               <line x1="0" y1="125" x2="1000" y2="125" class="map-grid-line" />
               <line x1="0" y1="250" x2="1000" y2="250" class="map-grid-line" />
               <line x1="0" y1="375" x2="1000" y2="375" class="map-grid-line" />
               <line x1="250" y1="0" x2="250" y2="500" class="map-grid-line" />
               <line x1="500" y1="0" x2="500" y2="500" class="map-grid-line" />
               <line x1="750" y1="0" x2="750" y2="500" class="map-grid-line" />
-
-              <!-- Stylized Continental Polygons -->
-              <!-- North America -->
               <polygon class="continent-shape" points="70,65 260,55 320,120 285,205 210,235 165,215 120,165 75,120" />
-              <!-- South America -->
               <polygon class="continent-shape" points="265,255 345,270 395,335 360,445 305,465 280,375" />
-              <!-- Europe -->
               <polygon class="continent-shape" points="445,70 585,60 610,145 555,185 455,180 435,130" />
-              <!-- Africa -->
               <polygon class="continent-shape" points="450,200 585,200 635,285 595,410 535,415 495,335 445,265" />
-              <!-- Asia -->
               <polygon class="continent-shape" points="595,65 895,75 925,195 845,295 725,290 635,215 600,145" />
-              <!-- Australia -->
               <polygon class="continent-shape" points="775,335 905,335 920,425 815,435 765,390" />
-
-              <!-- Dynamic Region Pins Group -->
               <g id="map-pins-group"></g>
             </svg>
           </div>
@@ -356,14 +344,10 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Selected Data Center / Instance Popup Card -->
-        <div class="panel" id="map-inspector-panel">
-          <!-- Populated dynamically by renderMapInspector() -->
-        </div>
+        <div class="panel" id="map-inspector-panel"></div>
       </div>
     </section>
 
-    <!-- TAB 2: INSTANCE LIST & COST HISTORY (WITH DELETED & TIME WINDOW)      -->
     <section id="tab-instances" class="tab-pane">
       <div class="panel">
         <div class="panel-header">
@@ -453,6 +437,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           </div>
         </div>
 
+        <div id="target-fleet-breakdown-bar" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;"></div>
         <div id="inst-window-summary" style="margin-bottom:10px; font-size:12.5px; color:var(--text-muted);"></div>
 
         <div class="table-wrap">
@@ -1216,7 +1201,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     function waitForControlVm() {
-      // One shared wait: every blocked request resumes when /api/health returns 200.
       if (!CONTROL_VM_WAIT) {
         setControlVmBanner(true);
         CONTROL_VM_WAIT = (async () => {
@@ -1225,9 +1209,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             try {
               const health = await NATIVE_FETCH("/api/health", { cache: "no-store", credentials: "same-origin" });
               if (health.status === 200) return;
-            } catch (_err) {
-              // Still unreachable; keep polling.
-            }
+            } catch (_err) {}
           }
         })().finally(() => {
           CONTROL_VM_WAIT = null;
@@ -1236,7 +1218,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
       return CONTROL_VM_WAIT;
     }
-
     async function isControlVmUnavailable(res) {
       if (!res || res.status !== 503) return false;
       try {
@@ -1246,10 +1227,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         return false;
       }
     }
-
     async function oauthSignInNeeded() {
-      // True when GitHub sign-in is enabled and this browser has no usable session: an expired session
-      // (401) or one that a target-policy change no longer covers (403). Waits out a control VM outage.
       try {
         const res = await fetchWithControlVmRetry("/api/auth/status", { cache: "no-store", credentials: "same-origin" });
         const data = res.ok ? await res.json() : {};
@@ -1258,7 +1236,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         return false;
       }
     }
-
     async function externalChangePendingSeconds(res) {
       if (!res || res.status !== 202) return null;
       try {
@@ -1269,10 +1246,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         return null;
       }
     }
-
-    // Delays (seconds) between automatic retries of a change whose outcome GitHub did not confirm.
     const SAME_KEY_RETRY_DELAYS = [2, 5, 10];
-
     async function sameKeyRetryRequested(res) {
       if (!res || res.status !== 424) return false;
       try {
@@ -1282,9 +1256,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         return false;
       }
     }
-
     async function fetchWithControlVmRetry(input, reqInit) {
-      // Retries the SAME request (same Idempotency-Key) after the control VM comes back.
       let sameKeyRetries = 0;
       for (;;) {
         let res;
@@ -1303,14 +1275,11 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
         const pendingSeconds = await externalChangePendingSeconds(res);
         if (pendingSeconds !== null) {
-          // A change with this Idempotency-Key is still running (for example the edge timed out a long save or
-          // hot-patch): keep asking with the same key until the stored result comes back.
           await new Promise(resolve => setTimeout(resolve, pendingSeconds * 1000));
           continue;
         }
         if (sameKeyRetries < SAME_KEY_RETRY_DELAYS.length && reqInit && reqInit.headers &&
             reqInit.headers.has && reqInit.headers.has("Idempotency-Key") && await sameKeyRetryRequested(res)) {
-          // GitHub did not confirm the outcome: the same key lets the dashboard reconcile instead of repeating.
           await new Promise(resolve => setTimeout(resolve, SAME_KEY_RETRY_DELAYS[sameKeyRetries] * 1000));
           sameKeyRetries += 1;
           continue;
@@ -1318,7 +1287,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         return res;
       }
     }
-
     window.fetch = async function dashboardAuthorizedFetch(input, init = {}) {
       const method = String(init.method || (input && input.method) || "GET").toUpperCase();
       const reqInit = { ...init, method, credentials: init.credentials || "same-origin" };
@@ -1336,8 +1304,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       reqInit.headers = headers;
       let res = await fetchWithControlVmRetry(input, reqInit);
       if (res.status === 401 && token && !new Headers(init.headers || {}).has("Authorization")) {
-        // A stored bearer token is checked before the session cookie, so a stale one masks a valid
-        // GitHub or token session: drop it and retry once (same Idempotency-Key) with the cookie alone.
         storeDashboardAuthToken("");
         const cookieOnly = new Headers(headers);
         cookieOnly.delete("Authorization");
@@ -1345,7 +1311,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         res = await fetchWithControlVmRetry(input, { ...reqInit, headers: cookieOnly });
       }
       if ((res.status === 401 || res.status === 403) && await oauthSignInNeeded()) {
-        // The login gate at "/" offers every sign-in method (including the dashboard token).
         window.location.assign("/");
         return res;
       }
@@ -1549,7 +1514,10 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const unconfirmed = fs.unconfirmed_runner_hosts || 0;
       document.getElementById("kpi-runners-online").textContent = `${totalRunnerSlots} Runners (${runningRunnerVms} VMs)${unconfirmed ? ` · ${unconfirmed} host(s) not confirmed` : ""}`;
       const st = APP_STATE.scaling_telemetry;
-      document.getElementById("kpi-runners-sub").textContent = `Min floor: ${APP_STATE.profiles.cicd_runner.min_runners} · ${st.queued_jobs} queued · ${st.jobs_ran_past_hour} runs in past 1h`;
+      const archSplit = (fs.x86_64_runner_vms || fs.arm64_runner_vms)
+        ? `x86: ${fs.x86_64_runner_slots || 0} (${fs.x86_64_runner_vms || 0} VMs) · ARM64: ${fs.arm64_runner_slots || 0} (${fs.arm64_runner_vms || 0} VMs) · `
+        : "";
+      document.getElementById("kpi-runners-sub").textContent = `${archSplit}Min floor: ${APP_STATE.profiles.cicd_runner.min_runners} · ${st.queued_jobs} queued · ${st.jobs_ran_past_hour} runs/1h`;
 
       const runningBuilders = allRunning.filter(i => i.role === "rust_builder");
       const runningBuilderVms = fs.running_builder_vms !== undefined ? fs.running_builder_vms : runningBuilders.length;
@@ -1580,6 +1548,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       renderWorldMapPins();
       renderMapInspector();
       renderTargetDropdown();
+      renderTargetFleetBreakdown();
       renderInstancesTableRows();
       populateSizingForms();
       renderQualificationTable();
@@ -1907,6 +1876,34 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       SELECTED_TARGETS = null;
       renderTargetDropdown();
       refreshInstancesTable();
+    }
+
+    function selectSingleTarget(target) {
+      if (SELECTED_TARGETS && SELECTED_TARGETS.size === 1 && SELECTED_TARGETS.has(target)) {
+        SELECTED_TARGETS = null;
+      } else {
+        SELECTED_TARGETS = new Set([target]);
+      }
+      renderTargetDropdown();
+      refreshInstancesTable();
+    }
+
+    function renderTargetFleetBreakdown() {
+      const bar = document.getElementById("target-fleet-breakdown-bar");
+      if (!bar || !APP_STATE) return;
+      const rows = APP_STATE.target_fleet_breakdown || (APP_STATE.fleet_summary && APP_STATE.fleet_summary.target_breakdown) || [];
+      if (!rows.length) {
+        bar.innerHTML = "";
+        return;
+      }
+      bar.innerHTML = rows.map(r => {
+        const active = SELECTED_TARGETS && SELECTED_TARGETS.size === 1 && SELECTED_TARGETS.has(r.target);
+        const border = active ? "#38bdf8" : "var(--border)";
+        return `<div data-target="${esc(r.target)}" onclick="selectSingleTarget(this.dataset.target)" style="cursor:pointer; background:var(--bg-card); border:1px solid ${border}; border-radius:8px; padding:7px 11px; font-size:11.5px; display:flex; flex-direction:column; gap:2px;">
+          <div style="font-weight:700; color:#f8fafc;" class="mono">${esc(r.target)} <span class="badge badge-running" style="margin-left:4px;">${r.total_vms || 0} GCP Spot VM${(r.total_vms || 0) === 1 ? "" : "s"} · ${r.total_runner_slots || 0} Runner${(r.total_runner_slots || 0) === 1 ? "" : "s"}</span></div>
+          <div style="color:var(--text-muted);">x86_64: <strong>${r.x86_64_vms || 0} VM${(r.x86_64_vms || 0) === 1 ? "" : "s"}</strong> (${r.x86_64_runner_slots || 0} slots) · ARM64: <strong>${r.arm64_vms || 0} VM${(r.arm64_vms || 0) === 1 ? "" : "s"}</strong> (${r.arm64_runner_slots || 0} slots) · ${r.total_vcpus || 0} vCPU / ${r.total_ram_gib || 0} GiB · $${Number(r.active_hourly_usd || 0).toFixed(2)}/hr</div>
+        </div>`;
+      }).join("");
     }
 
     function applySort(field) {
@@ -3044,9 +3041,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       await loadOverview();
     }
 
-    // --- runner patches panel ---
-    // Renders server data with textContent and createElement only (no HTML parsing). Requests go through the
-    // dashboard fetch wrapper, so every POST carries an Idempotency-Key and waits out control VM restarts.
     const RunnerPatches = (function () {
       const S = { list: null, current: null, preview: null, dirty: false, pendingExternal: null };
       function el(id) { return document.getElementById(id); }
@@ -3067,8 +3061,6 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         return api(url, { method: "POST", headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
                           body: JSON.stringify(body) });
       }
-      // One Idempotency-Key per pending external change: reused for the same payload (also when the user clicks
-      // again) until a final result arrives, so the dashboard can reconcile instead of opening a second PR.
       async function postExternal(url, body) {
         const fingerprint = url + "\n" + JSON.stringify(body);
         if (!S.pendingExternal || S.pendingExternal.fingerprint !== fingerprint) {
@@ -3077,7 +3069,7 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const result = await postJson(url, body, { "Idempotency-Key": S.pendingExternal.key });
         const [res, d] = result;
         if (!(d && (d.retry_same_key === true || d.pending_retry === true)) && res.status !== 0) {
-          S.pendingExternal = null;  // a final answer: the next change gets a new key
+          S.pendingExternal = null;
         }
         return result;
       }
@@ -3643,6 +3635,8 @@ mod tests {
         assert!(DASHBOARD_HTML.contains(r#"id="inst-target-all-cb" checked"#));
         assert!(DASHBOARD_HTML.contains(r#"onclick="reverseTargetFilter()""#));
         assert!(DASHBOARD_HTML.contains(r#"onclick="clearTargetFilter()""#));
+        assert!(DASHBOARD_HTML.contains(r#"id="target-fleet-breakdown-bar""#));
+        assert!(DASHBOARD_HTML.contains(r#"selectSingleTarget"#));
     }
 
     #[test]
