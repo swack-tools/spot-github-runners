@@ -911,7 +911,38 @@ pub fn setup_service_container(
         .cloned()
         .collect();
 
-    if job_networks.is_empty() {
+    let ports_map = net_settings
+        .and_then(|ns| ns.get("Ports"))
+        .and_then(|v| v.as_object());
+    let has_published_tcp_ports = ports_map.map_or(false, |ports| {
+        ports.iter().any(|(k, v)| {
+            k.ends_with("/tcp")
+                && v.as_array().map_or(false, |arr| {
+                    arr.iter().any(|b| {
+                        b.get("HostPort")
+                            .and_then(|hp| hp.as_str())
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .unwrap_or(0)
+                            > 0
+                    })
+                })
+        })
+    });
+    let bridge_ip: Option<String> = networks_map
+        .get("bridge")
+        .and_then(|b| b.get("IPAddress"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            net_settings
+                .and_then(|ns| ns.get("IPAddress"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        });
+
+    if job_networks.is_empty() && (!has_published_tcp_ports || bridge_ip.is_none()) {
         return Ok(());
     }
 
@@ -955,6 +986,12 @@ pub fn setup_service_container(
         }
 
         if target_ip.is_empty() {
+            if let Some(ref bip) = bridge_ip {
+                target_ip = bip.clone();
+            }
+        }
+
+        if target_ip.is_empty() {
             let short_id = if cid.len() >= 12 { &cid[..12] } else { &cid };
             return Err(format!(
                 "Service container {short_id} on {:?} has no IPv4 address",
@@ -962,10 +999,6 @@ pub fn setup_service_container(
             )
             .into());
         }
-
-        let ports_map = net_settings
-            .and_then(|ns| ns.get("Ports"))
-            .and_then(|v| v.as_object());
         if let Some(ports) = ports_map {
             let mut port_keys: Vec<&String> = ports.keys().collect();
             port_keys.sort();

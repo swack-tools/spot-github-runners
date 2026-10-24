@@ -6,8 +6,8 @@ use tempfile::TempDir;
 
 use host_agent::docker_wrapper::{
     extract_option_value, parse_publish_spec, rewrite_publish_args, run_with_runner,
-    split_global_and_sub_args, terminate_relay, wait_for_tcp_handshake, DockerOutput, DockerRunner,
-    PublishSpec, RelayEntry, StateStore,
+    setup_service_container, split_global_and_sub_args, terminate_relay, wait_for_tcp_handshake,
+    DockerOutput, DockerRunner, PublishSpec, RelayEntry, StateStore, WrapperState,
 };
 use host_agent::platform::{MockSystemInspector, SystemInspector};
 
@@ -781,4 +781,25 @@ fn test_real_tcp_handshake_listener_and_timeout() {
 
     let res_fail = wait_for_tcp_handshake("127.0.0.1", closed_port, 0.15);
     assert!(res_fail.is_err());
+}
+
+#[test]
+fn test_bridge_network_published_port_relay() {
+    let temp = TempDir::new().unwrap();
+    let _store = StateStore::new(temp.path().to_path_buf());
+    let daemon =
+        FakeDockerDaemon::new("160bb3de045e6d3234fa30400028627418c30c5b382cf5412f30ba3407014685");
+    let sys = MockSystemInspector::new();
+
+    let cid = "b99999990656e571df71484f85a1571bec1fc74dda5ac87d716034252cdf034c";
+    daemon.add_service_container(cid, "nntp-proxy-smoke", "bridge", "172.17.0.9", 80, 49155);
+
+    let mut state = WrapperState::default();
+    setup_service_container(&[], &mut state, cid, None, &daemon, &sys).unwrap();
+
+    let entry = state.containers.get(cid).expect("bridge container tracked");
+    assert_eq!(entry.target_ip, "172.17.0.9");
+    assert_eq!(entry.relays.len(), 1);
+    assert_eq!(entry.relays[0].local_port, 49155);
+    assert_eq!(entry.relays[0].target_port, 80);
 }

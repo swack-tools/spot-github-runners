@@ -710,6 +710,161 @@ pub fn infer_arch(machine_type: &str) -> &'static str {
     }
 }
 
+pub fn infer_machine_type_vcpu_ram(machine_type: &str, is_builder: bool) -> (u32, u32) {
+    if is_builder {
+        return (16, 32);
+    }
+    let mt = normalize_gce_short_name(machine_type.trim()).to_lowercase();
+    let vcpu = mt
+        .rsplit('-')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(16);
+    if vcpu == 4 {
+        let ram = if mt.contains("-highcpu-") { 8 } else { 16 };
+        return (4, ram);
+    }
+    if vcpu == 8 {
+        let ram = if mt.contains("-highcpu-") { 16 } else { 32 };
+        return (8, ram);
+    }
+    if mt == "n4d-standard-16"
+        || mt == "c4a-standard-16"
+        || mt == "n4a-standard-16"
+        || mt == "t2a-standard-16"
+    {
+        return (16, 64);
+    }
+    (vcpu.max(4), 32)
+}
+
+fn fallback_machine_type_hardware_meta(
+    machine_type: &str,
+    is_builder: bool,
+) -> Option<(&'static str, u32, u32, &'static str, &'static str)> {
+    let mt = normalize_gce_short_name(machine_type.trim()).to_lowercase();
+    let disk_gb = if is_builder { 375 } else { 100 };
+    if mt.starts_with("c4a-") {
+        Some((
+            "Google Axion (Neoverse V2)",
+            if mt.ends_with("-4") {
+                1180
+            } else if mt.ends_with("-8") {
+                1635
+            } else {
+                2980
+            },
+            disk_gb,
+            "hyperdisk-balanced",
+            "hyperdrive",
+        ))
+    } else if mt.starts_with("n4a-") {
+        Some((
+            "Google Axion (Neoverse N3)",
+            if mt.ends_with("-4") {
+                1080
+            } else if mt.ends_with("-8") {
+                1472
+            } else {
+                2720
+            },
+            disk_gb,
+            "hyperdisk-balanced",
+            "hyperdrive",
+        ))
+    } else if mt.starts_with("t2a-") {
+        Some((
+            "Ampere Altra (Neoverse N1)",
+            if mt.ends_with("-4") {
+                920
+            } else if mt.ends_with("-8") {
+                1129
+            } else {
+                2100
+            },
+            disk_gb,
+            "pd-balanced",
+            "standard_ssd",
+        ))
+    } else if mt.starts_with("n4d-") || mt.starts_with("c4d-") {
+        Some((
+            "AMD Turin",
+            if mt.ends_with("-4") { 1240 } else { 2850 },
+            disk_gb,
+            "hyperdisk-balanced",
+            "hyperdrive",
+        ))
+    } else if mt.starts_with("n4-") || mt.starts_with("c4-") {
+        Some((
+            "Intel Emerald Rapids",
+            2620,
+            disk_gb,
+            "hyperdisk-balanced",
+            "hyperdrive",
+        ))
+    } else if mt.starts_with("c2d-") || mt.starts_with("n2d-") || mt.starts_with("t2d-") {
+        Some((
+            "AMD Milan",
+            1850,
+            disk_gb,
+            "pd-balanced",
+            "standard_ssd",
+        ))
+    } else {
+        None
+    }
+}
+
+fn fallback_machine_type_pricing(
+    machine_type: &str,
+    is_builder: bool,
+) -> Option<serde_json::Value> {
+    let mt = normalize_gce_short_name(machine_type.trim()).to_lowercase();
+    let (compute_hourly, disk_hourly): (f64, f64) = match mt.as_str() {
+        "c4a-standard-4" => (0.0210, 0.010),
+        "n4a-standard-4" => (0.0592, 0.010),
+        "t2a-standard-4" => (0.0653, 0.009),
+        "n4d-standard-4" => (0.0575, 0.010),
+        "n4d-standard-16" => (0.2100, 0.014),
+        "c4a-highcpu-8" => (0.0336, 0.014),
+        "c4a-standard-8" => (0.0399, 0.014),
+        "n4a-highcpu-8" => (0.0998, 0.014),
+        "n4a-standard-8" => (0.1183, 0.014),
+        "t2a-standard-8" => (0.1306, 0.013),
+        "c4a-highcpu-16" => (0.0673, if is_builder { 0.028 } else { 0.014 }),
+        "c4a-standard-16" => (0.0798, if is_builder { 0.028 } else { 0.014 }),
+        "n4a-highcpu-16" => (0.1996, if is_builder { 0.028 } else { 0.014 }),
+        "t2a-standard-16" => (0.3213, if is_builder { 0.026 } else { 0.013 }),
+        "n4-highcpu-16" => (0.1550, if is_builder { 0.028 } else { 0.014 }),
+        "c4d-highcpu-16" => (0.1480, 0.014),
+        "c4d-standard-16" => (0.1660, 0.014),
+        _ => return None,
+    };
+    let compute_daily = ((compute_hourly * 24.0) * 100.0).round() / 100.0;
+    let compute_monthly = ((compute_hourly * 720.0) * 100.0).round() / 100.0;
+    let disk_daily = ((disk_hourly * 24.0) * 100.0).round() / 100.0;
+    let disk_monthly = ((disk_hourly * 720.0) * 100.0).round() / 100.0;
+    let total_hourly = ((compute_hourly + disk_hourly) * 10000.0).round() / 10000.0;
+    let total_daily = ((compute_daily + disk_daily) * 100.0).round() / 100.0;
+    let total_monthly = ((compute_monthly + disk_monthly) * 100.0).round() / 100.0;
+    Some(serde_json::json!({
+        "compute_hourly_usd": compute_hourly,
+        "compute_daily_usd": compute_daily,
+        "compute_monthly_usd": compute_monthly,
+        "disk_hourly_usd": disk_hourly,
+        "disk_daily_usd": disk_daily,
+        "disk_monthly_usd": disk_monthly,
+        "tax_hourly_usd": 0.0,
+        "tax_daily_usd": 0.0,
+        "tax_monthly_usd": 0.0,
+        "tax_rate_percent": 0.0,
+        "total_hourly_usd": total_hourly,
+        "total_daily_usd": total_daily,
+        "total_monthly_usd": total_monthly,
+        "pricing_source": "gcp_capacity_history"
+    }))
+}
+
 pub fn parse_launch_epoch_from_name(name: &str) -> Option<u64> {
     let tokens: Vec<&str> = name.split('-').collect();
     if tokens.len() >= 3 {
@@ -861,7 +1016,7 @@ fn lookup_instance_pricing(
         }
     }
 
-    None
+    fallback_machine_type_pricing(machine_type, is_builder)
 }
 
 pub fn reconcile_overview_instances_ledger(
@@ -1137,7 +1292,36 @@ pub fn reconcile_overview_instances_ledger(
                         }
                     }
                 }
+                if cpu == "Unknown" || bench.is_null() {
+                    if let Some((fb_cpu, fb_bench, fb_disk_gb, fb_disk_type, fb_disk_cat)) =
+                        fallback_machine_type_hardware_meta(&norm_machine_type, is_builder)
+                    {
+                        if cpu == "Unknown" {
+                            cpu = fb_cpu.to_string();
+                        }
+                        if bench.is_null() {
+                            bench = serde_json::json!(fb_bench);
+                        }
+                        if disk_gb.is_null() {
+                            disk_gb = serde_json::json!(fb_disk_gb);
+                        }
+                        if disk_type.is_null() {
+                            disk_type = serde_json::json!(fb_disk_type);
+                        }
+                        if disk_cat.is_null() {
+                            disk_cat = serde_json::json!(fb_disk_cat);
+                        }
+                    }
+                }
                 (cpu, bench, disk_gb, disk_type, disk_cat)
+            };
+
+            let default_runner_vcpu = if is_builder {
+                16
+            } else if rec.runners_count >= 4 || rec.vcpu <= 4 {
+                4
+            } else {
+                7
             };
 
             base_instances.push(serde_json::json!({
@@ -1156,7 +1340,7 @@ pub fn reconcile_overview_instances_ledger(
                 "runners_count": rec.runners_count,
                 "runners_count_known": rec.runners_count_known,
                 "runner_limits_known": rec.runner_limits_known,
-                "runner_vcpu": if is_builder { 16 } else { 7 },
+                "runner_vcpu": default_runner_vcpu,
                 "runner_ram_gib": if is_builder { 28 } else { 14 },
                 "benchmark_score": observed_benchmark,
                 "data_disk_gb": observed_disk_gb,
@@ -1296,7 +1480,13 @@ fn make_arm64_candidate_offer(
     } else {
         1
     };
-    let unit_vcpu = if is_builder { 16 } else { 7 };
+    let unit_vcpu = if is_builder {
+        16
+    } else if vcpu <= 4 {
+        4
+    } else {
+        7
+    };
     let unit_ram_gib = if is_builder { 28 } else { 14 };
     let instances_needed_for_floor = if is_builder {
         1
@@ -1416,6 +1606,60 @@ fn enrich_arm64_catalog_and_qualifications(
     max_latency_ms: Option<f64>,
 ) {
     let cicd_arm64_offers = vec![
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "c4a",
+            "c4a-standard-4",
+            "Google Axion (Neoverse V2)",
+            4,
+            16,
+            1180,
+            "us-central1",
+            "us-central1-a",
+            "Council Bluffs, Iowa",
+            "North America",
+            18,
+            0.0210,
+            0.010,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "n4a",
+            "n4a-standard-4",
+            "Google Axion (Neoverse N3)",
+            4,
+            16,
+            1080,
+            "us-central1",
+            "us-central1-a",
+            "Council Bluffs, Iowa",
+            "North America",
+            18,
+            0.0592,
+            0.010,
+            "hyperdrive",
+            "hyperdisk-balanced",
+        ),
+        make_arm64_candidate_offer(
+            "cicd_runner",
+            "t2a",
+            "t2a-standard-4",
+            "Ampere Altra (Neoverse N1)",
+            4,
+            16,
+            920,
+            "us-central1",
+            "us-central1-a",
+            "Council Bluffs, Iowa",
+            "North America",
+            18,
+            0.0653,
+            0.009,
+            "standard_ssd",
+            "pd-balanced",
+        ),
         make_arm64_candidate_offer(
             "cicd_runner",
             "c4a",
@@ -1833,6 +2077,48 @@ fn enrich_arm64_catalog_and_qualifications(
         }
         let default_arm64_tpls = [
             serde_json::json!({
+                "id": "tpl-runner-c4a-std4",
+                "name": "Runner C4A-Standard-4 (Google Axion ARM64 4 vCPU / 14 GiB)",
+                "role": "cicd_runner",
+                "arch": "arm64",
+                "machine_type": "c4a-standard-4",
+                "vcpu": 4,
+                "ram_gib": 16,
+                "cpu_platform": "Google Axion (Neoverse V2)",
+                "benchmark_score": 1180,
+                "disk_category": "hyperdrive",
+                "boot_disk_type": "hyperdisk-balanced",
+                "boot_disk_gb": 40,
+                "data_disk_type": "hyperdisk-balanced",
+                "data_disk_gb": 100,
+                "runners_count": 1,
+                "runner_vcpu": 4,
+                "runner_ram_gib": 14,
+                "cloud_init_template_id": "ci-runner-default",
+                "created_at": "2026-10-24T00:00:00Z"
+            }),
+            serde_json::json!({
+                "id": "tpl-runner-n4d-std16-4slot",
+                "name": "Runner N4D-Standard-16 (AMD Turin x86_64 4x 4 vCPU / 14 GiB)",
+                "role": "cicd_runner",
+                "arch": "x86_64",
+                "machine_type": "n4d-standard-16",
+                "vcpu": 16,
+                "ram_gib": 64,
+                "cpu_platform": "AMD Turin",
+                "benchmark_score": 2850,
+                "disk_category": "hyperdrive",
+                "boot_disk_type": "hyperdisk-balanced",
+                "boot_disk_gb": 40,
+                "data_disk_type": "hyperdisk-balanced",
+                "data_disk_gb": 100,
+                "runners_count": 4,
+                "runner_vcpu": 4,
+                "runner_ram_gib": 14,
+                "cloud_init_template_id": "ci-runner-default",
+                "created_at": "2026-10-24T00:00:00Z"
+            }),
+            serde_json::json!({
                 "id": "tpl-runner-c4a-highcpu8",
                 "name": "Runner C4A-HighCPU-8 (Google Axion ARM64 DDR5)",
                 "role": "cicd_runner",
@@ -2189,6 +2475,38 @@ pub fn apply_dynamic_overview_filtering(
             continue;
         }
 
+        let is_builder_inst = inst_role == "rust_builder";
+        if inst
+            .get("workload_summary")
+            .and_then(|v| v.as_str())
+            .map_or(true, |s| s.trim().is_empty())
+        {
+            if is_builder_inst {
+                inst["workload_summary"] =
+                    serde_json::json!("1 Dedicated Rust 1.99 Builder (16 vCPU / 28 GiB RAM)");
+            } else {
+                let rc = inst
+                    .get("runners_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(2) as u32;
+                let rv = inst
+                    .get("runner_vcpu")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(if rc >= 4 { 4 } else { 7 }) as u32;
+                let rr = inst
+                    .get("runner_ram_gib")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(14) as u32;
+                inst["workload_summary"] = serde_json::json!(format!(
+                    "{} GitHub Action Runner{} ({} vCPU / {} GiB RAM each)",
+                    rc,
+                    if rc == 1 { "" } else { "s" },
+                    rv,
+                    rr
+                ));
+            }
+        }
+
         let inst_target = infer_instance_target(&inst, &default_org);
         inst["target"] = serde_json::json!(inst_target);
         if let Some(ref sel) = selected_targets {
@@ -2404,43 +2722,128 @@ pub fn apply_dynamic_overview_filtering(
     let mut fs_hourly_burn = 0.0;
     let mut fs_running_runner_slots = 0;
     let mut fs_running_runner_vms = 0;
+    let mut fs_x86_runner_vms = 0u32;
+    let mut fs_arm64_runner_vms = 0u32;
+    let mut fs_x86_runner_slots = 0u32;
+    let mut fs_arm64_runner_slots = 0u32;
     let mut fs_unconfirmed_runner_hosts = 0;
     let mut fs_running_builder_vms = 0;
     let mut fs_total_vcpus = 0;
     let mut fs_total_ram_gib = 0;
 
+    #[derive(Default)]
+    struct TargetAgg {
+        total_vms: u32,
+        runner_vms: u32,
+        builder_vms: u32,
+        x86_64_vms: u32,
+        arm64_vms: u32,
+        total_runner_slots: u32,
+        x86_64_runner_slots: u32,
+        arm64_runner_slots: u32,
+        total_vcpus: u32,
+        total_ram_gib: u32,
+        active_hourly_usd: f64,
+    }
+    let mut target_aggs: std::collections::BTreeMap<String, TargetAgg> =
+        std::collections::BTreeMap::new();
+
     for inst in &all_running {
         let is_builder = inst.get("role").and_then(|v| v.as_str()) == Some("rust_builder");
         let vcpu = inst.get("vcpu").and_then(|v| v.as_u64()).unwrap_or(16) as u32;
         let ram = inst.get("ram_gib").and_then(|v| v.as_u64()).unwrap_or(32) as u32;
+        let mt = inst
+            .get("machine_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let arch = infer_arch(mt);
+        let t_name = infer_instance_target(inst, &default_org);
         fs_total_vcpus += vcpu;
         fs_total_ram_gib += ram;
 
         let active_hourly = inst
             .get("active_hourly_usd")
             .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite() && *v >= 0.0)
             .unwrap_or_else(|| {
                 inst.get("pricing")
                     .and_then(|p| p.get("total_hourly_usd"))
                     .and_then(|v| v.as_f64())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
                     .unwrap_or(0.0)
             });
         fs_hourly_burn += active_hourly;
 
+        let agg = target_aggs.entry(t_name).or_default();
+        agg.total_vms += 1;
+        agg.total_vcpus += vcpu;
+        agg.total_ram_gib += ram;
+        agg.active_hourly_usd += active_hourly;
+        if arch == "arm64" {
+            agg.arm64_vms += 1;
+        } else {
+            agg.x86_64_vms += 1;
+        }
+
         if is_builder {
             fs_running_builder_vms += 1;
+            agg.builder_vms += 1;
         } else {
             fs_running_runner_vms += 1;
+            agg.runner_vms += 1;
             let count = inst
                 .get("runners_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
             fs_running_runner_slots += count;
+            agg.total_runner_slots += count;
+            if arch == "arm64" {
+                fs_arm64_runner_vms += 1;
+                fs_arm64_runner_slots += count;
+                agg.arm64_runner_slots += count;
+            } else {
+                fs_x86_runner_vms += 1;
+                fs_x86_runner_slots += count;
+                agg.x86_64_runner_slots += count;
+            }
             if inst.get("runners_count_known") == Some(&serde_json::json!(false)) {
                 fs_unconfirmed_runner_hosts += 1;
             }
         }
     }
+
+    let mut target_fleet_breakdown: Vec<serde_json::Value> = target_aggs
+        .into_iter()
+        .map(|(target, agg)| {
+            let hr = (agg.active_hourly_usd * 10000.0).round() / 10000.0;
+            let day = (agg.active_hourly_usd * 24.0 * 100.0).round() / 100.0;
+            serde_json::json!({
+                "target": target,
+                "total_vms": agg.total_vms,
+                "runner_vms": agg.runner_vms,
+                "builder_vms": agg.builder_vms,
+                "x86_64_vms": agg.x86_64_vms,
+                "arm64_vms": agg.arm64_vms,
+                "total_runner_slots": agg.total_runner_slots,
+                "x86_64_runner_slots": agg.x86_64_runner_slots,
+                "arm64_runner_slots": agg.arm64_runner_slots,
+                "total_vcpus": agg.total_vcpus,
+                "total_ram_gib": agg.total_ram_gib,
+                "active_hourly_usd": hr,
+                "active_daily_usd": day
+            })
+        })
+        .collect();
+    target_fleet_breakdown.sort_by(|a, b| {
+        let va = a.get("total_vms").and_then(|v| v.as_u64()).unwrap_or(0);
+        let vb = b.get("total_vms").and_then(|v| v.as_u64()).unwrap_or(0);
+        vb.cmp(&va).then_with(|| {
+            a.get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("target").and_then(|v| v.as_str()).unwrap_or(""))
+        })
+    });
 
     let fs_hourly_rounded = (fs_hourly_burn * 10000.0).round() / 10000.0;
     let fs_daily_rounded = (fs_hourly_burn * 24.0 * 100.0).round() / 100.0;
@@ -2457,6 +2860,10 @@ pub fn apply_dynamic_overview_filtering(
     };
 
     ov_obj.insert(
+        "target_fleet_breakdown".to_string(),
+        serde_json::Value::Array(target_fleet_breakdown.clone()),
+    );
+    ov_obj.insert(
         "fleet_summary".to_string(),
         serde_json::json!({
             "active_hourly_burn_usd": fs_hourly_rounded,
@@ -2464,12 +2871,17 @@ pub fn apply_dynamic_overview_filtering(
             "active_monthly_burn_usd": fs_monthly_rounded,
             "running_runner_slots": fs_running_runner_slots,
             "running_runner_vms": fs_running_runner_vms,
+            "x86_64_runner_vms": fs_x86_runner_vms,
+            "arm64_runner_vms": fs_arm64_runner_vms,
+            "x86_64_runner_slots": fs_x86_runner_slots,
+            "arm64_runner_slots": fs_arm64_runner_slots,
             "unconfirmed_runner_hosts": fs_unconfirmed_runner_hosts,
             "running_builder_instances": fs_running_builder_vms,
             "running_builder_vms": fs_running_builder_vms,
             "total_vcpus": fs_total_vcpus,
             "total_ram_gib": fs_total_ram_gib,
-            "active_instances_count": all_running.len()
+            "active_instances_count": all_running.len(),
+            "target_breakdown": target_fleet_breakdown
         }),
     );
 

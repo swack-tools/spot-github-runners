@@ -611,18 +611,30 @@ fn apply_gce_instance_targets_to_overview(
     instances: &[SimpleGceInstance],
 ) -> bool {
     let mut gce_targets: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut gce_runner_counts: std::collections::HashMap<&str, u32> =
+        std::collections::HashMap::new();
     for inst in instances {
         let target_opt = inst
             .metadata
             .get("spot-runner-registration-target")
             .or_else(|| inst.metadata.get("spot-runner-patch-target"))
+            .or_else(|| inst.metadata.get("spot-target"))
+            .or_else(|| inst.metadata.get("spot-runner-target"))
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if let Some(t) = target_opt {
             gce_targets.insert(inst.name.as_str(), t.to_string());
         }
+        if let Some(rc) = inst
+            .metadata
+            .get("spot-runner-count")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&c| c > 0)
+        {
+            gce_runner_counts.insert(inst.name.as_str(), rc);
+        }
     }
-    if gce_targets.is_empty() {
+    if gce_targets.is_empty() && gce_runner_counts.is_empty() {
         return false;
     }
     let mut changed = false;
@@ -649,6 +661,21 @@ fn apply_gce_instance_targets_to_overview(
                                 serde_json::json!(target),
                             );
                             obj.insert("target".to_string(), serde_json::json!(target));
+                            changed = true;
+                        }
+                    }
+                    if let Some(&rc) = gce_runner_counts.get(name.as_str()) {
+                        let existing_rc =
+                            obj.get("runners_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        if existing_rc != rc {
+                            obj.insert("runners_count".to_string(), serde_json::json!(rc));
+                            obj.insert("runners_count_known".to_string(), serde_json::json!(true));
+                            obj.insert("runner_limits_known".to_string(), serde_json::json!(true));
+                            let vcpu =
+                                obj.get("vcpu").and_then(|v| v.as_u64()).unwrap_or(16) as u32;
+                            let per_vcpu = (vcpu / rc.max(1)).max(1);
+                            obj.insert("runner_vcpu".to_string(), serde_json::json!(per_vcpu));
+                            obj.insert("runner_ram_gib".to_string(), serde_json::json!(14));
                             changed = true;
                         }
                     }
@@ -746,6 +773,13 @@ where
             let norm_region = norm_zone.split('-').take(2).collect::<Vec<_>>().join("-");
             let norm_machine_type = i.machine_type_short().to_string();
             let gce_id = i.id.clone().unwrap_or_else(|| i.name.clone());
+            let meta_runner_count = i
+                .metadata
+                .get("spot-runner-count")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|&c| c > 0);
+            let (inferred_vcpu, inferred_ram_gib) =
+                crate::state::infer_machine_type_vcpu_ram(&norm_machine_type, is_builder);
 
             if let Some(existing) = existing_by_name.get(&i.name) {
                 // If GCE ID changed, a new VM was created under the same name: reset identity and start timestamps
@@ -770,6 +804,12 @@ where
                         rec.runners_count = 0;
                         rec.runners_count_known = true;
                         rec.runner_limits_known = true;
+                    } else if let Some(rc) = meta_runner_count {
+                        rec.vcpu = inferred_vcpu;
+                        rec.ram_gib = inferred_ram_gib;
+                        rec.runners_count = rc;
+                        rec.runners_count_known = true;
+                        rec.runner_limits_known = true;
                     }
                     return rec;
                 }
@@ -788,11 +828,15 @@ where
                 } else {
                     "cicd_runner".to_string()
                 },
-                vcpu: if is_builder { 16 } else { MIN_HOST_VCPU },
-                ram_gib: if is_builder { 32 } else { MIN_HOST_RAM_GIB },
-                runners_count: 0,
-                runners_count_known: is_builder,
-                runner_limits_known: is_builder,
+                vcpu: inferred_vcpu,
+                ram_gib: inferred_ram_gib,
+                runners_count: if is_builder {
+                    0
+                } else {
+                    meta_runner_count.unwrap_or(0)
+                },
+                runners_count_known: is_builder || meta_runner_count.is_some(),
+                runner_limits_known: is_builder || meta_runner_count.is_some(),
                 created_at,
                 created_epoch: launch_epoch,
             }
@@ -1568,6 +1612,13 @@ where
                 let norm_region = norm_zone.split('-').take(2).collect::<Vec<_>>().join("-");
                 let norm_machine_type = i.machine_type_short().to_string();
                 let gce_id = i.id.clone().unwrap_or_else(|| i.name.clone());
+                let meta_runner_count = i
+                    .metadata
+                    .get("spot-runner-count")
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .filter(|&c| c > 0);
+                let (inferred_vcpu, inferred_ram_gib) =
+                    crate::state::infer_machine_type_vcpu_ram(&norm_machine_type, is_builder);
 
                 if let Some(existing) = existing_by_name.get(&i.name) {
                     let id_changed =
@@ -1592,7 +1643,11 @@ where
                             rec.runners_count_known = true;
                             rec.runner_limits_known = true;
                         } else {
-                            rec.runners_count = RUNNERS_PER_HOST;
+                            if meta_runner_count.is_some() {
+                                rec.vcpu = inferred_vcpu;
+                                rec.ram_gib = inferred_ram_gib;
+                            }
+                            rec.runners_count = meta_runner_count.unwrap_or(RUNNERS_PER_HOST);
                             rec.runners_count_known = true;
                             rec.runner_limits_known = true;
                         }
@@ -1613,9 +1668,13 @@ where
                     } else {
                         "cicd_runner".to_string()
                     },
-                    vcpu: if is_builder { 16 } else { MIN_HOST_VCPU },
-                    ram_gib: if is_builder { 32 } else { MIN_HOST_RAM_GIB },
-                    runners_count: if is_builder { 0 } else { RUNNERS_PER_HOST },
+                    vcpu: inferred_vcpu,
+                    ram_gib: inferred_ram_gib,
+                    runners_count: if is_builder {
+                        0
+                    } else {
+                        meta_runner_count.unwrap_or(RUNNERS_PER_HOST)
+                    },
                     runners_count_known: true,
                     runner_limits_known: true,
                     created_at,

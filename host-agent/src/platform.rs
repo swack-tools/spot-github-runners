@@ -144,10 +144,10 @@ impl SystemInspector for DefaultSystemInspector {
         }
     }
 
-    fn process_record(&self, _pid: i32) -> Result<ProcessRecord, String> {
+    fn process_record(&self, pid: i32) -> Result<ProcessRecord, String> {
         #[cfg(target_os = "linux")]
         {
-            let stat_path = format!("/proc/{}/stat", _pid);
+            let stat_path = format!("/proc/{}/stat", pid);
             let content = std::fs::read_to_string(&stat_path)
                 .map_err(|e| format!("Cannot read {}: {}", stat_path, e))?;
             let (_, after_comm) = content
@@ -173,6 +173,7 @@ impl SystemInspector for DefaultSystemInspector {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = pid;
             Ok(ProcessRecord {
                 ppid: 1,
                 starttime: "1000".to_string(),
@@ -366,7 +367,7 @@ impl SystemInspector for DefaultSystemInspector {
             };
 
             Ok(AggregateCounters {
-                path: full_dir,
+                path: full_dir.clone(),
                 inode: meta.ino(),
                 device: meta.dev(),
                 monotonic_ns: std::time::SystemTime::now()
