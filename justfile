@@ -27,7 +27,7 @@ build-host-agent:
 
 # Build Cloudflare Worker Wasm bundle and JavaScript shim.
 build-worker:
-    cd cloudflare && worker-build --release
+    cd cloudflare && PATH="$(rustup which rustc 2>/dev/null | xargs dirname):$HOME/.cargo/bin:$PATH" worker-build --release
 
 # Fast check for compiler errors across both crates and verify documentation with Vale.
 check: check-crates check-vale
@@ -133,4 +133,8 @@ deploy-worker:
         exit 1
     fi
     echo "Deploying spot-dashboard-edge with GCP_PROJECT=$project"
-    cd cloudflare && wrangler deploy --var "GCP_PROJECT:$project"
+    config_args=()
+    if [ -f "${HOME}/oxidex-ops/wrangler.deploy.toml" ]; then
+        config_args=(-c "${HOME}/oxidex-ops/wrangler.deploy.toml")
+    fi
+    cd cloudflare && wrangler deploy ${config_args[@]+"${config_args[@]}"} --keep-vars --var "GCP_PROJECT:$project"

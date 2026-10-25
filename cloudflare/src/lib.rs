@@ -161,12 +161,43 @@ async fn github_get_json(url: &str, gh_token: Option<&str>) -> Result<(u16, Valu
 }
 
 fn is_production_oauth_configured(env: &Env) -> bool {
-    let secret = env
-        .secret("GITHUB_OAUTH_CLIENT_SECRET")
-        .or_else(|_| env.var("GITHUB_OAUTH_CLIENT_SECRET"))
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-    !secret.trim().is_empty()
+    resolve_env_non_empty(env, "GITHUB_OAUTH_CLIENT_SECRET").is_some()
+}
+
+fn resolve_env_non_empty(env: &Env, key: &str) -> Option<String> {
+    if let Ok(val) = env.var(key) {
+        let s = val.to_string();
+        if !s.trim().is_empty() {
+            return Some(s.trim().to_string());
+        }
+    }
+    if let Ok(val) = env.secret(key) {
+        let s = val.to_string();
+        if !s.trim().is_empty() {
+            return Some(s.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Resolves the GitHub OAuth client ID from Worker vars or secrets.
+/// Refuses to fall back to `mock-spot-client-id` when production OAuth is enabled.
+pub fn resolve_oauth_client_id(
+    var_val: Option<&str>,
+    secret_val: Option<&str>,
+    is_production: bool,
+) -> Option<String> {
+    if let Some(id) = var_val.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(id.to_string());
+    }
+    if let Some(id) = secret_val.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(id.to_string());
+    }
+    if is_production {
+        None
+    } else {
+        Some("mock-spot-client-id".to_string())
+    }
 }
 
 /// Top-level fetch handler for the Cloudflare Worker.
@@ -1688,16 +1719,29 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             let verifier = auth::pkce_verifier(session_secret, &signed_state);
             let challenge = auth::pkce_challenge(&verifier);
 
-            let client_id = env
+            let var_client_id = env
                 .var("GITHUB_OAUTH_CLIENT_ID")
-                .or_else(|_| env.secret("GITHUB_OAUTH_CLIENT_ID"))
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| "mock-spot-client-id".to_string());
+                .ok()
+                .map(|s| s.to_string());
+            let secret_client_id = env
+                .secret("GITHUB_OAUTH_CLIENT_ID")
+                .ok()
+                .map(|s| s.to_string());
+            let Some(client_id) = resolve_oauth_client_id(
+                var_client_id.as_deref(),
+                secret_client_id.as_deref(),
+                is_production_oauth_configured(&env),
+            ) else {
+                return ui::serve_login_gate(
+                    &req,
+                    "GitHub OAuth application is not configured on this server (GITHUB_OAUTH_CLIENT_ID missing). Sign-in refused.",
+                    "",
+                    500,
+                );
+            };
 
-            let redirect_uri = env
-                .var("GITHUB_OAUTH_REDIRECT_URI")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| {
+            let redirect_uri = resolve_env_non_empty(&env, "GITHUB_OAUTH_REDIRECT_URI")
+                .unwrap_or_else(|| {
                     let scheme = url.scheme();
                     let host = url.host_str().unwrap_or("spot.swacktech.com");
                     match url.port() {
@@ -1791,16 +1835,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 );
             }
 
-            let client_id = env
-                .var("GITHUB_OAUTH_CLIENT_ID")
-                .or_else(|_| env.secret("GITHUB_OAUTH_CLIENT_ID"))
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let client_secret = env
-                .secret("GITHUB_OAUTH_CLIENT_SECRET")
-                .or_else(|_| env.var("GITHUB_OAUTH_CLIENT_SECRET"))
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            let client_id =
+                resolve_env_non_empty(&env, "GITHUB_OAUTH_CLIENT_ID").unwrap_or_default();
+            let client_secret =
+                resolve_env_non_empty(&env, "GITHUB_OAUTH_CLIENT_SECRET").unwrap_or_default();
 
             if client_id.is_empty() || client_secret.is_empty() {
                 return ui::serve_login_gate(
@@ -1812,13 +1850,19 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             }
 
             let verifier = auth::pkce_verifier(session_secret, &state);
-            let redirect_uri = env
-                .var("GITHUB_OAUTH_REDIRECT_URI")
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| {
+            let redirect_uri = resolve_env_non_empty(&env, "GITHUB_OAUTH_REDIRECT_URI")
+                .unwrap_or_else(|| {
                     let scheme = url.scheme();
                     let host = url.host_str().unwrap_or("spot.swacktech.com");
-                    format!("{}://{}/auth/github/callback", scheme, host)
+                    match url.port() {
+                        Some(port)
+                            if (scheme == "http" && port != 80)
+                                || (scheme == "https" && port != 443) =>
+                        {
+                            format!("{}://{}:{}/auth/github/callback", scheme, host, port)
+                        }
+                        _ => format!("{}://{}/auth/github/callback", scheme, host),
+                    }
                 });
 
             let token_form = format!(
@@ -2362,5 +2406,27 @@ mod tests {
         assert!(is_auth_path("/api/auth/status"));
         assert!(!is_auth_path("/api/overview"));
         assert!(!is_auth_path("/api/scaling"));
+    }
+
+    #[test]
+    fn test_resolve_oauth_client_id() {
+        // Explicit var takes precedence
+        assert_eq!(
+            resolve_oauth_client_id(Some("  real-var-id "), Some("secret-id"), true),
+            Some("real-var-id".to_string())
+        );
+        // Empty var falls back to secret instead of shadowing it
+        assert_eq!(
+            resolve_oauth_client_id(Some("   "), Some("  real-secret-id "), true),
+            Some("real-secret-id".to_string())
+        );
+        // Missing var and secret refuses mock fallback in production mode
+        assert_eq!(resolve_oauth_client_id(None, None, true), None);
+        assert_eq!(resolve_oauth_client_id(Some(""), Some(""), true), None);
+        // Non-production mode keeps mock fallback for local/test suites
+        assert_eq!(
+            resolve_oauth_client_id(None, None, false),
+            Some("mock-spot-client-id".to_string())
+        );
     }
 }
