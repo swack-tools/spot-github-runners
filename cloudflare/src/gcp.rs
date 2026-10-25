@@ -1287,7 +1287,11 @@ pub fn build_spot_builder_vm_request(
         labels,
         service_accounts: vec![GceServiceAccount {
             email: "default".to_string(),
-            scopes: vec![DEFAULT_BUILDER_STORAGE_SCOPE.to_string()],
+            scopes: vec![
+                DEFAULT_BUILDER_STORAGE_SCOPE.to_string(),
+                "https://www.googleapis.com/auth/logging.write".to_string(),
+                "https://www.googleapis.com/auth/monitoring.write".to_string(),
+            ],
         }],
     })
 }

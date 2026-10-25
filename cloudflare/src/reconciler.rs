@@ -665,8 +665,10 @@ fn apply_gce_instance_targets_to_overview(
                         }
                     }
                     if let Some(&rc) = gce_runner_counts.get(name.as_str()) {
-                        let existing_rc =
-                            obj.get("runners_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let existing_rc = obj
+                            .get("runners_count")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32;
                         if existing_rc != rc {
                             obj.insert("runners_count".to_string(), serde_json::json!(rc));
                             obj.insert("runners_count_known".to_string(), serde_json::json!(true));
@@ -1343,7 +1345,7 @@ where
                 runner_cpu_limit: "7",
                 tiered: true,
                 strict_heavy_pool: false,
-                resource_monitoring: false,
+                resource_monitoring: true,
             };
 
             let manifest_val = crate::patch_console::make_valid_manifest_json(target);
@@ -1465,7 +1467,7 @@ where
             runner_cpu_limit: "7",
             tiered: true,
             strict_heavy_pool: false,
-            resource_monitoring: false,
+            resource_monitoring: true,
         };
 
         let manifest_val = crate::patch_console::make_valid_manifest_json("swack-tools");

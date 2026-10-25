@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod gcp;
 pub mod github;
+pub mod observability;
 pub mod patch;
 pub mod patch_console;
 pub mod reconciler;
@@ -502,6 +503,96 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             }
             let body_val: Value = req.json().await?;
             match state::handle_post_regions(&kv, body_val, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(e) => error_response(400, "bad_request", &e.to_string()),
+            }
+        }
+
+        // Cloud Observability, Correlated Workflow Logs & Dynamic Runner Density Endpoints
+        (Method::Get, "/api/observability") => {
+            let session = match verified_session {
+                Some(s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+            let params: Vec<(String, String)> = url
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            let query = match observability::parse_observability_query(&params) {
+                Ok(q) => q,
+                Err(msg) => return error_response(400, "bad_request", &msg),
+            };
+            match observability::handle_get_observability(&kv, &query, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(e) => error_response(500, "internal_error", &e.to_string()),
+            }
+        }
+
+        (Method::Post, "/api/observability/ingest") => {
+            let is_authed = if verified_builder_token.is_some() || has_static_builder_secret {
+                true
+            } else if let Some(ref session) = verified_session {
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
+                auth::may_sign_in(&session.sub, session.uid, &added_admins)
+            } else {
+                false
+            };
+            if !is_authed {
+                return error_response(401, "unauthorized", "Valid telemetry credentials required");
+            }
+            let payload: observability::IngestedHostSnapshot = req.json().await?;
+            if payload.instance_name.trim().is_empty() {
+                return error_response(400, "bad_request", "instance_name is required");
+            }
+            observability::record_ingested_snapshot(payload, now);
+            json_response(
+                200,
+                &serde_json::json!({
+                    "status": "ok",
+                    "ingested_at": now,
+                }),
+            )
+        }
+
+        (Method::Post, "/api/observability/density") => {
+            let session = match verified_session {
+                Some(s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if !auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+            let req_body: observability::UpdateDynamicDensityRequest = req.json().await?;
+            match observability::handle_post_dynamic_density(&kv, req_body, now).await {
                 Ok((status_code, body)) => json_response(status_code, &body),
                 Err(e) => error_response(400, "bad_request", &e.to_string()),
             }

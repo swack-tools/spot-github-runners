@@ -37,7 +37,7 @@ The repository features two primary execution environments:
 </div>
 <!-- /shot -->
 
-The `host-agent` binary runs on runner hosts and dedicated builder VMs. It provides eight subcommands
+The `host-agent` binary runs on runner hosts and dedicated builder VMs. It provides nine subcommands
 and supports execution either directly or through symlink aliases.
 
 ```bash
@@ -157,6 +157,28 @@ Validates that compiler toolchains, browser binaries, and cgroup v2 controllers 
   - Cross-compilation targets (Linux musl and macOS Darwin stubs).
   - Playwright Chromium browser binary at `/opt/playwright-browsers`.
   - cgroup v2 memory controller and swap limits.
+
+### `telemetry`
+
+Collects cgroup v2 working-set memory, CPU load, disk I/O, admission leases, and workflow-correlated container logs; serves an OpenMetrics and JSON HTTP endpoint for the [GCP Ops Agent](https://cloud.google.com/stackdriver/docs/solutions/agents/ops-agent); and dynamically scales GitHub Actions runner slots on underutilized hosts.
+
+- **Aliases**: `gha-host-telemetry`, `host-telemetry`
+- **Usage**: `host-agent telemetry <action> [options...]`
+- **Actions**:
+  - `collect`: samples `/proc`, `/sys/fs/cgroup`, `/var/lib/gha-admission/leases.json`, and active Docker runner containers once and prints structured JSON or OpenMetrics output.
+    - `--instances-dir <path>`: path to runner instance directories (default: `/mnt/runner-data/instances`).
+    - `--log-output <path>`: appends structured JSONL telemetry and correlated log entries to the specified file.
+    - `--prometheus`: outputs OpenMetrics / Prometheus exposition text instead of JSON.
+  - `serve`: runs the lightweight telemetry HTTP server (`GET /metrics`, `GET /status`) and appends structured JSONL log lines for `google-cloud-ops-agent`.
+    - `--listen <host:port>`: bind address (default: `127.0.0.1:9464`).
+    - `--instances-dir <path>`: path to runner instance directories (default: `/mnt/runner-data/instances`).
+    - `--log-output <path>`: structured JSONL output path (default: `/var/log/gha-host-telemetry.jsonl`).
+    - `--edge-url <url>`: optional edge ingestion endpoint (`POST /api/observability/ingest`).
+    - `--bearer-token <token>`: bearer token for authenticated edge telemetry ingestion.
+  - `scale-runners`: evaluates observed peak working-set RAM and CPU usage per runner and recommends or launches additional runner containers without interrupting active jobs.
+    - `--target-runners <n>`: explicit target runner slot count override (defaults to the dynamic density recommendation).
+    - `--registration-token <token>`: registration token for GitHub Actions used when starting new runner containers.
+    - `--dry-run`: prints the recommended slot transition without starting new containers.
 
 ## Just recipes
 

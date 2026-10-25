@@ -73,40 +73,6 @@ rm -rf /var/lib/containerd/* /var/lib/docker/* /var/lib/apt/lists/* /var/cache/a
 apt-get clean
 
 install -d -m 0755 /opt/gha-runners/build
-RESOURCE_MONITORING={{RESOURCE_MONITORING}}
-if [[ "$RESOURCE_MONITORING" == 1 ]]; then
-  curl --proto '=https' --tlsv1.2 -fsS https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh -o /run/install-ops-agent.sh
-  bash /run/install-ops-agent.sh --also-install
-  rm /run/install-ops-agent.sh
-  cat >/etc/google-cloud-ops-agent/config.yaml <<'METRICS'
-logging:
-  service:
-    pipelines:
-      default_pipeline:
-        receivers: []
-metrics:
-  receivers:
-    hostmetrics:
-      type: hostmetrics
-      collection_interval: 60s
-  processors:
-    metrics_filter:
-      type: exclude_metrics
-      metrics_pattern:
-        - agent.googleapis.com/cpu/*
-        - agent.googleapis.com/disk/*
-        - agent.googleapis.com/interface/*
-        - agent.googleapis.com/network/*
-        - agent.googleapis.com/swap/*
-        - agent.googleapis.com/processes/*
-  service:
-    pipelines:
-      default_pipeline:
-        receivers: [hostmetrics]
-        processors: [metrics_filter]
-METRICS
-  systemctl restart google-cloud-ops-agent
-fi
 printf '%s' '{{DOCKERFILE_B64}}' | base64 -d >/opt/gha-runners/build/Dockerfile
 printf '%s' '{{ENTRYPOINT_B64}}' | base64 -d >/opt/gha-runners/build/entrypoint.sh
 printf '%s' '{{JOB_COMPLETED_B64}}' | base64 -d >/opt/gha-runners/build/job-completed.sh
@@ -119,6 +85,7 @@ if [[ -x /usr/local/bin/host-agent ]]; then
 fi
 for alias in clean-target host-admission docker-wrapper docker-admission \
              host-launcher builder-entrypoint worktree-commands toolchain-probe \
+             telemetry gha-host-telemetry host-telemetry \
              gha-runner-clean-target gha-host-admission oxidex-remote-build \
              oxidex-build-entrypoint oxidex-worktree-commands oxidex-toolchain-probe; do
   ln -sf /usr/local/bin/host-agent "/usr/local/bin/$alias"
@@ -234,5 +201,82 @@ for i in $(seq 1 "$RUNNER_COUNT"); do
   docker_args+=("$RUNNER_IMAGE")
   docker run "${docker_args[@]}"
 done
+RESOURCE_MONITORING={{RESOURCE_MONITORING}}
+if [[ "$RESOURCE_MONITORING" == 1 ]]; then
+  if [[ -x /usr/local/bin/host-agent ]]; then
+    cat >/etc/systemd/system/gha-telemetry.service <<'TELEMETRY_SERVICE'
+[Unit]
+Description=Runner cgroup v2, workflow correlation, and Prometheus telemetry exporter (host-agent)
+After=docker.service network-online.target
+[Service]
+ExecStart=/usr/local/bin/host-agent telemetry serve --listen 127.0.0.1:9464
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+TELEMETRY_SERVICE
+    systemctl daemon-reload
+    systemctl enable --now --no-block gha-telemetry.service || true
+  fi
+  install -d -m 0755 /etc/google-cloud-ops-agent
+  cat >/etc/google-cloud-ops-agent/config.yaml <<'METRICS'
+logging:
+  receivers:
+    systemd_journald:
+      type: systemd_journald
+    runner_bootstrap:
+      type: files
+      include_paths:
+        - /var/log/gha-runner-bootstrap.log
+        - /var/log/oxidex-builder-bootstrap.log
+    gha_workflow_logs:
+      type: files
+      include_paths:
+        - /var/log/gha-host-telemetry.jsonl
+  processors:
+    parse_workflow_json:
+      type: parse_json
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: [systemd_journald, runner_bootstrap]
+      workflow_pipeline:
+        receivers: [gha_workflow_logs]
+        processors: [parse_workflow_json]
+metrics:
+  receivers:
+    hostmetrics:
+      type: hostmetrics
+      collection_interval: 30s
+    gha_telemetry:
+      type: prometheus
+      config:
+        scrape_configs:
+          - job_name: 'gha_host_agent'
+            scrape_interval: 30s
+            static_configs:
+              - targets: ['127.0.0.1:9464']
+  processors:
+    metrics_filter:
+      type: exclude_metrics
+      metrics_pattern:
+        - agent.googleapis.com/processes/*
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: [hostmetrics, gha_telemetry]
+        processors: [metrics_filter]
+METRICS
+  if dpkg-query -W -f='${Status}' google-cloud-ops-agent 2>/dev/null | grep -q 'install ok installed'; then
+    systemctl reload-or-restart --no-block google-cloud-ops-agent || true
+  else
+    systemd-run --unit=gha-ops-agent-bootstrap --no-block /bin/bash -c '
+      curl --proto "=https" --tlsv1.2 -fsS https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh -o /run/install-ops-agent.sh &&
+      bash /run/install-ops-agent.sh --also-install &&
+      rm -f /run/install-ops-agent.sh &&
+      systemctl restart google-cloud-ops-agent
+    ' || true
+  fi
+fi
 unset REGISTRATION_TOKEN
 printf '%s\n' '{{DEPLOYMENT_ID}}' >/var/lib/gha-runner-bootstrap.complete
