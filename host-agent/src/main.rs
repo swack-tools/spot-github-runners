@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use host_agent::{
     admission, build_package, builder_entrypoint, clean_target, docker_admission, docker_wrapper,
-    host_launcher, toolchain_probe, worktree_commands,
+    host_launcher, telemetry, toolchain_probe, worktree_commands,
 };
 
 fn is_builder_environment() -> bool {
@@ -30,7 +30,8 @@ fn print_usage() {
              worktree-commands   Dual worktree runner with cgroup v2 metrics\n    \
              toolchain-probe     Toolchain, browser & cgroup verification probe\n    \
              build-package       Package 3 build artifacts (log, binaries, target) for GCS\n    \
-             queue-worker        Poll, claim, execute, package & complete queued Rust builds\n"
+             queue-worker        Poll, claim, execute, package & complete queued Rust builds\n    \
+             telemetry           Host/cgroup v2 metrics, workflow correlation & dynamic scaling\n"
     );
 }
 
@@ -70,6 +71,7 @@ fn main() -> ExitCode {
         "queue-worker" | "oxidex-queue-worker" | "example-rust-project-queue-worker" => {
             build_package::run_worker(&args[1..])
         }
+        "telemetry" | "gha-host-telemetry" | "host-telemetry" => telemetry::run(&args[1..]),
         _ => {
             if args.len() < 2 {
                 print_usage();
@@ -98,6 +100,7 @@ fn main() -> ExitCode {
                 "queue-worker" | "oxidex-queue-worker" | "example-rust-project-queue-worker" => {
                     build_package::run_worker(&args[2..])
                 }
+                "telemetry" | "gha-host-telemetry" | "host-telemetry" => telemetry::run(&args[2..]),
                 "--help" | "-h" | "help" => {
                     print_usage();
                     return ExitCode::SUCCESS;

@@ -130,6 +130,22 @@ pub struct ScalingConfig {
     pub rust_builder: BuilderScalingPolicy,
 }
 
+fn default_enable_dynamic_runner_density() -> bool {
+    true
+}
+
+fn default_dynamic_target_cpu_percent() -> f64 {
+    80.0
+}
+
+fn default_dynamic_target_memory_percent() -> f64 {
+    80.0
+}
+
+fn default_max_dynamic_runners_per_instance() -> u32 {
+    8
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunnerScalingPolicy {
     pub min_runners: u32,
@@ -162,6 +178,14 @@ pub struct RunnerScalingPolicy {
     pub include_disk_in_scale_budget: bool,
     #[serde(default)]
     pub shared_global_budget: bool,
+    #[serde(default = "default_enable_dynamic_runner_density")]
+    pub enable_dynamic_runner_density: bool,
+    #[serde(default = "default_dynamic_target_cpu_percent")]
+    pub dynamic_target_cpu_percent: f64,
+    #[serde(default = "default_dynamic_target_memory_percent")]
+    pub dynamic_target_memory_percent: f64,
+    #[serde(default = "default_max_dynamic_runners_per_instance")]
+    pub max_dynamic_runners_per_instance: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -803,13 +827,7 @@ fn fallback_machine_type_hardware_meta(
             "hyperdrive",
         ))
     } else if mt.starts_with("c2d-") || mt.starts_with("n2d-") || mt.starts_with("t2d-") {
-        Some((
-            "AMD Milan",
-            1850,
-            disk_gb,
-            "pd-balanced",
-            "standard_ssd",
-        ))
+        Some(("AMD Milan", 1850, disk_gb, "pd-balanced", "standard_ssd"))
     } else {
         None
     }
@@ -5363,6 +5381,10 @@ pub fn default_dashboard_bundle(now: u64) -> Result<DashboardBundle, StateError>
                 max_scale_up_monthly_usd: 50.0,
                 include_disk_in_scale_budget: true,
                 shared_global_budget: false,
+                enable_dynamic_runner_density: true,
+                dynamic_target_cpu_percent: 80.0,
+                dynamic_target_memory_percent: 80.0,
+                max_dynamic_runners_per_instance: 8,
             },
             rust_builder: BuilderScalingPolicy {
                 min_instances: 1,

@@ -53,8 +53,12 @@ sub-15 ms latency, backed by Cloudflare Workers KV (`SPOT_KV`). Zero control VMs
 <figcaption markdown>Tab 8 (Runner Patches): `spot-runner-patch-v1` manifest editor, security validator, effective JSON view, and pull request creator.</figcaption>
 </figure>
 <figure class="shot" markdown>
+![Observability and Logs](images/observability-tab.png)
+<figcaption markdown>Tab 9 (Observability and Logs): displays GCP Ops Agent and `host-agent` Grafana-style metrics, multi-select organization and repository filters, and Dynamic Runner Density scaling.</figcaption>
+</figure>
+<figure class="shot" markdown>
 ![Admins](images/admins.png)
-<figcaption markdown>Tab 9 (Admins): owner-only dashboard administrator allowlist keyed by numeric GitHub user ID with an audit history table.</figcaption>
+<figcaption markdown>Tab 10 (Admins): owner-only dashboard administrator allowlist keyed by numeric GitHub user ID with an audit history table.</figcaption>
 </figure>
 </div>
 </div>
@@ -74,6 +78,7 @@ qualifying offers, and scaling alerts) and a daily budget tracking bar.
 | Regions and Latency Filter | Configures regions by latency, continent, machine families, CPU platforms, and disk types. |
 | Rust Builders Telemetry and IP Intel | Records and summarizes remote build runs: cache hits, peak RAM, CPU time, and builder statistics. |
 | Runner Patches | Edits and validates patch manifests in the configuration repository. See [The patch console](#the-patch-console). |
+| Observability and Logs | Displays Grafana-style time-series charts from the GCP Ops Agent and `host-agent telemetry`, configures Dynamic Runner Density scaling (`enable_dynamic_runner_density`), and provides a searchable log explorer with deep-links to GitHub Actions workflow jobs. See [Observability, dynamic runner density, and log explorer](#observability-dynamic-runner-density-and-log-explorer). |
 | Admins | Owner only. Manages added administrators. See [Manage administrators](#manage-administrators). |
 
 !!! note "The dashboard preserves safety gates"
@@ -198,6 +203,81 @@ are also available under the alias `/api/patches/*`:
 
 Direct live hot-patching (`POST /api/patches/hot-patch`) is deprecated. The bootstrap endpoint reports `executor.available=false` with the reason that the serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick. Saving a patch creates an idempotent branch and opens a pull request against the configuration repository (`CONFIG_REPO`, for example `example-org/spot-runners-config`).
 The console enforces hardware sizing constraints (minimum 16 vCPUs, 32 GiB RAM, 2 runner containers, and queue threshold >= 20).
+
+## Observability, dynamic runner density, and log explorer
+
+<div class="carousel" markdown>
+<div class="carousel-track" markdown>
+<figure class="shot" markdown>
+![Observability and Logs tab](images/observability-tab.png)
+<figcaption markdown>Observability and Logs tab displaying the Workload Role selector, conditional multi-select Organization and Repository dropdown, Dynamic Runner Density opt-out toggle, and four Grafana-style SVG time-series charts.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Workflow-correlated log explorer](images/observability-log-explorer.png)
+<figcaption markdown>Searchable Log Explorer correlating container and host log lines with the active GitHub Actions workflow run and job URL executing on that runner slot at that timestamp.</figcaption>
+</figure>
+<figure class="shot" markdown>
+![Observability and dynamic density architecture](images/flow-observability-density.svg)
+<figcaption markdown>Architecture flowchart showing how `google-cloud-ops-agent` and `host-agent telemetry` stream cgroup v2 metrics and workflow-correlated logs to the edge control plane to unlock extra runner slots on underutilized Spot VMs.</figcaption>
+</figure>
+</div>
+</div>
+<!-- /shot -->
+
+The **Observability & Logs** tab (`/?tab=observability`) exposes real-time host, cgroup v2 container, and admission lease telemetry collected by `host-agent telemetry` (`127.0.0.1:9464`) alongside the [GCP Ops Agent](https://cloud.google.com/stackdriver/docs/solutions/agents/ops-agent).
+
+```mermaid
+flowchart LR
+  subgraph Host["Spot Runner / Builder VM"]
+    Cgroup["cgroup v2 + /proc + Leases"] --> HA["host-agent telemetry (:9464)"]
+    Diag["Runner _diag/Worker_*.log"] --> HA
+    HA --> OpsAgent["google-cloud-ops-agent"]
+    HA --> Scale["host-agent telemetry scale-runners"]
+  end
+  subgraph Edge["Cloudflare Edge Control Plane"]
+    Ingest["POST /api/observability/ingest"] --> KV[("SPOT_KV")]
+    KV --> Query["GET /api/observability"]
+    Density["POST /api/observability/density"] --> KV
+  end
+  OpsAgent -->|"Metrics & structured logs"| Ingest
+  HA -->|"JSON snapshot"| Ingest
+  Query --> UI["Observability & Logs UI"]
+  UI -->|"Deep-link"| GH["github.com/.../actions/runs/<run_id>/job/<job_id>"]
+```
+
+### Role and multi-select organization and repository filters
+
+The filter bar at the top of the **Observability & Logs** tab narrows both the Grafana-style time-series charts and the log explorer:
+
+- **Workload Role**: filters telemetry to **All Roles (CI/CD + Rust Builders)** (`all`), **CI/CD Runners Only** (`cicd_runner`), or **Rust Builders Only** (`rust_builder`).
+- **Organizations & Repositories (Multi-Select)**: when **All Roles** or **CI/CD Runners Only** is selected, the multi-select dropdown activates so you can select any combination of GitHub organizations (`example-org`) and repositories (`example-org/service-a`, `example-org/service-b`). Selecting **Rust Builders Only** hides the organization and repository selector and scopes charts to dedicated `builder-*` instances.
+- **Instance, Log Source, Severity, and Window**: filters down to a single VM (`runner-useast1-c-demo01`), log subsystem (`gha_worker`, `ops_agent`, `admission`, `kernel`), minimum severity (`INFO`, `WARN`, `ERROR`), and time window (`1h` to `24h`).
+
+### Grafana-style time-series panels and dynamic runner density
+
+The dashboard renders four synchronized SVG time-series panels from the ingested Ops Agent and `host-agent` metrics:
+
+1. **CPU Utilization vs Target Headroom (%)**: plots host CPU utilization, container cgroup CPU usage, and the target ceiling (`target_cpu_percent`, default `80%`).
+2. **Memory Working Set vs Cgroup Peak (GiB)**: compares actual non-reclaimable working-set memory (`memory.current - inactive_file`) against total cgroup peak memory and available host RAM.
+3. **Runner Slot Density (`Baseline -> Active -> Recommended`)**: tracks baseline provisioned runner containers against dynamically scaled runner slots and active GitHub Actions workflows.
+4. **Disk I/O Throughput (`MiB/s`) & Space Utilization (%)**: plots read and write throughput alongside `/mnt/runner-data` capacity.
+
+The **Dynamic Runner Density** banner (`enable_dynamic_runner_density: true` by default) allows operators to adjust target CPU utilization, target memory utilization, and the maximum runner slots per VM—or opt out at any time using the checkbox toggle (`POST /api/observability/density`).
+
+### Workflow-correlated log explorer
+
+Every log entry ingested from runner containers (`_diag/Worker_*.log`), `host-agent admission`, `google-cloud-ops-agent`, and the kernel journal is enriched with the active container's workflow metadata (`organization`, `repository`, `workflow_name`, `job_name`, `run_id`, and `job_id`).
+
+- Enter a free-text query (`q=`) in the **Search Logs** input to filter by job name, container ID, runner slot, cgroup metric, or error text.
+- Each correlated log row renders a clickable badge linking directly to `https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>` for the workflow job that was executing on that runner slot at that exact timestamp.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/observability` | Queries filtered time-series metrics, per-instance density recommendations, and workflow-correlated logs (`role`, `orgs`, `repos`, `instance`, `source`, `severity`, `q`, `window_hours`). |
+| `POST /api/observability/ingest` | Ingests a host telemetry snapshot and correlated log batch from `host-agent telemetry`. |
+| `POST /api/observability/density` | Updates Dynamic Runner Density policy (`enable_dynamic_runner_density`, `target_cpu_percent`, `target_memory_percent`, `max_runners_per_instance`). |
+
+For upstream agent configuration details, see the [GCP Ops Agent overview](https://cloud.google.com/stackdriver/docs/solutions/agents/ops-agent), [Ops Agent configuration reference](https://cloud.google.com/stackdriver/docs/solutions/agents/ops-agent/configuration), and [Ops Agent Prometheus receiver documentation](https://cloud.google.com/stackdriver/docs/solutions/agents/ops-agent/third-party/prometheus).
 
 ## Edge state and quota conservation
 

@@ -242,7 +242,7 @@ if [[ -x /usr/local/bin/host-agent ]]; then
 fi
 for alias in clean-target host-admission docker-wrapper docker-admission \
              host-launcher builder-entrypoint worktree-commands toolchain-probe \
-             build-package queue-worker \
+             build-package queue-worker telemetry gha-host-telemetry host-telemetry \
              gha-runner-clean-target gha-host-admission oxidex-remote-build \
              oxidex-build-entrypoint oxidex-worktree-commands oxidex-toolchain-probe \
              oxidex-build-package oxidex-queue-worker \
@@ -462,6 +462,71 @@ jq -n \
     groups: ["oxidex-build"]
   }' >/var/lib/oxidex-builder/uploader-observed.json
 chmod 0600 /var/lib/oxidex-builder/uploader-observed.json
+
+if [[ -x /usr/local/bin/host-agent ]]; then
+  cat >/etc/systemd/system/gha-telemetry.service <<'TELEMETRY_SERVICE'
+[Unit]
+Description=Dedicated builder cgroup v2 and Prometheus telemetry exporter (host-agent)
+After=docker.service network-online.target
+[Service]
+ExecStart=/usr/local/bin/host-agent telemetry serve --listen 127.0.0.1:9464
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+TELEMETRY_SERVICE
+  systemctl daemon-reload
+  systemctl enable --now --no-block gha-telemetry.service || true
+fi
+install -d -m 0755 /etc/google-cloud-ops-agent
+cat >/etc/google-cloud-ops-agent/config.yaml <<'METRICS'
+logging:
+  receivers:
+    systemd_journald:
+      type: systemd_journald
+    builder_bootstrap:
+      type: files
+      include_paths:
+        - /var/log/oxidex-builder-bootstrap.log
+        - /var/log/gha-host-telemetry.jsonl
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: [systemd_journald, builder_bootstrap]
+metrics:
+  receivers:
+    hostmetrics:
+      type: hostmetrics
+      collection_interval: 30s
+    gha_telemetry:
+      type: prometheus
+      config:
+        scrape_configs:
+          - job_name: 'gha_host_agent'
+            scrape_interval: 30s
+            static_configs:
+              - targets: ['127.0.0.1:9464']
+  processors:
+    metrics_filter:
+      type: exclude_metrics
+      metrics_pattern:
+        - agent.googleapis.com/processes/*
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: [hostmetrics, gha_telemetry]
+        processors: [metrics_filter]
+METRICS
+if dpkg-query -W -f='${Status}' google-cloud-ops-agent 2>/dev/null | grep -q 'install ok installed'; then
+  systemctl reload-or-restart --no-block google-cloud-ops-agent || true
+else
+  systemd-run --unit=gha-ops-agent-bootstrap --no-block /bin/bash -c '
+    curl --proto "=https" --tlsv1.2 -fsS https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh -o /run/install-ops-agent.sh &&
+    bash /run/install-ops-agent.sh --also-install &&
+    rm -f /run/install-ops-agent.sh &&
+    systemctl restart google-cloud-ops-agent
+  ' || true
+fi
 
 printf '%s\n' "$deployment_id" >/var/lib/oxidex-builder-bootstrap.complete
 chmod 0444 /var/lib/oxidex-builder-bootstrap.complete

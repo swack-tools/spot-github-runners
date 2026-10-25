@@ -6,5 +6,6 @@ pub mod docker_admission;
 pub mod docker_wrapper;
 pub mod host_launcher;
 pub mod platform;
+pub mod telemetry;
 pub mod toolchain_probe;
 pub mod worktree_commands;

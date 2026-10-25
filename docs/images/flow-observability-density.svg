@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 560" width="1280" height="560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" filterUnits="userSpaceOnUse" x="0" y="0" width="1280" height="560">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#1e293b" stroke-width="0.7" opacity="0.55"/>
+    </pattern>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/></marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 1 L 10 5 L 0 9 z" fill="#fbbf24"/></marker>
+  </defs>
+  <rect width="1280" height="560" rx="14" fill="url(#bgGrad)" stroke="#334155" stroke-width="2"/>
+  <rect x="2" y="68" width="1276" height="490" fill="url(#grid)"/>
+  <rect x="2" y="2" width="1276" height="66" rx="12" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>
+  <circle cx="28" cy="35" r="7" fill="#34d399"/>
+  <text x="48" y="31" fill="#f8fafc" font-size="18" font-weight="700">Cloud Ops Agent Telemetry, Dynamic Runner Density &amp; Workflow Log Correlation</text>
+  <text x="48" y="52" fill="#94a3b8" font-size="12.5">Fast-boot runner registration (0s delay), cgroup v2 working-set metrics, dynamic slot scaling, and GitHub job deep-links.</text>
+  <rect x="1115" y="18" width="142" height="30" rx="6" fill="#1e293b" stroke="#34d399" stroke-width="1"/>
+  <text x="1186" y="38" text-anchor="middle" fill="#34d399" font-size="11.5" font-weight="700">MERMAID FLOW SVG</text>
+  <path d="M 260.0 207.5 C 280.5 207.5, 280.5 207.5, 301.0 207.5" fill="none" stroke="#38bdf8" stroke-width="2.4" marker-end="url(#arrow-blue)"/>
+  <rect x="228.0" y="186.5" width="104.0" height="20" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="1"/>
+  <text x="280.0" y="200.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">0s Boot Path</text>
+  <path d="M 525.0 207.5 C 545.5 207.5, 545.5 207.5, 566.0 207.5" fill="none" stroke="#a78bfa" stroke-width="2.4" marker-end="url(#arrow-purple)"/>
+  <rect x="491.0" y="186.5" width="109.0" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+  <text x="545.5" y="200.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">:9464 + JSONL</text>
+  <path d="M 795.0 207.5 C 815.5 207.5, 815.5 207.5, 836.0 207.5" fill="none" stroke="#34d399" stroke-width="2.4" marker-end="url(#arrow-emerald)"/>
+  <rect x="761.0" y="186.5" width="108.0" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="815.0" y="200.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">scale-runners</text>
+  <path d="M 1035.0 207.5 C 1053.0 207.5, 1053.0 207.5, 1071.0 207.5" fill="none" stroke="#fbbf24" stroke-width="2.4" marker-end="url(#arrow-amber)"/>
+  <rect x="998.0" y="186.5" width="110.0" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>
+  <text x="1053.0" y="200.5" text-anchor="middle" fill="#e2e8f0" font-size="11" font-weight="600">/api/observability</text>
+  <g filter="url(#shadow)">
+    <rect x="40" y="140" width="220" height="135" rx="10" fill="#0f2942" stroke="#38bdf8" stroke-width="2"/>
+    <rect x="52" y="150" width="105" height="20" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="1"/>
+    <text x="59" y="164" fill="#38bdf8" font-size="10.5" font-weight="700">ASYNC BOOTSTRAP</text>
+    <text x="54" y="188" fill="#ffffff" font-size="14" font-weight="700">Runner First, Ops Second</text>
+    <text x="54" y="208" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Register runners first</text>
+    <text x="54" y="226" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">systemd-run --no-block</text>
+    <text x="54" y="244" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Golden Image fast-path</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="305" y="140" width="220" height="135" rx="10" fill="#241646" stroke="#a78bfa" stroke-width="2"/>
+    <rect x="317" y="150" width="118" height="20" rx="5" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+    <text x="324" y="164" fill="#a78bfa" font-size="10.5" font-weight="700">HOST TELEMETRY</text>
+    <text x="319" y="188" fill="#ffffff" font-size="14" font-weight="700">host-agent telemetry</text>
+    <text x="319" y="208" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">cgroup v2 working-set</text>
+    <text x="319" y="226" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">_diag/Worker_*.log scan</text>
+    <text x="319" y="244" fill="#ede9fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Exposes 127.0.0.1:9464</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="570" y="140" width="225" height="135" rx="10" fill="#062e22" stroke="#34d399" stroke-width="2"/>
+    <rect x="582" y="150" width="122" height="20" rx="5" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+    <text x="589" y="164" fill="#34d399" font-size="10.5" font-weight="700">CLOUD OPS AGENT</text>
+    <text x="584" y="188" fill="#ffffff" font-size="14" font-weight="700">Metrics &amp; JSONL Logs</text>
+    <text x="584" y="208" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Scrapes :9464/metrics</text>
+    <text x="584" y="226" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Tails telemetry.jsonl</text>
+    <text x="584" y="244" fill="#d1fae5" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Streams to Cloud Ops</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="840" y="140" width="195" height="135" rx="10" fill="#0f2942" stroke="#38bdf8" stroke-width="2"/>
+    <rect x="852" y="150" width="122" height="20" rx="5" fill="#0f172a" stroke="#38bdf8" stroke-width="1"/>
+    <text x="859" y="164" fill="#38bdf8" font-size="10.5" font-weight="700">DYNAMIC DENSITY</text>
+    <text x="854" y="188" fill="#ffffff" font-size="14" font-weight="700">Auto-Scale Slots / VM</text>
+    <text x="854" y="208" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Default: enabled (true)</text>
+    <text x="854" y="226" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Fits extra runner slots</text>
+    <text x="854" y="244" fill="#e0f2fe" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">0 interrupted CI jobs</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="1075" y="140" width="170" height="135" rx="10" fill="#332108" stroke="#fbbf24" stroke-width="2"/>
+    <rect x="1087" y="150" width="115" height="20" rx="5" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>
+    <text x="1094" y="164" fill="#fbbf24" font-size="10.5" font-weight="700">EDGE DASHBOARD</text>
+    <text x="1089" y="188" fill="#ffffff" font-size="14" font-weight="700">Grafana &amp; Log Links</text>
+    <text x="1089" y="208" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Filter Role / Org / Repo</text>
+    <text x="1089" y="226" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Search logs (?q=...)</text>
+    <text x="1089" y="244" fill="#fef3c7" font-size="12" font-family="SFMono-Regular, Menlo, Consolas, monospace">Click GitHub job URL</text>
+  </g>
+  <rect x="920" y="259" width="32" height="32" rx="16" fill="none" stroke="#34d399" stroke-width="2.5" stroke-dasharray="5,4"/>
+  <path d="M 625.0 360 L 936 275" fill="none" stroke="#34d399" stroke-width="2.5" stroke-dasharray="6,4" marker-end="url(#arrow-emerald)"/>
+  <g filter="url(#shadow)">
+    <rect x="260" y="360" width="730" height="62" rx="9" fill="#0f172a" stroke="#34d399" stroke-width="2.2"/>
+    <text x="276" y="384" fill="#34d399" font-size="12.5" font-weight="700">DYNAMIC RUNNER DENSITY &amp; WORKFLOW CORRELATION</text>
+    <text x="276" y="405" fill="#e2e8f0" font-size="12">Underutilized hosts automatically launch extra sibling runner containers when working-set RAM and CPU headroom permit.</text>
+  </g>
+</svg>

@@ -449,7 +449,11 @@ fn test_builder_vm_request_attaches_persistent_cache_disk_and_excludes_runner_ta
     assert_eq!(req.service_accounts[0].email, "default");
     assert_eq!(
         req.service_accounts[0].scopes,
-        vec!["https://www.googleapis.com/auth/devstorage.read_write".to_string()]
+        vec![
+            "https://www.googleapis.com/auth/devstorage.read_write".to_string(),
+            "https://www.googleapis.com/auth/logging.write".to_string(),
+            "https://www.googleapis.com/auth/monitoring.write".to_string(),
+        ]
     );
     assert!(req.disks[0].boot);
     assert!(req.disks[0].auto_delete);
