@@ -833,6 +833,50 @@ fn fallback_machine_type_hardware_meta(
     }
 }
 
+/// Fills hardware fields a persisted ledger row is missing (`cpu_platform` of
+/// "Unknown", null `benchmark_score` or disk fields) from the machine-type
+/// fallback table. Rows written before a machine family was added to the table
+/// would otherwise keep showing null forever, because live updates to an
+/// existing row never touch these fields.
+fn backfill_missing_hardware_meta(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    machine_type: &str,
+    is_builder: bool,
+) {
+    let cpu_missing = obj
+        .get("cpu_platform")
+        .and_then(|v| v.as_str())
+        .map_or(true, |c| c.trim().is_empty() || c == "Unknown");
+    let is_missing = |key: &str| obj.get(key).map_or(true, |v| v.is_null());
+    let bench_missing = is_missing("benchmark_score");
+    let disk_gb_missing = is_missing("data_disk_gb");
+    let disk_type_missing = is_missing("data_disk_type");
+    let disk_cat_missing = is_missing("disk_category");
+    if !(cpu_missing || bench_missing || disk_gb_missing || disk_type_missing || disk_cat_missing) {
+        return;
+    }
+    let Some((cpu, bench, disk_gb, disk_type, disk_cat)) =
+        fallback_machine_type_hardware_meta(machine_type, is_builder)
+    else {
+        return;
+    };
+    if cpu_missing {
+        obj.insert("cpu_platform".to_string(), serde_json::json!(cpu));
+    }
+    if bench_missing {
+        obj.insert("benchmark_score".to_string(), serde_json::json!(bench));
+    }
+    if disk_gb_missing {
+        obj.insert("data_disk_gb".to_string(), serde_json::json!(disk_gb));
+    }
+    if disk_type_missing {
+        obj.insert("data_disk_type".to_string(), serde_json::json!(disk_type));
+    }
+    if disk_cat_missing {
+        obj.insert("disk_category".to_string(), serde_json::json!(disk_cat));
+    }
+}
+
 fn fallback_machine_type_pricing(
     machine_type: &str,
     is_builder: bool,
@@ -1128,6 +1172,12 @@ pub fn reconcile_overview_instances_ledger(
                 if norm_mt != raw_mt {
                     obj.insert("machine_type".to_string(), serde_json::json!(norm_mt));
                 }
+                let is_builder = obj.get("role").and_then(|v| v.as_str()) == Some("rust_builder")
+                    || obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map_or(false, |n| n.starts_with("builder-"));
+                backfill_missing_hardware_meta(obj, &norm_mt, is_builder);
             }
         }
     }
@@ -1310,7 +1360,12 @@ pub fn reconcile_overview_instances_ledger(
                         }
                     }
                 }
-                if cpu == "Unknown" || bench.is_null() {
+                if cpu == "Unknown"
+                    || bench.is_null()
+                    || disk_gb.is_null()
+                    || disk_type.is_null()
+                    || disk_cat.is_null()
+                {
                     if let Some((fb_cpu, fb_bench, fb_disk_gb, fb_disk_type, fb_disk_cat)) =
                         fallback_machine_type_hardware_meta(&norm_machine_type, is_builder)
                     {

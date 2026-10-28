@@ -2059,9 +2059,9 @@ return `
 </td>
 <td>
 <div class="mono" style="font-weight:600;">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)} (${inst.vcpu} vCPU / ${inst.ram_gib} GiB)</div>
-<div style="font-size:11px; color:var(--text-muted);">${esc(inst.cpu_platform)} · ${inst.data_disk_gb}GB ${esc(inst.data_disk_type)} (${esc(inst.disk_category)})</div>
+<div style="font-size:11px; color:var(--text-muted);">${esc(inst.cpu_platform || 'Unknown')} · ${inst.data_disk_gb != null ? `${inst.data_disk_gb}GB ${esc(inst.data_disk_type || '')} (${esc(inst.disk_category || '')})` : 'disk not reported'}</div>
 </td>
-<td class="mono" style="font-weight:700; color:#38bdf8;">${inst.benchmark_score}</td>
+<td class="mono" style="font-weight:700; color:#38bdf8;">${inst.benchmark_score != null ? inst.benchmark_score : '—'}</td>
 <td>
 <div style="font-weight:600;">${inst.role === 'cicd_runner' ? inst.runners_count + ' GitHub Runners' : '1 Rust Builder'}</div>
 <div style="font-size:11px; color:var(--text-muted);">${inst.runner_limits_known === false ? "per-runner limits not recorded" : `${inst.runner_vcpu} vCPU / ${inst.runner_ram_gib} GiB each`}</div>
