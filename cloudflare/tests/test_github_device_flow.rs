@@ -148,3 +148,19 @@ fn not_admin_message_names_the_account() {
     assert!(msg.contains("'xbmc4lyfe'"));
     assert!(msg.contains("not an authorized administrator"));
 }
+
+#[test]
+fn oauth_exchange_error_message_keeps_githubs_code() {
+    let msg = oauth_exchange_error_message(
+        200,
+        &json!({ "error": "bad_verification_code", "error_description": "The code passed is incorrect or expired." }),
+    );
+    assert!(msg.starts_with("GitHub OAuth Error [bad_verification_code]: The code passed"));
+    assert!(msg.contains("already used or expired"));
+
+    let msg = oauth_exchange_error_message(502, &serde_json::Value::Null);
+    assert!(msg.contains("HTTP 502"));
+
+    let msg = oauth_exchange_error_message(200, &json!({ "error": "something_new" }));
+    assert_eq!(msg, "GitHub OAuth Error [something_new].");
+}

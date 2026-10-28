@@ -1833,6 +1833,28 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 );
             }
 
+            // A repeated callback (browser retry, back button, second tab) carries a
+            // code GitHub already redeemed. If this browser already holds a valid
+            // administrator session, finish the sign-in instead of showing an error.
+            if let Some(ref session) = verified_session {
+                let (bundle, _) = state::load_state(&kv, now)
+                    .await
+                    .map_err(|e| Error::RustError(e.to_string()))?;
+                let added_admins: Vec<u64> = bundle
+                    .state
+                    .dashboard_admins
+                    .iter()
+                    .map(|a| a.uid)
+                    .collect();
+                if auth::may_sign_in(&session.sub, session.uid, &added_admins) {
+                    let headers = Headers::new();
+                    headers.set("Location", "/")?;
+                    headers.append("Set-Cookie", &clear_state_cookie)?;
+                    headers.set("Cache-Control", "no-store")?;
+                    return Ok(Response::empty()?.with_status(302).with_headers(headers));
+                }
+            }
+
             let code = match pairs.get("code") {
                 Some(c) if !c.is_empty() && c.len() <= 1024 => c.clone(),
                 _ => {
@@ -1944,24 +1966,25 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             let gh_req =
                 Request::new_with_init("https://github.com/login/oauth/access_token", &init)?;
             let mut gh_resp = Fetch::Request(gh_req).send().await?;
-            let token_json: Value = gh_resp
-                .json()
-                .await
-                .map_err(|e| Error::RustError(e.to_string()))?;
+            let gh_status = gh_resp.status_code();
+            let token_json: Value = gh_resp.json().await.unwrap_or(Value::Null);
 
-            let access_token = match token_json.get("access_token").and_then(|v| v.as_str()) {
+            let access_token = match token_json
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 Some(tok) => tok.to_string(),
                 None => {
-                    let err_desc = token_json
-                        .get("error_description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Code exchange failed");
-                    return ui::serve_login_gate(
-                        &req,
-                        &format!("GitHub OAuth Error: {}", err_desc),
-                        "",
-                        403,
+                    let message = auth::oauth_exchange_error_message(gh_status, &token_json);
+                    console_error!(
+                        "GitHub OAuth code exchange failed: http={} body_error={:?} redirect_uri={}",
+                        gh_status,
+                        token_json.get("error"),
+                        redirect_uri
                     );
+                    console_error!("{}", message);
+                    return ui::serve_login_gate(&req, &message, "", 403);
                 }
             };
 
