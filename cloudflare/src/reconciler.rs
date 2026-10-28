@@ -33,6 +33,77 @@ pub const RUNNER_VCPU: u32 = 7;
 pub const RUNNER_RAM_GIB: u32 = 14;
 pub const MIN_QUEUED_JOBS_THRESHOLD: u32 = 20;
 pub const MAX_DAILY_USD_CAP: f64 = 1.50;
+
+/// ISA features a `DEFAULT_MACHINE_TYPE` host (AMD EPYC Zen 5) has. Compared with
+/// `normalize_isa_name`, so `avx512-vbmi2`, `avx512_vbmi2` and `AVX512VBMI2` all match.
+const FLOOR_HOST_ISA: &[&str] = &[
+    "sse4.2",
+    "popcnt",
+    "avx",
+    "avx2",
+    "fma",
+    "f16c",
+    "bmi1",
+    "bmi2",
+    "aes",
+    "pclmulqdq",
+    "sha",
+    "vaes",
+    "vpclmulqdq",
+    "gfni",
+    "avx-vnni",
+    "avx512",
+    "avx512f",
+    "avx512cd",
+    "avx512bw",
+    "avx512dq",
+    "avx512vl",
+    "avx512-ifma",
+    "avx512-vbmi",
+    "avx512-vbmi2",
+    "avx512-vnni",
+    "avx512-bitalg",
+    "avx512-vpopcntdq",
+    "avx512-bf16",
+    "avx512-vp2intersect",
+    "x86-64-v2",
+    "x86-64-v3",
+    "x86-64-v4",
+];
+
+/// Prefixes that mark an extra label as naming an ISA feature, so it gets the same check.
+const ISA_LABEL_PREFIXES: &[&str] = &["amx", "avx", "apx", "sse", "sve", "sme", "neon", "x8664v"];
+
+fn normalize_isa_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn floor_host_has_isa(name: &str) -> bool {
+    let wanted = normalize_isa_name(name);
+    FLOOR_HOST_ISA
+        .iter()
+        .any(|have| normalize_isa_name(have) == wanted)
+}
+
+/// The first ISA the patch asks for that a floor host lacks: any `isa` entry, or an extra
+/// label that names an ISA feature. A host registered with that label would take jobs it
+/// can't run.
+fn missing_floor_host_isa(patch: &crate::patch::RunnerPatch) -> Option<&str> {
+    let named_isa = patch.hardware.extra_labels.iter().filter(|l| {
+        let n = normalize_isa_name(l);
+        ISA_LABEL_PREFIXES.iter().any(|p| n.starts_with(p))
+    });
+    patch
+        .hardware
+        .isa
+        .iter()
+        .chain(named_isa)
+        .map(|l| l.as_str())
+        .find(|l| !floor_host_has_isa(l))
+}
 pub const RECONCILER_LEASE_TTL_SECS: u64 = 240;
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 1800; // 30 minutes
 pub const LAUNCH_TIMEOUT_SECS: u64 = 900; // 15 minutes
@@ -1346,6 +1417,13 @@ where
                     held_floor_targets.push(format!(
                         "{}: runner patch needs {}, floor hosts are {}",
                         target, p.hardware.arch, DEFAULT_MACHINE_TYPE
+                    ));
+                    continue;
+                }
+                if let Some(isa) = missing_floor_host_isa(p) {
+                    held_floor_targets.push(format!(
+                        "{}: runner patch needs ISA {:?}, floor hosts are {}",
+                        target, isa, DEFAULT_MACHINE_TYPE
                     ));
                     continue;
                 }
