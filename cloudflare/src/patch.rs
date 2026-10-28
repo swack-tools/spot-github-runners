@@ -1073,6 +1073,33 @@ fn strip_yaml_comment(line: &str) -> String {
     out
 }
 
+/// Splits the inside of a flat flow collection on commas outside quotes.
+fn split_flow_items(inner: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    for c in inner.chars() {
+        // A quote opens a quoted item only at the item's start, as in YAML (`[it's, b]`).
+        let at_start = current.trim().is_empty();
+        match c {
+            '\'' if !in_double && (in_single || at_start) => in_single = !in_single,
+            '"' if !in_single && (in_double || at_start) => in_double = !in_double,
+            ',' if !in_single && !in_double => {
+                items.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(c);
+    }
+    // YAML allows a trailing comma: `[a, b,]`.
+    if !current.trim().is_empty() || items.is_empty() {
+        items.push(current);
+    }
+    items
+}
+
 fn parse_yaml_scalar(s: &str) -> Value {
     let s = s.trim();
     if s.is_empty() {
@@ -1080,6 +1107,39 @@ fn parse_yaml_scalar(s: &str) -> Value {
     }
     if s.eq_ignore_ascii_case("null") || s == "~" {
         return Value::Null;
+    }
+    // Flat flow collections, as the config repo writes them: `[]`, `[a, b]`, `{}`, `{k: v}`.
+    if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
+        let inner = s[1..s.len() - 1].trim();
+        if inner.is_empty() {
+            return Value::Array(Vec::new());
+        }
+        return Value::Array(
+            split_flow_items(inner)
+                .iter()
+                .map(|i| parse_yaml_scalar(i))
+                .collect(),
+        );
+    }
+    if s.starts_with('{') && s.ends_with('}') && s.len() >= 2 {
+        let inner = s[1..s.len() - 1].trim();
+        let mut map = serde_json::Map::new();
+        for item in split_flow_items(inner) {
+            if item.trim().is_empty() {
+                continue;
+            }
+            match item.split_once(':') {
+                Some((k, v)) => {
+                    let key = match parse_yaml_scalar(k) {
+                        Value::String(k) => k,
+                        other => other.to_string(),
+                    };
+                    map.insert(key, parse_yaml_scalar(v));
+                }
+                None => return Value::String(s.to_string()),
+            }
+        }
+        return Value::Object(map);
     }
     if s.eq_ignore_ascii_case("true") {
         return Value::Bool(true);

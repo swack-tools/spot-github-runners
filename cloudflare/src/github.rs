@@ -210,6 +210,100 @@ impl GitHubActionsClient {
         Ok(all_runners)
     }
 
+    /// Read one file of the config repo (`spot-runners-config`) at its default branch.
+    /// Returns `Ok(None)` when the file doesn't exist (HTTP 404).
+    async fn read_config_file(&self, file_path: &str) -> Result<Option<String>, GitHubError> {
+        let path = format!(
+            "repos/{}/contents/{}",
+            crate::patch_console::CONFIG_REPO,
+            file_path
+        );
+        let auth_hdr = format!("Bearer {}", self.token);
+        let headers = [
+            ("Authorization", auth_hdr.as_str()),
+            ("Accept", "application/vnd.github+json"),
+            ("X-GitHub-Api-Version", "2022-11-28"),
+            ("User-Agent", "spot-dashboard-edge/1.0"),
+        ];
+        let (status, bytes) = self
+            .transport
+            .request("GET", &path, &headers, None)
+            .await
+            .map_err(GitHubError::Http)?;
+        if status == 404 {
+            return Ok(None);
+        }
+        if status != 200 {
+            return Err(GitHubError::Api {
+                status,
+                message: String::from_utf8_lossy(&bytes).to_string(),
+            });
+        }
+        if bytes.len() > crate::patch_console::MAX_MANIFEST_BYTES * 2 {
+            return Err(GitHubError::Validation(format!(
+                "{} is larger than the manifest limit",
+                file_path
+            )));
+        }
+        let resp: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let content = resp
+            .get("content")
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| GitHubError::Validation(format!("{} has no content", file_path)))?;
+        let raw = B64_STANDARD
+            .decode(content.replace(['\n', '\r', ' '], ""))
+            .map_err(|e| GitHubError::Validation(format!("{} is not base64: {}", file_path, e)))?;
+        String::from_utf8(raw)
+            .map(Some)
+            .map_err(|_| GitHubError::Validation(format!("{} is not UTF-8", file_path)))
+    }
+
+    /// The effective runner patch of a controlled target from the config repo: `defaults.yaml`
+    /// merged with `repos/<owner>/<repo>.yaml` (defaults alone when the repository has no file),
+    /// validated against the hardware floors. An organization target reads `defaults.yaml` only.
+    pub async fn fetch_target_patch(&self, target: &str) -> Result<RunnerPatch, GitHubError> {
+        let parse = |file: &str, text: &str| -> Result<RunnerPatch, GitHubError> {
+            let val = crate::patch::parse_manifest_to_value(text)
+                .map_err(|e| GitHubError::Validation(format!("{}: {}", file, e)))?;
+            serde_json::from_value::<RunnerPatch>(val)
+                .map_err(|e| GitHubError::Validation(format!("{}: {}", file, e)))
+        };
+        let defaults_path = crate::patch_console::DEFAULTS_PATH;
+        // GitHub answers 404 for every path of a private repository the token can't read, so a
+        // missing defaults.yaml means "unreadable", never "empty patch".
+        let defaults = match self.read_config_file(defaults_path).await? {
+            Some(text) => parse(defaults_path, &text)?,
+            None => {
+                return Err(GitHubError::Validation(format!(
+                    "{} not found in {}; check that the token can read it",
+                    defaults_path,
+                    crate::patch_console::CONFIG_REPO
+                )))
+            }
+        };
+        let mut patch = defaults.clone();
+        if target.contains('/') {
+            let repo_path = crate::patch_console::manifest_path_for_target(target)
+                .map_err(GitHubError::Validation)?;
+            if let Some(text) = self.read_config_file(&repo_path).await? {
+                let repo_patch = parse(&repo_path, &text)?;
+                if !repo_patch.repository.is_empty()
+                    && !repo_patch.repository.eq_ignore_ascii_case(target)
+                {
+                    return Err(GitHubError::Validation(format!(
+                        "{} declares repository {}, not {}",
+                        repo_path, repo_patch.repository, target
+                    )));
+                }
+                patch = crate::patch::merge_patches(&defaults, &repo_patch);
+            }
+            patch.repository = target.to_string();
+        }
+        crate::patch::validate_patch_constraints(&patch)
+            .map_err(|errs| GitHubError::Validation(errs.join("; ")))?;
+        Ok(patch)
+    }
+
     /// Deregister an offline, idle runner. Safe against HTTP 404 (already deleted).
     pub async fn delete_runner(
         &self,
@@ -504,16 +598,14 @@ pub fn render_startup_script(
     patch: Option<&RunnerPatch>,
 ) -> Result<String, String> {
     let mut script = RAW_STARTUP_SCRIPT.to_string();
+    let dockerfile = render_dockerfile(RUNNER_DOCKERFILE, patch)?;
 
     let disk_device = format!("/dev/disk/by-id/google-{}", params.disk_device_name);
 
     // 31 Canonical Replacements
     let replacements: [(&str, String); 31] = [
         ("DISK_DEVICE", disk_device),
-        (
-            "DOCKERFILE_B64",
-            B64_STANDARD.encode(RUNNER_DOCKERFILE.as_bytes()),
-        ),
+        ("DOCKERFILE_B64", B64_STANDARD.encode(dockerfile.as_bytes())),
         (
             "ENTRYPOINT_B64",
             B64_STANDARD.encode(RUNNER_ENTRYPOINT.as_bytes()),
@@ -752,6 +844,66 @@ pub fn render_docker_run_args(patch: &RunnerPatch) -> Vec<String> {
         flags.push(spec);
     }
     flags
+}
+
+/// The runner Dockerfile with the patch's container changes (packages, files, `dockerfile_run`)
+/// as one root layer before the image switches to the runner user.
+pub fn render_dockerfile(base: &str, patch: Option<&RunnerPatch>) -> Result<String, String> {
+    let patch = match patch {
+        Some(p) if p.has_container_image_changes() => p,
+        _ => return Ok(base.to_string()),
+    };
+    let mut commands: Vec<String> = Vec::new();
+    if !patch.container.apt_packages.is_empty() {
+        let pkgs: Vec<String> = patch
+            .container
+            .apt_packages
+            .iter()
+            .map(|p| shell_quote(p))
+            .collect();
+        commands.push(format!(
+            "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*",
+            pkgs.join(" ")
+        ));
+    }
+    for file in &patch.container.files {
+        let parent = Path::new(&file.path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "/".to_string());
+        commands.push(format!(
+            "install -d -m 0755 {} && printf '%s' '{}' | base64 -d >{} && chown {} {} && chmod {} {}",
+            shell_quote(&parent),
+            B64_STANDARD.encode(file.content.as_bytes()),
+            shell_quote(&file.path),
+            shell_quote(&file.owner),
+            shell_quote(&file.path),
+            shell_quote(&file.mode),
+            shell_quote(&file.path)
+        ));
+    }
+    if !patch.container.dockerfile_run.trim().is_empty() {
+        commands.push(format!(
+            "printf '%s' '{}' | base64 -d | bash -euo pipefail",
+            B64_STANDARD.encode(patch.container.dockerfile_run.as_bytes())
+        ));
+    }
+    let sha = patch.patch_sha256();
+    let layer = format!(
+        "# Repo patch {}\nRUN {}\n",
+        &sha[..12],
+        commands.join(" \\\n    && ")
+    );
+    // After the toolchain install and its read-only lock, so `dockerfile_run` can use cargo.
+    let anchor = "USER runner\nENV CARGO_HOME=/work/.cargo\n";
+    if !base.contains(anchor) {
+        return Err(
+            "Runner Dockerfile is missing the USER runner anchor for the container patch"
+                .to_string(),
+        );
+    }
+    Ok(base.replacen(anchor, &format!("{}{}", layer, anchor), 1))
 }
 
 pub fn inject_startup_patch(startup_script: &str, patch: &RunnerPatch) -> Result<String, String> {

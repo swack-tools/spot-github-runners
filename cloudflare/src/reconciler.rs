@@ -86,6 +86,9 @@ pub struct ReconciliationReport {
     pub cleaned_runners: Vec<String>,
     pub snapshot_written: bool,
     pub kv_puts: usize,
+    /// Floor targets that launched nothing this tick, each as `<target>: <reason>`.
+    #[serde(default)]
+    pub held_floor_targets: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -219,6 +222,15 @@ pub trait GitHubReconcilerClient {
         labels: &[String],
     ) -> Result<RunnerBootstrapConfig, ReconcilerError>;
     async fn count_queued_jobs(&self, owner: &str, repo: &str) -> Result<u32, ReconcilerError>;
+    /// The target's effective runner patch from the config repo. `Ok(None)` means this client
+    /// has no config repo to read (simulation and test doubles), and the floor keeper falls back
+    /// to its built-in template manifest.
+    async fn fetch_target_patch(
+        &self,
+        _target: &str,
+    ) -> Result<Option<crate::patch::RunnerPatch>, ReconcilerError> {
+        Ok(None)
+    }
 }
 
 // ============================================================================
@@ -355,6 +367,16 @@ impl GitHubReconcilerClient for crate::github::GitHubActionsClient {
     async fn count_queued_jobs(&self, owner: &str, repo: &str) -> Result<u32, ReconcilerError> {
         self.count_queued_jobs_for_repo(owner, repo)
             .await
+            .map_err(|e| ReconcilerError::Github(e.to_string()))
+    }
+
+    async fn fetch_target_patch(
+        &self,
+        target: &str,
+    ) -> Result<Option<crate::patch::RunnerPatch>, ReconcilerError> {
+        crate::github::GitHubActionsClient::fetch_target_patch(self, target)
+            .await
+            .map(Some)
             .map_err(|e| ReconcilerError::Github(e.to_string()))
     }
 }
@@ -712,6 +734,7 @@ where
                     cleaned_runners: vec![],
                     snapshot_written: false,
                     kv_puts: TOTAL_KV_PUTS.load(Ordering::SeqCst),
+                    held_floor_targets: vec![],
                 });
             }
         }
@@ -880,6 +903,7 @@ where
         cleaned_runners: vec![],
         snapshot_written,
         kv_puts: TOTAL_KV_PUTS.load(Ordering::SeqCst),
+        held_floor_targets: vec![],
     })
 }
 
@@ -1014,6 +1038,7 @@ where
                     cleaned_runners: vec![],
                     snapshot_written: false,
                     kv_puts: TOTAL_KV_PUTS.load(Ordering::SeqCst),
+                    held_floor_targets: vec![],
                 });
             }
         }
@@ -1117,6 +1142,7 @@ where
     let mut cleaned_vms = Vec::new();
     let mut cleaned_runners = Vec::new();
     let mut launched_hosts = Vec::new();
+    let mut held_floor_targets: Vec<String> = Vec::new();
 
     // 3. Process Injected Test Terminated VMs
     {
@@ -1282,9 +1308,54 @@ where
             let host_name = format!("oxidex-runners-{}-{}-{}", safe_slug, now, hex_suffix);
             let deployment_id = format!("dep-{}", now);
 
+            // The target's runner patch from the config repo (packages, mounts, ISA, labels). A
+            // patch that can't be read holds this target's launch until a later tick: a host
+            // without it would serve the target's labels without what its jobs need.
+            let fetched_patch = match gh.fetch_target_patch(target).await {
+                Ok(p) => p,
+                Err(e) => {
+                    held_floor_targets.push(format!("{}: runner patch unavailable: {}", target, e));
+                    continue;
+                }
+            };
+            if let Some(p) = &fetched_patch {
+                // Labels reach the startup script inside single quotes and GitHub's label API.
+                if let Some(bad) = p
+                    .hardware
+                    .isa
+                    .iter()
+                    .chain(p.hardware.extra_labels.iter())
+                    .find(|l| {
+                        l.is_empty()
+                            || l.len() > 64
+                            || !l
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                    })
+                {
+                    held_floor_targets.push(format!(
+                        "{}: runner patch label {:?} is not valid",
+                        target, bad
+                    ));
+                    continue;
+                }
+                let arch = p.hardware.arch.to_ascii_lowercase();
+                if arch != "x86_64" && arch != "amd64" {
+                    held_floor_targets.push(format!(
+                        "{}: runner patch needs {}, floor hosts are {}",
+                        target, p.hardware.arch, DEFAULT_MACHINE_TYPE
+                    ));
+                    continue;
+                }
+            }
+            let manifest_val = match &fetched_patch {
+                Some(p) => serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+                None => crate::patch_console::make_valid_manifest_json(target),
+            };
+
             // Mint 2-slot JIT configs with fallback to registration token
             let runner_prefix = "oxidex";
-            let labels = vec![
+            let mut labels = vec![
                 "self-hosted".to_string(),
                 "Linux".to_string(),
                 "X64".to_string(),
@@ -1292,6 +1363,16 @@ where
                 DEFAULT_MACHINE_TYPE.to_string(),
                 DEFAULT_ZONE.to_string(),
             ];
+            if let Some(p) = &fetched_patch {
+                // The patch's ISA and extra labels, so jobs that select them land here. GitHub
+                // compares labels without case.
+                for label in p.hardware.isa.iter().chain(p.hardware.extra_labels.iter()) {
+                    let label = label.trim();
+                    if !label.is_empty() && !labels.iter().any(|l| l.eq_ignore_ascii_case(label)) {
+                        labels.push(label.to_string());
+                    }
+                }
+            }
 
             let gh_target = if target.contains('/') {
                 format!("repos/{}", target)
@@ -1348,7 +1429,6 @@ where
                 resource_monitoring: true,
             };
 
-            let manifest_val = crate::patch_console::make_valid_manifest_json(target);
             let patch_sha = crate::patch::compute_canonical_patch_sha256(&manifest_val)
                 .unwrap_or_else(|_| {
                     "0000000000000000000000000000000000000000000000000000000000000000".to_string()
@@ -1358,9 +1438,18 @@ where
             let runner_patch =
                 serde_json::from_value::<crate::patch::RunnerPatch>(manifest_val.clone()).ok();
 
-            let rendered_script =
-                crate::github::render_startup_script(&startup_params, runner_patch.as_ref())
-                    .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
+            let rendered_script = match crate::github::render_startup_script(
+                &startup_params,
+                runner_patch.as_ref(),
+            ) {
+                Ok(script) => script,
+                Err(e) => {
+                    // A host without its bootstrap would count as the floor and serve nothing.
+                    held_floor_targets
+                        .push(format!("{}: startup script render failed: {}", target, e));
+                    continue;
+                }
+            };
 
             let vm_cfg = crate::gcp::RunnerVmConfig {
                 instance_name: &host_name,
@@ -1762,5 +1851,6 @@ where
         cleaned_runners,
         snapshot_written,
         kv_puts: TOTAL_KV_PUTS.load(Ordering::SeqCst),
+        held_floor_targets,
     })
 }

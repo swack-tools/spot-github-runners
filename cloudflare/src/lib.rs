@@ -2370,9 +2370,14 @@ pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
             .ok();
         reconciler::set_reconciler_session_secret(sess_sec);
 
-        let _ =
+        if let Ok(report) =
             reconciler::reconcile_worker_fleet(&kv, sa_key.as_deref(), gh_token.as_deref(), now)
-                .await;
+                .await
+        {
+            for held in &report.held_floor_targets {
+                console_log!("Floor launch held: {}", held);
+            }
+        }
     }
 }
 

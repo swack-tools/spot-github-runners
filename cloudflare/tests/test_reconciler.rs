@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use spot_dashboard_edge::gcp::{GceInsertInstanceRequest, GceMetadata, GceOperation};
 use spot_dashboard_edge::github::RunnerBootstrapConfig;
+use spot_dashboard_edge::patch::{parse_manifest_text, RunnerPatch};
 use spot_dashboard_edge::reconciler::*;
 use spot_dashboard_edge::state::{invalidate_state_cache, KvStoreBackend, StateError};
 
@@ -129,6 +130,9 @@ pub struct MockGitHubReconciler {
     pub target_runners: Arc<Mutex<HashMap<String, Vec<SimpleGitHubRunner>>>>,
     pub deleted_runners: Arc<Mutex<Vec<u64>>>,
     pub queued_jobs: Arc<Mutex<u32>>,
+    /// Config-repo patches by target; a target missing here reads as "no config repo" (Ok(None)).
+    pub patches: Arc<Mutex<HashMap<String, Result<RunnerPatch, String>>>>,
+    pub minted_labels: Arc<Mutex<Vec<(String, Vec<String>)>>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -154,12 +158,16 @@ impl GitHubReconcilerClient for MockGitHubReconciler {
 
     async fn mint_2slot_runner_configs(
         &self,
-        _target_api_path: &str,
+        target_api_path: &str,
         _vm_name: &str,
         _runner_prefix: &str,
         _runner_group_id: u32,
-        _labels: &[String],
+        labels: &[String],
     ) -> Result<RunnerBootstrapConfig, ReconcilerError> {
+        self.minted_labels
+            .lock()
+            .unwrap()
+            .push((target_api_path.to_string(), labels.to_vec()));
         Ok(RunnerBootstrapConfig::JitConfig {
             runner_1_jitconfig: "jit1-token-xyz".to_string(),
             runner_2_jitconfig: "jit2-token-xyz".to_string(),
@@ -171,6 +179,17 @@ impl GitHubReconcilerClient for MockGitHubReconciler {
             Ok(*self.queued_jobs.lock().unwrap())
         } else {
             Ok(0)
+        }
+    }
+
+    async fn fetch_target_patch(
+        &self,
+        target: &str,
+    ) -> Result<Option<RunnerPatch>, ReconcilerError> {
+        match self.patches.lock().unwrap().get(target) {
+            Some(Ok(p)) => Ok(Some(p.clone())),
+            Some(Err(e)) => Err(ReconcilerError::Github(e.clone())),
+            None => Ok(None),
         }
     }
 }
@@ -722,4 +741,229 @@ async fn test_reconciler_queries_runners_across_org_and_repo_targets() {
         gcp.scrubbed_instances.lock().unwrap().as_slice(),
         &["oxidex-runners-xbmc4lyfe-newznab-tmux-vm"]
     );
+}
+
+// ============================================================================
+// Floor hosts get their target's config-repo runner patch
+// ============================================================================
+
+const NEWZNAB_MANIFEST: &str = r#"schema: spot-runner-patch-v1
+repository: xbmc4lyfe/newznab-tmux
+
+hardware:
+  arch: x86_64
+  min_vcpu: 16
+  min_ram_gib: 32
+  isa:
+    - avx512-vbmi2
+  extra_labels:
+    - x86
+    - ubuntu-latest
+    - avx512-vbmi2
+    - nntmux-simd
+
+host:
+  apt_packages: []
+  sysctl:
+    vm.max_map_count: 262144
+  files: []
+  boot_mkdirs:
+    - /mnt/runner-data/nntmux-cache
+  boot_script: |
+    chown 1001:1001 /mnt/runner-data/nntmux-cache
+
+container:
+  apt_packages:
+    - php-cli
+  sysctl: {}
+  mounts:
+    - source: /mnt/runner-data/nntmux-cache
+      target: /work/.nntmux-cache
+      read_only: false
+  files: []
+  dockerfile_run: ""
+"#;
+
+fn inserted_for<'a>(
+    inserted: &'a [GceInsertInstanceRequest],
+    target: &str,
+) -> Option<&'a GceInsertInstanceRequest> {
+    inserted
+        .iter()
+        .find(|r| r.metadata.get("spot-runner-patch-target") == Some(target))
+}
+
+#[tokio::test]
+async fn test_floor_host_gets_the_config_repo_patch_and_its_labels() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+    let patch = parse_manifest_text(NEWZNAB_MANIFEST).expect("manifest parses");
+    gh.patches
+        .lock()
+        .unwrap()
+        .insert("xbmc4lyfe/newznab-tmux".into(), Ok(patch.clone()));
+
+    let report = run_reconciliation(&kv, &gcp, &gh, 1700000000)
+        .await
+        .unwrap();
+    assert_eq!(report.launched_hosts.len(), 4);
+    assert!(report.held_floor_targets.is_empty());
+
+    let inserted = gcp.inserted_instances.lock().unwrap();
+    let host = inserted_for(&inserted, "xbmc4lyfe/newznab-tmux").expect("newznab floor host");
+    assert_eq!(
+        host.metadata.get("spot-runner-patch-sha256"),
+        Some(patch.patch_sha256().as_str())
+    );
+    let script = host.metadata.get("startup-script").unwrap();
+    let dockerfile = spot_dashboard_edge::github::render_dockerfile(
+        spot_dashboard_edge::github::RUNNER_DOCKERFILE,
+        Some(&patch),
+    )
+    .unwrap();
+    assert!(
+        dockerfile.contains("--no-install-recommends 'php-cli'")
+            || dockerfile.contains("--no-install-recommends php-cli")
+    );
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(dockerfile.as_bytes());
+    assert!(
+        script.contains(&encoded),
+        "container packages reach the image"
+    );
+    assert!(
+        script.contains("/work/.nntmux-cache"),
+        "the cache mount reaches docker run"
+    );
+    assert!(script.contains("avx512-vbmi2"));
+
+    let minted = gh.minted_labels.lock().unwrap();
+    let (_, labels) = minted
+        .iter()
+        .find(|(path, _)| path == "repos/xbmc4lyfe/newznab-tmux")
+        .unwrap();
+    for wanted in [
+        "spot",
+        "x86",
+        "ubuntu-latest",
+        "avx512-vbmi2",
+        "nntmux-simd",
+    ] {
+        assert!(
+            labels.iter().any(|l| l == wanted),
+            "missing label {}",
+            wanted
+        );
+    }
+    let lowered: Vec<String> = labels.iter().map(|l| l.to_ascii_lowercase()).collect();
+    let mut unique = lowered.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        lowered.len(),
+        "labels are unique without case"
+    );
+
+    // A target with no config repo source keeps the built-in template and its fixed labels.
+    let (_, rustnzb_labels) = minted
+        .iter()
+        .find(|(path, _)| path == "repos/xbmc4lyfe/rustnzb")
+        .unwrap();
+    assert_eq!(rustnzb_labels.len(), 6);
+}
+
+#[tokio::test]
+async fn test_an_unreadable_patch_holds_only_that_floor_target() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+    gh.patches.lock().unwrap().insert(
+        "xbmc4lyfe/newznab-tmux".into(),
+        Err("GitHub API error (status 502): bad gateway".into()),
+    );
+    let mut arm = parse_manifest_text(NEWZNAB_MANIFEST).unwrap();
+    arm.hardware.arch = "arm64".into();
+    gh.patches
+        .lock()
+        .unwrap()
+        .insert("xbmc4lyfe/rustnzb".into(), Ok(arm));
+
+    let report = run_reconciliation(&kv, &gcp, &gh, 1700000000)
+        .await
+        .unwrap();
+    assert_eq!(report.launched_hosts.len(), 2);
+    assert_eq!(report.held_floor_targets.len(), 2);
+    assert!(report.held_floor_targets[0]
+        .starts_with("xbmc4lyfe/newznab-tmux: runner patch unavailable"));
+    assert!(report.held_floor_targets[1].starts_with("xbmc4lyfe/rustnzb: runner patch needs arm64"));
+    let inserted = gcp.inserted_instances.lock().unwrap();
+    assert!(inserted_for(&inserted, "xbmc4lyfe/newznab-tmux").is_none());
+    assert!(inserted_for(&inserted, "xbmc4lyfe/rustnzb").is_none());
+    assert!(gh
+        .minted_labels
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(path, _)| path != "repos/xbmc4lyfe/newznab-tmux"));
+}
+
+#[tokio::test]
+async fn test_a_patch_with_an_unsafe_label_holds_the_floor_target() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+    let mut patch = parse_manifest_text(NEWZNAB_MANIFEST).unwrap();
+    patch.hardware.extra_labels.push("it's".into());
+    gh.patches
+        .lock()
+        .unwrap()
+        .insert("xbmc4lyfe/newznab-tmux".into(), Ok(patch));
+
+    let report = run_reconciliation(&kv, &gcp, &gh, 1700000000)
+        .await
+        .unwrap();
+    assert_eq!(report.launched_hosts.len(), 3);
+    assert_eq!(report.held_floor_targets.len(), 1);
+    assert!(report.held_floor_targets[0].contains("is not valid"));
+    let inserted = gcp.inserted_instances.lock().unwrap();
+    assert!(inserted_for(&inserted, "xbmc4lyfe/newznab-tmux").is_none());
+}
+
+#[tokio::test]
+async fn test_a_startup_script_over_the_size_limit_holds_the_floor_target() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+    let mut patch = parse_manifest_text(NEWZNAB_MANIFEST).unwrap();
+    patch.container.dockerfile_run = "x".repeat(200 * 1024);
+    gh.patches
+        .lock()
+        .unwrap()
+        .insert("xbmc4lyfe/newznab-tmux".into(), Ok(patch));
+
+    let report = run_reconciliation(&kv, &gcp, &gh, 1700000000)
+        .await
+        .unwrap();
+    assert_eq!(report.launched_hosts.len(), 3);
+    assert!(report.held_floor_targets[0].contains("startup script render failed"));
+    let inserted = gcp.inserted_instances.lock().unwrap();
+    assert!(inserted_for(&inserted, "xbmc4lyfe/newznab-tmux").is_none());
 }

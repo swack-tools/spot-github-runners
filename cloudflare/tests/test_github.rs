@@ -509,3 +509,157 @@ async fn test_count_queued_jobs_propagates_non_200_errors() {
         other => panic!("Expected GitHubError::Api, got {:?}", other),
     }
 }
+
+// ============================================================================
+// Config-repo runner patches for floor hosts
+// ============================================================================
+
+const DEFAULTS_YAML: &str = "schema: spot-runner-patch-v1\n\nhardware:\n  arch: x86_64\n  min_vcpu: 16\n  min_ram_gib: 32\n  isa: []\n  extra_labels: []\n\nhost:\n  apt_packages: []\n  sysctl: {}\n  files: []\n  boot_mkdirs: []\n  boot_script: \"\"\n\ncontainer:\n  apt_packages: []\n  sysctl: {}\n  mounts: []\n  files: []\n  dockerfile_run: \"\"\n";
+
+const NEWZNAB_YAML: &str = "schema: spot-runner-patch-v1\nrepository: xbmc4lyfe/newznab-tmux\n\nhardware:\n  arch: x86_64\n  min_vcpu: 16\n  min_ram_gib: 32\n  isa:\n    - avx512-vbmi2\n  extra_labels:\n    - x86\n    - nntmux-simd\n\nhost:\n  apt_packages: []\n  sysctl:\n    vm.max_map_count: 262144\n  files: []\n  boot_mkdirs:\n    - /mnt/runner-data/nntmux-cache\n  boot_script: |\n    chown 1001:1001 /mnt/runner-data/nntmux-cache\n\ncontainer:\n  apt_packages:\n    - php-cli\n    - composer\n  sysctl: {}\n  mounts:\n    - source: /mnt/runner-data/nntmux-cache\n      target: /work/.nntmux-cache\n      read_only: false\n  files: []\n  dockerfile_run: |\n    php -v && composer --version\n";
+
+fn config_transport(
+    files: &[(&str, &str)],
+) -> spot_dashboard_edge::patch_console::MockGitHubTransport {
+    let transport = spot_dashboard_edge::patch_console::MockGitHubTransport::new();
+    {
+        let mut all = transport.files.lock().unwrap();
+        let head = all.get_mut(&"a".repeat(40)).unwrap();
+        head.clear();
+        for (path, text) in files {
+            head.insert(path.to_string(), text.to_string());
+        }
+    }
+    transport
+}
+
+#[tokio::test]
+async fn test_fetch_target_patch_merges_defaults_and_the_repository_manifest() {
+    let transport = config_transport(&[
+        ("defaults.yaml", DEFAULTS_YAML),
+        ("repos/xbmc4lyfe/newznab-tmux.yaml", NEWZNAB_YAML),
+    ]);
+    let client = GitHubActionsClient::new("tok".to_string(), Arc::new(transport));
+    let patch = client
+        .fetch_target_patch("xbmc4lyfe/newznab-tmux")
+        .await
+        .unwrap();
+    assert_eq!(patch.repository, "xbmc4lyfe/newznab-tmux");
+    assert_eq!(patch.hardware.isa, vec!["avx512-vbmi2".to_string()]);
+    assert!(patch
+        .hardware
+        .extra_labels
+        .contains(&"nntmux-simd".to_string()));
+    assert_eq!(
+        patch.container.apt_packages,
+        vec!["php-cli".to_string(), "composer".to_string()]
+    );
+    assert_eq!(patch.container.mounts[0].target, "/work/.nntmux-cache");
+    assert!(patch.host.boot_script.contains("chown 1001:1001"));
+    assert!(patch
+        .container
+        .dockerfile_run
+        .contains("composer --version"));
+}
+
+#[tokio::test]
+async fn test_fetch_target_patch_without_a_repository_file_uses_defaults() {
+    let transport = config_transport(&[("defaults.yaml", DEFAULTS_YAML)]);
+    let client = GitHubActionsClient::new("tok".to_string(), Arc::new(transport));
+    let patch = client
+        .fetch_target_patch("xbmc4lyfe/rustnzb")
+        .await
+        .unwrap();
+    assert_eq!(patch.repository, "xbmc4lyfe/rustnzb");
+    assert!(patch.container.apt_packages.is_empty());
+    let org = client.fetch_target_patch("swack-tools").await.unwrap();
+    assert_eq!(org.repository, "");
+}
+
+#[tokio::test]
+async fn test_fetch_target_patch_refuses_a_foreign_or_unreadable_manifest() {
+    let foreign = NEWZNAB_YAML.replace(
+        "repository: xbmc4lyfe/newznab-tmux",
+        "repository: xbmc4lyfe/rustnzb",
+    );
+    let transport = config_transport(&[
+        ("defaults.yaml", DEFAULTS_YAML),
+        ("repos/xbmc4lyfe/newznab-tmux.yaml", &foreign),
+    ]);
+    let client = GitHubActionsClient::new("tok".to_string(), Arc::new(transport));
+    let err = client
+        .fetch_target_patch("xbmc4lyfe/newznab-tmux")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("declares repository xbmc4lyfe/rustnzb"),
+        "{}",
+        err
+    );
+
+    let transport = CustomMockGitHubTransport::new();
+    transport.set_response(
+        "contents/defaults.yaml",
+        502,
+        serde_json::json!({"message": "bad gateway"}),
+    );
+    let client = GitHubActionsClient::new("tok".to_string(), Arc::new(transport));
+    let err = client
+        .fetch_target_patch("xbmc4lyfe/newznab-tmux")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("502"), "{}", err);
+}
+
+#[test]
+fn test_render_dockerfile_adds_the_container_patch_as_a_root_layer() {
+    assert_eq!(
+        render_dockerfile(RUNNER_DOCKERFILE, None).unwrap(),
+        RUNNER_DOCKERFILE
+    );
+    let empty = RunnerPatch::default();
+    assert_eq!(
+        render_dockerfile(RUNNER_DOCKERFILE, Some(&empty)).unwrap(),
+        RUNNER_DOCKERFILE
+    );
+
+    let patch = spot_dashboard_edge::patch::parse_manifest_text(NEWZNAB_YAML).unwrap();
+    let rendered = render_dockerfile(RUNNER_DOCKERFILE, Some(&patch)).unwrap();
+    let layer = rendered.find("# Repo patch ").unwrap();
+    let user = rendered
+        .find("USER runner\nENV CARGO_HOME=/work/.cargo\n")
+        .unwrap();
+    assert!(layer < user, "the layer runs as root, before USER runner");
+    assert!(rendered[layer..user].contains("install -y --no-install-recommends php-cli composer"));
+    assert!(rendered[layer..user].contains("| base64 -d | bash -euo pipefail"));
+    assert_eq!(rendered.matches("# Repo patch ").count(), 1);
+}
+
+#[tokio::test]
+async fn test_fetch_target_patch_treats_a_missing_defaults_file_as_unreadable() {
+    // A private config repo the token can't read answers 404 for every file.
+    let transport = config_transport(&[]);
+    let client = GitHubActionsClient::new("tok".to_string(), Arc::new(transport));
+    let err = client
+        .fetch_target_patch("xbmc4lyfe/newznab-tmux")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("defaults.yaml not found"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn test_render_dockerfile_layer_follows_the_toolchain_install() {
+    let patch = spot_dashboard_edge::patch::parse_manifest_text(NEWZNAB_YAML).unwrap();
+    let rendered = render_dockerfile(RUNNER_DOCKERFILE, Some(&patch)).unwrap();
+    let layer = rendered.find("# Repo patch ").unwrap();
+    let toolchain = rendered.find("rustc --version").unwrap();
+    assert!(
+        toolchain < layer,
+        "dockerfile_run can use the installed toolchain"
+    );
+}
