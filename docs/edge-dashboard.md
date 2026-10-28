@@ -290,6 +290,30 @@ Set these variables in `cloudflare/wrangler.toml` or as Cloudflare Worker secret
 | `GITHUB_OAUTH_CLIENT_SECRET` | Secret | GitHub OAuth 2.0 app client secret. |
 | `SPOT_CONFIG_GH_TOKEN` | Secret | GitHub personal access token with repository and runner administration permissions. |
 
+## Deployment
+
+The `Deploy Worker` workflow (`.github/workflows/deploy-worker.yml`) deploys the Worker automatically, but only
+after a push to `main` is fully green:
+
+1. The `CI` workflow runs format checks, both Rust test suites, and the release bundle build with a 3 MiB size
+   check on every pull request and every push to `main`.
+2. When `CI` succeeds on a push to `main`, the deploy workflow waits until every other workflow run, check run,
+   and commit status on that commit has finished. Any failure stops the deploy.
+3. If `main` has moved to a newer commit, the run skips the older commit and leaves the deploy to the newer one.
+4. The workflow renders the production KV namespace ID into a copy of `wrangler.toml`, runs `wrangler deploy` with
+   `--keep-vars`, and labels the Worker version with the commit.
+
+Deploys run one at a time and stay off until you turn them on. To turn them on:
+
+1. Create the `worker-production` environment in the repository settings.
+2. Add these environment secrets: `CLOUDFLARE_API_TOKEN` (an API token limited to this account's Workers
+   scripts, KV, routes, and the dashboard zone's DNS), `CLOUDFLARE_ACCOUNT_ID`, `SPOT_KV_NAMESPACE_ID`, and
+   `GCP_PROJECT`.
+3. Set the repository variable `WORKER_AUTO_DEPLOY` to `true`. Set it to any other value to pause deploys.
+
+The workflow leaves Worker secrets such as `SESSION_SECRET` unchanged. `just deploy-worker` still works for
+manual deploys.
+
 ## Commands
 
 Run unit tests for the Rust Cloudflare Worker:
