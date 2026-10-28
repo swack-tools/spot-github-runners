@@ -723,3 +723,51 @@ async fn test_reconciler_queries_runners_across_org_and_repo_targets() {
         &["oxidex-runners-xbmc4lyfe-newznab-tmux-vm"]
     );
 }
+
+async fn set_runner_floor_and_cap(kv: &MockKvStore, min_runners: u32, max_runners: u32, now: u64) {
+    let (mut bundle, _) = spot_dashboard_edge::state::load_state(kv, now)
+        .await
+        .unwrap();
+    bundle.state.scaling.cicd_runner.min_runners = min_runners;
+    bundle.state.scaling.cicd_runner.max_runners = max_runners;
+    spot_dashboard_edge::state::save_state(kv, &mut bundle, now)
+        .await
+        .unwrap();
+    invalidate_state_cache();
+}
+
+#[tokio::test]
+async fn test_zero_min_runners_disables_floor_keeper() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+    let now = 1700000000;
+    set_runner_floor_and_cap(&kv, 0, 24, now).await;
+
+    let report = run_reconciliation(&kv, &gcp, &gh, now).await.unwrap();
+    assert_eq!(report.status, "reconciled");
+    assert!(report.launched_hosts.is_empty());
+    assert!(gcp.inserted_instances.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_zero_max_runners_disables_backlog_scale_up() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+    let now = 1700000000;
+    set_runner_floor_and_cap(&kv, 0, 0, now).await;
+    *gh.queued_jobs.lock().unwrap() = 50;
+
+    let report = run_reconciliation(&kv, &gcp, &gh, now).await.unwrap();
+    assert!(report.launched_hosts.is_empty());
+    assert!(gcp.inserted_instances.lock().unwrap().is_empty());
+}

@@ -1222,7 +1222,9 @@ where
     }
 
     // 8. Floor Target Keeper (Ensure >= 1 Host Per Target)
-    for target in &controlled_targets {
+    // `min_runners == 0` disables the floor so the fleet can be scaled to zero.
+    let floor_enabled = bundle.state.scaling.cicd_runner.min_runners > 0;
+    for target in controlled_targets.iter().filter(|_| floor_enabled) {
         let target_slug = target.replace('/', "-").to_lowercase();
         let safe_slug = if target_slug.len() > 24 {
             &target_slug[..24]
@@ -1413,7 +1415,9 @@ where
         })
         .count();
 
+    // `max_runners == 0` disables backlog scale-up entirely.
     if backlog_known
+        && bundle.state.scaling.cicd_runner.max_runners > 0
         && queued_jobs >= MIN_QUEUED_JOBS_THRESHOLD
         && current_live < (max_instances as usize)
     {
