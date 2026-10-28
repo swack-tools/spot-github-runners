@@ -96,11 +96,12 @@ The session cookie `__Host-spot_session` uses purpose-separated HMAC-SHA256 sign
 The Worker supports two authentication workflows:
 
 1. **Browser web flow with PKCE**:
-   - `/auth/github/login` generates an encrypted state parameter with a PKCE code verifier and redirects to GitHub.
+   - `/auth/github/login` generates an encrypted state parameter with a PKCE code verifier and redirects to GitHub. The redirect asks GitHub to show its account picker, so a person signed in to more than one GitHub account chooses which one to use.
    - `/auth/github/callback` validates the state and code verifier, exchanges the code for an access token, confirms administrator authorization, and issues the signed session cookie.
 2. **Device authorization flow**:
-   - `/auth/device/code` issues a user verification code and URI for headless terminal workstations.
-   - `/auth/device/token` and `/auth/device/poll` poll for completion with rate limiting and exponential backoff (`slow_down`).
+   - `/auth/device/code` requests a user code from GitHub (`https://github.com/login/device/code`) and returns it with a signed, expiring handle that wraps GitHub's device code.
+   - `/auth/device/token` and `/auth/device/poll` verify the handle, poll GitHub's token endpoint, pass GitHub's `slow_down` interval through, and issue the session cookie once an administrator account approves. The GitHub access token never leaves the Worker.
+   - GitHub issues device codes only when **Enable Device Flow** is turned on in the OAuth app's settings. Without it, the sign-in gate reports that device sign-in is off.
 
 ### Dashboard administrators
 

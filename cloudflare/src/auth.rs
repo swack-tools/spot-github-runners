@@ -444,7 +444,7 @@ pub fn build_github_authorize_url(
     let encoded_challenge =
         percent_encoding::utf8_percent_encode(challenge, percent_encoding::NON_ALPHANUMERIC);
     format!(
-        "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read%3Aorg%2Crepo&state={}&code_challenge={}&code_challenge_method=S256&allow_signup=false",
+        "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read%3Aorg%2Crepo&state={}&code_challenge={}&code_challenge_method=S256&allow_signup=false&prompt=select_account",
         client_id, encoded_redirect, encoded_state, encoded_challenge
     )
 }
@@ -649,4 +649,153 @@ pub fn authorize_device(code_or_handle: &str, user_login: &str, user_id: u64) ->
             false
         }
     })
+}
+
+/// GitHub endpoint that issues real device-flow user codes (RFC 8628).
+pub const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+/// Device-flow sign-in only reads the caller's identity from `/user`.
+pub const DEVICE_FLOW_SCOPE: &str = "read:user";
+pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// A device code GitHub issued, as returned by `/login/device/code`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubDeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+/// Parses GitHub's `/login/device/code` JSON reply. GitHub answers 200 with an
+/// `error` field (for example `device_flow_disabled`) when the OAuth app has the
+/// device flow turned off, so the error is surfaced instead of a code.
+pub fn parse_github_device_code_response(body: &Value) -> Result<GithubDeviceCode, String> {
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        let desc = body
+            .get("error_description")
+            .and_then(|v| v.as_str())
+            .unwrap_or(err);
+        return Err(format!("{err}: {desc}"));
+    }
+    let field = |name: &str| -> Result<String, String> {
+        body.get(name)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 512)
+            .map(str::to_string)
+            .ok_or_else(|| format!("GitHub device code response is missing {name}"))
+    };
+    let expires_in = body
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(900)
+        .clamp(60, 1800);
+    let interval = body
+        .get("interval")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEVICE_MIN_INTERVAL_SECONDS)
+        .clamp(DEVICE_MIN_INTERVAL_SECONDS, DEVICE_MAX_INTERVAL_SECONDS);
+    Ok(GithubDeviceCode {
+        device_code: field("device_code")?,
+        user_code: field("user_code")?,
+        verification_uri: field("verification_uri")?,
+        expires_in,
+        interval,
+    })
+}
+
+/// Wraps GitHub's device code in a signed, expiring handle so the browser can
+/// poll without the Worker keeping per-isolate state.
+pub fn sign_device_handle(
+    secret: &[u8],
+    code: &GithubDeviceCode,
+    now: u64,
+) -> Result<String, String> {
+    let handshake = DeviceHandshakeRecord {
+        device_code: code.device_code.clone(),
+        expires_at: now + code.expires_in,
+        interval: code.interval,
+        next_poll_at: now + code.interval,
+    };
+    sign_token(&derive_purpose_key(secret, "device-flow"), &handshake)
+}
+
+/// Verifies a handle from `sign_device_handle`. Expired handles are rejected.
+pub fn verify_device_handle(
+    secret: &[u8],
+    handle: &str,
+    now: u64,
+) -> Result<DeviceHandshakeRecord, DevicePollResult> {
+    if handle.is_empty() || handle.len() > MAX_TOKEN_CHARS {
+        return Err(DevicePollResult::Invalid);
+    }
+    let val = verify_token_signature(&derive_purpose_key(secret, "device-flow"), handle)
+        .ok_or(DevicePollResult::Invalid)?;
+    let record: DeviceHandshakeRecord =
+        serde_json::from_value(val).map_err(|_| DevicePollResult::Invalid)?;
+    if record.device_code.is_empty() {
+        return Err(DevicePollResult::Invalid);
+    }
+    if now >= record.expires_at {
+        return Err(DevicePollResult::Expired);
+    }
+    Ok(record)
+}
+
+/// Outcome of polling GitHub's token endpoint with a device code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubDeviceTokenOutcome {
+    AccessToken(String),
+    Pending,
+    SlowDown { interval: u64 },
+    Expired,
+    Denied,
+    Failed(String),
+}
+
+/// Maps GitHub's `/login/oauth/access_token` device-grant reply to an outcome.
+pub fn classify_github_device_token_response(
+    body: &Value,
+    current_interval: u64,
+) -> GithubDeviceTokenOutcome {
+    if let Some(tok) = body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return GithubDeviceTokenOutcome::AccessToken(tok.to_string());
+    }
+    match body.get("error").and_then(|v| v.as_str()).unwrap_or("") {
+        "authorization_pending" => GithubDeviceTokenOutcome::Pending,
+        "slow_down" => {
+            let interval = body
+                .get("interval")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(current_interval + DEVICE_SLOW_DOWN_INCREMENT_SECONDS)
+                .clamp(DEVICE_MIN_INTERVAL_SECONDS, DEVICE_MAX_INTERVAL_SECONDS);
+            GithubDeviceTokenOutcome::SlowDown { interval }
+        }
+        "expired_token" => GithubDeviceTokenOutcome::Expired,
+        "access_denied" => GithubDeviceTokenOutcome::Denied,
+        other => {
+            let desc = body
+                .get("error_description")
+                .and_then(|v| v.as_str())
+                .unwrap_or(if other.is_empty() {
+                    "GitHub returned no access token"
+                } else {
+                    other
+                });
+            GithubDeviceTokenOutcome::Failed(desc.to_string())
+        }
+    }
+}
+
+/// Message for a GitHub account that authenticated but is not an administrator.
+pub fn not_admin_message(login: &str) -> String {
+    format!(
+        "Forbidden: GitHub signed you in as '{login}', which is not an authorized administrator. \
+         If you have more than one GitHub account, sign in again and pick the administrator account."
+    )
 }
