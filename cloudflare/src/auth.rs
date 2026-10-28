@@ -799,3 +799,32 @@ pub fn not_admin_message(login: &str) -> String {
          If you have more than one GitHub account, sign in again and pick the administrator account."
     )
 }
+
+/// Sign-in gate text for a failed authorization-code exchange. Keeps GitHub's
+/// error code so a screenshot or log line identifies the cause.
+pub fn oauth_exchange_error_message(http_status: u16, body: &Value) -> String {
+    let code = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    let desc = body
+        .get("error_description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let hint = match code {
+        "bad_verification_code" => {
+            " The sign-in link was already used or expired; select Sign in with GitHub again."
+        }
+        "redirect_uri_mismatch" => {
+            " The OAuth app's callback URL does not match this dashboard's /auth/github/callback."
+        }
+        "incorrect_client_credentials" => {
+            " The Worker's GITHUB_OAUTH_CLIENT_ID or GITHUB_OAUTH_CLIENT_SECRET does not match the OAuth app."
+        }
+        _ => "",
+    };
+    match (code.is_empty(), desc.is_empty()) {
+        (true, _) => format!(
+            "GitHub OAuth Error: code exchange failed (HTTP {http_status}, no error in response). Select Sign in with GitHub again."
+        ),
+        (false, true) => format!("GitHub OAuth Error [{code}].{hint}"),
+        (false, false) => format!("GitHub OAuth Error [{code}]: {desc}{hint}"),
+    }
+}
