@@ -944,6 +944,54 @@ async fn test_a_patch_with_an_unsafe_label_holds_the_floor_target() {
 }
 
 #[tokio::test]
+async fn test_a_patch_needing_an_isa_floor_hosts_lack_holds_the_floor_target() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+    // AMX in `isa`, and AMX named only as an extra label: both would route AMX jobs to
+    // c4d hosts that can't run them.
+    let mut amx_isa = parse_manifest_text(NEWZNAB_MANIFEST).unwrap();
+    amx_isa.hardware.isa.push("amx".into());
+    gh.patches
+        .lock()
+        .unwrap()
+        .insert("xbmc4lyfe/newznab-tmux".into(), Ok(amx_isa));
+    let mut amx_label = parse_manifest_text(NEWZNAB_MANIFEST).unwrap();
+    amx_label.repository = "xbmc4lyfe/rustnzb".into();
+    amx_label.hardware.isa = vec!["AVX512_VBMI2".into()];
+    amx_label.hardware.extra_labels.push("amx-tile".into());
+    gh.patches
+        .lock()
+        .unwrap()
+        .insert("xbmc4lyfe/rustnzb".into(), Ok(amx_label));
+
+    let report = run_reconciliation(&kv, &gcp, &gh, 1700000000)
+        .await
+        .unwrap();
+    assert_eq!(report.launched_hosts.len(), 2);
+    assert_eq!(report.held_floor_targets.len(), 2);
+    assert!(report.held_floor_targets[0]
+        .starts_with("xbmc4lyfe/newznab-tmux: runner patch needs ISA \"amx\""));
+    assert!(report.held_floor_targets[1]
+        .starts_with("xbmc4lyfe/rustnzb: runner patch needs ISA \"amx-tile\""));
+    let inserted = gcp.inserted_instances.lock().unwrap();
+    assert!(inserted_for(&inserted, "xbmc4lyfe/newznab-tmux").is_none());
+    assert!(inserted_for(&inserted, "xbmc4lyfe/rustnzb").is_none());
+    assert!(gh
+        .minted_labels
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, labels)| !labels
+            .iter()
+            .any(|l| l.to_ascii_lowercase().starts_with("amx"))));
+}
+
+#[tokio::test]
 async fn test_a_startup_script_over_the_size_limit_holds_the_floor_target() {
     let _guard = TEST_MUTEX.lock().unwrap();
     invalidate_state_cache();
