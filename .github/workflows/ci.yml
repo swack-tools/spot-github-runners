@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded pull request runs; let every push to main finish so the Worker deploy gate sees a result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host-agent:
+    name: host-agent tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        # actions/checkout v7.0.1, pinned to the commit the tag resolved to on 2026-10-17.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        # rust-toolchain.toml pins the channel; the minimal profile leaves out rustfmt.
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path host-agent/Cargo.toml -- --check
+
+      - name: Run tests
+        run: cargo test --manifest-path host-agent/Cargo.toml --locked
+
+  worker:
+    name: Worker tests and bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        # actions/checkout v7.0.1, pinned to the commit the tag resolved to on 2026-10-17.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt
+          rustup target add wasm32-unknown-unknown
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path cloudflare/Cargo.toml -- --check
+
+      - name: Run tests
+        run: cargo test --manifest-path cloudflare/Cargo.toml --locked
+
+      - name: Install worker-build
+        # Matches the worker crate version in cloudflare/Cargo.toml.
+        run: cargo install --locked worker-build --version 0.8.7
+
+      - name: Build release bundle
+        working-directory: cloudflare
+        run: worker-build --release
+
+      - name: Check bundle size
+        # Workers reject scripts over their size limit; AGENTS.md keeps the bundle under 3 MiB.
+        working-directory: cloudflare/build
+        run: |
+          limit=$((3 * 1024 * 1024))
+          total=$(find . -type f -printf '%s\n' | awk '{s += $1} END {print s + 0}')
+          ls -lR
+          echo "Bundle size: ${total} bytes (limit ${limit})"
+          if [ "${total}" -ge "${limit}" ]; then
+            echo "::error::Worker bundle is ${total} bytes, over the 3 MiB limit."
+            exit 1
+          fi

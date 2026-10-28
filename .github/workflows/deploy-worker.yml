@@ -1,0 +1,195 @@
+name: Deploy Worker
+
+# Deploys the Cloudflare Worker (cloudflare/) only after a push to main has finished with every check green.
+#
+# Setup (repository settings):
+#   - Variable WORKER_AUTO_DEPLOY = true turns deploys on. Unset or any other value turns them off.
+#   - Environment "worker-production" with these secrets:
+#       CLOUDFLARE_API_TOKEN   API token scoped to this account: Workers Scripts edit, Workers KV edit,
+#                              Workers Routes edit, and DNS edit on the dashboard zone (custom domain).
+#       CLOUDFLARE_ACCOUNT_ID  Cloudflare account ID.
+#       SPOT_KV_NAMESPACE_ID   Production SPOT_KV namespace ID, substituted into wrangler.toml at deploy time.
+#       GCP_PROJECT            GCP project ID, passed as the GCP_PROJECT var like `just deploy-worker` does.
+# Worker secrets (SESSION_SECRET and the rest) stay on the Worker; `wrangler deploy` does not touch them.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  gate:
+    name: Wait for green main
+    # Only a successful CI run from a push to main in this repository can start a deploy.
+    if: >-
+      vars.WORKER_AUTO_DEPLOY == 'true' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      statuses: read
+    outputs:
+      deploy: ${{ steps.wait.outputs.deploy }}
+    steps:
+      - name: Wait for every check on the commit
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          SELF_PATH: .github/workflows/deploy-worker.yml
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 40 * 60 ))
+
+          while true; do
+            tip=$(gh api "repos/${REPO}/commits/main" --jq .sha)
+            if [ "${tip}" != "${SHA}" ]; then
+              echo "::notice::main moved to ${tip}; skipping ${SHA}. The newer commit deploys on its own green run."
+              echo "deploy=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+
+            # Workflow runs on this commit, leaving out this workflow's own runs.
+            runs=$(gh api --paginate "repos/${REPO}/actions/runs?head_sha=${SHA}&per_page=100" \
+              --jq '.workflow_runs[] | {id, name, path, status, conclusion, check_suite_id}' | jq -s .)
+            own_suites=$(jq -c --arg p "${SELF_PATH}" '[.[] | select(.path | startswith($p)) | .check_suite_id]' <<<"${runs}")
+            other_runs=$(jq -c --arg p "${SELF_PATH}" '[.[] | select(.path | startswith($p) | not)]' <<<"${runs}")
+
+            # Check runs on this commit (Actions jobs, CodeQL, other apps), leaving out this workflow's jobs.
+            checks=$(gh api --paginate "repos/${REPO}/commits/${SHA}/check-runs?per_page=100" \
+              --jq '.check_runs[] | {name, status, conclusion, suite: .check_suite.id}' | jq -s .)
+            checks=$(jq -c --argjson own "${own_suites}" '[.[] | select(.suite as $s | $own | index($s) | not)]' <<<"${checks}")
+
+            # Legacy commit statuses. A commit with none reports "pending", so count them first.
+            status=$(gh api "repos/${REPO}/commits/${SHA}/status" --jq '{state, total_count}')
+
+            pending=$(jq -n --argjson r "${other_runs}" --argjson c "${checks}" --argjson s "${status}" '
+              ([$r[] | select(.status != "completed")] | length)
+              + ([$c[] | select(.status != "completed")] | length)
+              + (if $s.total_count > 0 and $s.state == "pending" then 1 else 0 end)')
+            failed=$(jq -n --argjson r "${other_runs}" --argjson c "${checks}" --argjson s "${status}" '
+              def ok: . == "success" or . == "skipped" or . == "neutral";
+              [ ($r[] | select(.status == "completed" and (.conclusion | ok | not)) | "run \(.name): \(.conclusion)"),
+                ($c[] | select(.status == "completed" and (.conclusion | ok | not)) | "check \(.name): \(.conclusion)"),
+                (if $s.total_count > 0 and ($s.state == "failure" or $s.state == "error") then "commit status: \($s.state)" else empty end)
+              ]')
+
+            if [ "$(jq length <<<"${failed}")" -gt 0 ]; then
+              echo "::error::Not deploying ${SHA}; these did not pass:"
+              jq -r '.[]' <<<"${failed}"
+              exit 1
+            fi
+            if [ "${pending}" -eq 0 ]; then
+              echo "All $(jq length <<<"${other_runs}") workflow runs and $(jq length <<<"${checks}") checks on ${SHA} passed."
+              echo "deploy=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "${deadline}" ]; then
+              echo "::error::Timed out with ${pending} checks still running on ${SHA}."
+              exit 1
+            fi
+            echo "Waiting on ${pending} checks..."
+            sleep 20
+          done
+
+  deploy:
+    name: Deploy Worker
+    needs: gate
+    if: needs.gate.outputs.deploy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # One deploy at a time, and never cancel one mid-flight. Only runs that passed the gate join this group,
+    # so a run that GitHub replaces while it waits is always for the same or an older commit.
+    concurrency:
+      group: deploy-worker
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    environment:
+      name: worker-production
+      url: https://spot.swacktech.com
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Check out the green commit
+        # actions/checkout v7.0.1, pinned to the commit the tag resolved to on 2026-10-17.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        # wrangler 4 needs Node.js 22 or later. actions/setup-node v6.5.0, pinned to the commit the tag resolved to on 2026-10-28.
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add wasm32-unknown-unknown
+          # Matches the worker crate version in cloudflare/Cargo.toml.
+          cargo install --locked worker-build --version 0.8.7
+
+      - name: Render production config
+        env:
+          SPOT_KV_NAMESPACE_ID: ${{ secrets.SPOT_KV_NAMESPACE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+        run: |
+          set -euo pipefail
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID SPOT_KV_NAMESPACE_ID GCP_PROJECT; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret ${name} is not set on the worker-production environment."
+              exit 1
+            fi
+          done
+          if ! [[ "${SPOT_KV_NAMESPACE_ID}" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "::error::SPOT_KV_NAMESPACE_ID is not a 32-character hex namespace ID."
+            exit 1
+          fi
+          placeholder=REPLACE_WITH_SPOT_KV_NAMESPACE_ID
+          if [ "$(grep -c "${placeholder}" cloudflare/wrangler.toml)" -ne 1 ]; then
+            echo "::error::cloudflare/wrangler.toml must contain ${placeholder} exactly once."
+            exit 1
+          fi
+          # Written next to wrangler.toml so main and the build command resolve the same way.
+          sed "s/${placeholder}/${SPOT_KV_NAMESPACE_ID}/" cloudflare/wrangler.toml > cloudflare/wrangler.deploy.toml
+
+      - name: Confirm main still points at this commit
+        id: tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          tip=$(gh api "repos/${REPO}/commits/main" --jq .sha)
+          if [ "${tip}" != "${SHA}" ]; then
+            echo "::notice::main moved to ${tip}; skipping the older ${SHA}. The newer commit deploys on its own green run."
+            echo "current=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "current=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Deploy
+        if: steps.tip.outputs.current == 'true'
+        working-directory: cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          npx --yes wrangler@4.151.1 deploy -c wrangler.deploy.toml --keep-vars \
+            --var "GCP_PROJECT:${GCP_PROJECT}" \
+            --message "main ${SHA:0:12} via ${RUN_URL}"
