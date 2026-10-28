@@ -160,6 +160,52 @@ async fn github_get_json(url: &str, gh_token: Option<&str>) -> Result<(u16, Valu
     Ok((status, json_val))
 }
 
+/// POSTs an `application/x-www-form-urlencoded` body to a GitHub OAuth endpoint
+/// and returns the JSON reply.
+async fn github_post_form(url: &str, fields: &[(&str, &str)]) -> Result<(u16, Value)> {
+    let form = fields
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                k,
+                percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post);
+    let headers = Headers::new();
+    headers.set("Content-Type", "application/x-www-form-urlencoded")?;
+    headers.set("Accept", "application/json")?;
+    headers.set("User-Agent", "spot-dashboard-edge")?;
+    init.with_headers(headers);
+    init.with_body(Some(worker::wasm_bindgen::JsValue::from_str(&form)));
+    let req = Request::new_with_init(url, &init)?;
+    let mut resp = Fetch::Request(req).send().await?;
+    let status = resp.status_code();
+    let json_val: Value = resp.json().await.unwrap_or(Value::Null);
+    Ok((status, json_val))
+}
+
+/// Resolves the GitHub login and numeric ID behind a user access token.
+async fn fetch_github_identity(access_token: &str) -> Result<Option<(String, u64)>> {
+    let (status, user_json) =
+        github_get_json("https://api.github.com/user", Some(access_token)).await?;
+    if status != 200 {
+        return Ok(None);
+    }
+    let login = user_json.get("login").and_then(|v| v.as_str());
+    let uid = user_json.get("id").and_then(|v| v.as_u64());
+    Ok(match (login, uid) {
+        (Some(l), Some(id)) if auth::is_valid_github_login(l) && id > 0 => {
+            Some((l.to_string(), id))
+        }
+        _ => None,
+    })
+}
+
 fn is_production_oauth_configured(env: &Env) -> bool {
     resolve_env_non_empty(env, "GITHUB_OAUTH_CLIENT_SECRET").is_some()
 }
@@ -1968,15 +2014,8 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 .map(|a| a.uid)
                 .collect();
             if !auth::may_sign_in(&login, uid, &added_admins) {
-                return ui::serve_login_gate(
-                    &req,
-                    &format!(
-                        "Forbidden: GitHub user '{}' is not an authorized administrator",
-                        login
-                    ),
-                    &login,
-                    403,
-                );
+                // No session exists yet, so the gate must not claim the user is signed in.
+                return ui::serve_login_gate(&req, &auth::not_admin_message(&login), "", 403);
             }
 
             let session_cookie = match auth::mint_session_cookie(
@@ -2004,17 +2043,60 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // GitHub Device Flow - Request Code
         (Method::Post, "/auth/device/code") => {
-            let (record, device_handle) = match auth::start_device_flow(session_secret, now) {
-                Ok(res) => res,
+            if !is_production_oauth_configured(&env) {
+                // Local and E2E builds keep the in-memory mock, approved through
+                // /api/test/authorize-device.
+                let (record, device_handle) = match auth::start_device_flow(session_secret, now) {
+                    Ok(res) => res,
+                    Err(e) => return error_response(500, "internal_error", &e),
+                };
+                let resp_body = serde_json::json!({
+                    "device_code": record.device_code,
+                    "user_code": record.user_code,
+                    "verification_uri": record.verification_uri,
+                    "expires_in": 900,
+                    "interval": record.interval,
+                    "device_handle": device_handle,
+                });
+                return json_response(200, &resp_body);
+            }
+
+            let Some(client_id) = resolve_env_non_empty(&env, "GITHUB_OAUTH_CLIENT_ID") else {
+                return error_response(
+                    500,
+                    "oauth_not_configured",
+                    "GitHub OAuth application is not configured on this server (GITHUB_OAUTH_CLIENT_ID missing).",
+                );
+            };
+            let (_, gh_body) = github_post_form(
+                auth::GITHUB_DEVICE_CODE_URL,
+                &[
+                    ("client_id", client_id.as_str()),
+                    ("scope", auth::DEVICE_FLOW_SCOPE),
+                ],
+            )
+            .await?;
+            let code = match auth::parse_github_device_code_response(&gh_body) {
+                Ok(code) => code,
+                Err(e) => {
+                    console_error!("GitHub device code request failed: {}", e);
+                    let message = if e.starts_with("device_flow_disabled") {
+                        "Device sign-in is turned off for this GitHub OAuth app. Enable Device Flow in the app's GitHub settings, or use Sign in with GitHub.".to_string()
+                    } else {
+                        format!("GitHub did not issue a device code: {e}")
+                    };
+                    return error_response(502, "device_code_unavailable", &message);
+                }
+            };
+            let device_handle = match auth::sign_device_handle(session_secret, &code, now) {
+                Ok(h) => h,
                 Err(e) => return error_response(500, "internal_error", &e),
             };
-
             let resp_body = serde_json::json!({
-                "device_code": record.device_code,
-                "user_code": record.user_code,
-                "verification_uri": record.verification_uri,
-                "expires_in": 900,
-                "interval": record.interval,
+                "user_code": code.user_code,
+                "verification_uri": code.verification_uri,
+                "expires_in": code.expires_in,
+                "interval": code.interval,
                 "device_handle": device_handle,
             });
             json_response(200, &resp_body)
@@ -2024,10 +2106,11 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         (Method::Post, "/auth/device/token" | "/auth/device/poll") => {
             let body_val: Value = req.json().await.unwrap_or(Value::Null);
             let code_or_handle = body_val
-                .get("device_code")
-                .or_else(|| body_val.get("device_handle"))
+                .get("device_handle")
+                .or_else(|| body_val.get("device_code"))
                 .and_then(|v| v.as_str())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .to_string();
 
             if code_or_handle.is_empty() {
                 return error_response(
@@ -2039,7 +2122,74 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
             let is_poll = path == "/auth/device/poll";
 
-            match auth::poll_device_flow(code_or_handle, now) {
+            let poll_result = if is_production_oauth_configured(&env) {
+                let handshake =
+                    match auth::verify_device_handle(session_secret, &code_or_handle, now) {
+                        Ok(h) => h,
+                        Err(auth::DevicePollResult::Expired) => {
+                            return error_response(400, "expired_token", "Device code expired")
+                        }
+                        Err(_) => {
+                            return error_response(
+                                400,
+                                "invalid_device_code",
+                                "Invalid device code",
+                            )
+                        }
+                    };
+                let client_id =
+                    resolve_env_non_empty(&env, "GITHUB_OAUTH_CLIENT_ID").unwrap_or_default();
+                let (_, gh_body) = github_post_form(
+                    "https://github.com/login/oauth/access_token",
+                    &[
+                        ("client_id", client_id.as_str()),
+                        ("device_code", handshake.device_code.as_str()),
+                        ("grant_type", auth::DEVICE_GRANT_TYPE),
+                    ],
+                )
+                .await?;
+                match auth::classify_github_device_token_response(&gh_body, handshake.interval) {
+                    auth::GithubDeviceTokenOutcome::AccessToken(token) => {
+                        match fetch_github_identity(&token).await? {
+                            Some((user_login, user_id)) => auth::DevicePollResult::Authorized {
+                                user_login,
+                                user_id,
+                            },
+                            None => {
+                                return error_response(
+                                    502,
+                                    "identity_unavailable",
+                                    "Failed to retrieve GitHub user identity",
+                                )
+                            }
+                        }
+                    }
+                    auth::GithubDeviceTokenOutcome::Pending => auth::DevicePollResult::Pending,
+                    auth::GithubDeviceTokenOutcome::SlowDown { interval } => {
+                        auth::DevicePollResult::SlowDown { interval }
+                    }
+                    auth::GithubDeviceTokenOutcome::Expired => auth::DevicePollResult::Expired,
+                    auth::GithubDeviceTokenOutcome::Denied => {
+                        return error_response(
+                            403,
+                            "access_denied",
+                            "GitHub authorization was not granted.",
+                        )
+                    }
+                    auth::GithubDeviceTokenOutcome::Failed(desc) => {
+                        console_error!("GitHub device token poll failed: {}", desc);
+                        return error_response(
+                            502,
+                            "device_poll_failed",
+                            &format!("GitHub device sign-in failed: {desc}"),
+                        );
+                    }
+                }
+            } else {
+                auth::poll_device_flow(&code_or_handle, now)
+            };
+
+            match poll_result {
                 auth::DevicePollResult::Authorized {
                     user_login,
                     user_id,
@@ -2047,6 +2197,19 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     let (bundle, _) = state::load_state(&kv, now)
                         .await
                         .map_err(|e| Error::RustError(e.to_string()))?;
+                    let added_admins: Vec<u64> = bundle
+                        .state
+                        .dashboard_admins
+                        .iter()
+                        .map(|a| a.uid)
+                        .collect();
+                    if !auth::may_sign_in(&user_login, user_id, &added_admins) {
+                        return error_response(
+                            403,
+                            "forbidden",
+                            &auth::not_admin_message(&user_login),
+                        );
+                    }
                     let session_cookie = auth::mint_session_cookie(
                         session_secret,
                         &user_login,
@@ -2054,7 +2217,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                         bundle.state.controlled_targets.clone(),
                         now,
                     )
-                    .map_err(|e| Error::RustError(e))?;
+                    .map_err(Error::RustError)?;
 
                     let headers = Headers::new();
                     headers.set("Content-Type", "application/json")?;
@@ -2064,7 +2227,6 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     let resp_body = serde_json::json!({
                         "status": "authorized",
                         "user": user_login,
-                        "access_token": "ghu_mock_token_12345"
                     });
                     Ok(Response::ok(resp_body.to_string())?.with_headers(headers))
                 }
