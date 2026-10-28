@@ -2141,3 +2141,107 @@ async fn test_multi_arch_newznab_fleet_metadata_and_target_breakdown() {
     assert_eq!(newznab["total_vcpus"], 20);
     assert_eq!(newznab["total_ram_gib"], 80);
 }
+
+#[tokio::test]
+async fn test_overview_backfills_hardware_meta_on_stale_ledger_rows() {
+    // Rows persisted before a machine family was in the hardware fallback table
+    // carry "Unknown" CPU and null bench/disk; live refreshes must fill them.
+    let now = 1792000000;
+    let now_f64 = now as f64;
+
+    let mut ov = serde_json::json!({
+        "instances_view": {
+            "instances": [
+                {
+                    "name": "oxidex-runners-xbmc4lyfe-newznab-tmux-x86-2",
+                    "id": "1",
+                    "machine_type": "n4d-standard-16",
+                    "zone": "us-east5-b",
+                    "region": "us-east5",
+                    "cpu_platform": "Unknown",
+                    "benchmark_score": serde_json::Value::Null,
+                    "data_disk_gb": serde_json::Value::Null,
+                    "data_disk_type": serde_json::Value::Null,
+                    "disk_category": serde_json::Value::Null,
+                    "status": "RUNNING",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 3600.0,
+                    "deleted_epoch": serde_json::Value::Null,
+                    "pricing": { "total_hourly_usd": 0.42 }
+                },
+                {
+                    "name": "oxidex-runners-old-deleted",
+                    "id": "2",
+                    "machine_type": "c4a-standard-8",
+                    "zone": "us-central1-a",
+                    "region": "us-central1",
+                    "status": "TERMINATED",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 7200.0,
+                    "deleted_epoch": now_f64 - 3600.0,
+                    "pricing": { "total_hourly_usd": 0.10 }
+                },
+                {
+                    "name": "oxidex-runners-known",
+                    "id": "3",
+                    "machine_type": "n4d-standard-16",
+                    "zone": "us-east5-c",
+                    "region": "us-east5",
+                    "cpu_platform": "Custom Turin",
+                    "benchmark_score": 3000,
+                    "data_disk_gb": 200,
+                    "data_disk_type": "pd-ssd",
+                    "disk_category": "standard_ssd",
+                    "status": "TERMINATED",
+                    "role": "cicd_runner",
+                    "started_epoch": now_f64 - 7200.0,
+                    "deleted_epoch": now_f64 - 3600.0,
+                    "pricing": { "total_hourly_usd": 0.42 }
+                }
+            ]
+        }
+    });
+
+    let live_inventory = vec![InstanceRecord {
+        id: "1".into(),
+        name: "oxidex-runners-xbmc4lyfe-newznab-tmux-x86-2".into(),
+        zone: "us-east5-b".into(),
+        region: "us-east5".into(),
+        machine_type: "n4d-standard-16".into(),
+        status: "RUNNING".into(),
+        role: "cicd_runner".into(),
+        vcpu: 16,
+        ram_gib: 32,
+        runners_count: 10,
+        runners_count_known: true,
+        runner_limits_known: true,
+        created_at: None,
+        created_epoch: None,
+    }];
+
+    let query = OverviewQuery {
+        include_deleted: Some(true),
+        ..Default::default()
+    };
+    apply_dynamic_overview_filtering(&mut ov, &query, &live_inventory, now);
+    let instances = ov["instances_view"]["instances"].as_array().unwrap();
+    let find = |name: &str| instances.iter().find(|i| i["name"] == name).unwrap();
+
+    let live = find("oxidex-runners-xbmc4lyfe-newznab-tmux-x86-2");
+    assert_eq!(live["cpu_platform"], "AMD Turin");
+    assert_eq!(live["benchmark_score"], 2850);
+    assert_eq!(live["data_disk_gb"], 100);
+    assert_eq!(live["data_disk_type"], "hyperdisk-balanced");
+    assert_eq!(live["disk_category"], "hyperdrive");
+
+    let deleted = find("oxidex-runners-old-deleted");
+    assert_eq!(deleted["cpu_platform"], "Google Axion (Neoverse V2)");
+    assert_eq!(deleted["benchmark_score"], 1635);
+
+    // Recorded values are never overwritten by the fallback table.
+    let known = find("oxidex-runners-known");
+    assert_eq!(known["cpu_platform"], "Custom Turin");
+    assert_eq!(known["benchmark_score"], 3000);
+    assert_eq!(known["data_disk_gb"], 200);
+    assert_eq!(known["data_disk_type"], "pd-ssd");
+}
