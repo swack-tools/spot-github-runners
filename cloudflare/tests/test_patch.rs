@@ -536,3 +536,33 @@ container:
         Some(&"4096".to_string())
     );
 }
+
+#[test]
+fn test_yaml_flow_collections_parse_as_collections() {
+    let val = spot_dashboard_edge::patch::parse_manifest_to_value(
+        "schema: spot-runner-patch-v1\nhardware:\n  isa: []\n  extra_labels: [x86, \"a,b\"]\nhost:\n  sysctl: {}\ncontainer:\n  sysctl: {net.core.somaxconn: 4096}\n",
+    )
+    .unwrap();
+    assert_eq!(val["hardware"]["isa"], serde_json::json!([]));
+    assert_eq!(
+        val["hardware"]["extra_labels"],
+        serde_json::json!(["x86", "a,b"])
+    );
+    assert_eq!(val["host"]["sysctl"], serde_json::json!({}));
+    assert_eq!(
+        val["container"]["sysctl"],
+        serde_json::json!({"net.core.somaxconn": 4096})
+    );
+}
+
+#[test]
+fn test_yaml_flow_collection_edge_cases() {
+    let val = spot_dashboard_edge::patch::parse_manifest_to_value(
+        "schema: spot-runner-patch-v1\nhardware:\n  extra_labels: [it's, b,]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        val["hardware"]["extra_labels"],
+        serde_json::json!(["it's", "b"])
+    );
+}
