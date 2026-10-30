@@ -73,6 +73,7 @@ nav:
   - Dashboard:
       - Dashboard: dashboard.md
       - Serverless edge dashboard: edge-dashboard.md
+      - Design system: design-system.md
   - Dedicated builders:
       - Set up a builder: dedicated-builders.md
       - Runtime updates: builder-runtime-updates.md
