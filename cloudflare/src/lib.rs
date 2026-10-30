@@ -373,8 +373,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         .or_else(|| auth_header.strip_prefix("bearer "))
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let verified_builder_token =
-        bearer_token.and_then(|tok| auth::verify_builder_queue_token(tok, session_secret, now));
+    let verified_builder_token = bearer_token
+        .and_then(|tok| auth::verify_builder_queue_token(tok, session_secret, now))
+        .filter(|tok| auth::builder_token_issued_after_cutoff(tok, nbf_str.as_deref()));
     let configured_builder_secret = env
         .secret("SPOT_BUILDER_QUEUE_TOKEN")
         .map(|s| s.to_string())
@@ -388,6 +389,19 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
         _ => false,
     };
+
+    // Cookie-authenticated writes must come from the dashboard's own origin (CSRF guard).
+    if method != Method::Get && method != Method::Head && verified_session.is_some() {
+        let origin = req.headers().get("Origin").ok().flatten();
+        let sec_fetch_site = req.headers().get("Sec-Fetch-Site").ok().flatten();
+        if auth::is_cross_origin_request(
+            origin.as_deref(),
+            sec_fetch_site.as_deref(),
+            &url.origin().ascii_serialization(),
+        ) {
+            return error_response(403, "forbidden", "Cross-origin request refused");
+        }
+    }
 
     let kv = env.kv("SPOT_KV")?;
 
@@ -714,6 +728,18 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             let payload: observability::IngestedHostSnapshot = req.json().await?;
             if payload.instance_name.trim().is_empty() {
                 return error_response(400, "bad_request", "instance_name is required");
+            }
+            // A per-instance queue token may only report for its own instance.
+            if verified_session.is_none() && !has_static_builder_secret {
+                if let Some(ref btok) = verified_builder_token {
+                    if payload.instance_name.trim() != btok.inst {
+                        return error_response(
+                            403,
+                            "forbidden",
+                            "Builder queue token instance_name mismatch",
+                        );
+                    }
+                }
             }
             observability::record_ingested_snapshot(payload, now);
             json_response(

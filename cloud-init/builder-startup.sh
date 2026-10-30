@@ -110,8 +110,52 @@ cat >/etc/systemd/system/docker.service.d/builder-data.conf <<EOF
 RequiresMountsFor=$MOUNT_POINT/docker
 EOF
 printf '{"data-root":"%s/docker","features":{"containerd-snapshotter":false},"log-driver":"local","log-opts":{"max-size":"20m","max-file":"3"}}\n' "$MOUNT_POINT" >/etc/docker/daemon.json
+# Job and build containers must not reach the GCE metadata server (HTTP; DNS stays open). It serves this instance's
+# attributes (bootstrap credentials) and, where the VM has a service account, its access token.
+# Host services keep metadata access: DOCKER-USER only filters traffic forwarded from containers.
+# The unit runs before Docker so restarted containers never start without the rule.
+cat >/usr/local/sbin/gce-metadata-container-block <<'METADATA_BLOCK'
+#!/bin/bash
+set -euo pipefail
+# Rebuild the rules on every run so the DNS exceptions always sit above the REJECT.
+# The metadata address is also the VPC DNS resolver containers inherit from the host, so DNS
+# (port 53) returns to Docker's own rules and everything else to that address is rejected.
+block() {
+  local cmd=$1 addr=$2 rule
+  "$cmd" -N DOCKER-USER 2>/dev/null || true
+  for rule in "-p udp --dport 53 -j RETURN" "-p tcp --dport 53 -j RETURN" "-j REJECT"; do
+    # shellcheck disable=SC2086
+    while "$cmd" -D DOCKER-USER -d "$addr" $rule 2>/dev/null; do :; done
+  done
+  "$cmd" -I DOCKER-USER 1 -d "$addr" -j REJECT
+  "$cmd" -I DOCKER-USER 1 -d "$addr" -p tcp --dport 53 -j RETURN
+  "$cmd" -I DOCKER-USER 1 -d "$addr" -p udp --dport 53 -j RETURN
+}
+block iptables 169.254.169.254/32
+# The IPv6 metadata address only answers on IPv6-enabled networks, so this part is best effort.
+block ip6tables fd20:ce::254/128 2>/dev/null || true
+METADATA_BLOCK
+chmod 0755 /usr/local/sbin/gce-metadata-container-block
+cat >/etc/systemd/system/gce-metadata-container-block.service <<'METADATA_BLOCK_UNIT'
+[Unit]
+Description=Block container access to the GCE metadata server
+Before=docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gce-metadata-container-block
+[Install]
+WantedBy=docker.service
+METADATA_BLOCK_UNIT
+systemctl daemon-reload
+systemctl enable gce-metadata-container-block.service
+/usr/local/sbin/gce-metadata-container-block
 systemctl daemon-reload
 systemctl enable --now containerd docker
+# Refuse to start runners or builds if containers could still reach the metadata server.
+iptables -C FORWARD -j DOCKER-USER && iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT &&
+  iptables -C DOCKER-USER -d 169.254.169.254/32 -p udp --dport 53 -j RETURN ||
+  { echo "Container metadata block is not in place" >&2; exit 78; }
 docker_info=$(/usr/bin/docker info --format=json)
 driver=$(printf '%s' "$docker_info" | jq -re '.Driver')
 [[ "$driver" == "overlay2" ]] || { echo "Docker storage driver is not overlay2: $driver" >&2; exit 78; }

@@ -36,6 +36,11 @@ pub const DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 pub const COMPUTE_API_BASE: &str = "https://compute.googleapis.com/compute/v1";
 pub const GCP_OAUTH_SCOPE: &str =
     "https://www.googleapis.com/auth/compute https://www.googleapis.com/auth/cloud-platform";
+/// Bootstrap credentials removed from instance metadata once the host is online. Jobs on the host can
+/// read instance attributes, so the startup script (registration token) and the unused JIT runner
+/// configs must not outlive the boot that needed them.
+pub const SCRUBBED_BOOTSTRAP_METADATA_KEYS: &[&str] =
+    &["startup-script", "runner_1_jitconfig", "runner_2_jitconfig"];
 pub const TOKEN_CACHE_TTL_SECS: u64 = 3300; // 55 minutes
 pub const JWT_EXPIRY_SECS: u64 = 3600; // 1 hour
 pub const DEFAULT_BOOT_DISK_SIZE_GB: u64 = 40;
@@ -110,12 +115,16 @@ impl GceMetadata {
     }
 
     pub fn without_key(&self, key: &str) -> Self {
+        self.without_keys(&[key])
+    }
+
+    pub fn without_keys(&self, keys: &[&str]) -> Self {
         Self {
             fingerprint: self.fingerprint.clone(),
             items: self
                 .items
                 .iter()
-                .filter(|i| i.key != key)
+                .filter(|i| !keys.contains(&i.key.as_str()))
                 .cloned()
                 .collect(),
         }
@@ -865,7 +874,7 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
         Ok(op)
     }
 
-    /// Scrub startup-script from instance metadata once online.
+    /// Scrub the startup script and JIT runner configs from instance metadata once online.
     pub async fn scrub_startup_script(
         &self,
         zone: &str,
@@ -878,7 +887,7 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
             COMPUTE_API_BASE, self.project, zone, instance
         );
 
-        let scrubbed_metadata = current_metadata.without_key("startup-script");
+        let scrubbed_metadata = current_metadata.without_keys(SCRUBBED_BOOTSTRAP_METADATA_KEYS);
         let body = serde_json::to_vec(&scrubbed_metadata)?;
 
         let mut headers = self.auth_headers(now).await?;

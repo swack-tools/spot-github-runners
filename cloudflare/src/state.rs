@@ -4601,21 +4601,60 @@ fn build_status_response(
     })
 }
 
+/// `owner/name` as GitHub spells it. Builders turn this into a clone URL, so URLs, local paths and
+/// option-looking values are refused here.
+pub fn is_github_repo_identifier(repo: &str) -> bool {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return false;
+    };
+    let owner_ok = !owner.is_empty()
+        && owner.len() <= 39
+        && !owner.starts_with('-')
+        && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let name_ok = !name.is_empty()
+        && name.len() <= 100
+        && !name.starts_with(['-', '.'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    owner_ok && name_ok
+}
+
+/// A branch name the builder can pass to `git fetch` without it being read as an option or a
+/// revision expression (a subset of `git check-ref-format --branch`).
+pub fn is_safe_git_branch_name(branch: &str) -> bool {
+    if branch.is_empty()
+        || branch.starts_with(['-', '/', '.'])
+        || branch.ends_with(['/', '.'])
+        || branch.ends_with(".lock")
+        || branch.contains("..")
+        || branch.contains("//")
+        || branch.contains("@{")
+        || branch.contains("/.")
+    {
+        return false;
+    }
+    branch
+        .chars()
+        .all(|c| c.is_ascii_graphic() && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+}
+
 pub async fn handle_post_rust_builds_enqueue<K: KvStoreBackend>(
     kv: &K,
     req: EnqueueRustBuildRequest,
     now: u64,
 ) -> Result<(u16, serde_json::Value), StateError> {
     let repo = req.repo.trim();
-    if repo.is_empty() || repo.len() > 128 || repo.contains("..") {
+    if repo.len() > 128 || !is_github_repo_identifier(repo) {
         return Err(StateError::Validation(
-            "repo must be a non-empty repository identifier (<= 128 chars)".into(),
+            "repo must be a GitHub owner/name repository identifier (<= 128 chars)".into(),
         ));
     }
     let branch = req.branch.trim();
-    if branch.is_empty() || branch.len() > 128 || branch.contains("..") {
+    if branch.len() > 128 || !is_safe_git_branch_name(branch) {
         return Err(StateError::Validation(
-            "branch must be a non-empty branch name (<= 128 chars)".into(),
+            "branch must be a valid Git branch name (<= 128 chars) that does not start with '-'"
+                .into(),
         ));
     }
     let commit_sha = req.commit_sha.trim();

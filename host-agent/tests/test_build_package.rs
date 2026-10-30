@@ -599,3 +599,92 @@ fn test_debug_build_after_cached_release_build_packages_debug_binary_not_stale_r
         sym_manifest.binaries_included
     );
 }
+
+#[test]
+fn test_materialize_checkout_refuses_option_like_git_arguments() {
+    use host_agent::build_package::{materialize_repository_checkout, ClaimedBuildJob};
+
+    let temp = TempDir::new().expect("tempdir");
+    let marker = temp.path().join("pwned");
+    let job = |repo: &str, branch: &str, sha: &str| ClaimedBuildJob {
+        build_id: 9100,
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        commit_sha: sha.to_string(),
+        command: "cargo test".to_string(),
+        profile: None,
+        binary_name: None,
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+    };
+    let upload_pack = format!("--upload-pack=touch {}", marker.display());
+    for bad in [
+        job("example-org/example-rust-project", &upload_pack, "deadbeef"),
+        job("--upload-pack=sh", "main", "deadbeef"),
+        job("example-org/example-rust-project", "main", "--orphan"),
+        job("example-org/example-rust-project", "main", "not-hex!"),
+    ] {
+        let ws = temp
+            .path()
+            .join(format!("ws-{}", bad.repo.len() + bad.branch.len()));
+        fs::create_dir_all(&ws).expect("create ws");
+        let err = materialize_repository_checkout(&ws, &bad)
+            .expect_err("option-like git arguments must be refused");
+        assert!(err.contains("Refusing claimed build job"), "got: {err}");
+        assert!(
+            !ws.join(".git").exists(),
+            "git must not run for a refused job"
+        );
+    }
+    assert!(!marker.exists());
+}
+
+#[test]
+fn test_materialize_checkout_succeeds_for_a_pushed_commit() {
+    use host_agent::build_package::{materialize_repository_checkout, ClaimedBuildJob};
+    use std::process::Command;
+
+    let temp = TempDir::new().expect("tempdir");
+    let upstream = temp.path().join("upstream");
+    let git = |args: &[&str]| {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&upstream)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    fs::create_dir_all(&upstream).expect("create upstream");
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    fs::write(upstream.join("README.md"), b"hello\n").expect("write README");
+    git(&["add", "README.md"]);
+    git(&["commit", "--quiet", "-m", "init"]);
+    let sha = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&upstream)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let job = ClaimedBuildJob {
+        build_id: 9101,
+        repo: format!("file://{}", upstream.display()),
+        branch: "main".to_string(),
+        commit_sha: sha,
+        command: "cargo test".to_string(),
+        profile: None,
+        binary_name: None,
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+    };
+    let ws = temp.path().join("ws");
+    fs::create_dir_all(&ws).expect("create ws");
+    materialize_repository_checkout(&ws, &job).expect("a pushed commit checks out");
+    assert_eq!(fs::read(ws.join("README.md")).unwrap(), b"hello\n");
+}

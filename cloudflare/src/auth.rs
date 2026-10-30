@@ -74,6 +74,34 @@ pub fn verify_builder_queue_token(
     Some(payload)
 }
 
+/// A builder queue token minted before `SESSION_NOT_BEFORE` is revoked, like a session. A
+/// malformed cut-off fails closed.
+pub fn builder_token_issued_after_cutoff(
+    payload: &BuilderQueueTokenPayload,
+    session_not_before_str: Option<&str>,
+) -> bool {
+    parse_session_not_before(session_not_before_str).is_some_and(|nbf| payload.iat >= nbf)
+}
+
+/// True when a browser marks a cookie-authenticated, state-changing request as coming from
+/// another origin. `SameSite=Lax` still sends the session cookie from sibling subdomains, so
+/// the Worker checks `Sec-Fetch-Site` and `Origin` too. Clients that send neither (scripts) pass.
+pub fn is_cross_origin_request(
+    origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    request_origin: &str,
+) -> bool {
+    if let Some(site) = sec_fetch_site.map(str::trim).filter(|s| !s.is_empty()) {
+        if !site.eq_ignore_ascii_case("same-origin") && !site.eq_ignore_ascii_case("none") {
+            return true;
+        }
+    }
+    match origin.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(o) => !o.eq_ignore_ascii_case(request_origin),
+        None => false,
+    }
+}
+
 pub const MAX_TOKEN_CHARS: usize = 4096;
 pub const MAX_SESSION_COOKIE_BYTES: usize = 3900;
 pub const MAX_STATE_TOKEN_CHARS: usize = 3072;
@@ -463,7 +491,7 @@ pub fn build_github_authorize_url(
     let encoded_challenge =
         percent_encoding::utf8_percent_encode(challenge, percent_encoding::NON_ALPHANUMERIC);
     format!(
-        "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read%3Aorg%2Crepo&state={}&code_challenge={}&code_challenge_method=S256&allow_signup=false&prompt=select_account",
+        "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope=read%3Auser&state={}&code_challenge={}&code_challenge_method=S256&allow_signup=false&prompt=select_account",
         client_id, encoded_redirect, encoded_state, encoded_challenge
     )
 }

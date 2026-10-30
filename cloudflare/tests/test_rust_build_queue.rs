@@ -832,3 +832,56 @@ async fn test_recover_orphaned_running_builds_on_preempted_builder_or_expired_le
         now + 5 * 86_400
     ));
 }
+
+#[tokio::test]
+async fn test_enqueue_rejects_git_option_and_url_inputs() {
+    invalidate_state_cache();
+    let kv = MockKvStore::new();
+    let now = 1_792_020_000;
+    let request = |repo: &str, branch: &str| EnqueueRustBuildRequest {
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        commit_sha: "abcdef0123456789".to_string(),
+        command: "cargo test".to_string(),
+        requested_output: Some("log".to_string()),
+        template_id: None,
+        profile: None,
+        binary_name: None,
+        gcs_bucket: None,
+        origin_ip: None,
+    };
+
+    // The builder passes repo and branch to git, so option-looking values, URLs and local
+    // paths must never reach the queue.
+    for (repo, branch) in [
+        (
+            "example-org/example-rust-project",
+            "--upload-pack=touch /tmp/pwned",
+        ),
+        ("example-org/example-rust-project", "-c"),
+        ("example-org/example-rust-project", "main~1"),
+        (
+            "example-org/example-rust-project",
+            "refs/heads/x:refs/heads/y",
+        ),
+        ("file:///etc", "main"),
+        ("https://evil.example/repo.git", "main"),
+        ("/var/lib/oxidex-builder", "main"),
+        ("--upload-pack=sh/repo", "main"),
+        ("example-org", "main"),
+    ] {
+        let result = handle_post_rust_builds_enqueue(&kv, request(repo, branch), now).await;
+        assert!(
+            matches!(result, Err(StateError::Validation(_))),
+            "repo {repo:?} branch {branch:?} should be refused"
+        );
+    }
+
+    let ok = handle_post_rust_builds_enqueue(
+        &kv,
+        request("example-org/example-rust-project", "feat/remote-queue"),
+        now,
+    )
+    .await;
+    assert!(ok.is_ok(), "a normal owner/name and branch is accepted");
+}
