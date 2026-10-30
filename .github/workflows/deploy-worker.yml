@@ -159,13 +159,18 @@ jobs:
             echo "::error::SPOT_KV_NAMESPACE_ID is not a 32-character hex namespace ID."
             exit 1
           fi
-          placeholder=REPLACE_WITH_SPOT_KV_NAMESPACE_ID
-          if [ "$(grep -c "${placeholder}" cloudflare/wrangler.toml)" -ne 1 ]; then
+          # Match the quoted binding value only; the header comment in wrangler.toml names the placeholder too.
+          placeholder='id = "REPLACE_WITH_SPOT_KV_NAMESPACE_ID"'
+          if [ "$(grep -cF "${placeholder}" cloudflare/wrangler.toml)" -ne 1 ]; then
             echo "::error::cloudflare/wrangler.toml must contain ${placeholder} exactly once."
             exit 1
           fi
           # Written next to wrangler.toml so main and the build command resolve the same way.
-          sed "s/${placeholder}/${SPOT_KV_NAMESPACE_ID}/" cloudflare/wrangler.toml > cloudflare/wrangler.deploy.toml
+          sed "s/${placeholder}/id = \"${SPOT_KV_NAMESPACE_ID}\"/" cloudflare/wrangler.toml > cloudflare/wrangler.deploy.toml
+          if ! grep -qF "id = \"${SPOT_KV_NAMESPACE_ID}\"" cloudflare/wrangler.deploy.toml; then
+            echo "::error::Rendering the KV namespace ID into wrangler.deploy.toml failed."
+            exit 1
+          fi
 
       - name: Confirm main still points at this commit
         id: tip
