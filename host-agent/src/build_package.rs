@@ -1220,12 +1220,8 @@ pub fn materialize_repository_checkout(
     let checkout_out = build_git_command(uploader.as_ref())
         .arg("-C")
         .arg(workspace)
-        .args([
-            "checkout",
-            "--force",
-            "--end-of-options",
-            job.commit_sha.trim(),
-        ])
+        // commit_sha is hexadecimal (checked above); checkout has no --end-of-options.
+        .args(["checkout", "--force", job.commit_sha.trim()])
         .output()
         .map_err(|e| format!("Failed invoking git checkout '{}': {e}", job.commit_sha))?;
     if !checkout_out.status.success() {

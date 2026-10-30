@@ -637,3 +637,54 @@ fn test_materialize_checkout_refuses_option_like_git_arguments() {
     }
     assert!(!marker.exists());
 }
+
+#[test]
+fn test_materialize_checkout_succeeds_for_a_pushed_commit() {
+    use host_agent::build_package::{materialize_repository_checkout, ClaimedBuildJob};
+    use std::process::Command;
+
+    let temp = TempDir::new().expect("tempdir");
+    let upstream = temp.path().join("upstream");
+    let git = |args: &[&str]| {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&upstream)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    fs::create_dir_all(&upstream).expect("create upstream");
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    fs::write(upstream.join("README.md"), b"hello\n").expect("write README");
+    git(&["add", "README.md"]);
+    git(&["commit", "--quiet", "-m", "init"]);
+    let sha = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&upstream)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let job = ClaimedBuildJob {
+        build_id: 9101,
+        repo: format!("file://{}", upstream.display()),
+        branch: "main".to_string(),
+        commit_sha: sha,
+        command: "cargo test".to_string(),
+        profile: None,
+        binary_name: None,
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+    };
+    let ws = temp.path().join("ws");
+    fs::create_dir_all(&ws).expect("create ws");
+    materialize_repository_checkout(&ws, &job).expect("a pushed commit checks out");
+    assert_eq!(fs::read(ws.join("README.md")).unwrap(), b"hello\n");
+}
