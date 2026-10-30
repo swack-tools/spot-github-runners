@@ -33,6 +33,6 @@ These model rules apply to Claude subagent launches. Keep the human-selected mai
 
 Always run the independent local review gate before opening a pull request (`gh pr create`) so the first pushed commit is already clean:
 - Verify null and `NaN` guards on query parameters (such as `window_hours.is_finite()`) and optional JSON or JavaScript fields (such as `inst.pricing` and `origin_ip`).
-- Verify administrator session revalidation (`may_sign_in`) on every newly added or modified endpoint.
+- Verify that every Worker route, not only new or modified ones, calls `require_administrator` (or an equivalent `may_sign_in`, owner, or builder-token check) or is on the public list, and that `cargo test --manifest-path cloudflare/Cargo.toml --test test_route_auth_coverage` passes. See "Worker routes deny access by default" in `AGENTS.md`.
 - Verify that documentation examples respect GCE's 256 KiB `startup-script` metadata limit and do not rely on single-pass `sed` `r` insertions for placeholder substitution.
 

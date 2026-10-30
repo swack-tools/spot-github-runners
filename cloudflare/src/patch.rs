@@ -1260,7 +1260,7 @@ pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
                                 i += 1;
                                 continue;
                             }
-                            let cur_indent = raw.len() - raw.trim_start().len();
+                            let cur_indent = raw.len() - raw.trim_start_matches(' ').len();
                             if block_indent.is_none() {
                                 if cur_indent <= indent {
                                     break;
@@ -1346,7 +1346,7 @@ pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
                         i += 1;
                         continue;
                     }
-                    let cur_indent = raw.len() - raw.trim_start().len();
+                    let cur_indent = raw.len() - raw.trim_start_matches(' ').len();
                     if block_indent.is_none() {
                         if cur_indent <= indent {
                             break;

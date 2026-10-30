@@ -1499,6 +1499,15 @@ el.textContent = msg;
 box.appendChild(el);
 setTimeout(() => el.remove(), 3400);
 }
+// Encodes a value as a JavaScript string literal for an inline event-handler attribute.
+function jsArg(val) {
+return esc(JSON.stringify(String(val ?? "")));
+}
+// Allows only https links, so stored data can't inject a javascript: URL.
+function safeUrl(val) {
+const s = String(val ?? "");
+return /^https:\/\//i.test(s) ? s : "#";
+}
 function esc(val) {
 return String(val ?? "")
 .replace(/&/g, "&amp;")
@@ -1755,10 +1764,10 @@ let instancesHtml = "";
 if (running.length === 0) {
 instancesHtml = `
 <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:9px; padding:14px; margin-bottom:12px;">
-<div style="color:var(--text-muted); margin-bottom:10px;">No running instances currently in <strong>${reg.display_name} (${reg.region})</strong>.</div>
+<div style="color:var(--text-muted); margin-bottom:10px;">No running instances currently in <strong>${esc(reg.display_name)} (${esc(reg.region)})</strong>.</div>
 <div style="display:flex; gap:8px; flex-wrap:wrap;">
-<button class="btn btn-sm btn-emerald" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', 1)">Plan 1 CI/CD Runner Host Here</button>
-<button class="btn btn-sm btn-purple" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', 1)">Plan 1 Rust Builder Host Here</button>
+<button class="btn btn-sm btn-emerald" onclick="scaleRegion(${jsArg(reg.region)}, 'cicd_runner', 1)">Plan 1 CI/CD Runner Host Here</button>
+<button class="btn btn-sm btn-purple" onclick="scaleRegion(${jsArg(reg.region)}, 'rust_builder', 1)">Plan 1 Rust Builder Host Here</button>
 </div>
 </div>
 `;
@@ -1812,10 +1821,10 @@ return `
 <div style="font-size:var(--fs-sm); font-weight:600; color:var(--text-muted);">SSH Into GCloud Instance (Terminal Command):</div>
 <div class="ssh-block">
 <code id="ssh-code-${esc(inst.instance_id || inst.id)}">${esc(inst.ssh_command)}</code>
-<button class="btn btn-sm" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'gcloud SSH command')">📋 Copy SSH</button>
+<button class="btn btn-sm" onclick="copyTextToClipboard(${jsArg(inst.ssh_command)}, 'gcloud SSH command')">📋 Copy SSH</button>
 </div>
 <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
-${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id || inst.id)}', '${esc(inst.name)}')">🖥️ Create VM Template</button>` : ""}
+${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance(${jsArg(inst.instance_id || inst.id)}, ${jsArg(inst.name)})">🖥️ Create VM Template</button>` : ""}
 </div>
 </div>
 `;
@@ -1835,19 +1844,19 @@ panel.innerHTML = `
 <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
 <div style="font-size:var(--fs-sm); font-weight:600;">CI/CD Runner Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
 <div style="display:flex; align-items:center; gap:6px;">
-<button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', Math.max(0, ${runnerCountInReg} - 1))">−1</button>
+<button class="btn btn-sm btn-secondary" onclick="scaleRegion(${jsArg(reg.region)}, 'cicd_runner', Math.max(0, ${runnerCountInReg} - 1))">−1</button>
 <input type="number" id="map-scale-input-${esc(reg.region)}" value="${runnerCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
-<button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', ${runnerCountInReg} + 1)">+1</button>
-<button class="btn btn-sm btn-emerald" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', parseInt(document.getElementById('map-scale-input-${esc(reg.region)}').value || '0', 10))">Plan Runner Scale</button>
+<button class="btn btn-sm btn-secondary" onclick="scaleRegion(${jsArg(reg.region)}, 'cicd_runner', ${runnerCountInReg} + 1)">+1</button>
+<button class="btn btn-sm btn-emerald" onclick="scaleRegion(${jsArg(reg.region)}, 'cicd_runner', parseInt(document.getElementById(${jsArg('map-scale-input-' + reg.region)}).value || '0', 10))">Plan Runner Scale</button>
 </div>
 </div>
 <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; border-top:1px solid var(--border); padding-top:8px;">
 <div style="font-size:var(--fs-sm); font-weight:600; color:var(--violet);">🦀 Rust Builder Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
 <div style="display:flex; align-items:center; gap:6px;">
-<button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', Math.max(0, ${builderCountInReg} - 1))">−1</button>
+<button class="btn btn-sm btn-secondary" onclick="scaleRegion(${jsArg(reg.region)}, 'rust_builder', Math.max(0, ${builderCountInReg} - 1))">−1</button>
 <input type="number" id="map-scale-builder-input-${esc(reg.region)}" value="${builderCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
-<button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', ${builderCountInReg} + 1)">+1</button>
-<button class="btn btn-sm btn-purple" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', parseInt(document.getElementById('map-scale-builder-input-${esc(reg.region)}').value || '0', 10))">Plan Builder Scale</button>
+<button class="btn btn-sm btn-secondary" onclick="scaleRegion(${jsArg(reg.region)}, 'rust_builder', ${builderCountInReg} + 1)">+1</button>
+<button class="btn btn-sm btn-purple" onclick="scaleRegion(${jsArg(reg.region)}, 'rust_builder', parseInt(document.getElementById(${jsArg('map-scale-builder-input-' + reg.region)}).value || '0', 10))">Plan Builder Scale</button>
 </div>
 </div>
 </div>
@@ -2165,8 +2174,8 @@ ${esc(inst.deletion_trigger)}
 </td>
 <td>
 <div style="display:flex; gap:5px; flex-wrap:wrap;">
-<button class="btn btn-sm btn-secondary" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'SSH command')">📋 SSH</button>
-${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance('${esc(inst.instance_id || inst.id)}', '${esc(inst.name)}')">Template</button>` : ""}
+<button class="btn btn-sm btn-secondary" onclick="copyTextToClipboard(${jsArg(inst.ssh_command)}, 'SSH command')">📋 SSH</button>
+${canTemplate(inst) ? `<button class="btn btn-sm btn-purple" onclick="makeTemplateFromInstance(${jsArg(inst.instance_id || inst.id)}, ${jsArg(inst.name)})">Template</button>` : ""}
 </div>
 </td>
 </tr>
@@ -2409,7 +2418,7 @@ document.getElementById("scaling-decision-box").innerHTML = `
 </div>
 ${ev.budget_capped ? `<div style="color:var(--warning); font-size:var(--fs-sm); margin-bottom:6px;">⚠️ ${esc(ev.budget_cap_note)}</div>` : ""}
 <div style="display:flex; flex-direction:column; gap:5px;">
-${reasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)} ${r.deep_link ? `<a href="${esc(r.deep_link)}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || '<div style="font-size:var(--fs-sm); color:var(--text-muted);">No scale change required.</div>'}
+${reasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)} ${r.deep_link ? `<a href="${esc(safeUrl(r.deep_link))}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || '<div style="font-size:var(--fs-sm); color:var(--text-muted);">No scale change required.</div>'}
 </div>
 `;
 const bsc = APP_STATE.scaling.rust_builder || {};
@@ -2460,7 +2469,7 @@ return `
 <div class="mono" style="font-size:var(--fs-sm); color:${textCol}; margin-bottom:6px;">${esc(run.error_excerpt)}</div>
 <div style="font-size:var(--fs-sm); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
 <span>Runner: <code class="mono">${esc(run.runner_name || 'not reported')}</code> · Run <code class="mono">#${esc(run.run_id)}</code> · Job <code class="mono">${esc(run.job_id)}</code> · Step <code class="mono">${esc(run.step_number)}</code> · Line <code class="mono">${esc(run.line_number)}</code> · ${esc(formatLocalTime(run.failed_at))}</span>
-<a href="${esc(run.deep_link)}" target="_blank" rel="noopener" class="btn btn-sm ${btnCls} mono" style="text-decoration:none;">
+<a href="${esc(safeUrl(run.deep_link))}" target="_blank" rel="noopener" class="btn btn-sm ${btnCls} mono" style="text-decoration:none;">
 🔗 ${esc(run.deep_link)}
 </a>
 </div>
@@ -2809,7 +2818,7 @@ return `
 <tr>
 <td>
 <label class="toggle-label">
-<input type="checkbox" ${r.enabled ? "checked" : ""} onchange="toggleSingleRegion('${esc(r.region)}', this.checked)" />
+<input type="checkbox" ${r.enabled ? "checked" : ""} onchange="toggleSingleRegion(${jsArg(r.region)}, this.checked)" />
 <span>${r.enabled ? "Enabled" : "Deselected"}</span>
 </label>
 </td>
@@ -3405,7 +3414,7 @@ list.innerHTML = OBS_CATALOG_TARGETS.map(t => {
 const checked = OBS_SELECTED_TARGETS === null || OBS_SELECTED_TARGETS.has(t);
 const isRepo = t.includes("/");
 const badge = isRepo ? '<span class="badge badge-runner" style="font-size:var(--fs-xs);padding:1px 5px;">repo</span>' : '<span class="badge badge-direct" style="font-size:var(--fs-xs);padding:1px 5px;">org</span>';
-return `<div class="target-dd-row"><label class="toggle-label" style="font-size:var(--fs-sm);flex:1;"><input type="checkbox" ${checked ? "checked" : ""} onchange="toggleSingleObsTarget('${esc(t)}', this.checked)" /><span class="mono">${esc(t)}</span> ${badge}</label><button type="button" class="target-only-btn" onclick="selectSingleObsTarget('${esc(t)}')">only</button></div>`;
+return `<div class="target-dd-row"><label class="toggle-label" style="font-size:var(--fs-sm);flex:1;"><input type="checkbox" ${checked ? "checked" : ""} onchange="toggleSingleObsTarget(${jsArg(t)}, this.checked)" /><span class="mono">${esc(t)}</span> ${badge}</label><button type="button" class="target-only-btn" onclick="selectSingleObsTarget(${jsArg(t)})">only</button></div>`;
 }).join("");
 }
 function toggleSingleObsTarget(t, checked) {
@@ -3554,7 +3563,7 @@ const instTbody = document.getElementById("obs-instances-tbody");
 if (instTbody) {
 instTbody.innerHTML = (OBS_STATE.instances || []).map(inst => {
 const roleBadge = inst.role === "rust_builder" ? '<span class="badge badge-builder">rust_builder</span>' : '<span class="badge badge-runner">cicd_runner</span>';
-const wfs = (inst.active_workflows || []).map(w => `<a href="${esc(w.github_workflow_url)}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="margin:2px 2px 0 0;text-decoration:none;" title="Open GitHub Actions Run #${esc(w.run_number)} (${esc(w.job_name)})">🔗 ${esc(w.repository)} #${esc(w.run_number)} · ${esc(w.job_name)} ↗</a>`).join(" ") || '<span style="color:var(--text-muted);font-size:var(--fs-sm);">Idle / Listening</span>';
+const wfs = (inst.active_workflows || []).map(w => `<a href="${esc(safeUrl(w.github_workflow_url))}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="margin:2px 2px 0 0;text-decoration:none;" title="Open GitHub Actions Run #${esc(w.run_number)} (${esc(w.job_name)})">🔗 ${esc(w.repository)} #${esc(w.run_number)} · ${esc(w.job_name)} ↗</a>`).join(" ") || '<span style="color:var(--text-muted);font-size:var(--fs-sm);">Idle / Listening</span>';
 if (inst.ops_agent_status === "no_telemetry") {
 return `<tr>
 <td class="mono"><strong>${esc(inst.instance_name)}</strong><div style="font-size:var(--fs-xs);color:var(--text-muted);">${esc(inst.zone)}</div></td>
@@ -3584,7 +3593,7 @@ if (logsTbody) {
 logsTbody.innerHTML = (OBS_STATE.logs || []).map(l => {
 const sevClass = l.severity === "ERROR" ? "badge-deleted" : (l.severity === "WARN" ? "badge-warn" : "badge-runner");
 const wfHtml = l.github_workflow_url
-? `<a href="${esc(l.github_workflow_url)}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="text-decoration:none;" title="Jump directly to GitHub Actions workflow job at ${esc(l.timestamp)}">🔗 ${esc(l.repository)} · ${esc(l.workflow_name)} #${esc(l.run_number || l.run_id)} (${esc(l.job_name)}) ↗</a>`
+? `<a href="${esc(safeUrl(l.github_workflow_url))}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="text-decoration:none;" title="Jump directly to GitHub Actions workflow job at ${esc(l.timestamp)}">🔗 ${esc(l.repository)} · ${esc(l.workflow_name)} #${esc(l.run_number || l.run_id)} (${esc(l.job_name)}) ↗</a>`
 : `<span class="mono" style="color:var(--text-muted);font-size:var(--fs-xs);">${esc(l.repository || l.organization || "host-daemon")}</span>`;
 return `<tr>
 <td class="mono" style="white-space:nowrap;font-size:var(--fs-sm);">${esc(formatLocalTime(l.timestamp || l.epoch))}</td>
@@ -3834,11 +3843,23 @@ pub fn render_login_gate_html(
     )
 }
 
+/// Stops other sites from framing the dashboard (clickjacking on admin actions)
+/// and from sniffing content types or reading full referrers.
+fn set_page_security_headers(headers: &Headers) -> Result<()> {
+    headers.set("Content-Security-Policy", "frame-ancestors 'none'")?;
+    headers.set("X-Frame-Options", "DENY")?;
+    headers.set("X-Content-Type-Options", "nosniff")?;
+    headers.set("Referrer-Policy", "same-origin")?;
+    headers.set("Strict-Transport-Security", "max-age=31536000")?;
+    Ok(())
+}
+
 /// Serve the single-page dashboard HTML document (handling GET and HEAD requests).
 pub fn serve_dashboard_ui(req: &Request, project: &str, org: &str) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Content-Type", "text/html; charset=utf-8")?;
     headers.set("Cache-Control", "no-store")?;
+    set_page_security_headers(&headers)?;
 
     let html = render_dashboard_html(project, org);
     headers.set("Content-Length", &html.len().to_string())?;
@@ -3860,6 +3881,7 @@ pub fn serve_login_gate(
     let headers = Headers::new();
     headers.set("Content-Type", "text/html; charset=utf-8")?;
     headers.set("Cache-Control", "no-store")?;
+    set_page_security_headers(&headers)?;
 
     let html = render_login_gate_html(true, true, false, message, signed_in_as);
     headers.set("Content-Length", &html.len().to_string())?;

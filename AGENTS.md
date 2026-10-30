@@ -126,6 +126,15 @@ Several modules embed or compile canonical assets and fixtures that are tested f
   - Never weaken `host-agent host-launcher`, `host-agent docker-admission`, or `host-agent host-admission` checks. Do not pass the Docker socket into builder containers, broaden directory permissions to bypass an uploader/control account mismatch, or replace direct authenticated SSH for `oxidex-uploader` with `gcloud compute ssh/scp`.
   - Never delete or hand-edit admission lease ledgers (`/var/lib/gha-admission/leases.json`) or their locks to bypass an admission hold.
   - Distinguish host OOM from container OOM and require kernel or cgroup evidence joined to the active job interval before classifying exit code 137.
+- **Worker routes deny access by default**: every route in `cloudflare/src/lib.rs` that returns or changes fleet, administrator, patch, template, build, or configuration state, or that uses a Worker secret such as the GitHub token, must check the caller before it loads state.
+  - Call `require_administrator` at the top of the route. It returns 401 without a session and 403 unless `auth::may_sign_in` passes for the owner or an added administrator. A valid session alone is not enough, because a removed administrator keeps a signed cookie until it expires.
+  - Owner-only routes also compare the caller with `state::OWNER_UID`. Builder routes (claim, heartbeat, complete, and `/api/observability/ingest`) accept a builder queue token, `SPOT_BUILDER_QUEUE_TOKEN`, or an administrator session, and builder tokens never unlock administrator reads.
+  - Only the login gate, `/favicon.ico`, `/api/health`, `/api/auth/status`, and the `/auth/*` sign-in and sign-out routes may answer anonymous callers, and they must not return deployment data. Adding a public route needs the user's explicit approval and an entry in `PUBLIC_ROUTES` in `cloudflare/tests/test_route_auth_coverage.rs`.
+  - Removing fields from a response is not access control. Refuse the request instead.
+  - Never make an authorization check depend on configuration such as `is_production_oauth_configured`. A missing secret must fail closed; mock sign-in runs only with `SPOT_ALLOW_MOCK_AUTH=1` under `wrangler dev`.
+  - Insert server data into inline event handlers only through `jsArg(...)`, and into `href` only through `safeUrl(...)`. HTML escaping alone does not protect a JavaScript string inside an attribute.
+  - Keep `test_route_auth_coverage` and `test_security_regressions` passing. When either fails, fix the route; never add a marker or a public entry to silence it.
+  - When a change touches a route, also check the routes it reads from or depends on, not only the lines in the diff.
 - **Label evidence states accurately**: local unit tests, Cloudflare Worker tests, GitHub CI checks, merged commits on `main`, rendered startup payloads, and live VM/container observations prove different things. State the exact command and environment for every verification claim, and never claim a live deployment or workload qualification from a source-only test run.
 
 ## Development and verification workflow
@@ -203,6 +212,6 @@ A human task prompt authorizes agents to work on an isolated feature branch, com
 
 Always run the independent local review gate before opening a pull request (`gh pr create`) so the first pushed commit is already clean:
 - Verify null and `NaN` guards on query parameters (such as `window_hours.is_finite()`) and optional JSON or JavaScript fields (such as `inst.pricing` and `origin_ip`).
-- Verify administrator session revalidation (`may_sign_in`) on every newly added or modified endpoint.
+- Verify that every Worker route, not only new or modified ones, calls `require_administrator` (or an equivalent `may_sign_in`, owner, or builder-token check) or is on the public list, and that `cargo test --manifest-path cloudflare/Cargo.toml --test test_route_auth_coverage` passes.
 - Verify that documentation examples respect GCE's 256 KiB `startup-script` metadata limit and do not rely on single-pass `sed` `r` insertions for placeholder substitution.
 

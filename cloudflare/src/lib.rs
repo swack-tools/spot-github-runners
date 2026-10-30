@@ -125,6 +125,38 @@ pub fn error_response(status: u16, error: &str, message: &str) -> Result<Respons
         .with_headers(headers))
 }
 
+/// Refuses a dashboard API request unless it carries a session for the owner or an
+/// added administrator: `Some(response)` is the 401 or 403 to send back.
+/// Every route that reads or changes fleet, admin, patch, template or build state
+/// must call this (or check `auth::may_sign_in` itself) before touching state.
+async fn require_administrator<K: state::KvStoreBackend>(
+    kv: &K,
+    session: Option<&auth::SessionData>,
+    now: u64,
+) -> Result<Option<Response>> {
+    let Some(session) = session else {
+        return error_response(401, "unauthorized", "Sign in required").map(Some);
+    };
+    let (bundle, _) = state::load_state(kv, now)
+        .await
+        .map_err(|e| Error::RustError(e.to_string()))?;
+    let added_admins: Vec<u64> = bundle
+        .state
+        .dashboard_admins
+        .iter()
+        .map(|a| a.uid)
+        .collect();
+    match auth::admin_read_access(Some(session), &added_admins) {
+        auth::AdminReadAccess::Allowed => Ok(None),
+        auth::AdminReadAccess::Unauthenticated => {
+            error_response(401, "unauthorized", "Sign in required").map(Some)
+        }
+        auth::AdminReadAccess::Forbidden => {
+            error_response(403, "forbidden", "Administrator permissions required").map(Some)
+        }
+    }
+}
+
 fn is_global_admins_enabled(env: &Env) -> bool {
     match env.var("DASHBOARD_GLOBAL_ADMINS") {
         Ok(v) => v.to_string().trim().to_lowercase() != "none",
@@ -246,6 +278,24 @@ pub fn resolve_oauth_client_id(
     }
 }
 
+/// Decides whether a request may proceed given how sign-in is configured.
+/// Without `GITHUB_OAUTH_CLIENT_SECRET` the Worker would fall back to the mock
+/// device flow, which hands an owner session to anyone, so it fails closed unless
+/// `SPOT_ALLOW_MOCK_AUTH=1` turns mock sign-in on for local development.
+pub fn oauth_mode_allows_request(
+    production_oauth: bool,
+    mock_auth_allowed: bool,
+    path: &str,
+) -> bool {
+    production_oauth || mock_auth_allowed || matches!(path, "/api/health" | "/favicon.ico")
+}
+
+fn is_mock_auth_allowed(env: &Env) -> bool {
+    env.var("SPOT_ALLOW_MOCK_AUTH")
+        .map(|v| v.to_string().trim() == "1")
+        .unwrap_or(false)
+}
+
 /// Top-level fetch handler for the Cloudflare Worker.
 #[event(fetch)]
 pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -255,6 +305,18 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
     // 1. Normalization & Security Filter: block /api/control* returning 404
     if is_control_path(path) {
         return error_response(404, "not_found", "Not found");
+    }
+
+    if !oauth_mode_allows_request(
+        is_production_oauth_configured(&env),
+        is_mock_auth_allowed(&env),
+        path,
+    ) {
+        return error_response(
+            503,
+            "oauth_not_configured",
+            "GitHub OAuth is not configured; set GITHUB_OAUTH_CLIENT_SECRET",
+        );
     }
 
     // 2. Request body cap enforcement
@@ -488,23 +550,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Scaling Endpoints
         (Method::Get, "/api/scaling") => {
-            let session = match verified_session {
-                Some(ref s) => s,
-                None => return error_response(401, "unauthorized", "Sign in required"),
-            };
-            let (bundle, _) = state::load_state(&kv, now)
-                .await
-                .map_err(|e| Error::RustError(e.to_string()))?;
-            let added_admins: Vec<u64> = bundle
-                .state
-                .dashboard_admins
-                .iter()
-                .map(|a| a.uid)
-                .collect();
-            if auth::admin_read_access(Some(session), &added_admins)
-                != auth::AdminReadAccess::Allowed
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
             {
-                return error_response(403, "forbidden", "Administrator permissions required");
+                return Ok(denied);
             }
             match state::handle_get_scaling(&kv, now).await {
                 Ok((status_code, body)) => json_response(status_code, &body),
@@ -703,6 +751,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Admin Management Endpoints
         (Method::Get, "/api/admins") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             let session = match verified_session {
                 Some(s) => s,
                 None => return error_response(401, "unauthorized", "Sign in required"),
@@ -896,6 +948,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/admins/remove") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             let session = match verified_session {
                 Some(s) => s,
                 None => return error_response(401, "unauthorized", "Sign in required"),
@@ -965,16 +1021,18 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Patch Console & Multi-Repo Manifest Endpoints
         (Method::Get, "/api/patch-console/bootstrap" | "/api/patches") => {
-            if verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
             }
             let (status_code, body) = patch_console::handle_bootstrap();
             json_response(status_code, &body)
         }
 
         (Method::Get, "/api/patch-console/manifest" | "/api/patches/manifest") => {
-            if verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
             }
             let repo = url
                 .query_pairs()
@@ -998,14 +1056,19 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/patch-console/validate" | "/api/patches/validate") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             let manifest_val: Value = req.json().await.unwrap_or(Value::Null);
             let (status_code, body) = patch_console::handle_validate(&manifest_val);
             json_response(status_code, &body)
         }
 
         (Method::Post, "/api/patch-console/save" | "/api/patches/save") => {
-            if verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
             }
             let save_val: Value = req.json().await.unwrap_or(Value::Null);
             let gh_token = env
@@ -1025,6 +1088,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post | Method::Get, "/api/patches/preview" | "/api/patch-console/preview") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             let body_val: Value = if method == Method::Post {
                 req.json().await.unwrap_or(Value::Null)
             } else {
@@ -1036,6 +1103,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Profile Qualification & Profiles
         (Method::Post, "/api/qualify") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             let qual_req: Value = req.json().await.unwrap_or(Value::Null);
             let role = qual_req
                 .get("role")
@@ -1065,6 +1136,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Post, "/api/profile/cicd_runner" | "/api/profile/rust_builder") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             let role = if path.ends_with("rust_builder") {
                 "rust_builder"
             } else {
@@ -1096,6 +1171,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Cloud-Init Visualizer & Editor
         (Method::Post, "/api/cloud-init/parse") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             let body_val: Value = req.json().await.unwrap_or(Value::Null);
             let content = body_val
                 .get("content")
@@ -1187,8 +1266,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Rust Build Telemetry
         (Method::Get, "/api/rust-builds") => {
-            if is_production_oauth_configured(&env) && verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
             }
             let (bundle, _) = state::load_state(&kv, now)
                 .await
@@ -1310,8 +1390,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Get, "/api/rust-builds/queue") => {
-            if is_production_oauth_configured(&env) && verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
             }
             let (bundle, _) = state::load_state(&kv, now)
                 .await
@@ -1660,8 +1741,9 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         (Method::Get, p) if p.starts_with("/api/rust-builds/") => {
-            if is_production_oauth_configured(&env) && verified_session.is_none() {
-                return error_response(401, "unauthorized", "Sign in required");
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
             }
             let id_str = p
                 .trim_start_matches("/api/rust-builds/")
@@ -1702,6 +1784,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Legacy Live Hot Patching (Deprecated in favor of PR Patch Console)
         (Method::Post, "/api/patches/hot-patch") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             let resp = serde_json::json!({
                 "status": "deprecated",
                 "message": "Live hot-patching is deprecated. Runner patches must be submitted and reviewed via the Runner Patch Console (/api/patch-console/*)."
@@ -2331,6 +2417,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Dedicated Read-Only Inventory Refresh Endpoint
         (Method::Post, "/api/inventory/refresh") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             if is_production_oauth_configured(&env) {
                 let session = match verified_session {
                     Some(ref s) => s,
@@ -2373,6 +2463,10 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
 
         // Reconciler Simulation & Control Endpoints
         (Method::Post, "/api/reconciler/tick") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
             if is_production_oauth_configured(&env) {
                 let session = match verified_session {
                     Some(ref s) => s,
