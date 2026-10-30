@@ -2793,6 +2793,8 @@ pub fn apply_dynamic_overview_filtering(
         .collect();
 
     let mut fs_hourly_burn = 0.0;
+    let mut fs_runner_hourly_burn = 0.0;
+    let mut fs_builder_hourly_burn = 0.0;
     let mut fs_running_runner_slots = 0;
     let mut fs_running_runner_vms = 0;
     let mut fs_x86_runner_vms = 0u32;
@@ -2860,9 +2862,11 @@ pub fn apply_dynamic_overview_filtering(
 
         if is_builder {
             fs_running_builder_vms += 1;
+            fs_builder_hourly_burn += active_hourly;
             agg.builder_vms += 1;
         } else {
             fs_running_runner_vms += 1;
+            fs_runner_hourly_burn += active_hourly;
             agg.runner_vms += 1;
             let count = inst
                 .get("runners_count")
@@ -2942,6 +2946,8 @@ pub fn apply_dynamic_overview_filtering(
             "active_hourly_burn_usd": fs_hourly_rounded,
             "active_daily_burn_usd": fs_daily_rounded,
             "active_monthly_burn_usd": fs_monthly_rounded,
+            "runner_hourly_burn_usd": (fs_runner_hourly_burn * 10000.0).round() / 10000.0,
+            "builder_hourly_burn_usd": (fs_builder_hourly_burn * 10000.0).round() / 10000.0,
             "running_runner_slots": fs_running_runner_slots,
             "running_runner_vms": fs_running_runner_vms,
             "x86_64_runner_vms": fs_x86_runner_vms,
@@ -3039,16 +3045,265 @@ pub fn apply_dynamic_overview_filtering(
     }
 }
 
+/// Live runner-scaling evaluation computed from the current inventory and policy.
+///
+/// It mirrors the two rules the scheduled reconciler acts on: the floor keeper
+/// (one host for each controlled target that has none, when `min_runners > 0`)
+/// and backlog scale-up (one more host when `queued_jobs` reaches
+/// `MIN_QUEUED_JOBS_THRESHOLD`, while under `max_runners`).
+pub fn evaluate_cicd_runner_scaling(
+    state: &DashboardState,
+    fleet_summary: &serde_json::Value,
+    now: u64,
+) -> serde_json::Value {
+    use crate::reconciler::{MIN_QUEUED_JOBS_THRESHOLD, RUNNERS_PER_HOST};
+
+    let policy = &state.scaling.cicd_runner;
+    let u32_field = |key: &str| fleet_summary.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let current_instances = u32_field("running_runner_vms");
+    let current_runners = u32_field("running_runner_slots");
+    let runner_hourly_burn = fleet_summary
+        .get("runner_hourly_burn_usd")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0);
+    let queued_jobs = state.scaling_telemetry.queued_jobs;
+
+    let targets: Vec<String> = if state.controlled_targets.is_empty() {
+        crate::patch::CONTROLLED_TARGETS
+            .iter()
+            .map(|t| t.to_string())
+            .collect()
+    } else {
+        state.controlled_targets.clone()
+    };
+    let runner_vms_for = |target: &str| {
+        fleet_summary
+            .get("target_breakdown")
+            .and_then(|v| v.as_array())
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|r| r.get("target").and_then(|v| v.as_str()) == Some(target))
+            })
+            .and_then(|r| r.get("runner_vms"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+
+    let mut scale_up_reasons: Vec<serde_json::Value> = Vec::new();
+    let mut desired_instances = current_instances;
+
+    let floor_enabled = policy.min_runners > 0;
+    if floor_enabled {
+        let missing: Vec<&String> = targets.iter().filter(|t| runner_vms_for(t) == 0).collect();
+        if !missing.is_empty() {
+            desired_instances += missing.len() as u32;
+            scale_up_reasons.push(serde_json::json!({
+                "trigger": "floor",
+                "summary": format!(
+                    "{} controlled target(s) have no runner host; the floor keeper launches one each",
+                    missing.len()
+                ),
+            }));
+        }
+    }
+
+    let max_instances = (policy.max_runners / RUNNERS_PER_HOST).max(1);
+    if policy.max_runners > 0
+        && queued_jobs >= MIN_QUEUED_JOBS_THRESHOLD
+        && current_instances < max_instances
+    {
+        // The reconciler runs this check on the pre-floor count, in the same
+        // tick as the floor keeper, so the two launches add up.
+        desired_instances += 1;
+        scale_up_reasons.push(serde_json::json!({
+            "trigger": "queued_jobs",
+            "summary": format!(
+                "{} queued jobs >= {}; adding one {}-runner host",
+                queued_jobs, MIN_QUEUED_JOBS_THRESHOLD, RUNNERS_PER_HOST
+            ),
+        }));
+    }
+
+    let direction = if desired_instances > current_instances {
+        "scale_up"
+    } else {
+        "hold"
+    };
+    let hold_reason = if direction == "scale_up" {
+        String::new()
+    } else if !floor_enabled && policy.max_runners == 0 {
+        "Scaling is off: min_runners and max_runners are both 0".to_string()
+    } else if policy.max_runners == 0 {
+        "Backlog scale-up is off (max_runners is 0)".to_string()
+    } else if current_instances >= max_instances && queued_jobs >= MIN_QUEUED_JOBS_THRESHOLD {
+        format!(
+            "At max_runners {} ({} hosts)",
+            policy.max_runners, max_instances
+        )
+    } else {
+        format!(
+            "{} queued jobs < threshold {}",
+            queued_jobs, MIN_QUEUED_JOBS_THRESHOLD
+        )
+    };
+
+    // Project cost only from what the live inventory prices; a scale-up from
+    // zero has no live rate to extrapolate from, so it is left unreported.
+    let projected_hourly = if desired_instances == current_instances {
+        Some(runner_hourly_burn)
+    } else if current_instances > 0 {
+        Some(runner_hourly_burn / current_instances as f64 * desired_instances as f64)
+    } else {
+        None
+    };
+    let round = |v: f64, places: i32| {
+        let f = 10f64.powi(places);
+        (v * f).round() / f
+    };
+
+    serde_json::json!({
+        "role": "cicd_runner",
+        "source": "worker",
+        "direction": direction,
+        "current_instances": current_instances,
+        "current_runners": current_runners,
+        "desired_instances": desired_instances,
+        "desired_runners": current_runners + (desired_instances - current_instances) * RUNNERS_PER_HOST,
+        "runners_per_instance": RUNNERS_PER_HOST,
+        "queued_jobs": queued_jobs,
+        "queued_jobs_threshold": MIN_QUEUED_JOBS_THRESHOLD,
+        "projected_hourly_usd": projected_hourly.map(|h| round(h, 4)),
+        "projected_daily_usd": projected_hourly.map(|h| round(h * 24.0, 2)),
+        "projected_monthly_usd": projected_hourly.map(|h| round(h * 720.0, 2)),
+        "budget_capped": false,
+        "hold_reason": hold_reason,
+        "scale_up_reasons": scale_up_reasons,
+        "scale_down_reasons": [],
+        "evaluated_at": chrono_iso(now),
+    })
+}
+
+/// Replaces the scaling evaluation and telemetry stored in the precomputed
+/// overview with values derived from live state.
+///
+/// The stored overview was last written by the retired Python control plane,
+/// and nothing in the Worker refreshes its `scaling_evaluation`,
+/// `builder_scaling_evaluation`, `scaling_evaluations` or `scaling_telemetry`,
+/// so they kept showing the fleet as it was before it went to zero. Values the
+/// Worker does not measure (jobs run in the past hour, provisioned jobs, CPU
+/// samples, OOM lists) are reported as unknown instead of carried forward.
+pub fn overlay_live_scaling_view(ov: &mut serde_json::Value, state: &mut DashboardState, now: u64) {
+    let fleet_summary = ov
+        .get("fleet_summary")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let runner_eval = evaluate_cicd_runner_scaling(state, &fleet_summary, now);
+    let builder = evaluate_rust_builder_queue_scaling(state, now);
+    let mut builder_eval = state
+        .scaling_evaluations
+        .get("rust_builder")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let builder_hourly_burn = fleet_summary
+        .get("builder_hourly_burn_usd")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0);
+    if let Some(be) = builder_eval.as_object_mut() {
+        let projected = if builder.target_builders == builder.active_builders {
+            Some(builder_hourly_burn)
+        } else if builder.active_builders > 0 {
+            Some(
+                builder_hourly_burn / builder.active_builders as f64
+                    * builder.target_builders as f64,
+            )
+        } else {
+            None
+        };
+        let round = |v: f64, f: f64| (v * f).round() / f;
+        be.insert(
+            "projected_hourly_usd".into(),
+            serde_json::json!(projected.map(|h| round(h, 10000.0))),
+        );
+        be.insert(
+            "projected_daily_usd".into(),
+            serde_json::json!(projected.map(|h| round(h * 24.0, 100.0))),
+        );
+        be.insert(
+            "projected_monthly_usd".into(),
+            serde_json::json!(projected.map(|h| round(h * 720.0, 100.0))),
+        );
+    }
+
+    let u32_field = |key: &str| fleet_summary.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let telemetry = serde_json::json!({
+        "source": "worker",
+        "current_instances": u32_field("running_runner_vms"),
+        "current_runners": state.scaling_telemetry.current_runners,
+        "queued_jobs": state.scaling_telemetry.queued_jobs,
+        "jobs_ran_past_hour": null,
+        "provisioned_jobs": null,
+        "template_runners_per_instance": crate::reconciler::RUNNERS_PER_HOST,
+        "running_instance_hourly_rates": [],
+        "instance_cpu_percentages": [],
+        "journal_oom_events": [],
+        "github_oom_runs": [],
+        "unknown_runner_count_hosts": [],
+        "current_builder_instances": builder.active_builders,
+        "active_builds": builder.running_builds,
+        "queued_builds": builder.queued_builds,
+        "builds_ran_past_hour": null,
+        "builder_instance_hourly_rates": [],
+        "builder_cpu_percentages": [],
+        "builder_journal_oom_events": [],
+    });
+
+    let Some(obj) = ov.as_object_mut() else {
+        return;
+    };
+    obj.insert("scaling_evaluation".into(), runner_eval.clone());
+    obj.insert("builder_scaling_evaluation".into(), builder_eval.clone());
+    obj.insert(
+        "scaling_evaluations".into(),
+        serde_json::json!({
+            "cicd_runner": runner_eval,
+            "rust_builder": builder_eval,
+        }),
+    );
+    obj.insert("scaling_telemetry".into(), telemetry);
+
+    // The stored instances_view also kept the old fleet's burn and slot totals.
+    if let Some(iv) = obj
+        .get_mut("instances_view")
+        .and_then(|v| v.as_object_mut())
+    {
+        for key in [
+            "active_hourly_burn_usd",
+            "active_daily_burn_usd",
+            "active_monthly_burn_usd",
+            "running_runner_slots",
+            "running_runner_vms",
+            "running_builder_vms",
+            "unconfirmed_runner_hosts",
+        ] {
+            if let Some(v) = fleet_summary.get(key) {
+                iv.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+}
+
 pub async fn handle_api_overview<K: KvStoreBackend>(
     kv: &K,
     query: OverviewQuery,
     now: u64,
 ) -> Result<(u16, serde_json::Value), StateError> {
-    let (bundle, _source) = load_state(kv, now).await?;
+    let (mut bundle, _source) = load_state(kv, now).await?;
 
     // If precomputed overview is present in bundle, serve directly (<1ms) with live budget/scaling overlaid
-    if let Some(ref overview) = bundle.state.overview {
-        let mut ov = overview.clone();
+    if let Some(overview) = bundle.state.overview.take() {
+        let mut ov = overview;
         if let Some(obj) = ov.as_object_mut() {
             if let Ok(gb) = serde_json::to_value(&bundle.state.global_budget) {
                 obj.insert("global_budget".to_string(), gb);
@@ -3090,6 +3345,7 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
             }
         }
         apply_dynamic_overview_filtering(&mut ov, &query, &bundle.state.instances_view, now);
+        overlay_live_scaling_view(&mut ov, &mut bundle.state, now);
         return Ok((200, ov));
     }
 
@@ -3146,6 +3402,7 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
         &bundle.state.instances_view,
         now,
     );
+    overlay_live_scaling_view(&mut fallback_overview, &mut bundle.state, now);
     Ok((200, fallback_overview))
 }
 
@@ -4296,15 +4553,13 @@ pub fn count_active_builder_instances(state: &DashboardState) -> u32 {
     } else {
         &state.instances
     };
-    let live = source
+    // Report the live count only. The reconciler scales from this same number,
+    // so padding it (for example to `min_instances.max(1)`) made the queue show
+    // a builder that does not exist and hid the scale-from-zero decision.
+    source
         .iter()
         .filter(|i| i.role == "rust_builder" && !i.status.eq_ignore_ascii_case("TERMINATED"))
-        .count() as u32;
-    if live > 0 {
-        live
-    } else {
-        state.scaling.rust_builder.min_instances.max(1)
-    }
+        .count() as u32
 }
 
 pub fn effective_average_build_seconds(state: &DashboardState) -> f64 {
@@ -4370,7 +4625,15 @@ pub fn evaluate_rust_builder_queue_scaling(
         active_builders
     };
 
-    let (decision, summary) = if should_scale_up {
+    let (decision, summary) = if should_scale_up && queued_builds < threshold {
+        (
+            "SCALE_UP".to_string(),
+            format!(
+                "Scale up from {} to {} builders ({} queued builds, below min_instances {})",
+                active_builders, target_builders, queued_builds, policy.min_instances
+            ),
+        )
+    } else if should_scale_up {
         (
             "SCALE_UP".to_string(),
             format!(
@@ -4396,15 +4659,28 @@ pub fn evaluate_rust_builder_queue_scaling(
         )
     };
 
+    // `direction`, `desired_instances` and the reason lists are the shape the
+    // Autoscaling tab renders; `decision` and `target_instances` stay for API callers.
     let eval_json = serde_json::json!({
+        "role": "rust_builder",
+        "source": "worker",
         "decision": decision,
+        "direction": if should_scale_up { "scale_up" } else { "hold" },
         "current_instances": active_builders,
         "target_instances": target_builders,
+        "desired_instances": target_builders,
         "queued_builds": queued_builds,
         "running_builds": running_builds,
         "queued_builds_threshold": threshold,
         "evaluated_at": chrono_iso(now),
         "summary": summary,
+        "budget_capped": false,
+        "scale_up_reasons": if should_scale_up {
+            serde_json::json!([{"trigger": "queued_builds", "summary": summary}])
+        } else {
+            serde_json::json!([])
+        },
+        "scale_down_reasons": [],
         "scale_up_triggers": if should_scale_up {
             serde_json::json!([format!("queued_builds: {} >= {}", queued_builds, threshold)])
         } else {
