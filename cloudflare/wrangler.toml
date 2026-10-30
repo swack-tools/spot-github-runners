@@ -1,7 +1,7 @@
 # Cloudflare Worker that fronts the Spot dashboard on https://spot.swacktech.com.
 #
 # Before the first deploy:
-#   1. Create the KV namespace and replace REPLACE_WITH_SPOT_KV_NAMESPACE_ID below with its id.
+#   1. Create the KV namespace and put its id in the SPOT_KV binding below (the deploy workflow fills the placeholder from a secret).
 #   2. Set the Worker secrets (never commit them, never put them in [vars]):
 #        wrangler secret put SESSION_SECRET            # same value as DASHBOARD_SESSION_SECRET on the VM
 #        wrangler secret put GITHUB_OAUTH_CLIENT_ID    # GitHub OAuth App client ID
