@@ -2,9 +2,11 @@ use spot_dashboard_edge::observability::{
     clear_ingested_snapshots, compute_dynamic_runner_recommendation, handle_get_observability,
     handle_post_dynamic_density, parse_observability_query, record_ingested_snapshot,
     IngestedDensityPayload, IngestedHostSnapshot, ObservabilityLogEntry, ObservabilityQuery,
-    UpdateDynamicDensityRequest, WorkflowCorrelationEntry,
+    UpdateDynamicDensityRequest, WorkflowCorrelationEntry, NO_TELEMETRY_STATUS,
 };
-use spot_dashboard_edge::state::{KvStoreBackend, StateError};
+use spot_dashboard_edge::state::{
+    invalidate_state_cache, load_state, save_state, InstanceRecord, KvStoreBackend, StateError,
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -78,7 +80,8 @@ async fn test_observability_filters_correlated_logs_and_dynamic_density_persiste
     let kv = MemKv(Mutex::new(HashMap::new()));
     let now = 1_792_000_000;
 
-    // 1. Default policy has dynamic runner density enabled by default
+    // 1. Default policy has dynamic runner density enabled by default, and an
+    // empty fleet reports no hosts, samples, logs or workflow links.
     let default_query = ObservabilityQuery {
         role: "all".to_string(),
         window_hours: 6.0,
@@ -93,34 +96,12 @@ async fn test_observability_filters_correlated_logs_and_dynamic_density_persiste
         "Dynamic runner density must be enabled by default"
     );
     assert!(
-        resp.dynamic_density.extra_runners_unlocked > 0,
-        "Default fleet should unlock extra dynamic runner slots"
+        resp.instances.is_empty(),
+        "empty fleet must not list demo hosts"
     );
-    assert!(!resp.timeseries.is_empty());
-    assert!(!resp.logs.is_empty());
-    assert!(resp
-        .logs
-        .iter()
-        .any(|l| l.github_workflow_url.starts_with("https://github.com/")));
-
-    // 2. Filter to CI/CD runners and specific repo xbmc4lyfe/newznab-tmux
-    let repo_query = ObservabilityQuery {
-        role: "cicd_runner".to_string(),
-        repositories: vec!["xbmc4lyfe/newznab-tmux".to_string()],
-        window_hours: 6.0,
-        ..Default::default()
-    };
-    let (_, repo_resp) = handle_get_observability(&kv, &repo_query, now)
-        .await
-        .expect("repo filtered observability");
-    assert!(!repo_resp.instances.is_empty());
-    for inst in &repo_resp.instances {
-        assert_eq!(inst.role, "cicd_runner");
-        assert_eq!(inst.repository, "xbmc4lyfe/newznab-tmux");
-    }
-    for log in &repo_resp.logs {
-        assert_eq!(log.repository, "xbmc4lyfe/newznab-tmux");
-    }
+    assert!(resp.logs.is_empty(), "empty fleet must not fabricate logs");
+    assert!(resp.timeseries.is_empty());
+    assert_eq!(resp.dynamic_density.extra_runners_unlocked, 0);
 
     // 3. Ingest live host telemetry with a correlated GitHub workflow job log and search for it
     record_ingested_snapshot(
@@ -234,6 +215,64 @@ async fn test_observability_filters_correlated_logs_and_dynamic_density_persiste
         .expect("observability after opt-out");
     assert!(!after_opt_out.dynamic_density.enabled);
     assert_eq!(after_opt_out.dynamic_density.extra_runners_unlocked, 0);
+    // The ingested host carries its real workflow link through.
+    let ingested = after_opt_out
+        .instances
+        .iter()
+        .find(|i| i.instance_name == "oxidex-runners-xbmc4lyfe-newznab-tmux-arm-01")
+        .expect("ingested host listed");
+    assert_eq!(ingested.active_workflows.len(), 1);
+    assert_eq!(after_opt_out.timeseries.len(), 1);
 
     clear_ingested_snapshots();
+}
+
+#[tokio::test]
+async fn test_observability_never_fabricates_telemetry_for_silent_instances() {
+    clear_ingested_snapshots();
+    invalidate_state_cache();
+    let kv = MemKv(Mutex::new(HashMap::new()));
+    let now = 1_792_100_000;
+
+    let (mut bundle, _) = load_state(&kv, now).await.expect("load state");
+    bundle.state.instances = vec![InstanceRecord {
+        id: "1".to_string(),
+        name: "oxidex-runners-swack-tools-oxidex".to_string(),
+        zone: "us-central1-a".to_string(),
+        region: "us-central1".to_string(),
+        machine_type: "n4d-standard-16".to_string(),
+        status: "RUNNING".to_string(),
+        role: "cicd_runner".to_string(),
+        vcpu: 16,
+        ram_gib: 64,
+        runners_count: 3,
+        runners_count_known: true,
+        runner_limits_known: true,
+        created_at: None,
+        created_epoch: None,
+    }];
+    save_state(&kv, &mut bundle, now).await.expect("save state");
+
+    let query = ObservabilityQuery {
+        role: "all".to_string(),
+        window_hours: 6.0,
+        ..Default::default()
+    };
+    let (_, resp) = handle_get_observability(&kv, &query, now + 1)
+        .await
+        .expect("observability");
+    assert_eq!(resp.instances.len(), 1);
+    let inst = &resp.instances[0];
+    assert_eq!(inst.ops_agent_status, NO_TELEMETRY_STATUS);
+    assert!(
+        inst.active_workflows.is_empty(),
+        "no invented workflow links"
+    );
+    assert_eq!(inst.cpu_utilization_pct, 0.0);
+    assert_eq!(inst.current_runners, 3);
+    assert_eq!(inst.extra_runners_unlocked, 0);
+    assert!(resp.logs.is_empty(), "no invented log rows");
+    assert!(resp.timeseries.is_empty(), "no invented samples");
+
+    invalidate_state_cache();
 }

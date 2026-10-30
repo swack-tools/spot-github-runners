@@ -13,6 +13,8 @@ use crate::state::{
 pub const DEFAULT_WINDOW_HOURS: f64 = 6.0;
 pub const MAX_INGESTED_HOSTS: usize = 64;
 pub const MAX_INGESTED_LOGS_PER_HOST: usize = 50;
+/// `ops_agent_status` for an instance that has not pushed host-agent telemetry.
+pub const NO_TELEMETRY_STATUS: &str = "no_telemetry";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowCorrelationEntry {
@@ -480,7 +482,6 @@ fn build_instance_observability(
     target_cpu_pct: f64,
     target_mem_pct: f64,
     max_per_instance: u32,
-    now: u64,
 ) -> (InstanceObservabilityRecord, Vec<ObservabilityLogEntry>) {
     let arch = infer_arch(&inst.machine_type, &inst.name);
     let (default_org, default_repo) = infer_instance_target(&inst.name, &inst.role);
@@ -591,13 +592,9 @@ fn build_instance_observability(
         return (rec, logs);
     }
 
-    // Deterministic telemetry for instances without a live ingest push yet
-    let hash_seed: u64 = inst
-        .name
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    let jitter = ((hash_seed % 17) as f64) * 0.08;
-
+    // No host-agent push for this instance: report what the control plane
+    // actually knows and leave telemetry, workflows and logs empty rather
+    // than inventing them.
     let baseline = if is_builder {
         0
     } else if vcpu <= 4 {
@@ -605,207 +602,16 @@ fn build_instance_observability(
     } else {
         2
     };
-    let current = if is_builder {
+    let current = if is_builder || !inst.runners_count_known {
         0
-    } else if vcpu <= 4 {
-        if inst.runners_count <= 2 {
-            inst.runners_count.max(1)
-        } else {
-            1
-        }
     } else {
-        inst.runners_count.clamp(2, 4)
+        inst.runners_count
     };
-
-    let peak_ws = if is_builder {
-        round2(11.4 + jitter)
-    } else if vcpu <= 4 {
-        round2(1.85 + jitter * 0.4)
+    let reason = if is_builder {
+        "Dedicated Rust builder (1 isolated 28 GiB container)".to_string()
     } else {
-        round2(1.32 + jitter * 0.3)
+        "No host-agent telemetry received yet; density recommendation unavailable".to_string()
     };
-    let peak_cg = if is_builder {
-        round2(16.8 + jitter)
-    } else if vcpu <= 4 {
-        round2(7.5 + jitter)
-    } else {
-        round2(9.6 + jitter)
-    };
-    let avg_cpu_cores = if is_builder {
-        12.4
-    } else if vcpu <= 4 {
-        round2(0.95 + (hash_seed % 3) as f64 * 0.04)
-    } else {
-        round2(1.15 + (hash_seed % 4) as f64 * 0.05)
-    };
-    let loadavg_1m = if is_builder {
-        round2(12.4 + jitter)
-    } else {
-        round2(avg_cpu_cores * (current as f64))
-    };
-    let cpu_pct = round2(((loadavg_1m / (vcpu as f64)) * 100.0).clamp(8.0, 96.0));
-    let mem_used = if is_builder {
-        round2(14.2 + jitter)
-    } else {
-        round2(0.8 + peak_ws * (current as f64) * 0.85)
-    };
-    let mem_avail = round2(((ram_gib as f64) - mem_used).max(1.0));
-    let mem_pct = round2((mem_used / (ram_gib as f64) * 100.0).clamp(4.0, 95.0));
-
-    let (recommended, extra, reason) = if is_builder {
-        (
-            0,
-            0,
-            "Dedicated Rust builder (1 isolated 28 GiB container)".to_string(),
-        )
-    } else {
-        compute_dynamic_runner_recommendation(
-            dyn_enabled,
-            vcpu,
-            ram_gib,
-            baseline,
-            current,
-            peak_ws,
-            avg_cpu_cores,
-            0,
-            target_cpu_pct,
-            target_mem_pct,
-            max_per_instance,
-        )
-    };
-
-    let mut active_workflows = Vec::new();
-    let mut logs = Vec::new();
-    let base_run_id = 40124985100u64 + (hash_seed % 900);
-    let base_job_id = 120964372500u64 + (hash_seed % 900);
-    let started_iso = chrono_iso(now.saturating_sub(240 + (hash_seed % 180)));
-
-    if is_builder {
-        let cid = format!("{:012x}", hash_seed & 0xffffffffffff);
-        let wf_url =
-            "https://github.com/swack-tools/oxidex/actions/runs/40124985001/job/120964372001"
-                .to_string();
-        logs.push(ObservabilityLogEntry {
-            timestamp: started_iso.clone(),
-            epoch: now.saturating_sub(60),
-            severity: "INFO".to_string(),
-            source: "ops_agent".to_string(),
-            instance_name: inst.name.clone(),
-            zone: inst.zone.clone(),
-            role: inst.role.clone(),
-            arch: arch.clone(),
-            runner_name: format!("{}-worker", inst.name),
-            container_id: cid,
-            organization: default_org.clone(),
-            repository: default_repo.clone(),
-            workflow_name: "Remote Rust Build Queue".to_string(),
-            job_name: "cargo build --release (Rust 1.99.0)".to_string(),
-            run_id: "40124985001".to_string(),
-            run_number: "842".to_string(),
-            job_id: "120964372001".to_string(),
-            github_workflow_url: wf_url,
-            message: format!(
-                "[host-agent] Builder cgroup v2 verified: memory.peak={:.2} GiB / 28.0 GiB cap, cpu.max=1600000/100000, 0 OOM kills",
-                peak_ws
-            ),
-        });
-    } else {
-        let slots_to_emit = current.clamp(1, 2);
-        for slot in 1..=slots_to_emit {
-            let rname = format!("gha-{}-{}", inst.name, slot);
-            let cid = format!(
-                "{:012x}",
-                (hash_seed.wrapping_add(slot as u64)) & 0xffffffffffff
-            );
-            let run_id_s = (base_run_id + slot as u64).to_string();
-            let job_id_s = (base_job_id + slot as u64 * 10).to_string();
-            let (wf_name, job_label) = if default_repo.contains("newznab-tmux") {
-                (
-                    "Run tests",
-                    if slot % 2 == 1 {
-                        "PHP 8.5 (Unit & Feature Suite)"
-                    } else {
-                        "PHP 8.4 (Integration & MariaDB 11.4)"
-                    },
-                )
-            } else if default_repo.contains("rustnzb") || default_repo.contains("nntp-proxy") {
-                ("CI", "cargo test --workspace --all-targets")
-            } else {
-                ("CI / Rust Test Suite", "cargo nextest run --workspace")
-            };
-            let wf_url = format!(
-                "https://github.com/{}/actions/runs/{}/job/{}",
-                default_repo, run_id_s, job_id_s
-            );
-            active_workflows.push(WorkflowCorrelationEntry {
-                runner_name: rname.clone(),
-                container_id: cid.clone(),
-                organization: default_org.clone(),
-                repository: default_repo.clone(),
-                workflow_name: wf_name.to_string(),
-                job_name: job_label.to_string(),
-                run_id: run_id_s.clone(),
-                run_number: (1600 + (hash_seed % 40) + slot as u64).to_string(),
-                job_id: job_id_s.clone(),
-                github_workflow_url: wf_url.clone(),
-                commit_sha: "5871398b6dcd9dc834e704b0c8386b8991412806".to_string(),
-                started_at: started_iso.clone(),
-                completed_at: None,
-                status: "in_progress".to_string(),
-            });
-
-            logs.push(ObservabilityLogEntry {
-                timestamp: chrono_iso(now.saturating_sub(45 * slot as u64)),
-                epoch: now.saturating_sub(45 * slot as u64),
-                severity: "INFO".to_string(),
-                source: "gha_worker".to_string(),
-                instance_name: inst.name.clone(),
-                zone: inst.zone.clone(),
-                role: inst.role.clone(),
-                arch: arch.clone(),
-                runner_name: rname.clone(),
-                container_id: cid.clone(),
-                organization: default_org.clone(),
-                repository: default_repo.clone(),
-                workflow_name: wf_name.to_string(),
-                job_name: job_label.to_string(),
-                run_id: run_id_s.clone(),
-                run_number: (1600 + (hash_seed % 40) + slot as u64).to_string(),
-                job_id: job_id_s.clone(),
-                github_workflow_url: wf_url.clone(),
-                message: format!(
-                    "[JobDispatcher] Running job '{}' on {} (working_set={:.2} GiB, cgroup_peak={:.2} GiB, load={:.2})",
-                    job_label, rname, peak_ws, peak_cg, loadavg_1m
-                ),
-            });
-            if slot == 1 && extra > 0 {
-                logs.push(ObservabilityLogEntry {
-                    timestamp: chrono_iso(now.saturating_sub(15)),
-                    epoch: now.saturating_sub(15),
-                    severity: "INFO".to_string(),
-                    source: "ops_agent".to_string(),
-                    instance_name: inst.name.clone(),
-                    zone: inst.zone.clone(),
-                    role: inst.role.clone(),
-                    arch: arch.clone(),
-                    runner_name: rname,
-                    container_id: cid,
-                    organization: default_org.clone(),
-                    repository: default_repo.clone(),
-                    workflow_name: wf_name.to_string(),
-                    job_name: job_label.to_string(),
-                    run_id: run_id_s,
-                    run_number: (1600 + (hash_seed % 40) + slot as u64).to_string(),
-                    job_id: job_id_s,
-                    github_workflow_url: wf_url,
-                    message: format!(
-                        "[DynamicDensity] Host {} underutilized ({:.1}% RAM, {:.1}% CPU): recommends scaling {} -> {} runners (+{} slots)",
-                        inst.name, mem_pct, cpu_pct, current, recommended, extra
-                    ),
-                });
-            }
-        }
-    }
 
     let rec = InstanceObservabilityRecord {
         instance_name: inst.name.clone(),
@@ -818,28 +624,28 @@ fn build_instance_observability(
         repository: default_repo,
         vcpu,
         ram_gib,
-        cpu_utilization_pct: cpu_pct,
-        loadavg_1m,
-        mem_used_gib: mem_used,
-        mem_available_gib: mem_avail,
-        mem_utilization_pct: mem_pct,
-        disk_used_gib: round2(18.4 + jitter * 2.0),
-        disk_total_gib: 100.0,
-        disk_utilization_pct: round2(18.4 + jitter * 2.0),
-        observed_peak_working_set_gib: peak_ws,
-        observed_peak_cgroup_gib: peak_cg,
-        observed_avg_cpu_cores_per_runner: avg_cpu_cores,
+        cpu_utilization_pct: 0.0,
+        loadavg_1m: 0.0,
+        mem_used_gib: 0.0,
+        mem_available_gib: 0.0,
+        mem_utilization_pct: 0.0,
+        disk_used_gib: 0.0,
+        disk_total_gib: 0.0,
+        disk_utilization_pct: 0.0,
+        observed_peak_working_set_gib: 0.0,
+        observed_peak_cgroup_gib: 0.0,
+        observed_avg_cpu_cores_per_runner: 0.0,
         baseline_runners: baseline,
         current_runners: current,
-        recommended_runners: recommended,
-        extra_runners_unlocked: extra,
+        recommended_runners: current,
+        extra_runners_unlocked: 0,
         oom_kills: 0,
-        ops_agent_status: "active".to_string(),
+        ops_agent_status: NO_TELEMETRY_STATUS.to_string(),
         density_reason: reason,
-        active_workflows,
+        active_workflows: Vec::new(),
     };
 
-    (rec, logs)
+    (rec, Vec::new())
 }
 
 pub async fn handle_get_observability<K: KvStoreBackend>(
@@ -859,75 +665,8 @@ pub async fn handle_get_observability<K: KvStoreBackend>(
     // Combine state instances with any newly ingested hosts
     let mut source_instances: Vec<InstanceRecord> = if !bundle.state.instances_view.is_empty() {
         bundle.state.instances_view.clone()
-    } else if !bundle.state.instances.is_empty() {
-        bundle.state.instances.clone()
     } else {
-        vec![
-            InstanceRecord {
-                id: "inst-oxidex-1".to_string(),
-                name: "oxidex-runners-swack-tools-oxidex".to_string(),
-                zone: "us-central1-a".to_string(),
-                region: "us-central1".to_string(),
-                machine_type: "n4d-standard-16".to_string(),
-                status: "RUNNING".to_string(),
-                role: "cicd_runner".to_string(),
-                vcpu: 16,
-                ram_gib: 64,
-                runners_count: 4,
-                runners_count_known: true,
-                runner_limits_known: true,
-                created_at: Some(chrono_iso(now.saturating_sub(3600))),
-                created_epoch: Some(now.saturating_sub(3600)),
-            },
-            InstanceRecord {
-                id: "inst-newznab-x86-1".to_string(),
-                name: "oxidex-runners-xbmc4lyfe-newznab-tmux-x86-1".to_string(),
-                zone: "us-central1-a".to_string(),
-                region: "us-central1".to_string(),
-                machine_type: "n4d-standard-16".to_string(),
-                status: "RUNNING".to_string(),
-                role: "cicd_runner".to_string(),
-                vcpu: 16,
-                ram_gib: 64,
-                runners_count: 4,
-                runners_count_known: true,
-                runner_limits_known: true,
-                created_at: Some(chrono_iso(now.saturating_sub(3600))),
-                created_epoch: Some(now.saturating_sub(3600)),
-            },
-            InstanceRecord {
-                id: "inst-newznab-arm-01".to_string(),
-                name: "oxidex-runners-xbmc4lyfe-newznab-tmux-arm-01".to_string(),
-                zone: "us-central1-a".to_string(),
-                region: "us-central1".to_string(),
-                machine_type: "c4a-standard-4".to_string(),
-                status: "RUNNING".to_string(),
-                role: "cicd_runner".to_string(),
-                vcpu: 4,
-                ram_gib: 16,
-                runners_count: 1,
-                runners_count_known: true,
-                runner_limits_known: true,
-                created_at: Some(chrono_iso(now.saturating_sub(3600))),
-                created_epoch: Some(now.saturating_sub(3600)),
-            },
-            InstanceRecord {
-                id: "inst-builder-01".to_string(),
-                name: "builder-rust-central-01".to_string(),
-                zone: "us-central1-a".to_string(),
-                region: "us-central1".to_string(),
-                machine_type: "n4-highcpu-16".to_string(),
-                status: "RUNNING".to_string(),
-                role: "rust_builder".to_string(),
-                vcpu: 16,
-                ram_gib: 32,
-                runners_count: 0,
-                runners_count_known: true,
-                runner_limits_known: true,
-                created_at: Some(chrono_iso(now.saturating_sub(3600))),
-                created_epoch: Some(now.saturating_sub(3600)),
-            },
-        ]
+        bundle.state.instances.clone()
     };
     for (name, snap) in &ingested_map {
         if !source_instances.iter().any(|i| &i.name == name) {
@@ -993,7 +732,6 @@ pub async fn handle_get_observability<K: KvStoreBackend>(
             target_cpu_pct,
             target_mem_pct,
             max_per_inst,
-            now,
         );
         org_set.insert(rec.organization.clone());
         repo_set.insert(rec.repository.clone());
@@ -1113,52 +851,23 @@ pub async fn handle_get_observability<K: KvStoreBackend>(
     let recommended_total: u32 = runner_insts.iter().map(|i| i.recommended_runners).sum();
     let extra_unlocked: u32 = runner_insts.iter().map(|i| i.extra_runners_unlocked).sum();
 
-    let count_f = (filtered_instances.len().max(1)) as f64;
-    let avg_peak_ws = round2(
-        filtered_instances
-            .iter()
-            .map(|i| i.observed_peak_working_set_gib)
-            .sum::<f64>()
-            / count_f,
-    );
-    let avg_peak_cg = round2(
-        filtered_instances
-            .iter()
-            .map(|i| i.observed_peak_cgroup_gib)
-            .sum::<f64>()
-            / count_f,
-    );
-    let avg_cpu = round2(
-        filtered_instances
-            .iter()
-            .map(|i| i.cpu_utilization_pct)
-            .sum::<f64>()
-            / count_f,
-    );
-    let avg_mem = round2(
-        filtered_instances
-            .iter()
-            .map(|i| i.mem_utilization_pct)
-            .sum::<f64>()
-            / count_f,
-    );
-    let total_avail_gib: f64 = filtered_instances
+    // Averages cover only hosts that pushed telemetry, so a silent host does
+    // not drag the fleet figures toward zero.
+    let reporting: Vec<&InstanceObservabilityRecord> = filtered_instances
         .iter()
-        .map(|i| i.mem_available_gib)
-        .sum::<f64>()
-        / count_f;
-    let total_ws_gib: f64 = filtered_instances
-        .iter()
-        .map(|i| i.mem_used_gib)
-        .sum::<f64>()
-        / count_f;
-    let avg_disk_pct: f64 = round2(
-        filtered_instances
-            .iter()
-            .map(|i| i.disk_utilization_pct)
-            .sum::<f64>()
-            / count_f,
-    );
+        .filter(|i| i.ops_agent_status != NO_TELEMETRY_STATUS)
+        .collect();
+    let count_f = (reporting.len().max(1)) as f64;
+    let avg_of = |f: fn(&InstanceObservabilityRecord) -> f64| -> f64 {
+        reporting.iter().map(|i| f(i)).sum::<f64>() / count_f
+    };
+    let avg_peak_ws = round2(avg_of(|i| i.observed_peak_working_set_gib));
+    let avg_peak_cg = round2(avg_of(|i| i.observed_peak_cgroup_gib));
+    let avg_cpu = round2(avg_of(|i| i.cpu_utilization_pct));
+    let avg_mem = round2(avg_of(|i| i.mem_utilization_pct));
+    let avg_avail_gib = round2(avg_of(|i| i.mem_available_gib));
+    let avg_used_gib = round2(avg_of(|i| i.mem_used_gib));
+    let avg_disk_pct = round2(avg_of(|i| i.disk_utilization_pct));
 
     let density_multiplier = if baseline_total > 0 {
         round2(recommended_total as f64 / baseline_total as f64)
@@ -1166,34 +875,28 @@ pub async fn handle_get_observability<K: KvStoreBackend>(
         1.0
     };
 
-    // Build 18-point Grafana-style time series over `query.window_hours`
-    let points_count = 18usize;
-    let step_secs = (((query.window_hours * 3600.0) / (points_count as f64)) as u64).max(60);
-    let mut timeseries = Vec::with_capacity(points_count);
-    for idx in 0..points_count {
-        let offset = (points_count - 1 - idx) as u64 * step_secs;
-        let pt_epoch = now.saturating_sub(offset);
-        let wave = ((idx as f64 * 0.65).sin()) * 4.2;
-        let cpu_pt = round2((avg_cpu + wave).clamp(5.0, 98.0));
-        let cgroup_cpu_pt = round2((cpu_pt * 0.88).clamp(4.0, 95.0));
-        let ws_pt = round2((total_ws_gib + wave * 0.12).max(0.8));
-        let cg_pt = round2((avg_peak_cg + wave * 0.18).max(ws_pt));
-        let avail_pt = round2((total_avail_gib - wave * 0.12).max(1.0));
+    // The Worker keeps only each host's latest snapshot, so the series is a
+    // single current sample, and empty when no host has reported.
+    let mut timeseries = Vec::new();
+    if !reporting.is_empty() {
         timeseries.push(ObservabilityTimeSeriesPoint {
-            timestamp: chrono_iso(pt_epoch),
-            epoch: pt_epoch,
-            cpu_utilization_pct: cpu_pt,
-            container_cpu_pct: cgroup_cpu_pt,
+            timestamp: chrono_iso(now),
+            epoch: now,
+            cpu_utilization_pct: avg_cpu,
+            container_cpu_pct: avg_cpu,
             target_cpu_pct,
-            mem_working_set_gib: ws_pt,
-            mem_cgroup_peak_gib: cg_pt,
-            mem_available_gib: avail_pt,
-            disk_read_mib_s: round2((28.5 + wave * 1.8).max(2.0)),
-            disk_write_mib_s: round2((42.0 + wave * 2.4).max(4.0)),
+            mem_working_set_gib: avg_used_gib,
+            mem_cgroup_peak_gib: avg_peak_cg,
+            mem_available_gib: avg_avail_gib,
+            disk_read_mib_s: 0.0,
+            disk_write_mib_s: 0.0,
             disk_utilization_pct: avg_disk_pct,
             active_runners: current_total,
             recommended_dense_runners: recommended_total,
-            active_workflows: current_total,
+            active_workflows: reporting
+                .iter()
+                .map(|i| i.active_workflows.len() as u32)
+                .sum(),
         });
     }
 
