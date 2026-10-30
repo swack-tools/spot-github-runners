@@ -3476,6 +3476,15 @@ if (instTbody) {
 instTbody.innerHTML = (OBS_STATE.instances || []).map(inst => {
 const roleBadge = inst.role === "rust_builder" ? '<span class="badge badge-builder">rust_builder</span>' : '<span class="badge badge-runner">cicd_runner</span>';
 const wfs = (inst.active_workflows || []).map(w => `<a href="${esc(w.github_workflow_url)}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="margin:2px 2px 0 0;text-decoration:none;" title="Open GitHub Actions Run #${esc(w.run_number)} (${esc(w.job_name)})">🔗 ${esc(w.repository)} #${esc(w.run_number)} · ${esc(w.job_name)} ↗</a>`).join(" ") || '<span style="color:var(--text-muted);font-size:11.5px;">Idle / Listening</span>';
+if (inst.ops_agent_status === "no_telemetry") {
+return `<tr>
+<td class="mono"><strong>${esc(inst.instance_name)}</strong><div style="font-size:11px;color:var(--text-muted);">${esc(inst.zone)}</div></td>
+<td>${roleBadge}<div class="mono" style="font-size:11px;margin-top:3px;">${esc(inst.repository || inst.organization)}</div></td>
+<td class="mono">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)}<div style="font-size:11px;color:var(--text-muted);">${inst.vcpu} vCPU · ${inst.ram_gib} GiB</div></td>
+<td class="mono" colspan="4" style="color:var(--text-muted);font-size:11.5px;">No host-agent telemetry received from this instance yet.</td>
+<td style="font-size:11.5px;"><span class="badge badge-warn">no telemetry</span></td>
+</tr>`;
+}
 const extraBadge = inst.extra_runners_unlocked > 0 ? `<span class="badge badge-running">+${inst.extra_runners_unlocked} dense slots</span>` : '<span class="badge badge-direct">optimal</span>';
 return `<tr>
 <td class="mono"><strong>${esc(inst.instance_name)}</strong><div style="font-size:11px;color:var(--text-muted);">${esc(inst.zone)}</div></td>
@@ -3487,7 +3496,7 @@ return `<tr>
 <td>${wfs}</td>
 <td style="font-size:11.5px;"><span class="badge badge-running">${esc(inst.ops_agent_status)}</span><div style="color:var(--text-muted);margin-top:3px;">${esc(inst.density_reason)}</div></td>
 </tr>`;
-}).join("");
+}).join("") || '<tr><td colspan="8" style="color:var(--text-muted);font-size:12px;text-align:center;padding:14px;">No running instances. The fleet is scaled to zero or the control plane has not listed any VMs yet.</td></tr>';
 }
 const logBadge = document.getElementById("obs-log-count-badge");
 if (logBadge) logBadge.textContent = `${OBS_STATE.total_matching_logs || 0} logs`;
@@ -3505,7 +3514,7 @@ return `<tr>
 <td>${wfHtml}</td>
 <td class="mono" style="font-size:11.5px;color:#e8eaed;word-break:break-word;">${esc(l.message)}</td>
 </tr>`;
-}).join("");
+}).join("") || '<tr><td colspan="5" style="color:var(--text-muted);font-size:12px;text-align:center;padding:14px;">No log entries. Logs and workflow links appear here only after a runner host pushes real host-agent telemetry.</td></tr>';
 }
 }
 async function saveDynamicDensityPolicy() {
