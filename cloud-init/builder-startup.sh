@@ -110,8 +110,41 @@ cat >/etc/systemd/system/docker.service.d/builder-data.conf <<EOF
 RequiresMountsFor=$MOUNT_POINT/docker
 EOF
 printf '{"data-root":"%s/docker","features":{"containerd-snapshotter":false},"log-driver":"local","log-opts":{"max-size":"20m","max-file":"3"}}\n' "$MOUNT_POINT" >/etc/docker/daemon.json
+# Job and build containers must not reach the GCE metadata server. It serves this instance's
+# attributes (bootstrap credentials) and, where the VM has a service account, its access token.
+# Host services keep metadata access: DOCKER-USER only filters traffic forwarded from containers.
+# The unit runs before Docker so restarted containers never start without the rule.
+cat >/usr/local/sbin/gce-metadata-container-block <<'METADATA_BLOCK'
+#!/bin/bash
+set -euo pipefail
+iptables -N DOCKER-USER 2>/dev/null || true
+iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT 2>/dev/null ||
+  iptables -I DOCKER-USER 1 -d 169.254.169.254/32 -j REJECT
+# The IPv6 metadata address only answers on IPv6-enabled networks, so this part is best effort.
+ip6tables -N DOCKER-USER 2>/dev/null || true
+ip6tables -C DOCKER-USER -d fd20:ce::254/128 -j REJECT 2>/dev/null ||
+  ip6tables -I DOCKER-USER 1 -d fd20:ce::254/128 -j REJECT 2>/dev/null || true
+METADATA_BLOCK
+chmod 0755 /usr/local/sbin/gce-metadata-container-block
+cat >/etc/systemd/system/gce-metadata-container-block.service <<'METADATA_BLOCK_UNIT'
+[Unit]
+Description=Block container access to the GCE metadata server
+Before=docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gce-metadata-container-block
+[Install]
+WantedBy=docker.service
+METADATA_BLOCK_UNIT
+systemctl daemon-reload
+systemctl enable gce-metadata-container-block.service
+/usr/local/sbin/gce-metadata-container-block
 systemctl daemon-reload
 systemctl enable --now containerd docker
+# Refuse to start runners or builds if containers could still reach the metadata server.
+iptables -C FORWARD -j DOCKER-USER && iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT ||
+  { echo "Container metadata block is not in place" >&2; exit 78; }
 docker_info=$(/usr/bin/docker info --format=json)
 driver=$(printf '%s' "$docker_info" | jq -re '.Driver')
 [[ "$driver" == "overlay2" ]] || { echo "Docker storage driver is not overlay2: $driver" >&2; exit 78; }

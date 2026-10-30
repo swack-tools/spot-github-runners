@@ -408,7 +408,8 @@ async fn test_instances_scrub_startup_script() {
     // Verify other metadata and fingerprint are preserved
     assert_eq!(scrubbed.fingerprint.as_deref(), Some("fingerprint-xyz123"));
     assert_eq!(scrubbed.get("spot-target"), Some("swack-tools"));
-    assert_eq!(scrubbed.get("runner_1_jitconfig"), Some("jit-base64"));
+    // JIT runner credentials are bootstrap secrets too and go with the startup script
+    assert_eq!(scrubbed.get("runner_1_jitconfig"), None);
 }
 
 #[tokio::test]

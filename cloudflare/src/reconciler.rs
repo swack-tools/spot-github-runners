@@ -612,7 +612,9 @@ impl GcpReconcilerClient for SimulatedFleetProvider {
         let mut list = SIMULATED_INSTANCES.lock().unwrap();
         if let Some(inst) = list.iter_mut().find(|i| i.name == instance) {
             let mut new_meta = current_metadata.clone();
-            new_meta.items.retain(|item| item.key != "startup-script");
+            new_meta.items.retain(|item| {
+                !crate::gcp::SCRUBBED_BOOTSTRAP_METADATA_KEYS.contains(&item.key.as_str())
+            });
             inst.metadata = new_meta;
         }
         Ok(GceOperation {

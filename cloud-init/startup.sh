@@ -60,6 +60,36 @@ cat >/etc/systemd/system/containerd.service.d/runner-data.conf <<EOF
 ExecStart=
 ExecStart=/usr/bin/containerd --root $MOUNT_POINT/containerd --state /run/containerd
 EOF
+# Job and build containers must not reach the GCE metadata server. It serves this instance's
+# attributes (bootstrap credentials) and, where the VM has a service account, its access token.
+# Host services keep metadata access: DOCKER-USER only filters traffic forwarded from containers.
+# The unit runs before Docker so restarted containers never start without the rule.
+cat >/usr/local/sbin/gce-metadata-container-block <<'METADATA_BLOCK'
+#!/bin/bash
+set -euo pipefail
+iptables -N DOCKER-USER 2>/dev/null || true
+iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT 2>/dev/null ||
+  iptables -I DOCKER-USER 1 -d 169.254.169.254/32 -j REJECT
+# The IPv6 metadata address only answers on IPv6-enabled networks, so this part is best effort.
+ip6tables -N DOCKER-USER 2>/dev/null || true
+ip6tables -C DOCKER-USER -d fd20:ce::254/128 -j REJECT 2>/dev/null ||
+  ip6tables -I DOCKER-USER 1 -d fd20:ce::254/128 -j REJECT 2>/dev/null || true
+METADATA_BLOCK
+chmod 0755 /usr/local/sbin/gce-metadata-container-block
+cat >/etc/systemd/system/gce-metadata-container-block.service <<'METADATA_BLOCK_UNIT'
+[Unit]
+Description=Block container access to the GCE metadata server
+Before=docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gce-metadata-container-block
+[Install]
+WantedBy=docker.service
+METADATA_BLOCK_UNIT
+systemctl daemon-reload
+systemctl enable gce-metadata-container-block.service
+/usr/local/sbin/gce-metadata-container-block
 systemctl daemon-reload
 systemctl enable --now containerd
 systemctl enable docker
@@ -68,6 +98,9 @@ containerd_exec=$(systemctl show -p ExecStart --value containerd)
 [[ "$containerd_exec" == *"--root $MOUNT_POINT/containerd"* ]] || { echo "containerd service root is unexpected: $containerd_exec" >&2; exit 1; }
 docker_root=$(docker info --format=json | jq -r .DockerRootDir)
 [[ "$docker_root" == "$MOUNT_POINT/docker" ]] || { echo "Docker root is $docker_root, expected $MOUNT_POINT/docker" >&2; exit 1; }
+# Refuse to start runners or builds if containers could still reach the metadata server.
+iptables -C FORWARD -j DOCKER-USER && iptables -C DOCKER-USER -d 169.254.169.254/32 -j REJECT ||
+  { echo "Container metadata block is not in place" >&2; exit 1; }
 # Remove the previous default roots after both services use the persistent disk.
 rm -rf /var/lib/containerd/* /var/lib/docker/* /var/lib/apt/lists/* /var/cache/apt/archives/*
 apt-get clean

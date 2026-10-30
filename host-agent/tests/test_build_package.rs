@@ -599,3 +599,41 @@ fn test_debug_build_after_cached_release_build_packages_debug_binary_not_stale_r
         sym_manifest.binaries_included
     );
 }
+
+#[test]
+fn test_materialize_checkout_refuses_option_like_git_arguments() {
+    use host_agent::build_package::{materialize_repository_checkout, ClaimedBuildJob};
+
+    let temp = TempDir::new().expect("tempdir");
+    let marker = temp.path().join("pwned");
+    let job = |repo: &str, branch: &str, sha: &str| ClaimedBuildJob {
+        build_id: 9100,
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        commit_sha: sha.to_string(),
+        command: "cargo test".to_string(),
+        profile: None,
+        binary_name: None,
+        gcs_bucket: "example-rust-project-build-artifacts".to_string(),
+    };
+    let upload_pack = format!("--upload-pack=touch {}", marker.display());
+    for bad in [
+        job("example-org/example-rust-project", &upload_pack, "deadbeef"),
+        job("--upload-pack=sh", "main", "deadbeef"),
+        job("example-org/example-rust-project", "main", "--orphan"),
+        job("example-org/example-rust-project", "main", "not-hex!"),
+    ] {
+        let ws = temp
+            .path()
+            .join(format!("ws-{}", bad.repo.len() + bad.branch.len()));
+        fs::create_dir_all(&ws).expect("create ws");
+        let err = materialize_repository_checkout(&ws, &bad)
+            .expect_err("option-like git arguments must be refused");
+        assert!(err.contains("Refusing claimed build job"), "got: {err}");
+        assert!(
+            !ws.join(".git").exists(),
+            "git must not run for a refused job"
+        );
+    }
+    assert!(!marker.exists());
+}

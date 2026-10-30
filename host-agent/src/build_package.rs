@@ -1106,6 +1106,26 @@ pub fn materialize_repository_checkout(
     workspace: &Path,
     job: &ClaimedBuildJob,
 ) -> Result<(), String> {
+    // The queue hands these to git as arguments, so anything that git could parse as an
+    // option (for example `--upload-pack=...`) is refused before git runs.
+    for (field, value) in [
+        ("repo", job.repo.trim()),
+        ("branch", job.branch.trim()),
+        ("commit_sha", job.commit_sha.trim()),
+    ] {
+        if value.is_empty() || value.starts_with('-') {
+            return Err(format!(
+                "Refusing claimed build job: {field} '{value}' is empty or starts with '-'"
+            ));
+        }
+    }
+    if !job.commit_sha.trim().chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Refusing claimed build job: commit_sha '{}' is not hexadecimal",
+            job.commit_sha.trim()
+        ));
+    }
+
     let remote_url = resolve_git_remote_url(&job.repo);
     let uploader = resolve_approved_uploader_identity();
 
@@ -1158,8 +1178,9 @@ pub fn materialize_repository_checkout(
             "--quiet",
             "--depth",
             "1",
+            "--end-of-options",
             "origin",
-            &job.commit_sha,
+            job.commit_sha.trim(),
         ])
         .status()
         .map(|s| s.success())
@@ -1168,7 +1189,13 @@ pub fn materialize_repository_checkout(
         let fetch_branch_ok = build_git_command(uploader.as_ref())
             .arg("-C")
             .arg(workspace)
-            .args(["fetch", "--quiet", "origin", &job.branch])
+            .args([
+                "fetch",
+                "--quiet",
+                "--end-of-options",
+                "origin",
+                job.branch.trim(),
+            ])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -1193,7 +1220,12 @@ pub fn materialize_repository_checkout(
     let checkout_out = build_git_command(uploader.as_ref())
         .arg("-C")
         .arg(workspace)
-        .args(["checkout", "--force", &job.commit_sha])
+        .args([
+            "checkout",
+            "--force",
+            "--end-of-options",
+            job.commit_sha.trim(),
+        ])
         .output()
         .map_err(|e| format!("Failed invoking git checkout '{}': {e}", job.commit_sha))?;
     if !checkout_out.status.success() {
