@@ -354,6 +354,25 @@ pub fn may_sign_in(login: &str, uid: u64, added_admins: &[u64]) -> bool {
     uid > 0 && added_admins.contains(&uid)
 }
 
+/// Outcome of gating a read endpoint that exposes fleet or admin state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminReadAccess {
+    /// No valid session cookie: answer 401.
+    Unauthenticated,
+    /// Signed in, but not the owner or an added administrator: answer 403.
+    Forbidden,
+    Allowed,
+}
+
+/// Decides whether a caller may read administrator-only dashboard state.
+pub fn admin_read_access(session: Option<&SessionData>, added_admins: &[u64]) -> AdminReadAccess {
+    match session {
+        None => AdminReadAccess::Unauthenticated,
+        Some(s) if may_sign_in(&s.sub, s.uid, added_admins) => AdminReadAccess::Allowed,
+        Some(_) => AdminReadAccess::Forbidden,
+    }
+}
+
 pub fn check_session(
     session: &SessionData,
     controlled_targets: &[String],

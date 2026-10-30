@@ -391,30 +391,36 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         // Dynamic Overview Endpoint with URL Query Parsing
         (Method::Get, "/api/overview") => {
             let mut query = state::OverviewQuery::default();
-            let is_authed_admin = if let Some(ref session) = verified_session {
-                let (bundle, _) = state::load_state(&kv, now)
-                    .await
-                    .map_err(|e| Error::RustError(e.to_string()))?;
-                let added_admins: Vec<u64> = bundle
-                    .state
-                    .dashboard_admins
-                    .iter()
-                    .map(|a| a.uid)
-                    .collect();
-                let global_admins =
-                    is_user_exempt_from_target_checks(&env, &bundle.state, session.uid);
-                matches!(
-                    auth::check_session(
-                        session,
-                        &bundle.state.controlled_targets,
-                        &added_admins,
-                        global_admins,
-                    ),
-                    auth::SessionCheckStatus::Ok
-                )
-            } else {
-                false
+            // The overview carries the admin list, fleet inventory, templates and
+            // build history, so it is never served to anonymous or non-admin callers.
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
             };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if auth::admin_read_access(Some(session), &added_admins)
+                != auth::AdminReadAccess::Allowed
+            {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+            let global_admins = is_user_exempt_from_target_checks(&env, &bundle.state, session.uid);
+            let is_authed_admin = matches!(
+                auth::check_session(
+                    session,
+                    &bundle.state.controlled_targets,
+                    &added_admins,
+                    global_admins,
+                ),
+                auth::SessionCheckStatus::Ok
+            );
             query.is_authenticated = Some(is_authed_admin);
             for (k, v) in url.query_pairs() {
                 match k.as_ref() {
@@ -481,10 +487,30 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         // Scaling Endpoints
-        (Method::Get, "/api/scaling") => match state::handle_get_scaling(&kv, now).await {
-            Ok((status_code, body)) => json_response(status_code, &body),
-            Err(e) => error_response(500, "internal_error", &e.to_string()),
-        },
+        (Method::Get, "/api/scaling") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let added_admins: Vec<u64> = bundle
+                .state
+                .dashboard_admins
+                .iter()
+                .map(|a| a.uid)
+                .collect();
+            if auth::admin_read_access(Some(session), &added_admins)
+                != auth::AdminReadAccess::Allowed
+            {
+                return error_response(403, "forbidden", "Administrator permissions required");
+            }
+            match state::handle_get_scaling(&kv, now).await {
+                Ok((status_code, body)) => json_response(status_code, &body),
+                Err(e) => error_response(500, "internal_error", &e.to_string()),
+            }
+        }
 
         (Method::Post, "/api/scaling") => {
             let session = match verified_session {
