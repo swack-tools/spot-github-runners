@@ -205,7 +205,13 @@ function validateHealthContract(probeResult) {
  */
 function validateOverviewContract(probeResult) {
   const issues = [];
-  if (!probeResult.ok) {
+  // The overview requires an administrator session; this probe sends none, so 401 is the healthy answer.
+  if (probeResult.status === 401) {
+    return { valid: true, issues };
+  }
+  if (probeResult.ok) {
+    issues.push('Overview answered an anonymous request; it must require sign-in');
+  } else {
     issues.push(`HTTP status ${probeResult.status} ${probeResult.statusText}`);
   }
   if (!probeResult.contentType.includes('application/json')) {
