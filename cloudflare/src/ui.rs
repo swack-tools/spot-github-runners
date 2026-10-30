@@ -11,128 +11,208 @@ pub static DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Spot GitHub Runners &amp; Rust Builders — Control Plane Dashboard</title>
 <style>
-:root {
---bg-base: #131314; --bg-panel: #1e1f20; --bg-card: #282a2c; --bg-card-hover: #333537;
---bg-input: #131314; --border: #3c4043; --border-hi: #8ab4f8; --text-main: #e8eaed;
---text-muted: #9aa0a6; --text-dim: #767c82; --accent: #1a73e8; --accent-hover: #1765cc;
---accent-soft: rgba(138, 180, 248, 0.14); --accent-text: #8ab4f8;
---cyan: #24c1e0; --emerald: #34a853; --amber: #fbbc04; --rose: #ea4335; --purple: #a142f4;
---sidebar-w: 258px;
---font-sans: "Google Sans", Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
---font-mono: "Roboto Mono", "SFMono-Regular", Consolas, Menlo, monospace;
+:root{
+--bg-base:#131314;
+--bg-panel:#1e1f20;
+--bg-card:#282a2c;
+--bg-card-hover:#333537;
+--bg-input:var(--bg-base);
+--bg-sunken:#0e0f10;
+--border:#3c4043;
+--border-control:#70757a;
+--border-hi:#8ab4f8;
+--text-strong:#ffffff;
+--text-main:#e8eaed;
+--text-muted:#9aa0a6;
+--text-dim:#8c9298;
+--accent:#1a73e8;
+--accent-hover:#1765cc;
+--on-accent:#ffffff;
+--accent-text:#8ab4f8;
+--accent-soft:rgba(138,180,248,0.14);
+--accent-line:rgba(138,180,248,0.35);
+--success:#34d399;
+--success-soft:rgba(52,211,153,0.14);
+--success-line:rgba(52,211,153,0.35);
+--success-fill:#047857;
+--success-fill-hover:#065f46;
+--danger:#fb7185;
+--danger-soft:rgba(244,63,94,0.15);
+--danger-line:rgba(244,63,94,0.4);
+--danger-fill:#e11d48;
+--danger-fill-hover:#be123c;
+--warning:#fbbf24;
+--warning-soft:rgba(245,158,11,0.15);
+--warning-line:rgba(245,158,11,0.4);
+--warning-fill:#7c2d12;
+--on-warning-fill:#fff7ed;
+--info:#38bdf8;
+--info-soft:rgba(56,189,248,0.14);
+--info-line:rgba(56,189,248,0.35);
+--violet:#c4b5fd;
+--violet-soft:rgba(139,92,246,0.18);
+--violet-line:rgba(139,92,246,0.35);
+--violet-fill:#7c3aed;
+--violet-fill-hover:#6d28d9;
+--teal:#5eead4;
+--teal-soft:rgba(36,193,224,0.16);
+--teal-line:rgba(36,193,224,0.42);
+--neutral-soft:rgba(154,160,166,0.14);
+--neutral-line:rgba(154,160,166,0.32);
+--chart-pink:#f472b6;
+--map-glow:#132038;
+--map-ground:#09101d;
+--map-land:#1c2c4c;
+--map-coast:#2e4775;
+--map-grid:rgba(148,163,184,0.08);
+--font-sans:"Google Sans",Roboto,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+--font-mono:"Roboto Mono","SFMono-Regular",Consolas,Menlo,monospace;
+--fs-xs:11px;
+--fs-sm:12px;
+--fs-md:13px;
+--fs-lg:15px;
+--fs-xl:16px;
+--fs-display:21px;
+--space-0:2px;
+--space-1:4px;
+--space-2:8px;
+--space-3:12px;
+--space-4:16px;
+--space-5:20px;
+--space-6:24px;
+--radius-xs:4px;
+--radius-sm:6px;
+--radius-md:8px;
+--radius-lg:12px;
+--radius-pill:999px;
+--shadow-bar:0 1px 4px rgba(0,0,0,0.45);
+--shadow-pop:0 8px 24px rgba(0,0,0,0.55);
+--sidebar-w:258px;
+color-scheme:dark
 }
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: var(--bg-base); color: var(--text-main); font-family: var(--font-sans); font-size: 13px; line-height: 1.45; min-height: 100vh; display: flex; flex-direction: column; }
-a { color: var(--accent-text); text-decoration: none; }
-a:hover { text-decoration: underline; }
-.topbar { background: #1e1f20; border-bottom: 1px solid var(--border); padding: 6px 16px; position: sticky; top: 0; z-index: 200; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45); }
-.topbar-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
-.brand { display: flex; align-items: center; gap: 10px; }
-.drawer-btn { width: 36px; height: 36px; border-radius: 50%; border: none; background: transparent; color: var(--text-main); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; font-size: 18px; transition: background 0.15s; }
-.drawer-btn:hover { background: var(--bg-card-hover); }
-.brand-logo { width: 30px; height: 30px; border-radius: 6px; background: #282a2c; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; }
-.brand-title { font-size: 15px; font-weight: 600; letter-spacing: 0.01em; color: #fff; display: flex; align-items: center; gap: 8px; }
-.gcp-project-pill { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 12px; color: var(--text-main); margin-left: 6px; }
-.brand-sub { font-size: 11.5px; color: var(--text-muted); display: flex; align-items: center; gap: 8px; }
-.tz-pill { display: inline-flex; align-items: center; gap: 4px; background: rgba(138, 180, 248, 0.12); color: var(--accent-text); border: 1px solid rgba(138, 180, 248, 0.3); padding: 2px 8px; border-radius: 4px; font-family: var(--font-mono); font-size: 11px; }
-.budget-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; background: var(--bg-card); border: 1px solid var(--border); padding: 4px 10px; border-radius: 6px; }
-.budget-bar label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
-.budget-input-group { display: flex; align-items: center; gap: 3px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
-.budget-input-group span { color: var(--text-muted); font-size: 11.5px; font-family: var(--font-mono); }
-.budget-input-group input { width: 56px; background: transparent; border: none; color: var(--text-main); font-family: var(--font-mono); font-size: 12px; font-weight: 600; outline: none; }
-.gcp-shell { display: flex; flex: 1; min-height: calc(100vh - 53px); position: relative; }
-.gcp-sidebar { width: var(--sidebar-w); min-width: var(--sidebar-w); background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; justify-content: space-between; padding: 10px 0 14px; transition: width 0.18s ease, min-width 0.18s ease, transform 0.18s ease; z-index: 150; user-select: none; }
-body.sidebar-collapsed .gcp-sidebar { width: 0; min-width: 0; overflow: hidden; border-right: none; padding: 0; }
-.nav-cat-label { padding: 12px 18px 4px; font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); }
-.nav-cat-label:first-child { padding-top: 4px; }
-.nav-tabs { display: flex; flex-direction: column; gap: 2px; padding: 0 8px; }
-.tab-btn { background: transparent; color: var(--text-main); border: none; border-left: 3px solid transparent; padding: 8px 12px; border-radius: 0 20px 20px 0; cursor: pointer; font-size: 13px; font-weight: 500; display: flex; align-items: center; justify-content: space-between; gap: 8px; transition: background 0.12s ease, color 0.12s ease; text-align: left; width: 100%; }
-.tab-btn-label { display: inline-flex; align-items: center; gap: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tab-btn:hover { background: var(--bg-card); }
-.tab-btn.active { background: var(--accent-soft); color: var(--accent-text); border-left-color: var(--accent-text); font-weight: 600; }
-.tab-badge { background: rgba(255, 255, 255, 0.08); color: var(--text-muted); padding: 1px 7px; border-radius: 99px; font-size: 10.5px; font-family: var(--font-mono); flex-shrink: 0; }
-.tab-btn.active .tab-badge { background: rgba(138, 180, 248, 0.22); color: var(--accent-text); }
-.sidebar-footer { margin: 12px 12px 0; padding: 10px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; font-size: 11px; color: var(--text-muted); }
-.main-container { flex: 1; min-width: 0; max-width: 1920px; padding: 14px 22px 48px; }
-.gcp-action-bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding-bottom: 12px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
-.gcp-breadcrumb { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text-muted); }
-.gcp-breadcrumb strong { color: #fff; font-size: 16px; font-weight: 600; }
-.arch-pill-group { display: inline-flex; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-.arch-pill-btn { background: transparent; color: var(--text-muted); border: none; border-right: 1px solid var(--border); padding: 5px 11px; font-size: 12px; font-weight: 600; cursor: pointer; }
-.arch-pill-btn:last-child { border-right: none; }
-.arch-pill-btn:hover { background: var(--bg-card); color: #fff; }
-.arch-pill-btn.active { background: var(--accent-soft); color: var(--accent-text); }
-.tab-pane { display: none; }
-.tab-pane.active { display: block; }
-[hidden] { display: none !important; }
-.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-bottom: 16px; }
-.kpi-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; }
-.kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 4px; }
-.kpi-value { font-size: 21px; font-weight: 700; font-family: var(--font-mono); color: var(--text-main); }
-.kpi-sub { font-size: 11.5px; color: var(--text-muted); margin-top: 3px; }
-.panel { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
-.panel-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
-.panel-title { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-.panel-subtitle { font-size: 12px; color: var(--text-muted); }
-.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.map-layout { display: grid; grid-template-columns: 1.55fr 1fr; gap: 16px; align-items: start; }
-@media (max-width: 1150px) { .two-col, .map-layout { grid-template-columns: 1fr; } }
-.btn { background: var(--accent); color: #fff; border: 1px solid transparent; padding: 6px 12px; border-radius: 7px; font-size: 12.5px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: all 0.15s; }
-.btn:hover { background: var(--accent-hover); }
-.btn-sm { padding: 4px 9px; font-size: 11.5px; border-radius: 6px; }
-.btn-secondary { background: var(--bg-card); color: var(--text-main); border-color: var(--border); }
-.btn-secondary:hover { background: var(--bg-card-hover); border-color: #475569; }
-.btn-emerald { background: #059669; } .btn-emerald:hover { background: #047857; }
-.btn-danger { background: #e11d48; } .btn-danger:hover { background: #be123c; }
-.btn-purple { background: #7c3aed; } .btn-purple:hover { background: #6d28d9; }
-input[type="text"], input[type="number"], select, textarea { background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; font-size: 12.5px; font-family: inherit; outline: none; }
-input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2); }
-.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 11px; margin-bottom: 12px; }
-.field { display: flex; flex-direction: column; gap: 4px; }
-.field label { font-size: 11.5px; color: var(--text-muted); font-weight: 600; }
-.toggle-label { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12.5px; user-select: none; }
-.toggle-label input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
-.world-map-box { position: relative; background: radial-gradient(circle at 50% 45%, #132038 0%, #09101d 100%); border: 1px solid var(--border); border-radius: 11px; overflow: hidden; min-height: 450px; }
-.world-svg { width: 100%; height: 450px; display: block; }
-.continent-shape { fill: #1c2c4c; stroke: #2e4775; stroke-width: 1.2; }
-.map-grid-line { stroke: rgba(148, 163, 184, 0.08); stroke-width: 1; stroke-dasharray: 3 3; }
-.dc-pin { cursor: pointer; transition: transform 0.15s ease; }
-.dc-pin:hover { filter: brightness(1.25); }
-.pin-pulse { animation: pulseRing 2.2s infinite ease-out; transform-origin: center; transform-box: fill-box; }
-@keyframes pulseRing { 0% { transform: scale(0.9); opacity: 0.85; } 70% { transform: scale(2.1); opacity: 0; } 100% { transform: scale(2.1); opacity: 0; } }
-.ssh-block { background: #070b12; border: 1px solid #1e293b; border-radius: 8px; padding: 9px 11px; display: flex; align-items: center; justify-content: space-between; gap: 10px; font-family: var(--font-mono); font-size: 12px; color: #38bdf8; margin-top: 8px; }
-.ssh-block code { overflow-x: auto; white-space: nowrap; }
-.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 9px; }
-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-th, td { padding: 9px 11px; text-align: left; border-bottom: 1px solid rgba(38, 51, 77, 0.65); }
-th { background: #0f172a; color: var(--text-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer; user-select: none; white-space: nowrap; }
-th:hover { color: #fff; background: #162238; }
-tr:hover td { background: rgba(30, 41, 59, 0.45); }
-.mono { font-family: var(--font-mono); }
-.badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; }
-.badge-running { background: rgba(16, 185, 129, 0.16); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.35); }
-.badge-deleted { background: rgba(244, 63, 94, 0.15); color: #fb7185; border: 1px solid rgba(244, 63, 94, 0.35); }
-.badge-runner { background: rgba(59, 130, 246, 0.16); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.35); }
-.badge-builder { background: rgba(139, 92, 246, 0.18); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.35); }
-.badge-warn { background: rgba(245, 158, 11, 0.16); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
-.badge-tor { background: rgba(244, 63, 94, 0.2); color: #fda4af; border: 1px solid rgba(244, 63, 94, 0.5); }
-.badge-vpn { background: rgba(245, 158, 11, 0.18); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.45); }
-.badge-direct { background: rgba(16, 185, 129, 0.14); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.3); }
-.badge-arm64 { background: rgba(36, 193, 224, 0.18); color: #5eead4; border: 1px solid rgba(36, 193, 224, 0.45); }
-.badge-x86 { background: rgba(148, 163, 184, 0.14); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.32); }
-.stage-list { display: flex; flex-direction: column; gap: 10px; }
-.stage-card { background: var(--bg-card); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 8px; padding: 10px 12px; }
-.stage-card-header { display: flex; justify-content: space-between; align-items: center; font-weight: 700; font-size: 13px; margin-bottom: 4px; }
-.stage-items { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
-.stage-chip { background: #0b1120; border: 1px solid #28354e; border-radius: 5px; padding: 2px 7px; font-family: var(--font-mono); font-size: 11px; color: #cbd5e1; }
-#toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
-.toast { background: #1e1f20; color: #f8fafc; border: 1px solid var(--border); border-left: 4px solid var(--accent-text); padding: 10px 14px; border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55); font-size: 12.5px; font-weight: 600; }
-.target-dd { position: relative; display: inline-block; }
-.target-dd-menu { position: absolute; top: calc(100% + 4px); left: 0; min-width: 265px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px; z-index: 300; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6); }
-.target-dd-hdr { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding-bottom: 6px; margin-bottom: 6px; border-bottom: 1px solid var(--border); }
-.target-dd-list { display: flex; flex-direction: column; gap: 4px; max-height: 210px; overflow-y: auto; }
-.target-dd-item { display: flex; align-items: center; gap: 7px; padding: 3px 5px; border-radius: 5px; cursor: pointer; font-size: 12px; user-select: none; }
-.target-dd-item:hover { background: var(--bg-card); }
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-base);color:var(--text-main);font-family:var(--font-sans);font-size:var(--fs-md);line-height:1.45;min-height:100vh;display:flex;flex-direction:column}
+a{color:var(--accent-text);text-decoration:none}
+a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--border-hi);outline-offset:2px}
+.topbar{background:var(--bg-panel);border-bottom:1px solid var(--border);padding:6px var(--space-4);position:sticky;top:0;z-index:200;box-shadow:var(--shadow-bar)}
+.topbar-row{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:var(--space-3)}
+.brand{display:flex;align-items:center;gap:var(--space-3)}
+.drawer-btn{width:36px;height:36px;border-radius:50%;border:none;background:transparent;color:var(--text-main);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font-size:18px;transition:background 0.15s}
+.drawer-btn:hover{background:var(--bg-card-hover)}
+.brand-logo{width:30px;height:30px;border-radius:var(--radius-sm);background:var(--bg-card);border:1px solid var(--border);display:flex;align-items:center;justify-content:center}
+.brand-title{font-size:var(--fs-lg);font-weight:600;letter-spacing:0.01em;color:var(--text-strong);display:flex;align-items:center;gap:var(--space-2)}
+.gcp-project-pill{display:inline-flex;align-items:center;gap:6px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:var(--space-1) 10px;font-size:var(--fs-sm);font-weight:400;color:var(--text-main);margin-left:6px}
+.tz-pill{display:inline-flex;align-items:center;gap:var(--space-1);background:var(--accent-soft);color:var(--accent-text);border:1px solid var(--accent-line);padding:var(--space-0) var(--space-2);border-radius:var(--radius-xs);font-family:var(--font-mono);font-size:var(--fs-xs);font-weight:400}
+.budget-bar{display:flex;align-items:center;flex-wrap:wrap;gap:var(--space-2);background:var(--bg-card);border:1px solid var(--border);padding:var(--space-1) 10px;border-radius:var(--radius-sm)}
+.budget-bar label{font-size:var(--fs-xs);color:var(--text-muted);text-transform:uppercase;letter-spacing:0.05em;font-weight:600}
+.budget-input-group{display:flex;align-items:center;gap:3px;background:var(--bg-input);border:1px solid var(--border-control);border-radius:var(--radius-xs);padding:var(--space-0) 6px}
+.budget-input-group span{color:var(--text-muted);font-size:var(--fs-sm);font-family:var(--font-mono)}
+.budget-input-group input[type="number"]{width:56px;padding:0;background:transparent;border:none;box-shadow:none;color:var(--text-main);font-family:var(--font-mono);font-size:var(--fs-sm);font-weight:600;outline:none}
+.gcp-shell{display:flex;flex:1;min-height:calc(100vh - 53px);position:relative}
+.gcp-sidebar{width:var(--sidebar-w);min-width:var(--sidebar-w);background:var(--bg-panel);border-right:1px solid var(--border);display:flex;flex-direction:column;justify-content:space-between;padding:10px 0 14px;transition:width 0.18s ease,min-width 0.18s ease,transform 0.18s ease;z-index:150;user-select:none}
+body.sidebar-collapsed .gcp-sidebar{width:0;min-width:0;overflow:hidden;border-right:none;padding:0}
+.nav-cat-label{padding:var(--space-3) 18px var(--space-1);font-size:var(--fs-xs);font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:var(--text-muted)}
+.nav-cat-label:first-child{padding-top:var(--space-1)}
+.nav-tabs{display:flex;flex-direction:column;gap:var(--space-0);padding:0 var(--space-2)}
+.tab-btn{background:transparent;color:var(--text-main);border:none;border-left:3px solid transparent;padding:var(--space-2) var(--space-3);border-radius:0 20px 20px 0;cursor:pointer;font-size:var(--fs-md);font-weight:500;display:flex;align-items:center;justify-content:space-between;gap:var(--space-2);transition:background 0.12s ease,color 0.12s ease;text-align:left;width:100%;font-family:inherit}
+.tab-btn-label{display:inline-flex;align-items:center;gap:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tab-btn:hover{background:var(--bg-card)}
+.tab-btn.active{background:var(--accent-soft);color:var(--accent-text);border-left-color:var(--accent-text);font-weight:600}
+.tab-badge{background:var(--neutral-soft);color:var(--text-muted);padding:1px 7px;border-radius:var(--radius-pill);font-size:var(--fs-xs);font-family:var(--font-mono);flex-shrink:0}
+.tab-btn.active .tab-badge{background:var(--accent-soft);color:var(--accent-text)}
+.sidebar-footer{margin:var(--space-3) var(--space-3) 0;padding:10px var(--space-3);background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-md);font-size:var(--fs-xs);color:var(--text-muted)}
+.main-container{flex:1;min-width:0;max-width:1920px;padding:14px 22px 48px}
+.gcp-action-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding-bottom:var(--space-3);margin-bottom:14px;border-bottom:1px solid var(--border)}
+.gcp-breadcrumb{display:flex;align-items:center;gap:var(--space-2);font-size:14px;color:var(--text-muted)}
+.gcp-breadcrumb strong{color:var(--text-strong);font-size:var(--fs-xl);font-weight:600}
+.arch-pill-group{display:inline-flex;background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden}
+.arch-pill-btn{background:transparent;color:var(--text-muted);border:none;border-right:1px solid var(--border);padding:5px 11px;font-size:var(--fs-sm);font-weight:600;cursor:pointer;font-family:inherit}
+.arch-pill-btn:last-child{border-right:none}
+.arch-pill-btn:hover{background:var(--bg-card);color:var(--text-strong)}
+.arch-pill-btn.active{background:var(--accent-soft);color:var(--accent-text)}
+.tab-pane{display:none}
+.tab-pane.active{display:block}
+[hidden]{display:none !important}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:var(--space-3);margin-bottom:var(--space-4)}
+.kpi-card{background:var(--bg-panel);border:1px solid var(--border);border-radius:10px;padding:13px 15px}
+.kpi-label{font-size:var(--fs-xs);text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);margin-bottom:var(--space-1)}
+.kpi-value{font-size:var(--fs-display);font-weight:700;font-family:var(--font-mono);color:var(--text-main);font-variant-numeric:tabular-nums}
+.kpi-sub{font-size:var(--fs-sm);color:var(--text-muted);margin-top:3px}
+.panel{background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius-lg);padding:var(--space-4) 18px;margin-bottom:var(--space-4)}
+.panel-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.panel-title{font-size:var(--fs-lg);font-weight:700;display:flex;align-items:center;gap:var(--space-2)}
+.panel-subtitle{font-size:var(--fs-sm);color:var(--text-muted)}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:var(--space-4)}
+.map-layout{display:grid;grid-template-columns:1.55fr 1fr;gap:var(--space-4);align-items:start}
+@media (max-width:1150px){.two-col,.map-layout{grid-template-columns:1fr}
+}
+.btn{background:var(--accent);color:var(--on-accent);border:1px solid transparent;padding:6px var(--space-3);border-radius:var(--radius-md);font-size:var(--fs-sm);font-weight:600;font-family:inherit;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:background 0.15s,border-color 0.15s}
+.btn:hover{background:var(--accent-hover)}
+.btn:disabled{opacity:0.55;cursor:not-allowed}
+.btn-sm{padding:var(--space-1) 9px;font-size:var(--fs-xs);border-radius:var(--radius-sm)}
+.btn-secondary{background:var(--bg-card);color:var(--text-main);border-color:var(--border)}
+.btn-secondary:hover{background:var(--bg-card-hover);border-color:var(--border-control)}
+.btn-emerald{background:var(--success-fill)}
+.btn-emerald:hover{background:var(--success-fill-hover)}
+.btn-danger{background:var(--danger-fill)}
+.btn-danger:hover{background:var(--danger-fill-hover)}
+.btn-purple{background:var(--violet-fill)}
+.btn-purple:hover{background:var(--violet-fill-hover)}
+input[type="text"],input[type="number"],input[type="password"],select,textarea{background:var(--bg-input);color:var(--text-main);border:1px solid var(--border-control);border-radius:var(--radius-md);padding:6px 10px;font-size:var(--fs-sm);font-family:inherit;outline:none}
+input[type="text"]:focus,input[type="number"]:focus,input[type="password"]:focus,select:focus,textarea:focus{border-color:var(--border-hi);box-shadow:0 0 0 2px var(--accent-soft)}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:11px;margin-bottom:var(--space-3)}
+.field{display:flex;flex-direction:column;gap:var(--space-1)}
+.field label{font-size:var(--fs-sm);color:var(--text-muted);font-weight:600}
+.toggle-label{display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-size:var(--fs-sm);user-select:none}
+.toggle-label input[type="checkbox"]{width:15px;height:15px;accent-color:var(--accent)}
+.world-map-box{position:relative;background:radial-gradient(circle at 50% 45%,var(--map-glow) 0%,var(--map-ground) 100%);border:1px solid var(--border);border-radius:11px;overflow:hidden;min-height:450px}
+.world-svg{width:100%;height:450px;display:block}
+.continent-shape{fill:var(--map-land);stroke:var(--map-coast);stroke-width:1.2}
+.map-grid-line{stroke:var(--map-grid);stroke-width:1;stroke-dasharray:3 3}
+.chart-grid{stroke:var(--neutral-soft)}
+.chart-text{fill:var(--text-muted)}
+.dc-pin{cursor:pointer;transition:transform 0.15s ease}
+.dc-pin:hover{filter:brightness(1.25)}
+.pin-pulse{animation:pulseRing 2.2s infinite ease-out;transform-origin:center;transform-box:fill-box}
+@keyframes pulseRing{0%{transform:scale(0.9);opacity:0.85}
+70%{transform:scale(2.1);opacity:0}
+100%{transform:scale(2.1);opacity:0}
+}
+@media (prefers-reduced-motion:reduce){.pin-pulse{animation:none}
+*{transition:none !important}
+}
+.ssh-block{background:var(--bg-sunken);border:1px solid var(--border);border-radius:var(--radius-md);padding:9px 11px;display:flex;align-items:center;justify-content:space-between;gap:10px;font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--info);margin-top:var(--space-2)}
+.ssh-block code{overflow-x:auto;white-space:nowrap}
+.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:9px}
+table{width:100%;border-collapse:collapse;font-size:var(--fs-sm);font-variant-numeric:tabular-nums}
+th,td{padding:9px 11px;text-align:left;border-bottom:1px solid var(--border)}
+th{background:var(--bg-card);color:var(--text-muted);font-weight:600;font-size:var(--fs-xs);text-transform:uppercase;letter-spacing:0.04em;cursor:pointer;user-select:none;white-space:nowrap}
+th:hover{color:var(--text-strong);background:var(--bg-card-hover)}
+tr:hover td{background:var(--bg-card)}
+.mono{font-family:var(--font-mono)}
+.badge{display:inline-flex;align-items:center;gap:var(--space-1);padding:var(--space-0) var(--space-2);border-radius:var(--radius-pill);font-size:var(--fs-xs);font-weight:600;white-space:nowrap;border:1px solid transparent}
+.badge-running,.badge-direct{background:var(--success-soft);color:var(--success);border-color:var(--success-line)}
+.badge-deleted,.badge-tor{background:var(--danger-soft);color:var(--danger);border-color:var(--danger-line)}
+.badge-runner{background:var(--accent-soft);color:var(--accent-text);border-color:var(--accent-line)}
+.badge-builder{background:var(--violet-soft);color:var(--violet);border-color:var(--violet-line)}
+.badge-warn,.badge-vpn{background:var(--warning-soft);color:var(--warning);border-color:var(--warning-line)}
+.badge-arm64{background:var(--teal-soft);color:var(--teal);border-color:var(--teal-line)}
+.badge-x86{background:var(--neutral-soft);color:var(--text-main);border-color:var(--neutral-line)}
+.stage-list{display:flex;flex-direction:column;gap:10px}
+.stage-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-md);padding:10px var(--space-3)}
+.stage-card-header{display:flex;justify-content:space-between;align-items:center;font-weight:700;font-size:var(--fs-md);margin-bottom:var(--space-1)}
+.stage-items{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.stage-chip{background:var(--bg-sunken);border:1px solid var(--border);border-radius:5px;padding:var(--space-0) 7px;font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-main)}
+#toast-container{position:fixed;bottom:var(--space-5);right:var(--space-5);z-index:9999;display:flex;flex-direction:column;gap:var(--space-2)}
+.toast{background:var(--bg-panel);color:var(--text-strong);border:1px solid var(--border-control);padding:10px 14px;border-radius:var(--radius-sm);box-shadow:var(--shadow-pop);font-size:var(--fs-sm);font-weight:600}
+.target-dd{position:relative;display:inline-block}
+.target-dd-menu{position:absolute;top:calc(100% + 4px);left:0;min-width:265px;background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius-md);padding:var(--space-2);z-index:300;box-shadow:var(--shadow-pop)}
+.target-dd-hdr{display:flex;align-items:center;justify-content:space-between;gap:6px;padding-bottom:6px;margin-bottom:6px;border-bottom:1px solid var(--border)}
+.target-dd-list{display:flex;flex-direction:column;gap:var(--space-1);max-height:210px;overflow-y:auto}
+.target-dd-item{display:flex;align-items:center;gap:7px;padding:3px 5px;border-radius:5px;cursor:pointer;font-size:var(--fs-sm);user-select:none}
+.target-dd-item:hover{background:var(--bg-card)}
+.status-banner{position:fixed;top:0;left:0;right:0;z-index:10000;padding:10px var(--space-4);background:var(--warning-fill);color:var(--on-warning-fill);font-weight:600;text-align:center;box-shadow:var(--shadow-pop)}
 </style>
 </head>
 <body>
@@ -142,14 +222,14 @@ tr:hover td { background: rgba(30, 41, 59, 0.45); }
 <button class="drawer-btn" id="sidebar-toggle-btn" onclick="toggleSidebar()" title="Toggle Left Navigation Drawer ([)">☰</button>
 <div class="brand-logo" aria-hidden="true">
 <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-<path d="M12 3L4 7.5V16.5L12 21L20 16.5V7.5L12 3Z" stroke="#4285F4" stroke-width="2"/>
-<circle cx="12" cy="12" r="3.5" fill="#34A853"/>
-<path d="M12 3L20 7.5L12 12L4 7.5L12 3Z" fill="#EA4335" fill-opacity="0.75"/>
-<path d="M12 12L20 7.5V16.5L12 21V12Z" fill="#FBBC04" fill-opacity="0.75"/>
+<path d="M12 3L4 7.5V16.5L12 21L20 16.5V7.5L12 3Z" style="stroke:var(--accent-text)" stroke-width="2"/>
+<circle cx="12" cy="12" r="3.5" style="fill:var(--success)"/>
+<path d="M12 3L20 7.5L12 12L4 7.5L12 3Z" style="fill:var(--danger)" fill-opacity="0.75"/>
+<path d="M12 12L20 7.5V16.5L12 21V12Z" style="fill:var(--warning)" fill-opacity="0.75"/>
 </svg>
 </div>
 <div class="brand-title">
-<span>Google Cloud · Spot Fleet Console</span>
+<span>Spot Fleet Console</span>
 <div class="gcp-project-pill">
 <span>▾</span>
 <span id="hdr-project-org">GCP Project: not configured · GitHub Org: not configured</span>
@@ -240,10 +320,10 @@ Incl. Disk &amp; Tax
 </nav>
 </div>
 <div class="sidebar-footer">
-<div style="font-weight:600; color:#e8eaed; margin-bottom:4px;">First-Class Multi-Arch</div>
-<div><span class="badge badge-arm64" style="font-size:10px;">ARM64</span> C4A · N4A · T2A</div>
-<div style="margin-top:3px;"><span class="badge badge-x86" style="font-size:10px;">x86_64</span> C4D · N4D · N4 · C2D</div>
-<div style="margin-top:6px; font-size:10.5px;">Press <code class="mono">[</code> to toggle drawer</div>
+<div style="font-weight:600; color:var(--text-main); margin-bottom:4px;">First-Class Multi-Arch</div>
+<div><span class="badge badge-arm64" style="font-size:var(--fs-xs);">ARM64</span> C4A · N4A · T2A</div>
+<div style="margin-top:3px;"><span class="badge badge-x86" style="font-size:var(--fs-xs);">x86_64</span> C4D · N4D · N4 · C2D</div>
+<div style="margin-top:6px; font-size:var(--fs-xs);">Press <code class="mono">[</code> to toggle drawer</div>
 </div>
 </aside>
 <main class="main-container">
@@ -256,7 +336,7 @@ Incl. Disk &amp; Tax
 <strong id="breadcrumb-current">Fleet Overview &amp; World Map</strong>
 </div>
 <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-<span style="font-size:11.5px; color:var(--text-muted); font-weight:600;">Architecture:</span>
+<span style="font-size:var(--fs-sm); color:var(--text-muted); font-weight:600;">Architecture:</span>
 <div class="arch-pill-group" role="group" aria-label="Architecture filter">
 <button class="arch-pill-btn active" data-arch="all" onclick="setGlobalArchFilter('all')">All (ARM64 + x86_64)</button>
 <button class="arch-pill-btn" data-arch="arm64" onclick="setGlobalArchFilter('arm64')">ARM64 (Axion C4A/N4A · Altra T2A)</button>
@@ -289,7 +369,7 @@ Incl. Disk &amp; Tax
 </div>
 <div class="kpi-card">
 <div class="kpi-label">Scaling &amp; OOM Alerts</div>
-<div class="kpi-value" id="kpi-scaling-status" style="color: #fbbf24;">SCALE UP (+2)</div>
+<div class="kpi-value" id="kpi-scaling-status" style="color: var(--warning);">SCALE UP (+2)</div>
 <div class="kpi-sub" id="kpi-scaling-sub">GitHub CI OOM + Majority CPU &gt; 50%</div>
 </div>
 </section>
@@ -325,7 +405,7 @@ Show Prices With Disk &amp; Taxes
 <g id="map-pins-group"></g>
 </svg>
 </div>
-<div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:10px; font-size:12px; color:var(--text-muted);">
+<div style="display:flex; gap:14px; flex-wrap:wrap; margin-top:10px; font-size:var(--fs-sm); color:var(--text-muted);">
 <span>🟢 <strong>Emerald Pin:</strong> Active Running Spot Instances (Click to inspect)</span>
 <span>🔵 <strong>Blue Pin:</strong> Enabled Region (0 running)</span>
 <span>⚪ <strong>Gray Pin:</strong> Region Deselected by Operator Filter</span>
@@ -354,7 +434,7 @@ Include Disk &amp; Taxes
 </div>
 <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:14px; background:var(--bg-card); padding:10px 12px; border-radius:9px; border:1px solid var(--border);">
 <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-<span style="font-size:12px; color:var(--text-muted); font-weight:600;">Time Scale:</span>
+<span style="font-size:var(--fs-sm); color:var(--text-muted); font-weight:600;">Time Scale:</span>
 <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(0)">Now (0h)</button>
 <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(1)">1h</button>
 <button class="btn btn-sm btn-secondary" onclick="applyHoursWindow(6)">6h</button>
@@ -384,20 +464,20 @@ Include Disk &amp; Taxes
 <button type="button" class="btn btn-sm btn-secondary" id="inst-target-dd-btn" onclick="toggleTargetDropdown(event)">Org / Repo: All ▾</button>
 <div class="target-dd-menu" id="inst-target-dd-menu" hidden onclick="event.stopPropagation()">
 <div class="target-dd-hdr">
-<label class="toggle-label" style="font-size:12px;">
+<label class="toggle-label" style="font-size:var(--fs-sm);">
 <input type="checkbox" id="inst-target-all-cb" checked onchange="toggleAllTargets(this.checked)" />
 <strong>All</strong>
 </label>
 <div style="display:flex; gap:4px;">
-<button type="button" class="btn btn-sm btn-secondary" id="inst-target-reverse-btn" style="padding:2px 7px; font-size:11px;" onclick="reverseTargetFilter()">⇄ Reverse</button>
-<button type="button" class="btn btn-sm btn-secondary" id="inst-target-clear-btn" style="padding:2px 7px; font-size:11px;" onclick="clearTargetFilter()">↺ Clear</button>
+<button type="button" class="btn btn-sm btn-secondary" id="inst-target-reverse-btn" style="padding:2px 7px; font-size:var(--fs-xs);" onclick="reverseTargetFilter()">⇄ Reverse</button>
+<button type="button" class="btn btn-sm btn-secondary" id="inst-target-clear-btn" style="padding:2px 7px; font-size:var(--fs-xs);" onclick="clearTargetFilter()">↺ Clear</button>
 </div>
 </div>
 <div id="inst-target-list" class="target-dd-list"></div>
 </div>
 </div>
 <input type="text" id="inst-search-input" placeholder="Filter by instance, region, spec, trigger..." style="width:240px;" oninput="refreshInstancesTable()" onkeydown="if(event.key==='Enter'){event.preventDefault();refreshInstancesTable();}" />
-<select id="inst-sort-by" onchange="applySort(this.value)" style="padding:4px 8px; font-size:12px;">
+<select id="inst-sort-by" onchange="applySort(this.value)" style="padding:4px 8px; font-size:var(--fs-sm);">
 <option value="total_cost_in_window_usd" selected>Sort by Total Cost ($)</option>
 <option value="active_hourly_usd">Sort by Rate ($/hr)</option>
 <option value="runtime_hours">Sort by Runtime</option>
@@ -408,9 +488,9 @@ Include Disk &amp; Taxes
 <option value="role">Sort by Role</option>
 </select>
 <button class="btn btn-sm btn-purple" onclick="triggerLiveInventoryRefresh()">🔄 Refresh Inventory</button>
-<label style="font-size:12px; color:var(--text-muted); display:inline-flex; align-items:center; gap:4px; margin-left:4px;">
+<label style="font-size:var(--fs-sm); color:var(--text-muted); display:inline-flex; align-items:center; gap:4px; margin-left:4px;">
 Auto-refresh:
-<select id="inst-autorefresh-select" onchange="setInventoryAutoRefresh(this.value)" style="padding:2px 6px; font-size:11.5px;">
+<select id="inst-autorefresh-select" onchange="setInventoryAutoRefresh(this.value)" style="padding:2px 6px; font-size:var(--fs-sm);">
 <option value="0">Off</option>
 <option value="60" selected>1m</option>
 <option value="300">5m</option>
@@ -420,7 +500,7 @@ Auto-refresh:
 </div>
 </div>
 <div id="target-fleet-breakdown-bar" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;"></div>
-<div id="inst-window-summary" style="margin-bottom:10px; font-size:12.5px; color:var(--text-muted);"></div>
+<div id="inst-window-summary" style="margin-bottom:10px; font-size:var(--fs-sm); color:var(--text-muted);"></div>
 <div class="table-wrap">
 <table>
 <thead>
@@ -469,7 +549,7 @@ Auto-refresh:
 <div class="field"><label>Cloud-Init Template Dropdown</label><select id="runner-cloudinit-select"></select></div>
 <div class="field"><label>VM Instance Template</label><div style="display:flex; gap:6px; align-items:center;"><input type="checkbox" id="runner-use-vmtpl" checked title="Use VM Template" /><select id="runner-vmtpl-select" style="flex:1;"></select></div></div>
 </div>
-<div id="runner-sizing-math-banner" style="background:var(--bg-card); border:1px solid var(--border); padding:9px 12px; border-radius:8px; margin-bottom:12px; font-size:12px; color:#93c5fd;"></div>
+<div id="runner-sizing-math-banner" style="background:var(--bg-card); border:1px solid var(--border); padding:9px 12px; border-radius:8px; margin-bottom:12px; font-size:var(--fs-sm); color:var(--accent-text);"></div>
 <div style="display:flex; gap:8px; flex-wrap:wrap;">
 <button class="btn" onclick="saveProfile('cicd_runner')">Save CI/CD Runner Profile</button>
 <button class="btn btn-secondary" onclick="openSelectedCloudInit('cicd_runner')">Edit Selected Cloud-Init Template</button>
@@ -497,7 +577,7 @@ Auto-refresh:
 <div class="field"><label>Cloud-Init Template Dropdown</label><select id="builder-cloudinit-select"></select></div>
 <div class="field"><label>VM Instance Template</label><div style="display:flex; gap:6px; align-items:center;"><input type="checkbox" id="builder-use-vmtpl" checked /><select id="builder-vmtpl-select" style="flex:1;"></select></div></div>
 </div>
-<div id="builder-sizing-math-banner" style="background:var(--bg-card); border:1px solid var(--border); padding:9px 12px; border-radius:8px; margin-bottom:12px; font-size:12px; color:#c4b5fd;"></div>
+<div id="builder-sizing-math-banner" style="background:var(--bg-card); border:1px solid var(--border); padding:9px 12px; border-radius:8px; margin-bottom:12px; font-size:var(--fs-sm); color:var(--violet);"></div>
 <div style="display:flex; gap:8px; flex-wrap:wrap;">
 <button class="btn btn-purple" onclick="saveProfile('rust_builder')">Save Rust Builder Profile</button>
 <button class="btn btn-secondary" onclick="openSelectedCloudInit('rust_builder')">Edit Selected Cloud-Init Template</button>
@@ -562,7 +642,7 @@ Auto-refresh:
 <label class="toggle-label"><input type="checkbox" id="sc-en-gh-oom" checked /> GitHub CI OOM Run Trigger</label>
 </div>
 <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:9px; padding:11px 13px; margin-bottom:12px;">
-<div style="font-weight:700; font-size:12px; margin-bottom:8px; color:#93c5fd;">Live Telemetry &amp; Scenario Simulator (Test Scale-Up or Scale-Down Live)</div>
+<div style="font-weight:700; font-size:var(--fs-sm); margin-bottom:8px; color:var(--accent-text);">Live Telemetry &amp; Scenario Simulator (Test Scale-Up or Scale-Down Live)</div>
 <div class="form-grid" style="margin-bottom:8px;">
 <div class="field"><label>Jobs Ran in Past Hour</label><input type="number" id="sim-jobs-hour" min="0" max="500" value="14" /></div>
 <div class="field"><label>Currently Provisioned Jobs</label><input type="number" id="sim-jobs-prov" min="0" max="100" value="7" /></div>
@@ -573,12 +653,12 @@ Auto-refresh:
 <button class="btn btn-sm btn-secondary" onclick="simulateLowDemandScaleDown()">Simulate &lt;=5 Jobs/hr Scale-Down (5 jobs -&gt; 2 runners)</button>
 </div>
 </div>
-<div id="scaling-decision-box" style="background:#0c1424; border:1px solid var(--border); border-radius:9px; padding:12px; margin-bottom:14px;"></div>
+<div id="scaling-decision-box" style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:9px; padding:12px; margin-bottom:14px;"></div>
 <div style="border-top:1px solid var(--border); padding-top:14px; margin-top:6px;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
 <div>
-<div style="font-weight:700; font-size:14px; color:#c4b5fd;">🦀 Rust Remote Builders Autoscaling &amp; Idle Scale-Down</div>
-<div style="font-size:12px; color:var(--text-muted);">Configure dedicated Rust builder VM floor/ceiling, queue depth, CPU utilization, OOM triggers, and idle build scale-down.</div>
+<div style="font-weight:700; font-size:var(--fs-lg); color:var(--violet);">🦀 Rust Remote Builders Autoscaling &amp; Idle Scale-Down</div>
+<div style="font-size:var(--fs-sm); color:var(--text-muted);">Configure dedicated Rust builder VM floor/ceiling, queue depth, CPU utilization, OOM triggers, and idle build scale-down.</div>
 </div>
 <span class="badge badge-builder">rust_builder</span>
 </div>
@@ -601,7 +681,7 @@ Auto-refresh:
 <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
 <button class="btn btn-sm btn-purple" onclick="saveAndEvaluateBuilderScaling()">Save &amp; Evaluate Rust Builder Scaling</button>
 </div>
-<div id="builder-scaling-decision-box" style="background:#0c1424; border:1px solid var(--border); border-radius:9px; padding:12px;"></div>
+<div id="builder-scaling-decision-box" style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:9px; padding:12px;"></div>
 </div>
 </div>
 <div class="panel">
@@ -611,12 +691,12 @@ Auto-refresh:
 <div class="panel-subtitle">Click any failing GitHub Actions CI run below to jump directly to the exact build step and log line where the OOM occurred.</div>
 </div>
 </div>
-<div style="font-weight:700; font-size:12.5px; margin-bottom:8px; color:#fda4af;">GitHub Actions CI Runs Dying from OOM (Exact Step &amp; Line Deep-Links)</div>
+<div style="font-weight:700; font-size:var(--fs-sm); margin-bottom:8px; color:var(--danger);">GitHub Actions CI Runs Dying from OOM (Exact Step &amp; Line Deep-Links)</div>
 <div id="github-oom-runs-list" style="display:flex; flex-direction:column; gap:10px; margin-bottom:16px;"></div>
-<div style="font-weight:700; font-size:12.5px; margin-bottom:8px; color:#fcd34d;">VM Instance Journal (<code>journalctl</code>) Kernel / Cgroup OOM Events</div>
+<div style="font-weight:700; font-size:var(--fs-sm); margin-bottom:8px; color:var(--warning);">VM Instance Journal (<code>journalctl</code>) Kernel / Cgroup OOM Events</div>
 <div id="journal-oom-events-list" style="display:flex; flex-direction:column; gap:10px; margin-bottom:16px;"></div>
 <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:9px; padding:11px 13px;">
-<div style="font-weight:700; font-size:12px; margin-bottom:8px;">Record / Test GitHub Actions OOM Deep-Link</div>
+<div style="font-weight:700; font-size:var(--fs-sm); margin-bottom:8px;">Record / Test GitHub Actions OOM Deep-Link</div>
 <div class="form-grid" style="margin-bottom:8px;">
 <div class="field"><label>Repository</label><input type="text" id="new-oom-repo" placeholder="owner/repo" /></div>
 <div class="field"><label>Run ID</label><input type="number" id="new-oom-runid" min="1" /></div>
@@ -658,7 +738,7 @@ Auto-refresh:
 </div>
 <div class="field" style="margin-bottom:12px;">
 <label>Cloud-Init Configuration (<code>#cloud-config</code> YAML / Startup Script)</label>
-<textarea id="ci-editor-textarea" rows="22" class="mono" style="font-size:12px; line-height:1.45; width:100%;" oninput="liveParseCloudInit()"></textarea>
+<textarea id="ci-editor-textarea" rows="22" class="mono" style="font-size:var(--fs-sm); line-height:1.45; width:100%;" oninput="liveParseCloudInit()"></textarea>
 </div>
 <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
 <button class="btn" onclick="saveCloudInit('save')">💾 Save Current Template</button>
@@ -708,8 +788,8 @@ Set as Active Template for Role
 <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
 <button id="reg-update-latency-btn" class="btn btn-sm btn-secondary" onclick="probeRegionLatencies(false)">🔄 Update Latency</button>
 <div style="display:inline-flex; align-items:center; gap:6px; background:var(--bg-card); border:1px solid var(--border); border-radius:7px; padding:4px 8px;">
-<span style="font-size:11px; color:var(--text-muted); font-weight:600;">Auto-refresh:</span>
-<select id="reg-autorefresh-select" onchange="setLatencyAutoRefresh(this.value)" style="width:auto; padding:2px 6px; font-size:11.5px; background:transparent; border:none; color:#f8fafc;">
+<span style="font-size:var(--fs-xs); color:var(--text-muted); font-weight:600;">Auto-refresh:</span>
+<select id="reg-autorefresh-select" onchange="setLatencyAutoRefresh(this.value)" style="width:auto; padding:2px 6px; font-size:var(--fs-sm); background:transparent; border:none; color:var(--text-strong);">
 <option value="0">Off</option>
 <option value="15">15s</option>
 <option value="30">30s</option>
@@ -842,8 +922,8 @@ Set as Active Template for Role
 </table>
 </div>
 <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:14px;">
-<div style="font-weight:700; font-size:13px; margin-bottom:10px; color:#c4b5fd;">Record a Rust Remote Build</div>
-<div style="font-size:11.5px; color:var(--text-muted); margin-bottom:10px;">Enter what the build reported. Empty fields are recorded as not reported. A delivered build is stamped as delivered now.</div>
+<div style="font-weight:700; font-size:var(--fs-md); margin-bottom:10px; color:var(--violet);">Record a Rust Remote Build</div>
+<div style="font-size:var(--fs-sm); color:var(--text-muted); margin-bottom:10px;">Enter what the build reported. Empty fields are recorded as not reported. A delivered build is stamped as delivered now.</div>
 <div class="form-grid">
 <div class="field">
 <label>Status</label>
@@ -923,14 +1003,14 @@ Set as Active Template for Role
 <button class="btn btn-sm btn-secondary" id="rp-refresh">Load manifests</button>
 </div>
 </div>
-<p class="mono" id="rp-source" style="font-size:12px;"></p>
-<p id="rp-status" role="status" aria-live="polite" style="font-size:12.5px;"></p>
+<p class="mono" id="rp-source" style="font-size:var(--fs-sm);"></p>
+<p id="rp-status" role="status" aria-live="polite" style="font-size:var(--fs-sm);"></p>
 <div style="display:grid; grid-template-columns:minmax(180px,240px) 1fr; gap:14px;">
 <ul id="rp-list" style="list-style:none; padding:0; margin:0;"></ul>
 <div>
-<div class="mono" id="rp-path" style="font-size:12.5px; margin-bottom:6px;"></div>
-<textarea id="rp-editor" rows="18" class="mono" style="font-size:12px; line-height:1.45; width:100%;" aria-label="Manifest editor"></textarea>
-<ul id="rp-errors" style="color:#fda4af; font-size:12.5px;"></ul>
+<div class="mono" id="rp-path" style="font-size:var(--fs-sm); margin-bottom:6px;"></div>
+<textarea id="rp-editor" rows="18" class="mono" style="font-size:var(--fs-sm); line-height:1.45; width:100%;" aria-label="Manifest editor"></textarea>
+<ul id="rp-errors" style="color:var(--danger); font-size:var(--fs-sm);"></ul>
 <div class="field">
 <label for="rp-message">Pull request title</label>
 <input type="text" id="rp-message" placeholder="Update runner patch" />
@@ -940,8 +1020,8 @@ Set as Active Template for Role
 <button class="btn btn-sm btn-secondary" id="rp-preview">Preview rollout impact</button>
 <button class="btn btn-sm btn-emerald" id="rp-save">Save as pull request</button>
 </div>
-<div class="mono" id="rp-effective-sha" style="font-size:12px;"></div>
-<pre class="mono" id="rp-effective" style="font-size:11.5px; max-height:220px; overflow:auto;"></pre>
+<div class="mono" id="rp-effective-sha" style="font-size:var(--fs-sm);"></div>
+<pre class="mono" id="rp-effective" style="font-size:var(--fs-sm); max-height:220px; overflow:auto;"></pre>
 <div class="table-wrap">
 <table>
 <thead><tr><th>Runner host</th><th>Zone</th><th>Current patch</th><th>Rollout impact</th><th>Detail</th></tr></thead>
@@ -949,10 +1029,10 @@ Set as Active Template for Role
 </table>
 </div>
 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px;">
-<label style="font-size:12.5px;"><input type="checkbox" id="rp-confirm" /> I confirm hot-patching the running hosts listed above</label>
+<label style="font-size:var(--fs-sm);"><input type="checkbox" id="rp-confirm" /> I confirm hot-patching the running hosts listed above</label>
 <button class="btn btn-sm btn-danger" id="rp-hotpatch" disabled>Hot-patch running fleet</button>
 </div>
-<p id="rp-executor" style="font-size:12px;"></p>
+<p id="rp-executor" style="font-size:var(--fs-sm);"></p>
 </div>
 </div>
 </div>
@@ -968,16 +1048,16 @@ Set as Active Template for Role
 <button class="btn btn-sm btn-secondary" id="adm-refresh">Reload</button>
 </div>
 </div>
-<p id="adm-status" role="status" aria-live="polite" style="font-size:12.5px;"></p>
-<p id="adm-exempt" style="font-size:12.5px;"></p>
-<h3 style="font-size:14px; margin:12px 0 6px;">Owners</h3>
+<p id="adm-status" role="status" aria-live="polite" style="font-size:var(--fs-sm);"></p>
+<p id="adm-exempt" style="font-size:var(--fs-sm);"></p>
+<h3 style="font-size:var(--fs-lg); margin:12px 0 6px;">Owners</h3>
 <div class="table-wrap">
 <table>
 <thead><tr><th>GitHub user</th><th>User ID</th><th>Per-target checks</th></tr></thead>
 <tbody id="adm-owners"></tbody>
 </table>
 </div>
-<h3 style="font-size:14px; margin:16px 0 6px;">Added administrators</h3>
+<h3 style="font-size:var(--fs-lg); margin:16px 0 6px;">Added administrators</h3>
 <div class="table-wrap">
 <table>
 <thead><tr><th>GitHub user (when added)</th><th>User ID</th><th>Per-target checks</th><th>Added by</th><th>Added at</th><th></th></tr></thead>
@@ -991,8 +1071,8 @@ Set as Active Template for Role
 </div>
 <button type="submit" class="btn btn-sm btn-emerald" id="adm-add">Add administrator</button>
 </form>
-<h3 style="font-size:14px; margin:16px 0 6px;">Recent changes</h3>
-<ul id="adm-history" style="font-size:12.5px; padding-left:18px;"></ul>
+<h3 style="font-size:var(--fs-lg); margin:16px 0 6px;">Recent changes</h3>
+<ul id="adm-history" style="font-size:var(--fs-sm); padding-left:18px;"></ul>
 </div>
 </section>
 <section id="tab-observability" class="tab-pane">
@@ -1012,7 +1092,7 @@ Set as Active Template for Role
 </div>
 <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:14px; background:var(--bg-card); padding:10px 12px; border-radius:9px; border:1px solid var(--border);">
 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-<label style="font-size:11.5px; color:var(--text-muted); font-weight:600;">Workload Role:</label>
+<label style="font-size:var(--fs-sm); color:var(--text-muted); font-weight:600;">Workload Role:</label>
 <select id="obs-role-filter" onchange="onObsRoleFilterChange()">
 <option value="all">All Roles (CI/CD Runners + Rust Builders)</option>
 <option value="cicd_runner" selected>CI/CD Runners Only</option>
@@ -1022,13 +1102,13 @@ Set as Active Template for Role
 <button type="button" class="btn btn-sm btn-secondary" id="obs-target-dd-btn" onclick="toggleObsTargetDropdown(event)">CI/CD Orgs &amp; Repos: All ▾</button>
 <div class="target-dd-menu" id="obs-target-dd-menu" hidden onclick="event.stopPropagation()">
 <div class="target-dd-hdr">
-<label class="toggle-label" style="font-size:12px;">
+<label class="toggle-label" style="font-size:var(--fs-sm);">
 <input type="checkbox" id="obs-target-all-cb" checked onchange="toggleAllObsTargets(this.checked)" />
 <strong>All Orgs &amp; Repos</strong>
 </label>
 <div style="display:flex; gap:4px;">
-<button type="button" class="btn btn-sm btn-secondary" style="padding:2px 7px; font-size:11px;" onclick="reverseObsTargetFilter()">⇄ Reverse</button>
-<button type="button" class="btn btn-sm btn-secondary" style="padding:2px 7px; font-size:11px;" onclick="clearObsTargetFilter()">↺ Clear</button>
+<button type="button" class="btn btn-sm btn-secondary" style="padding:2px 7px; font-size:var(--fs-xs);" onclick="reverseObsTargetFilter()">⇄ Reverse</button>
+<button type="button" class="btn btn-sm btn-secondary" style="padding:2px 7px; font-size:var(--fs-xs);" onclick="clearObsTargetFilter()">↺ Clear</button>
 </div>
 </div>
 <div id="obs-target-list" class="target-dd-list"></div>
@@ -1045,45 +1125,45 @@ Set as Active Template for Role
 </select>
 </div>
 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-<span style="font-size:11.5px; color:var(--text-muted); font-weight:600;">Density Targets:</span>
-<label style="font-size:11.5px; color:var(--text-muted);">CPU % <input type="number" id="obs-density-cpu" value="80" min="30" max="95" style="width:58px; padding:3px 6px;" /></label>
-<label style="font-size:11.5px; color:var(--text-muted);">RAM % <input type="number" id="obs-density-mem" value="80" min="30" max="95" style="width:58px; padding:3px 6px;" /></label>
-<label style="font-size:11.5px; color:var(--text-muted);">Max/VM <input type="number" id="obs-density-max" value="8" min="1" max="32" style="width:54px; padding:3px 6px;" /></label>
+<span style="font-size:var(--fs-sm); color:var(--text-muted); font-weight:600;">Density Targets:</span>
+<label style="font-size:var(--fs-sm); color:var(--text-muted);">CPU % <input type="number" id="obs-density-cpu" value="80" min="30" max="95" style="width:58px; padding:3px 6px;" /></label>
+<label style="font-size:var(--fs-sm); color:var(--text-muted);">RAM % <input type="number" id="obs-density-mem" value="80" min="30" max="95" style="width:58px; padding:3px 6px;" /></label>
+<label style="font-size:var(--fs-sm); color:var(--text-muted);">Max/VM <input type="number" id="obs-density-max" value="8" min="1" max="32" style="width:54px; padding:3px 6px;" /></label>
 <button class="btn btn-sm btn-emerald" onclick="saveDynamicDensityPolicy()">Save Density Policy</button>
 </div>
 </div>
 <div class="kpi-grid" id="obs-density-kpis" style="margin-bottom:14px;"></div>
 <div class="two-col" id="obs-grafana-grid" style="margin-bottom:16px;">
-<div style="background:#0b0f17; border:1px solid var(--border); border-radius:10px; padding:12px;">
+<div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:10px; padding:12px;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-<strong style="font-size:12.5px; color:#38bdf8;">📊 CPU Utilization vs. Dynamic Density Target (%)</strong>
-<span class="mono" style="font-size:11px; color:var(--text-muted);">Host CPU · Container CPU · Target Ceiling</span>
+<strong style="font-size:var(--fs-sm); color:var(--info);">📊 CPU Utilization vs. Dynamic Density Target (%)</strong>
+<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">Host CPU · Container CPU · Target Ceiling</span>
 </div>
 <svg id="obs-chart-cpu" viewBox="0 0 560 155" style="width:100%; height:155px; display:block;"></svg>
 </div>
-<div style="background:#0b0f17; border:1px solid var(--border); border-radius:10px; padding:12px;">
+<div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:10px; padding:12px;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-<strong style="font-size:12.5px; color:#a78bfa;">🧠 Working-Set Memory vs. Cgroup Peak &amp; Free RAM (GiB)</strong>
-<span class="mono" style="font-size:11px; color:var(--text-muted);">Working Set · Peak Cgroup · Available GiB</span>
+<strong style="font-size:var(--fs-sm); color:var(--violet);">🧠 Working-Set Memory vs. Cgroup Peak &amp; Free RAM (GiB)</strong>
+<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">Working Set · Peak Cgroup · Available GiB</span>
 </div>
 <svg id="obs-chart-mem" viewBox="0 0 560 155" style="width:100%; height:155px; display:block;"></svg>
 </div>
-<div style="background:#0b0f17; border:1px solid var(--border); border-radius:10px; padding:12px;">
+<div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:10px; padding:12px;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-<strong style="font-size:12.5px; color:#34d399;">🚀 Dynamic GitHub Runner Density Slots &amp; Active Workflows</strong>
-<span class="mono" style="font-size:11px; color:var(--text-muted);">Active Slots · Recommended Dense Slots · Active Jobs</span>
+<strong style="font-size:var(--fs-sm); color:var(--success);">🚀 Dynamic GitHub Runner Density Slots &amp; Active Workflows</strong>
+<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">Active Slots · Recommended Dense Slots · Active Jobs</span>
 </div>
 <svg id="obs-chart-density" viewBox="0 0 560 155" style="width:100%; height:155px; display:block;"></svg>
 </div>
-<div style="background:#0b0f17; border:1px solid var(--border); border-radius:10px; padding:12px;">
+<div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:10px; padding:12px;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-<strong style="font-size:12.5px; color:#f472b6;">💾 Disk Throughput (MiB/s) &amp; Storage Utilization (%)</strong>
-<span class="mono" style="font-size:11px; color:var(--text-muted);">Read MiB/s · Write MiB/s · Used %</span>
+<strong style="font-size:var(--fs-sm); color:var(--chart-pink);">💾 Disk Throughput (MiB/s) &amp; Storage Utilization (%)</strong>
+<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">Read MiB/s · Write MiB/s · Used %</span>
 </div>
 <svg id="obs-chart-disk" viewBox="0 0 560 155" style="width:100%; height:155px; display:block;"></svg>
 </div>
 </div>
-<div style="font-weight:700; font-size:13px; margin-bottom:8px; color:#93c5fd;">Per-Instance Utilization, Peak Working-Set Memory &amp; Dynamic Runner Density Recommendations</div>
+<div style="font-weight:700; font-size:var(--fs-md); margin-bottom:8px; color:var(--accent-text);">Per-Instance Utilization, Peak Working-Set Memory &amp; Dynamic Runner Density Recommendations</div>
 <div class="table-wrap" style="margin-bottom:16px;">
 <table>
 <thead>
@@ -1104,8 +1184,8 @@ Set as Active Template for Role
 <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:14px;" id="obs-log-explorer">
 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
 <div>
-<div style="font-weight:700; font-size:13.5px; color:#fde047;">🔍 Cloud Ops Agent Log Explorer &amp; GitHub Actions Workflow Correlation</div>
-<div style="font-size:11.5px; color:var(--text-muted);">Search across <code class="mono">google-cloud-ops-agent</code>, container stdout/stderr, <code class="mono">_diag/Worker_*.log</code>, and <code class="mono">systemd_journald</code>. Click any correlated workflow badge to open the exact GitHub Actions job run at that timestamp.</div>
+<div style="font-weight:700; font-size:var(--fs-md); color:var(--warning);">🔍 Cloud Ops Agent Log Explorer &amp; GitHub Actions Workflow Correlation</div>
+<div style="font-size:var(--fs-sm); color:var(--text-muted);">Search across <code class="mono">google-cloud-ops-agent</code>, container stdout/stderr, <code class="mono">_diag/Worker_*.log</code>, and <code class="mono">systemd_journald</code>. Click any correlated workflow badge to open the exact GitHub Actions job run at that timestamp.</div>
 </div>
 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
 <input type="text" id="obs-log-query" placeholder="Search logs (e.g. cargo, test, runner, job, error)..." style="width:280px;" oninput="debounceObsLogSearch()" onkeydown="if(event.key==='Enter'){event.preventDefault();loadObservabilityView();}" />
@@ -1274,8 +1354,7 @@ banner = document.createElement("div");
 banner.id = "control-vm-banner";
 banner.setAttribute("role", "status");
 banner.setAttribute("aria-live", "polite");
-banner.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:10000;padding:10px 16px;" +
-"background:#7c2d12;color:#fff7ed;font-weight:600;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.35);";
+banner.className = "status-banner";
 banner.textContent = CONTROL_VM_BANNER_TEXT;
 (document.body || document.documentElement).appendChild(banner);
 }
@@ -1620,7 +1699,7 @@ const cx = (reg.map_x / 100) * 1000;
 const cy = (reg.map_y / 100) * 500;
 const runningCount = reg.running_instances.length;
 const isSelected = reg.region === SELECTED_MAP_REGION;
-const color = runningCount > 0 ? "#10b981" : (reg.enabled ? "#3b82f6" : "#64748b");
+const color = runningCount > 0 ? "var(--success)" : (reg.enabled ? "var(--accent-text)" : "var(--text-muted)");
 const pinGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
 pinGroup.setAttribute("class", "dc-pin");
 pinGroup.setAttribute("data-region", reg.region);
@@ -1634,7 +1713,7 @@ const pulse = document.createElementNS("http://www.w3.org/2000/svg", "circle");
 pulse.setAttribute("cx", cx);
 pulse.setAttribute("cy", cy);
 pulse.setAttribute("r", isSelected ? 16 : 12);
-pulse.setAttribute("fill", "rgba(16, 185, 129, 0.35)");
+pulse.style.fill = "var(--success-line)";
 pulse.setAttribute("class", "pin-pulse");
 pinGroup.appendChild(pulse);
 }
@@ -1643,8 +1722,8 @@ const ring = document.createElementNS("http://www.w3.org/2000/svg", "circle");
 ring.setAttribute("cx", cx);
 ring.setAttribute("cy", cy);
 ring.setAttribute("r", 14);
-ring.setAttribute("fill", "none");
-ring.setAttribute("stroke", "#fbbf24");
+ring.style.fill = "none";
+ring.style.stroke = "var(--warning)";
 ring.setAttribute("stroke-width", "2.5");
 pinGroup.appendChild(ring);
 }
@@ -1652,14 +1731,14 @@ const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
 dot.setAttribute("cx", cx);
 dot.setAttribute("cy", cy);
 dot.setAttribute("r", runningCount > 0 ? 8.5 : 5.5);
-dot.setAttribute("fill", color);
-dot.setAttribute("stroke", "#0b0f19");
+dot.style.fill = color;
+dot.style.stroke = "var(--bg-sunken)";
 dot.setAttribute("stroke-width", "2");
 pinGroup.appendChild(dot);
 const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
 label.setAttribute("x", cx + 11);
 label.setAttribute("y", cy + 4);
-label.setAttribute("fill", isSelected ? "#fde047" : (runningCount > 0 ? "#f8fafc" : "#94a3b8"));
+label.style.fill = isSelected ? "var(--warning)" : (runningCount > 0 ? "var(--text-strong)" : "var(--text-muted)");
 label.setAttribute("font-size", isSelected || runningCount > 0 ? "11.5" : "10");
 label.setAttribute("font-weight", isSelected || runningCount > 0 ? "700" : "500");
 label.textContent = `${reg.region}${runningCount > 0 ? " (" + runningCount + ")" : ""}`;
@@ -1705,32 +1784,32 @@ return `
 <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:12px;">
 <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px; margin-bottom:8px;">
 <div>
-<div style="font-size:14.5px; font-weight:700; color:#fff;" class="mono">${esc(inst.name)}</div>
-<div style="font-size:12px; color:var(--text-muted);">Zone: <span class="mono">${esc(inst.zone)}</span> · Instance Type: <strong class="mono">${esc(inst.machine_type)}</strong> (${inst.vcpu} vCPU / ${inst.ram_gib} GiB RAM)</div>
+<div style="font-size:var(--fs-lg); font-weight:700; color:var(--text-strong);" class="mono">${esc(inst.name)}</div>
+<div style="font-size:var(--fs-sm); color:var(--text-muted);">Zone: <span class="mono">${esc(inst.zone)}</span> · Instance Type: <strong class="mono">${esc(inst.machine_type)}</strong> (${inst.vcpu} vCPU / ${inst.ram_gib} GiB RAM)</div>
 </div>
 <span class="badge ${inst.role === 'cicd_runner' ? 'badge-runner' : 'badge-builder'}">${inst.role === 'cicd_runner' ? 'CI/CD Runner Host' : 'Rust Builder'}</span>
 </div>
-<div style="background:rgba(16, 185, 129, 0.11); border:1px solid rgba(16, 185, 129, 0.3); border-radius:8px; padding:9px 11px; margin-bottom:10px; color:#a7f3d0; font-weight:600; font-size:12.5px;">
+<div style="background:var(--success-soft); border:1px solid var(--success-line); border-radius:8px; padding:9px 11px; margin-bottom:10px; color:var(--success); font-weight:600; font-size:var(--fs-sm);">
 ⚡ ${esc(inst.workload_summary)}
 </div>
 <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-bottom:8px;">
-<div style="background:#0b1120; border:1px solid var(--border); border-radius:7px; padding:8px;">
-<div style="font-size:10.5px; color:var(--text-muted);">SPOT PRICE / HOUR</div>
-<div class="mono" style="font-size:16px; font-weight:700; color:#38bdf8;">${hasPricing ? `$${hr.toFixed(4)}/hr` : (hr > 0 ? `$${hr.toFixed(4)}/hr` : "Unknown")}</div>
+<div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:7px; padding:8px;">
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">SPOT PRICE / HOUR</div>
+<div class="mono" style="font-size:var(--fs-xl); font-weight:700; color:var(--info);">${hasPricing ? `$${hr.toFixed(4)}/hr` : (hr > 0 ? `$${hr.toFixed(4)}/hr` : "Unknown")}</div>
 </div>
-<div style="background:#0b1120; border:1px solid var(--border); border-radius:7px; padding:8px;">
-<div style="font-size:10.5px; color:var(--text-muted);">SPOT PRICE / DAY</div>
-<div class="mono" style="font-size:16px; font-weight:700; color:#34d399;">${hasPricing ? `$${day.toFixed(2)}/day` : (day > 0 ? `$${day.toFixed(2)}/day` : "Unknown")}</div>
+<div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:7px; padding:8px;">
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">SPOT PRICE / DAY</div>
+<div class="mono" style="font-size:var(--fs-xl); font-weight:700; color:var(--success);">${hasPricing ? `$${day.toFixed(2)}/day` : (day > 0 ? `$${day.toFixed(2)}/day` : "Unknown")}</div>
 </div>
-<div style="background:#0b1120; border:1px solid var(--border); border-radius:7px; padding:8px;">
-<div style="font-size:10.5px; color:var(--text-muted);">SPOT PRICE / MONTH</div>
-<div class="mono" style="font-size:16px; font-weight:700; color:#c4b5fd;">${hasPricing ? `$${mo.toFixed(2)}/mo` : (mo > 0 ? `$${mo.toFixed(2)}/mo` : "Unknown")}</div>
+<div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:7px; padding:8px;">
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">SPOT PRICE / MONTH</div>
+<div class="mono" style="font-size:var(--fs-xl); font-weight:700; color:var(--violet);">${hasPricing ? `$${mo.toFixed(2)}/mo` : (mo > 0 ? `$${mo.toFixed(2)}/mo` : "Unknown")}</div>
 </div>
 </div>
-<div style="font-size:11.5px; color:var(--text-muted); margin-bottom:10px;">
+<div style="font-size:var(--fs-sm); color:var(--text-muted); margin-bottom:10px;">
 💡 ${esc(modeNote)} · CPU: <strong>${esc(inst.cpu_platform || 'Unknown')}</strong> (Benchmark: <strong>${inst.benchmark_score != null ? inst.benchmark_score : '—'}</strong>)
 </div>
-<div style="font-size:11.5px; font-weight:600; color:var(--text-muted);">SSH Into GCloud Instance (Terminal Command):</div>
+<div style="font-size:var(--fs-sm); font-weight:600; color:var(--text-muted);">SSH Into GCloud Instance (Terminal Command):</div>
 <div class="ssh-block">
 <code id="ssh-code-${esc(inst.instance_id || inst.id)}">${esc(inst.ssh_command)}</code>
 <button class="btn btn-sm" onclick="copyTextToClipboard('${esc(inst.ssh_command)}', 'gcloud SSH command')">📋 Copy SSH</button>
@@ -1748,13 +1827,13 @@ panel.innerHTML = `
 <div class="panel-header">
 <div>
 <div class="panel-title">📍 ${esc(reg.display_name)} (<span class="mono">${esc(reg.region)}</span>)</div>
-<div class="panel-subtitle">Continent: ${esc(reg.continent)} · Backend Latency: <strong class="mono">${reg.latency_ms} ms</strong> · Status: ${reg.enabled ? '<span style="color:#34d399;">Enabled</span>' : '<span style="color:#fb7185;">Deselected</span>'}</div>
+<div class="panel-subtitle">Continent: ${esc(reg.continent)} · Backend Latency: <strong class="mono">${reg.latency_ms} ms</strong> · Status: ${reg.enabled ? '<span style="color:var(--success);">Enabled</span>' : '<span style="color:var(--danger);">Deselected</span>'}</div>
 </div>
 </div>
 <div style="display:flex; flex-direction:column; gap:8px; background:var(--bg-card); border:1px solid var(--border); padding:10px 12px; border-radius:9px; margin-bottom:12px;">
-<div style="font-size:11.5px; color:var(--text-muted);">Plan only: these controls check a scale change against budgets and caps and report what it would launch or retire. The dashboard never creates or deletes VMs; the autoscaler and the provisioning tools do.</div>
+<div style="font-size:var(--fs-sm); color:var(--text-muted);">Plan only: these controls check a scale change against budgets and caps and report what it would launch or retire. The dashboard never creates or deletes VMs; the autoscaler and the provisioning tools do.</div>
 <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
-<div style="font-size:12.5px; font-weight:600;">CI/CD Runner Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
+<div style="font-size:var(--fs-sm); font-weight:600;">CI/CD Runner Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
 <div style="display:flex; align-items:center; gap:6px;">
 <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'cicd_runner', Math.max(0, ${runnerCountInReg} - 1))">−1</button>
 <input type="number" id="map-scale-input-${esc(reg.region)}" value="${runnerCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
@@ -1763,7 +1842,7 @@ panel.innerHTML = `
 </div>
 </div>
 <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; border-top:1px solid var(--border); padding-top:8px;">
-<div style="font-size:12.5px; font-weight:600; color:#c4b5fd;">🦀 Rust Builder Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
+<div style="font-size:var(--fs-sm); font-weight:600; color:var(--violet);">🦀 Rust Builder Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
 <div style="display:flex; align-items:center; gap:6px;">
 <button class="btn btn-sm btn-secondary" onclick="scaleRegion('${esc(reg.region)}', 'rust_builder', Math.max(0, ${builderCountInReg} - 1))">−1</button>
 <input type="number" id="map-scale-builder-input-${esc(reg.region)}" value="${builderCountInReg}" min="0" max="20" style="width:58px; text-align:center;" />
@@ -1917,9 +1996,9 @@ return;
 }
 bar.innerHTML = rows.map(r => {
 const active = SELECTED_TARGETS && SELECTED_TARGETS.size === 1 && SELECTED_TARGETS.has(r.target);
-const border = active ? "#38bdf8" : "var(--border)";
-return `<div data-target="${esc(r.target)}" onclick="selectSingleTarget(this.dataset.target)" style="cursor:pointer; background:var(--bg-card); border:1px solid ${border}; border-radius:8px; padding:7px 11px; font-size:11.5px; display:flex; flex-direction:column; gap:2px;">
-<div style="font-weight:700; color:#f8fafc;" class="mono">${esc(r.target)} <span class="badge badge-running" style="margin-left:4px;">${r.total_vms || 0} GCP Spot VM${(r.total_vms || 0) === 1 ? "" : "s"} · ${r.total_runner_slots || 0} Runner${(r.total_runner_slots || 0) === 1 ? "" : "s"}</span></div>
+const border = active ? "var(--info)" : "var(--border)";
+return `<div data-target="${esc(r.target)}" onclick="selectSingleTarget(this.dataset.target)" style="cursor:pointer; background:var(--bg-card); border:1px solid ${border}; border-radius:8px; padding:7px 11px; font-size:var(--fs-sm); display:flex; flex-direction:column; gap:2px;">
+<div style="font-weight:700; color:var(--text-strong);" class="mono">${esc(r.target)} <span class="badge badge-running" style="margin-left:4px;">${r.total_vms || 0} GCP Spot VM${(r.total_vms || 0) === 1 ? "" : "s"} · ${r.total_runner_slots || 0} Runner${(r.total_runner_slots || 0) === 1 ? "" : "s"}</span></div>
 <div style="color:var(--text-muted);">x86_64: <strong>${r.x86_64_vms || 0} VM${(r.x86_64_vms || 0) === 1 ? "" : "s"}</strong> (${r.x86_64_runner_slots || 0} slots) · ARM64: <strong>${r.arm64_vms || 0} VM${(r.arm64_vms || 0) === 1 ? "" : "s"}</strong> (${r.arm64_runner_slots || 0} slots) · ${r.total_vcpus || 0} vCPU / ${r.total_ram_gib || 0} GiB · $${Number(r.active_hourly_usd || 0).toFixed(2)}/hr</div>
 </div>`;
 }).join("");
@@ -2035,17 +2114,17 @@ if (badgeEl) badgeEl.textContent = `${visibleInstances.length}`;
 const summary = document.getElementById("inst-window-summary");
 const fi = iv.fleet_inventory || APP_STATE.fleet_inventory || {};
 const inventoryNote = fi.source === "gce"
-? `Source: live Compute Engine inventory${fi.last_success_at ? ", last listed " + esc(formatLocalTime(fi.last_success_at)) : ", not listed yet"}${(fi.stale_reason || fi.last_error) ? ' · <span style="color:#fda4af;">' + esc(fi.stale_reason || fi.last_error) + "</span>" : ""}`
+? `Source: live Compute Engine inventory${fi.last_success_at ? ", last listed " + esc(formatLocalTime(fi.last_success_at)) : ", not listed yet"}${(fi.stale_reason || fi.last_error) ? ' · <span style="color:var(--danger);">' + esc(fi.stale_reason || fi.last_error) + "</span>" : ""}`
 : `Source: live Compute Engine inventory is not configured on this dashboard (set DASHBOARD_FLEET_INVENTORY=gce); no instances are shown`;
-summary.innerHTML = `${inventoryNote}<br>Showing <strong>${visibleInstances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} stopped or deleted) · Total Window Spend: <strong class="mono" style="color:#34d399;">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
+summary.innerHTML = `${inventoryNote}<br>Showing <strong>${visibleInstances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} stopped or deleted) · Total Window Spend: <strong class="mono" style="color:var(--success);">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
 const tbody = document.getElementById("instances-table-body");
 tbody.innerHTML = visibleInstances.map(inst => {
 const isRunning = inst.status === "RUNNING";
 return `
 <tr>
 <td>
-<div class="mono" style="font-weight:700; color:#f8fafc;">${esc(inst.name)}</div>
-<div class="mono" style="font-size:11px; color:var(--text-muted);">ID: ${esc(inst.instance_id || inst.id)} · ${esc(inst.target || APP_STATE.org || "swack-tools")}</div>
+<div class="mono" style="font-weight:700; color:var(--text-strong);">${esc(inst.name)}</div>
+<div class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">ID: ${esc(inst.instance_id || inst.id)} · ${esc(inst.target || APP_STATE.org || "swack-tools")}</div>
 </td>
 <td>
 <span class="badge ${isRunning ? 'badge-running' : 'badge-deleted'}">${esc(inst.status)}</span>
@@ -2055,33 +2134,33 @@ return `
 </td>
 <td>
 <div style="font-weight:600;">${esc(inst.display_location)}</div>
-<div class="mono" style="font-size:11px; color:var(--text-muted);">${esc(inst.zone)}</div>
+<div class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(inst.zone)}</div>
 </td>
 <td>
 <div class="mono" style="font-weight:600;">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)} (${inst.vcpu} vCPU / ${inst.ram_gib} GiB)</div>
-<div style="font-size:11px; color:var(--text-muted);">${esc(inst.cpu_platform || 'Unknown')} · ${inst.data_disk_gb != null ? `${inst.data_disk_gb}GB ${esc(inst.data_disk_type || '')} (${esc(inst.disk_category || '')})` : 'disk not reported'}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(inst.cpu_platform || 'Unknown')} · ${inst.data_disk_gb != null ? `${inst.data_disk_gb}GB ${esc(inst.data_disk_type || '')} (${esc(inst.disk_category || '')})` : 'disk not reported'}</div>
 </td>
-<td class="mono" style="font-weight:700; color:#38bdf8;">${inst.benchmark_score != null ? inst.benchmark_score : '—'}</td>
+<td class="mono" style="font-weight:700; color:var(--info);">${inst.benchmark_score != null ? inst.benchmark_score : '—'}</td>
 <td>
 <div style="font-weight:600;">${inst.role === 'cicd_runner' ? inst.runners_count + ' GitHub Runners' : '1 Rust Builder'}</div>
-<div style="font-size:11px; color:var(--text-muted);">${inst.runner_limits_known === false ? "per-runner limits not recorded" : `${inst.runner_vcpu} vCPU / ${inst.runner_ram_gib} GiB each`}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">${inst.runner_limits_known === false ? "per-runner limits not recorded" : `${inst.runner_vcpu} vCPU / ${inst.runner_ram_gib} GiB each`}</div>
 </td>
 <td class="mono">
 <div>${inst.runtime_hours}h total</div>
-<div style="font-size:11px; color:var(--text-muted);">${inst.hours_in_window}h in window</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">${inst.hours_in_window}h in window</div>
 </td>
 <td class="mono">
 <div>$${inst.active_hourly_usd.toFixed(4)}/hr</div>
-<div style="font-size:11px; color:var(--text-muted);">$${inst.active_daily_usd.toFixed(2)}/day</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">$${inst.active_daily_usd.toFixed(2)}/day</div>
 </td>
-<td class="mono" style="font-size:14px; font-weight:700; color:#34d399;">
+<td class="mono" style="font-size:var(--fs-lg); font-weight:700; color:var(--success);">
 $${inst.total_cost_in_window_usd.toFixed(2)}
 </td>
-<td style="font-size:11.5px;">
+<td style="font-size:var(--fs-sm);">
 <div><strong>Start:</strong> ${esc(formatLocalTime(inst.started_at))}</div>
-<div><strong>End:</strong> ${inst.deleted_at ? esc(formatLocalTime(inst.deleted_at)) : inst.status === "DETACHED" ? '<span style="color:#fcd34d;">Present (storage still billed)</span>' : inst.stopped_at ? 'Stopped ' + esc(formatLocalTime(inst.stopped_at)) : isRunning ? '<span style="color:#34d399;">Present (Running)</span>' : esc(inst.status)}</div>
+<div><strong>End:</strong> ${inst.deleted_at ? esc(formatLocalTime(inst.deleted_at)) : inst.status === "DETACHED" ? '<span style="color:var(--warning);">Present (storage still billed)</span>' : inst.stopped_at ? 'Stopped ' + esc(formatLocalTime(inst.stopped_at)) : isRunning ? '<span style="color:var(--success);">Present (Running)</span>' : esc(inst.status)}</div>
 </td>
-<td style="max-width:260px; font-size:11.5px; color:${isRunning ? '#a7f3d0' : '#fda4af'};">
+<td style="max-width:260px; font-size:var(--fs-sm); color:${isRunning ? 'var(--success)' : 'var(--danger)'};">
 ${esc(inst.deletion_trigger)}
 </td>
 <td>
@@ -2265,7 +2344,7 @@ const rows = onlyAffordable ? q.spot_price_qualifying : q.hardware_qualifying;
 document.getElementById("qual-summary-subtitle").innerHTML =
 `Role: <strong>${QUAL_ACTIVE_ROLE === 'cicd_runner' ? 'CI/CD GitHub Runners' : 'Rust Remote Builders'}</strong> · ` +
 `<strong>${q.hardware_qualifying_count}</strong> instances qualify by hardware &amp; CPU benchmark (&gt;=${q.requirements.min_benchmark_score}) · ` +
-`<strong style="color:#34d399;">${q.spot_price_qualifying_count}</strong> currently qualify under Spot pricing ($${q.requirements.budget.max_hourly_usd}/hr · $${q.requirements.budget.max_daily_usd}/day · $${q.requirements.budget.max_monthly_usd}/mo).`;
+`<strong style="color:var(--success);">${q.spot_price_qualifying_count}</strong> currently qualify under Spot pricing ($${q.requirements.budget.max_hourly_usd}/hr · $${q.requirements.budget.max_daily_usd}/day · $${q.requirements.budget.max_monthly_usd}/mo).`;
 const tbody = document.getElementById("qualification-table-body");
 const maxLat = GLOBAL_MAX_LATENCY_MS !== null ? GLOBAL_MAX_LATENCY_MS : Infinity;
 const archFilteredRows = rows.filter(r => {
@@ -2275,13 +2354,13 @@ return inferArchClient(r.machine_type, r.arch) === GLOBAL_ARCH_FILTER;
 });
 tbody.innerHTML = archFilteredRows.slice(0, 60).map(r => `
 <tr>
-<td class="mono" style="font-weight:700; color:#fff;">${esc(r.machine_type)} ${archBadgeHtml(r.machine_type, r.arch)}</td>
+<td class="mono" style="font-weight:700; color:var(--text-strong);">${esc(r.machine_type)} ${archBadgeHtml(r.machine_type, r.arch)}</td>
 <td>
 <div style="font-weight:600;">${esc(r.display_location)}</div>
-<div class="mono" style="font-size:11px; color:var(--text-muted);">${esc(r.zone)} (${r.latency_ms} ms)</div>
+<div class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(r.zone)} (${r.latency_ms} ms)</div>
 </td>
 <td>${esc(r.cpu_platform)}</td>
-<td class="mono" style="font-weight:700; color:#38bdf8;">${r.benchmark_score}</td>
+<td class="mono" style="font-weight:700; color:var(--info);">${r.benchmark_score}</td>
 <td class="mono">${r.vcpu} vCPU / ${r.ram_gib} GiB</td>
 <td class="mono"><strong>${r.units_per_instance}</strong> (${r.unit_vcpu}c/${r.unit_ram_gib}G each)</td>
 <td class="mono">${r.instances_needed_for_floor} VM(s) (${r.total_units_at_floor} total)</td>
@@ -2325,12 +2404,12 @@ const ev = APP_STATE.scaling_evaluation;
 const reasons = [...ev.scale_up_reasons, ...ev.scale_down_reasons];
 document.getElementById("scaling-decision-box").innerHTML = `
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-<div style="font-weight:700; font-size:14px;">Live Controller Evaluation: <span style="color:#38bdf8;">${esc(ev.direction.toUpperCase())}</span> (${ev.current_runners} → ${ev.desired_runners} CI/CD Runners / ${ev.desired_instances} VMs)</div>
-<span class="mono" style="font-size:12px; color:#34d399;">Projected: $${ev.projected_hourly_usd}/hr · $${ev.projected_daily_usd}/day · $${ev.projected_monthly_usd}/mo</span>
+<div style="font-weight:700; font-size:var(--fs-lg);">Live Controller Evaluation: <span style="color:var(--info);">${esc(ev.direction.toUpperCase())}</span> (${ev.current_runners} → ${ev.desired_runners} CI/CD Runners / ${ev.desired_instances} VMs)</div>
+<span class="mono" style="font-size:var(--fs-sm); color:var(--success);">Projected: $${ev.projected_hourly_usd}/hr · $${ev.projected_daily_usd}/day · $${ev.projected_monthly_usd}/mo</span>
 </div>
-${ev.budget_capped ? `<div style="color:#fbbf24; font-size:12px; margin-bottom:6px;">⚠️ ${esc(ev.budget_cap_note)}</div>` : ""}
+${ev.budget_capped ? `<div style="color:var(--warning); font-size:var(--fs-sm); margin-bottom:6px;">⚠️ ${esc(ev.budget_cap_note)}</div>` : ""}
 <div style="display:flex; flex-direction:column; gap:5px;">
-${reasons.map(r => `<div style="font-size:12px; color:#e2e8f0;">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)} ${r.deep_link ? `<a href="${esc(r.deep_link)}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || '<div style="font-size:12px; color:var(--text-muted);">No scale change required.</div>'}
+${reasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)} ${r.deep_link ? `<a href="${esc(r.deep_link)}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || '<div style="font-size:var(--fs-sm); color:var(--text-muted);">No scale change required.</div>'}
 </div>
 `;
 const bsc = APP_STATE.scaling.rust_builder || {};
@@ -2355,31 +2434,31 @@ if (bev) {
 const breasons = [...(bev.scale_up_reasons || []), ...(bev.scale_down_reasons || [])];
 document.getElementById("builder-scaling-decision-box").innerHTML = `
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-<div style="font-weight:700; font-size:13.5px;">Rust Builder Evaluation: <span style="color:#c4b5fd;">${esc(bev.direction.toUpperCase())}</span> (${bev.current_instances} → ${bev.desired_instances} Builder VMs)</div>
-<span class="mono" style="font-size:12px; color:#34d399;">Projected: $${bev.projected_hourly_usd}/hr · $${bev.projected_daily_usd}/day · $${bev.projected_monthly_usd}/mo</span>
+<div style="font-weight:700; font-size:var(--fs-md);">Rust Builder Evaluation: <span style="color:var(--violet);">${esc(bev.direction.toUpperCase())}</span> (${bev.current_instances} → ${bev.desired_instances} Builder VMs)</div>
+<span class="mono" style="font-size:var(--fs-sm); color:var(--success);">Projected: $${bev.projected_hourly_usd}/hr · $${bev.projected_daily_usd}/day · $${bev.projected_monthly_usd}/mo</span>
 </div>
-${bev.budget_capped ? `<div style="color:#fbbf24; font-size:12px; margin-bottom:6px;">⚠️ ${esc(bev.budget_cap_note)}</div>` : ""}
+${bev.budget_capped ? `<div style="color:var(--warning); font-size:var(--fs-sm); margin-bottom:6px;">⚠️ ${esc(bev.budget_cap_note)}</div>` : ""}
 <div style="display:flex; flex-direction:column; gap:5px;">
-${breasons.map(r => `<div style="font-size:12px; color:#e2e8f0;">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)}</div>`).join("") || '<div style="font-size:12px; color:var(--text-muted);">No builder scale change required.</div>'}
+${breasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)}</div>`).join("") || '<div style="font-size:var(--fs-sm); color:var(--text-muted);">No builder scale change required.</div>'}
 </div>
 `;
 }
 document.getElementById("github-oom-runs-list").innerHTML = st.github_oom_runs.map(run => {
 const isOom = run.is_oom !== false;
-const borderCol = isOom ? "rgba(244, 63, 94, 0.4)" : "rgba(245, 158, 11, 0.4)";
-const leftCol = isOom ? "#f43f5e" : "#f59e0b";
-const textCol = isOom ? "#fda4af" : "#fde68a";
+const borderCol = isOom ? "var(--danger-line)" : "var(--warning-line)";
+const leftCol = isOom ? "var(--danger)" : "var(--warning)";
+const textCol = isOom ? "var(--danger)" : "var(--warning)";
 const badgeCls = isOom ? "badge-deleted" : "badge-vpn";
 const badgeLabel = run.badge_text || (isOom ? "OOM Killed (Exit 137)" : "Timeout (Not OOM — Ignored)");
 const btnCls = isOom ? "btn-danger" : "btn-secondary";
 return `
 <div style="background:var(--bg-card); border:1px solid ${borderCol}; border-left:4px solid ${leftCol}; border-radius:8px; padding:11px 13px;">
 <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:4px;">
-<div style="font-weight:700; color:#fff;">${esc(run.repository)} — ${esc(run.workflow_name || 'CI Workflow')} (<span class="mono">${esc(run.job_name || 'job')}</span>)</div>
+<div style="font-weight:700; color:var(--text-strong);">${esc(run.repository)} — ${esc(run.workflow_name || 'CI Workflow')} (<span class="mono">${esc(run.job_name || 'job')}</span>)</div>
 <span class="badge ${badgeCls}">${esc(badgeLabel)}</span>
 </div>
-<div class="mono" style="font-size:11.5px; color:${textCol}; margin-bottom:6px;">${esc(run.error_excerpt)}</div>
-<div style="font-size:12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+<div class="mono" style="font-size:var(--fs-sm); color:${textCol}; margin-bottom:6px;">${esc(run.error_excerpt)}</div>
+<div style="font-size:var(--fs-sm); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
 <span>Runner: <code class="mono">${esc(run.runner_name || 'not reported')}</code> · Run <code class="mono">#${esc(run.run_id)}</code> · Job <code class="mono">${esc(run.job_id)}</code> · Step <code class="mono">${esc(run.step_number)}</code> · Line <code class="mono">${esc(run.line_number)}</code> · ${esc(formatLocalTime(run.failed_at))}</span>
 <a href="${esc(run.deep_link)}" target="_blank" rel="noopener" class="btn btn-sm ${btnCls} mono" style="text-decoration:none;">
 🔗 ${esc(run.deep_link)}
@@ -2389,12 +2468,12 @@ return `
 `;
 }).join("");
 document.getElementById("journal-oom-events-list").innerHTML = st.journal_oom_events.map(evt => `
-<div style="background:var(--bg-card); border:1px solid rgba(245, 158, 11, 0.4); border-left:4px solid #f59e0b; border-radius:8px; padding:10px 12px;">
+<div style="background:var(--bg-card); border:1px solid var(--warning-line); border-left:4px solid var(--warning); border-radius:8px; padding:10px 12px;">
 <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
 <strong>Host: <span class="mono">${esc(evt.instance_name)}</span> (${esc(evt.zone)}) — Process <span class="mono">${esc(evt.process)}</span> (PID ${esc(evt.pid)})</strong>
-<span class="mono" style="font-size:11px; color:var(--text-muted);">${esc(formatLocalTime(evt.observed_at))}</span>
+<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(formatLocalTime(evt.observed_at))}</span>
 </div>
-<div class="mono" style="font-size:11.5px; color:#fde68a; background:#090d16; padding:6px 8px; border-radius:6px;">${esc(evt.journal_line)}</div>
+<div class="mono" style="font-size:var(--fs-sm); color:var(--warning); background:var(--bg-sunken); padding:6px 8px; border-radius:6px;">${esc(evt.journal_line)}</div>
 </div>
 `).join("");
 }
@@ -2557,8 +2636,8 @@ srcSel.innerHTML = APP_STATE.instances_view.instances.map(i =>
 document.getElementById("vm-templates-list").innerHTML = APP_STATE.vm_templates.map(tpl => `
 <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:10px 12px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
 <div>
-<div style="font-weight:700; color:#fff;">${esc(tpl.name)} ${archBadgeHtml(tpl.machine_type, tpl.arch)} <span class="mono" style="font-size:11px; color:var(--text-muted);">(${esc(tpl.id)})</span></div>
-<div style="font-size:11.5px; color:var(--text-muted);">Shape: <code class="mono">${esc(tpl.machine_type)}</code> (${tpl.vcpu} vCPU / ${tpl.ram_gib} GiB · ${esc(tpl.cpu_platform)} · Bench ${tpl.benchmark_score}) · Disk: <code class="mono">${tpl.data_disk_gb}GB ${esc(tpl.data_disk_type)}</code> (${esc(tpl.disk_category)}) · ${tpl.source_instance ? `Source: <code class="mono">${esc(tpl.source_instance)}</code>` : 'Preset shape'}</div>
+<div style="font-weight:700; color:var(--text-strong);">${esc(tpl.name)} ${archBadgeHtml(tpl.machine_type, tpl.arch)} <span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">(${esc(tpl.id)})</span></div>
+<div style="font-size:var(--fs-sm); color:var(--text-muted);">Shape: <code class="mono">${esc(tpl.machine_type)}</code> (${tpl.vcpu} vCPU / ${tpl.ram_gib} GiB · ${esc(tpl.cpu_platform)} · Bench ${tpl.benchmark_score}) · Disk: <code class="mono">${tpl.data_disk_gb}GB ${esc(tpl.data_disk_type)}</code> (${esc(tpl.disk_category)}) · ${tpl.source_instance ? `Source: <code class="mono">${esc(tpl.source_instance)}</code>` : 'Preset shape'}</div>
 </div>
 <span class="badge ${tpl.role === 'cicd_runner' ? 'badge-runner' : 'badge-builder'}">${tpl.role === 'cicd_runner' ? 'Runner Template' : 'Builder Template'}</span>
 </div>
@@ -2601,10 +2680,10 @@ badge.textContent = parsed.valid
 : `⚠️ ${errList.length + warnList.length} Syntax / Advisory Issue(s)`;
 const warnBox = document.getElementById("ci-warnings-box");
 const errHtml = errList.map(e =>
-`<div style="background:rgba(244, 63, 94, 0.16); border:1px solid rgba(244, 63, 94, 0.45); color:#fda4af; padding:7px 10px; border-radius:7px; font-size:12px; margin-bottom:6px;">❌ ${esc(e)}</div>`
+`<div style="background:var(--danger-soft); border:1px solid var(--danger-line); color:var(--danger); padding:7px 10px; border-radius:7px; font-size:var(--fs-sm); margin-bottom:6px;">❌ ${esc(e)}</div>`
 );
 const warnHtml = warnList.map(w =>
-`<div style="background:rgba(245, 158, 11, 0.14); border:1px solid rgba(245, 158, 11, 0.4); color:#fde68a; padding:7px 10px; border-radius:7px; font-size:12px; margin-bottom:6px;">⚠️ ${esc(w)}</div>`
+`<div style="background:var(--warning-soft); border:1px solid var(--warning-line); color:var(--warning); padding:7px 10px; border-radius:7px; font-size:var(--fs-sm); margin-bottom:6px;">⚠️ ${esc(w)}</div>`
 );
 warnBox.innerHTML = [...errHtml, ...warnHtml].join("");
 const stagesBox = document.getElementById("ci-visualizer-stages");
@@ -2615,7 +2694,7 @@ stagesBox.innerHTML = (parsed.stages || []).map(st => `
 <span class="badge badge-runner">${esc(st.summary)}</span>
 </div>
 <div class="stage-items">
-${(st.items || []).map(item => `<span class="stage-chip">${esc(item)}</span>`).join("") || '<span style="font-size:11.5px; color:var(--text-muted);">No items in this stage</span>'}
+${(st.items || []).map(item => `<span class="stage-chip">${esc(item)}</span>`).join("") || '<span style="font-size:var(--fs-sm); color:var(--text-muted);">No items in this stage</span>'}
 </div>
 </div>
 `).join("");
@@ -2734,20 +2813,20 @@ return `
 <span>${r.enabled ? "Enabled" : "Deselected"}</span>
 </label>
 </td>
-<td class="mono" style="font-weight:700; color:#fff;">
+<td class="mono" style="font-weight:700; color:var(--text-strong);">
 ${esc(r.region)}
-<div style="font-size:11px; color:var(--text-muted); font-weight:400;">${esc(r.zones.join(", "))}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted); font-weight:400;">${esc(r.zones.join(", "))}</div>
 </td>
 <td>
 <div style="font-weight:600;">${esc(r.display_name)}</div>
-<div style="font-size:11px; color:var(--text-muted);">${esc(r.continent)}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(r.continent)}</div>
 </td>
-<td class="mono" style="font-weight:700; color:${r.latency_ms < 60 ? '#34d399' : (r.latency_ms < 140 ? '#38bdf8' : '#fbbf24')};">
+<td class="mono" style="font-weight:700; color:${r.latency_ms < 60 ? 'var(--success)' : (r.latency_ms < 140 ? 'var(--info)' : 'var(--warning)')};">
 ${r.latency_ms} ms
 </td>
-<td class="mono" style="font-size:11.5px;">${esc(r.families.join(", "))}</td>
-<td style="font-size:11.5px;">${esc(r.cpu_platforms.join(", "))}</td>
-<td class="mono" style="font-size:11px;">${esc(r.disk_types.join(", "))}</td>
+<td class="mono" style="font-size:var(--fs-sm);">${esc(r.families.join(", "))}</td>
+<td style="font-size:var(--fs-sm);">${esc(r.cpu_platforms.join(", "))}</td>
+<td class="mono" style="font-size:var(--fs-xs);">${esc(r.disk_types.join(", "))}</td>
 <td class="mono">${runningVms.length} running</td>
 </tr>
 `;
@@ -2825,22 +2904,22 @@ document.getElementById("rust-kpi-grid").innerHTML = `
 </div>
 <div class="kpi-card">
 <div class="kpi-label">Crate Cache Hits &amp; Rate</div>
-<div class="kpi-value" style="color:#34d399;">${reportedOr(rb.total_cache_hits, v => `${v.toLocaleString()} Hits`)}${reportedOr(rb.overall_cache_hit_rate_percent, v => ` (${v}%)`, "")}</div>
+<div class="kpi-value" style="color:var(--success);">${reportedOr(rb.total_cache_hits, v => `${v.toLocaleString()} Hits`)}${reportedOr(rb.overall_cache_hit_rate_percent, v => ` (${v}%)`, "")}</div>
 <div class="kpi-sub">Persistent NVMe /mnt/runner-data/remote-build</div>
 </div>
 <div class="kpi-card">
 <div class="kpi-label">Peak Active Memory (OOM Floor)</div>
-<div class="kpi-value" style="color:#fbbf24;">${reportedOr(rb.max_peak_ram_gib, v => `${v} GiB`)}</div>
+<div class="kpi-value" style="color:var(--warning);">${reportedOr(rb.max_peak_ram_gib, v => `${v} GiB`)}</div>
 <div class="kpi-sub">Active RAM required without OOM killing</div>
 </div>
 <div class="kpi-card">
 <div class="kpi-label">Total CPU Time &amp; CPU Points</div>
-<div class="kpi-value" style="color:#38bdf8;">${reportedOr(rb.total_cpu_points, v => `${v.toLocaleString()} pts`)}</div>
+<div class="kpi-value" style="color:var(--info);">${reportedOr(rb.total_cpu_points, v => `${v.toLocaleString()} pts`)}</div>
 <div class="kpi-sub">${reportedOr(rb.total_cpu_time_seconds, v => `${v.toLocaleString()}s CPU time × Instance Bench`, "CPU time not reported")}</div>
 </div>
 <div class="kpi-card">
 <div class="kpi-label">VPN / Proxy / Tor Origins</div>
-<div class="kpi-value" style="color:#fda4af;">${rb.vpn_or_tor_count} Flagged</div>
+<div class="kpi-value" style="color:var(--danger);">${rb.vpn_or_tor_count} Flagged</div>
 <div class="kpi-sub">ProtonVPN, Tor Exit Node &amp; Mullvad detected</div>
 </div>
 `;
@@ -2869,47 +2948,47 @@ const geoAsnIsp = (geo.asn || geo.isp)
 return `
 <tr>
 <td>
-<div class="mono" style="font-weight:700; color:#fff;">${esc(b.build_id)} <span style="font-size:11px; color:var(--text-muted);">${esc(b.status)}</span></div>
-<div style="font-size:11.5px; color:var(--text-muted);">${esc(b.project_name || "project not reported")}${b.profile ? ` (<code class="mono">--${esc(b.profile)}</code>)` : ""} · <code class="mono">${esc(b.commit_sha ? b.commit_sha.slice(0, 8) : "commit not reported")}</code></div>
+<div class="mono" style="font-weight:700; color:var(--text-strong);">${esc(b.build_id)} <span style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(b.status)}</span></div>
+<div style="font-size:var(--fs-sm); color:var(--text-muted);">${esc(b.project_name || "project not reported")}${b.profile ? ` (<code class="mono">--${esc(b.profile)}</code>)` : ""} · <code class="mono">${esc(b.commit_sha ? b.commit_sha.slice(0, 8) : "commit not reported")}</code></div>
 </td>
-<td style="font-size:11.5px;">
+<td style="font-size:var(--fs-sm);">
 <div><strong>Req:</strong> ${esc(formatLocalTime(b.requested_at))}</div>
 <div><strong>Fin:</strong> ${esc(formatLocalTime(b.finished_at))}</div>
 <div><strong>Del:</strong> ${esc(formatLocalTime(b.delivered_at))}</div>
 </td>
 <td class="mono">
-<div style="font-weight:700; color:#fff;">${reportedOr(b.total_duration_seconds, v => `${v}s total`, "duration not reported")}</div>
-<div style="font-size:11px; color:var(--text-muted);">${reportedOr(b.delivery_duration_seconds, v => `${b.compile_duration_seconds}s compile + ${v}s delivery`, reportedOr(b.compile_duration_seconds, c => (["QUEUED", "PENDING", "WAITING", "RUNNING", "COMPILING", "ACTIVE", "IN_PROGRESS", "BUILDING"].includes(String(b.status).toUpperCase()) ? `${c}s compile so far` : `${c}s compile · not delivered`), "compile/delivery split not reported"))}</div>
+<div style="font-weight:700; color:var(--text-strong);">${reportedOr(b.total_duration_seconds, v => `${v}s total`, "duration not reported")}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">${reportedOr(b.delivery_duration_seconds, v => `${b.compile_duration_seconds}s compile + ${v}s delivery`, reportedOr(b.compile_duration_seconds, c => (["QUEUED", "PENDING", "WAITING", "RUNNING", "COMPILING", "ACTIVE", "IN_PROGRESS", "BUILDING"].includes(String(b.status).toUpperCase()) ? `${c}s compile so far` : `${c}s compile · not delivered`), "compile/delivery split not reported"))}</div>
 </td>
 <td class="mono">
-<div style="font-weight:700; color:#34d399;">${reportedOr(b.cache_hit_rate_percent, v => `${b.cache_hits} / ${b.total_crates} (${v}%)`, `${reportedOr(b.cache_hits, h => `${h} hits`, "cache not reported")}`)}</div>
-<div style="font-size:11px; color:var(--text-muted);">${reportedOr(b.cache_misses, v => `${v} misses`)}</div>
+<div style="font-weight:700; color:var(--success);">${reportedOr(b.cache_hit_rate_percent, v => `${b.cache_hits} / ${b.total_crates} (${v}%)`, `${reportedOr(b.cache_hits, h => `${h} hits`, "cache not reported")}`)}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">${reportedOr(b.cache_misses, v => `${v} misses`)}</div>
 </td>
 <td>
-<div class="mono" style="font-weight:700; color:#c4b5fd;">${esc(b.instance_name || "host not reported")}</div>
-<div style="font-size:11px; color:var(--text-muted);">${esc(b.machine_type || "shape not reported")} (${esc(b.zone || "zone not reported")}) · Bench: <strong class="mono">${esc(reportedOr(b.instance_benchmark_score, v => v, "—"))}</strong></div>
+<div class="mono" style="font-weight:700; color:var(--violet);">${esc(b.instance_name || "host not reported")}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(b.machine_type || "shape not reported")} (${esc(b.zone || "zone not reported")}) · Bench: <strong class="mono">${esc(reportedOr(b.instance_benchmark_score, v => v, "—"))}</strong></div>
 </td>
 <td class="mono">
-<div style="font-weight:700; color:#f8fafc;">${esc(b.origin_ip || "not reported")}</div>
-<div style="font-size:11px; color:#93c5fd;">${esc(b.origin_hostname || "")}</div>
+<div style="font-weight:700; color:var(--text-strong);">${esc(b.origin_ip || "not reported")}</div>
+<div style="font-size:var(--fs-xs); color:var(--accent-text);">${esc(b.origin_hostname || "")}</div>
 </td>
 <td>
 <div style="font-weight:600;">${geoCityCountry}</div>
-<div style="font-size:11px; color:var(--text-muted);">${geoAsnIsp}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">${geoAsnIsp}</div>
 </td>
 <td>
 <span class="badge ${badgeClass}">${esc(ns.badge_text || "N/A")}</span>
 </td>
 <td class="mono">
-<div style="font-weight:700; color:#fbbf24;">${reportedOr(b.peak_ram_gib, v => `${v.toFixed(2)} GiB active`)}</div>
-<div style="font-size:10.5px; color:var(--text-muted);">OOM floor (cap ${b.container_ram_cap_gib || "—"} GiB)</div>
+<div style="font-weight:700; color:var(--warning);">${reportedOr(b.peak_ram_gib, v => `${v.toFixed(2)} GiB active`)}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">OOM floor (cap ${b.container_ram_cap_gib || "—"} GiB)</div>
 </td>
 <td class="mono" style="font-weight:700;">
 ${reportedOr(b.cpu_time_seconds, v => `${v.toLocaleString()} CPU-s`)}
 </td>
 <td class="mono">
-<div style="font-size:13.5px; font-weight:700; color:#38bdf8;">${reportedOr(b.cpu_points, v => `${v.toLocaleString()} pts`)}</div>
-<div style="font-size:10.5px; color:var(--text-muted);">${esc(b.cpu_points_formula || "")}</div>
+<div style="font-size:var(--fs-md); font-weight:700; color:var(--info);">${reportedOr(b.cpu_points, v => `${v.toLocaleString()} pts`)}</div>
+<div style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(b.cpu_points_formula || "")}</div>
 </td>
 </tr>
 `;
@@ -3325,8 +3404,8 @@ btn.textContent = isAll ? "CI/CD Orgs & Repos: All ▾" : (OBS_SELECTED_TARGETS.
 list.innerHTML = OBS_CATALOG_TARGETS.map(t => {
 const checked = OBS_SELECTED_TARGETS === null || OBS_SELECTED_TARGETS.has(t);
 const isRepo = t.includes("/");
-const badge = isRepo ? '<span class="badge badge-runner" style="font-size:9.5px;padding:1px 5px;">repo</span>' : '<span class="badge badge-direct" style="font-size:9.5px;padding:1px 5px;">org</span>';
-return `<div class="target-dd-row"><label class="toggle-label" style="font-size:12px;flex:1;"><input type="checkbox" ${checked ? "checked" : ""} onchange="toggleSingleObsTarget('${esc(t)}', this.checked)" /><span class="mono">${esc(t)}</span> ${badge}</label><button type="button" class="target-only-btn" onclick="selectSingleObsTarget('${esc(t)}')">only</button></div>`;
+const badge = isRepo ? '<span class="badge badge-runner" style="font-size:var(--fs-xs);padding:1px 5px;">repo</span>' : '<span class="badge badge-direct" style="font-size:var(--fs-xs);padding:1px 5px;">org</span>';
+return `<div class="target-dd-row"><label class="toggle-label" style="font-size:var(--fs-sm);flex:1;"><input type="checkbox" ${checked ? "checked" : ""} onchange="toggleSingleObsTarget('${esc(t)}', this.checked)" /><span class="mono">${esc(t)}</span> ${badge}</label><button type="button" class="target-only-btn" onclick="selectSingleObsTarget('${esc(t)}')">only</button></div>`;
 }).join("");
 }
 function toggleSingleObsTarget(t, checked) {
@@ -3367,7 +3446,7 @@ function renderSvgMultiSeries(svgId, points, seriesDefs, maxValFloor) {
 const svg = document.getElementById(svgId);
 if (!svg) return;
 if (!points || !points.length) {
-svg.innerHTML = '<text x="280" y="80" fill="#9aa0a6" text-anchor="middle" font-size="12">No telemetry samples in selected window</text>';
+svg.innerHTML = '<text x="280" y="80" class="chart-text" text-anchor="middle" font-size="12">No telemetry samples in selected window</text>';
 return;
 }
 const W = 560, H = 155, padL = 38, padR = 12, padT = 12, padB = 22;
@@ -3380,19 +3459,19 @@ let out = "";
 [0, 0.5, 1].forEach(f => {
 const y = (padT + plotH * (1 - f)).toFixed(1);
 const val = (maxY * f).toFixed(maxY >= 20 ? 0 : 1);
-out += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="rgba(148,163,184,0.14)" stroke-dasharray="3 3"/><text x="${padL - 5}" y="${Number(y) + 3}" fill="#767c82" font-size="9.5" text-anchor="end">${val}</text>`;
+out += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" class="chart-grid" stroke-dasharray="3 3"/><text x="${padL - 5}" y="${Number(y) + 3}" class="chart-text" font-size="9.5" text-anchor="end">${val}</text>`;
 });
 seriesDefs.forEach(s => {
 const coords = points.map((p, i) => `${xAt(i).toFixed(1)},${yAt(p[s.key]).toFixed(1)}`);
 if (s.fill) {
 const area = `M ${xAt(0).toFixed(1)},${padT + plotH} L ${coords.join(" L ")} L ${xAt(points.length - 1).toFixed(1)},${padT + plotH} Z`;
-out += `<path d="${area}" fill="${s.fill}" />`;
+out += `<path d="${area}" style="fill:${s.fill}" />`;
 }
-out += `<polyline fill="none" stroke="${s.color}" stroke-width="${s.width || 2}" ${s.dash ? `stroke-dasharray="${s.dash}"` : ""} points="${coords.join(" ")}" />`;
+out += `<polyline fill="none" style="stroke:${s.color}" stroke-width="${s.width || 2}" ${s.dash ? `stroke-dasharray="${s.dash}"` : ""} points="${coords.join(" ")}" />`;
 });
 const firstTs = formatLocalTime(points[0].timestamp || points[0].epoch);
 const lastTs = formatLocalTime(points[points.length - 1].timestamp || points[points.length - 1].epoch);
-out += `<text x="${padL}" y="${H - 5}" fill="#9aa0a6" font-size="9.5">${esc(firstTs)}</text><text x="${W - padR}" y="${H - 5}" fill="#9aa0a6" font-size="9.5" text-anchor="end">${esc(lastTs)}</text>`;
+out += `<text x="${padL}" y="${H - 5}" class="chart-text" font-size="9.5">${esc(firstTs)}</text><text x="${W - padR}" y="${H - 5}" class="chart-text" font-size="9.5" text-anchor="end">${esc(lastTs)}</text>`;
 svg.innerHTML = out;
 }
 async function loadObservabilityView() {
@@ -3445,58 +3524,58 @@ const badgeEl = document.getElementById("badge-obs-count");
 if (badgeEl) badgeEl.textContent = dd.extra_runners_unlocked > 0 ? `+${dd.extra_runners_unlocked} slots` : `${(OBS_STATE.instances || []).length} hosts`;
 const kpis = document.getElementById("obs-density-kpis");
 if (kpis) {
-kpis.innerHTML = `<div class="kpi-card"><div class="kpi-label">Dynamic Runner Density Capacity</div><div class="kpi-value" style="color:#34d399;">${dd.current_total_runners || 0} → ${dd.recommended_total_runners || 0} Runners</div><div class="kpi-sub">Baseline: ${dd.baseline_total_runners || 0} slots · <strong>+${dd.extra_runners_unlocked || 0} extra slots unlocked</strong> (${(dd.density_multiplier || 1).toFixed(2)}x density)</div></div>
-<div class="kpi-card"><div class="kpi-label">Observed Peak Working-Set RAM / Runner</div><div class="kpi-value" style="color:#a78bfa;">${(dd.avg_peak_working_set_gib || 0).toFixed(2)} GiB</div><div class="kpi-sub">Peak cgroup incl. page cache: ${(dd.avg_cgroup_peak_gib || 0).toFixed(2)} GiB · Host RAM used: ${(dd.avg_mem_utilization_pct || 0).toFixed(1)}%</div></div>
-<div class="kpi-card"><div class="kpi-label">Fleet CPU Utilization vs. Target</div><div class="kpi-value" style="color:#38bdf8;">${(dd.avg_cpu_utilization_pct || 0).toFixed(1)}% / ${(dd.target_cpu_percent || 80).toFixed(0)}%</div><div class="kpi-sub">Max density cap: ${dd.max_runners_per_instance || 8} runners/VM · Mode: ${dd.enabled ? "Auto-Scale Enabled" : "Opted Out (Static)"}</div></div>
+kpis.innerHTML = `<div class="kpi-card"><div class="kpi-label">Dynamic Runner Density Capacity</div><div class="kpi-value" style="color:var(--success);">${dd.current_total_runners || 0} → ${dd.recommended_total_runners || 0} Runners</div><div class="kpi-sub">Baseline: ${dd.baseline_total_runners || 0} slots · <strong>+${dd.extra_runners_unlocked || 0} extra slots unlocked</strong> (${(dd.density_multiplier || 1).toFixed(2)}x density)</div></div>
+<div class="kpi-card"><div class="kpi-label">Observed Peak Working-Set RAM / Runner</div><div class="kpi-value" style="color:var(--violet);">${(dd.avg_peak_working_set_gib || 0).toFixed(2)} GiB</div><div class="kpi-sub">Peak cgroup incl. page cache: ${(dd.avg_cgroup_peak_gib || 0).toFixed(2)} GiB · Host RAM used: ${(dd.avg_mem_utilization_pct || 0).toFixed(1)}%</div></div>
+<div class="kpi-card"><div class="kpi-label">Fleet CPU Utilization vs. Target</div><div class="kpi-value" style="color:var(--info);">${(dd.avg_cpu_utilization_pct || 0).toFixed(1)}% / ${(dd.target_cpu_percent || 80).toFixed(0)}%</div><div class="kpi-sub">Max density cap: ${dd.max_runners_per_instance || 8} runners/VM · Mode: ${dd.enabled ? "Auto-Scale Enabled" : "Opted Out (Static)"}</div></div>
 <div class="kpi-card"><div class="kpi-label">Correlated Container &amp; Host Logs</div><div class="kpi-value">${OBS_STATE.total_matching_logs || 0} Events</div><div class="kpi-sub">Google Cloud Ops Agent + <code class="mono">_diag/Worker_*.log</code> job links</div></div>`;
 }
 const ts = OBS_STATE.timeseries || [];
 renderSvgMultiSeries("obs-chart-cpu", ts, [
-{ key: "cpu_utilization_pct", color: "#38bdf8", fill: "rgba(56,189,248,0.16)" },
-{ key: "container_cpu_pct", color: "#34d399" },
-{ key: "target_cpu_pct", color: "#fbbf24", dash: "4 4", width: 1.5 }
+{ key: "cpu_utilization_pct", color: "var(--info)", fill: "var(--info-soft)" },
+{ key: "container_cpu_pct", color: "var(--success)" },
+{ key: "target_cpu_pct", color: "var(--warning)", dash: "4 4", width: 1.5 }
 ], 100);
 renderSvgMultiSeries("obs-chart-mem", ts, [
-{ key: "mem_available_gib", color: "#34d399", fill: "rgba(52,211,153,0.10)" },
-{ key: "mem_cgroup_peak_gib", color: "#fb7185" },
-{ key: "mem_working_set_gib", color: "#a78bfa", fill: "rgba(167,139,250,0.22)" }
+{ key: "mem_available_gib", color: "var(--success)", fill: "var(--success-soft)" },
+{ key: "mem_cgroup_peak_gib", color: "var(--danger)" },
+{ key: "mem_working_set_gib", color: "var(--violet)", fill: "var(--violet-soft)" }
 ], 16);
 renderSvgMultiSeries("obs-chart-density", ts, [
-{ key: "recommended_dense_runners", color: "#34d399", fill: "rgba(52,211,153,0.14)" },
-{ key: "active_runners", color: "#60a5fa" },
-{ key: "active_workflows", color: "#fbbf24" }
+{ key: "recommended_dense_runners", color: "var(--success)", fill: "var(--success-soft)" },
+{ key: "active_runners", color: "var(--accent-text)" },
+{ key: "active_workflows", color: "var(--warning)" }
 ], 10);
 renderSvgMultiSeries("obs-chart-disk", ts, [
-{ key: "disk_read_mib_s", color: "#38bdf8", fill: "rgba(56,189,248,0.14)" },
-{ key: "disk_write_mib_s", color: "#f472b6" },
-{ key: "disk_utilization_pct", color: "#fbbf24", dash: "3 3", width: 1.5 }
+{ key: "disk_read_mib_s", color: "var(--info)", fill: "var(--info-soft)" },
+{ key: "disk_write_mib_s", color: "var(--chart-pink)" },
+{ key: "disk_utilization_pct", color: "var(--warning)", dash: "3 3", width: 1.5 }
 ], 100);
 const instTbody = document.getElementById("obs-instances-tbody");
 if (instTbody) {
 instTbody.innerHTML = (OBS_STATE.instances || []).map(inst => {
 const roleBadge = inst.role === "rust_builder" ? '<span class="badge badge-builder">rust_builder</span>' : '<span class="badge badge-runner">cicd_runner</span>';
-const wfs = (inst.active_workflows || []).map(w => `<a href="${esc(w.github_workflow_url)}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="margin:2px 2px 0 0;text-decoration:none;" title="Open GitHub Actions Run #${esc(w.run_number)} (${esc(w.job_name)})">🔗 ${esc(w.repository)} #${esc(w.run_number)} · ${esc(w.job_name)} ↗</a>`).join(" ") || '<span style="color:var(--text-muted);font-size:11.5px;">Idle / Listening</span>';
+const wfs = (inst.active_workflows || []).map(w => `<a href="${esc(w.github_workflow_url)}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="margin:2px 2px 0 0;text-decoration:none;" title="Open GitHub Actions Run #${esc(w.run_number)} (${esc(w.job_name)})">🔗 ${esc(w.repository)} #${esc(w.run_number)} · ${esc(w.job_name)} ↗</a>`).join(" ") || '<span style="color:var(--text-muted);font-size:var(--fs-sm);">Idle / Listening</span>';
 if (inst.ops_agent_status === "no_telemetry") {
 return `<tr>
-<td class="mono"><strong>${esc(inst.instance_name)}</strong><div style="font-size:11px;color:var(--text-muted);">${esc(inst.zone)}</div></td>
-<td>${roleBadge}<div class="mono" style="font-size:11px;margin-top:3px;">${esc(inst.repository || inst.organization)}</div></td>
-<td class="mono">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)}<div style="font-size:11px;color:var(--text-muted);">${inst.vcpu} vCPU · ${inst.ram_gib} GiB</div></td>
-<td class="mono" colspan="4" style="color:var(--text-muted);font-size:11.5px;">No host-agent telemetry received from this instance yet.</td>
-<td style="font-size:11.5px;"><span class="badge badge-warn">no telemetry</span></td>
+<td class="mono"><strong>${esc(inst.instance_name)}</strong><div style="font-size:var(--fs-xs);color:var(--text-muted);">${esc(inst.zone)}</div></td>
+<td>${roleBadge}<div class="mono" style="font-size:var(--fs-xs);margin-top:3px;">${esc(inst.repository || inst.organization)}</div></td>
+<td class="mono">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)}<div style="font-size:var(--fs-xs);color:var(--text-muted);">${inst.vcpu} vCPU · ${inst.ram_gib} GiB</div></td>
+<td class="mono" colspan="4" style="color:var(--text-muted);font-size:var(--fs-sm);">No host-agent telemetry received from this instance yet.</td>
+<td style="font-size:var(--fs-sm);"><span class="badge badge-warn">no telemetry</span></td>
 </tr>`;
 }
 const extraBadge = inst.extra_runners_unlocked > 0 ? `<span class="badge badge-running">+${inst.extra_runners_unlocked} dense slots</span>` : '<span class="badge badge-direct">optimal</span>';
 return `<tr>
-<td class="mono"><strong>${esc(inst.instance_name)}</strong><div style="font-size:11px;color:var(--text-muted);">${esc(inst.zone)}</div></td>
-<td>${roleBadge}<div class="mono" style="font-size:11px;margin-top:3px;">${esc(inst.repository || inst.organization)}</div></td>
-<td class="mono">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)}<div style="font-size:11px;color:var(--text-muted);">${inst.vcpu} vCPU · ${inst.ram_gib} GiB</div></td>
-<td class="mono"><strong>${inst.cpu_utilization_pct.toFixed(1)}%</strong><div style="font-size:11px;color:var(--text-muted);">load 1m: ${inst.loadavg_1m.toFixed(2)}</div></td>
-<td class="mono"><strong>${inst.mem_used_gib.toFixed(2)} / ${inst.ram_gib} GiB (${inst.mem_utilization_pct.toFixed(1)}%)</strong><div style="font-size:11px;color:#c4b5fd;">peak working set: ${inst.observed_peak_working_set_gib.toFixed(2)} GiB/slot</div></td>
+<td class="mono"><strong>${esc(inst.instance_name)}</strong><div style="font-size:var(--fs-xs);color:var(--text-muted);">${esc(inst.zone)}</div></td>
+<td>${roleBadge}<div class="mono" style="font-size:var(--fs-xs);margin-top:3px;">${esc(inst.repository || inst.organization)}</div></td>
+<td class="mono">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)}<div style="font-size:var(--fs-xs);color:var(--text-muted);">${inst.vcpu} vCPU · ${inst.ram_gib} GiB</div></td>
+<td class="mono"><strong>${inst.cpu_utilization_pct.toFixed(1)}%</strong><div style="font-size:var(--fs-xs);color:var(--text-muted);">load 1m: ${inst.loadavg_1m.toFixed(2)}</div></td>
+<td class="mono"><strong>${inst.mem_used_gib.toFixed(2)} / ${inst.ram_gib} GiB (${inst.mem_utilization_pct.toFixed(1)}%)</strong><div style="font-size:var(--fs-xs);color:var(--violet);">peak working set: ${inst.observed_peak_working_set_gib.toFixed(2)} GiB/slot</div></td>
 <td class="mono"><strong>${inst.baseline_runners} → ${inst.current_runners} → ${inst.recommended_runners}</strong><div>${extraBadge}</div></td>
 <td>${wfs}</td>
-<td style="font-size:11.5px;"><span class="badge badge-running">${esc(inst.ops_agent_status)}</span><div style="color:var(--text-muted);margin-top:3px;">${esc(inst.density_reason)}</div></td>
+<td style="font-size:var(--fs-sm);"><span class="badge badge-running">${esc(inst.ops_agent_status)}</span><div style="color:var(--text-muted);margin-top:3px;">${esc(inst.density_reason)}</div></td>
 </tr>`;
-}).join("") || '<tr><td colspan="8" style="color:var(--text-muted);font-size:12px;text-align:center;padding:14px;">No running instances. The fleet is scaled to zero or the control plane has not listed any VMs yet.</td></tr>';
+}).join("") || '<tr><td colspan="8" style="color:var(--text-muted);font-size:var(--fs-sm);text-align:center;padding:14px;">No running instances. The fleet is scaled to zero or the control plane has not listed any VMs yet.</td></tr>';
 }
 const logBadge = document.getElementById("obs-log-count-badge");
 if (logBadge) logBadge.textContent = `${OBS_STATE.total_matching_logs || 0} logs`;
@@ -3506,15 +3585,15 @@ logsTbody.innerHTML = (OBS_STATE.logs || []).map(l => {
 const sevClass = l.severity === "ERROR" ? "badge-deleted" : (l.severity === "WARN" ? "badge-warn" : "badge-runner");
 const wfHtml = l.github_workflow_url
 ? `<a href="${esc(l.github_workflow_url)}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="text-decoration:none;" title="Jump directly to GitHub Actions workflow job at ${esc(l.timestamp)}">🔗 ${esc(l.repository)} · ${esc(l.workflow_name)} #${esc(l.run_number || l.run_id)} (${esc(l.job_name)}) ↗</a>`
-: `<span class="mono" style="color:var(--text-muted);font-size:11px;">${esc(l.repository || l.organization || "host-daemon")}</span>`;
+: `<span class="mono" style="color:var(--text-muted);font-size:var(--fs-xs);">${esc(l.repository || l.organization || "host-daemon")}</span>`;
 return `<tr>
-<td class="mono" style="white-space:nowrap;font-size:11.5px;">${esc(formatLocalTime(l.timestamp || l.epoch))}</td>
-<td><span class="badge ${sevClass}">${esc(l.severity)}</span><div class="mono" style="font-size:10.5px;color:var(--text-muted);margin-top:2px;">${esc(l.source)}</div></td>
-<td class="mono" style="font-size:11.5px;"><strong>${esc(l.instance_name)}</strong><div style="font-size:10.5px;color:var(--text-muted);">${esc(l.runner_name)} · ${esc(l.container_id)}</div></td>
+<td class="mono" style="white-space:nowrap;font-size:var(--fs-sm);">${esc(formatLocalTime(l.timestamp || l.epoch))}</td>
+<td><span class="badge ${sevClass}">${esc(l.severity)}</span><div class="mono" style="font-size:var(--fs-xs);color:var(--text-muted);margin-top:2px;">${esc(l.source)}</div></td>
+<td class="mono" style="font-size:var(--fs-sm);"><strong>${esc(l.instance_name)}</strong><div style="font-size:var(--fs-xs);color:var(--text-muted);">${esc(l.runner_name)} · ${esc(l.container_id)}</div></td>
 <td>${wfHtml}</td>
-<td class="mono" style="font-size:11.5px;color:#e8eaed;word-break:break-word;">${esc(l.message)}</td>
+<td class="mono" style="font-size:var(--fs-sm);color:var(--text-main);word-break:break-word;">${esc(l.message)}</td>
 </tr>`;
-}).join("") || '<tr><td colspan="5" style="color:var(--text-muted);font-size:12px;text-align:center;padding:14px;">No log entries. Logs and workflow links appear here only after a runner host pushes real host-agent telemetry.</td></tr>';
+}).join("") || '<tr><td colspan="5" style="color:var(--text-muted);font-size:var(--fs-sm);text-align:center;padding:14px;">No log entries. Logs and workflow links appear here only after a runner host pushes real host-agent telemetry.</td></tr>';
 }
 }
 async function saveDynamicDensityPolicy() {
@@ -3750,7 +3829,7 @@ pub fn render_login_gate_html(
     );
 
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Spot Dashboard sign-in</title><style>body{{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#1f2328;background:#fff}}.btn{{display:inline-block;padding:.6rem 1rem;background:#1f2328;color:#fff;border-radius:6px;text-decoration:none}}.msg{{color:#cf222e}}code{{font-size:1.4rem}}section{{margin-top:1.5rem}}</style></head><body><h1>Spot Dashboard sign-in</h1><p>Access is limited to the dashboard owner and the GitHub accounts the owner added as administrators.</p>{}{}{}{}{}<script>{}</script></body></html>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Spot Dashboard sign-in</title><style>:root{{--bg-base:#131314;--bg-panel:#1e1f20;--border:#3c4043;--border-control:#70757a;--border-hi:#8ab4f8;--text-main:#e8eaed;--text-muted:#9aa0a6;--accent:#1a73e8;--accent-hover:#1765cc;--on-accent:#fff;--accent-text:#8ab4f8;--danger:#fb7185;--bg-card:#282a2c;--radius-md:8px;--radius-lg:12px;color-scheme:dark}}body{{font-family:"Google Sans",Roboto,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px;line-height:1.5;max-width:40rem;margin:3rem auto;padding:0 1rem;color:var(--text-main);background:var(--bg-base)}}h1{{font-size:21px;margin-bottom:.5rem}}h2{{font-size:15px;margin-bottom:.6rem}}p{{color:var(--text-muted);margin:.4rem 0}}a{{color:var(--accent-text)}}section{{margin-top:1.5rem;padding:16px 18px;background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--radius-lg)}}.btn,button{{display:inline-block;padding:.5rem .9rem;background:var(--accent);color:var(--on-accent);border:1px solid transparent;border-radius:var(--radius-md);font-family:inherit;font-size:13px;font-weight:600;text-decoration:none;cursor:pointer}}.btn:hover,button:hover{{background:var(--accent-hover)}}button:disabled{{opacity:.55;cursor:not-allowed}}input{{background:var(--bg-base);color:var(--text-main);border:1px solid var(--border-control);border-radius:var(--radius-md);padding:.45rem .7rem;font:inherit}}:focus-visible{{outline:2px solid var(--border-hi);outline-offset:2px}}.msg{{color:var(--danger)}}strong{{color:var(--text-main)}}code{{font-family:"Roboto Mono",SFMono-Regular,Consolas,Menlo,monospace;font-size:1.4rem;color:var(--text-main);background:var(--bg-card);padding:.1rem .4rem;border-radius:6px}}</style></head><body><h1>Spot Dashboard sign-in</h1><p>Access is limited to the dashboard owner and the GitHub accounts the owner added as administrators.</p>{}{}{}{}{}<script>{}</script></body></html>"#,
         msg_html, who, web, device, legacy, script
     )
 }
