@@ -310,10 +310,18 @@ Deploys run one at a time and stay off until you turn them on. To turn them on:
 2. Add these environment secrets: `CLOUDFLARE_API_TOKEN` (an API token limited to this account's Workers
    scripts, KV, routes, and the dashboard zone's DNS), `CLOUDFLARE_ACCOUNT_ID`, `SPOT_KV_NAMESPACE_ID`, and
    `GCP_PROJECT`.
-3. Set the repository variable `WORKER_AUTO_DEPLOY` to `true`. Set it to any other value to pause deploys.
+3. Under the environment's **Deployment branches and tags**, allow only `main`. A manual run from another branch uses
+   that branch's copy of the workflow file, so this rule, not the workflow's own `main` check, is what keeps other
+   branches from reaching the environment's secrets.
+4. Set the repository variable `WORKER_AUTO_DEPLOY` to `true`. Set it to any other value to pause deploys.
 
-The workflow leaves Worker secrets such as `SESSION_SECRET` unchanged. `just deploy-worker` still works for
-manual deploys.
+To redeploy the current `main` without a new commit, for example after a failed deploy or a Cloudflare-side
+change, open **Actions** > **Deploy Worker** > **Run workflow** and run it from `main`. A manual run goes through the
+same gate: it deploys the `main` tip only when every check on that commit passed, and it skips the deploy when run
+from another branch or while `WORKER_AUTO_DEPLOY` isn't `true`.
+
+The workflow leaves Worker secrets such as `SESSION_SECRET` unchanged. `just deploy-worker` still works as a
+fallback from a workstation.
 
 ## Commands
 

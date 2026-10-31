@@ -817,3 +817,104 @@ fn test_example_rust_project_draining_sentinel_and_aliases() {
     );
     assert!(cmd.is_ok());
 }
+
+fn fake_docker(dir: &std::path::Path, script: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("docker");
+    fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn test_builder_status_reports_running_builds() {
+    // Serialize with the other process-spawning tests so no fork inherits the script while it is open for writing.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use host_agent::host_launcher::builder_status;
+    let temp = TempDir::new().unwrap();
+    let marker = temp.path().join("bootstrap.complete");
+    fs::write(&marker, "deployment").unwrap();
+    let args_log = temp.path().join("args");
+    let docker = fake_docker(
+        temp.path(),
+        &format!(
+            "echo \"$@\" > {}\nprintf '%064x\\n' 1 2",
+            args_log.display()
+        ),
+    );
+
+    let line = builder_status(temp.path(), &marker, &docker).unwrap();
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(fields.len(), 4, "unexpected status line: {line}");
+    assert_eq!(fields[0], "OK");
+    assert_eq!(fields[1], "2");
+    assert!(fields[2].parse::<u64>().unwrap() > 0);
+    assert!(fields[3].parse::<f64>().unwrap() >= 0.0);
+
+    // Only containers the launcher labels count as builds.
+    let args = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        args.contains("--filter label=oxidex.remote-build=true"),
+        "{args}"
+    );
+}
+
+#[test]
+fn test_builder_status_fails_closed_when_docker_fails() {
+    // Serialize with the other process-spawning tests so no fork inherits the script while it is open for writing.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use host_agent::host_launcher::builder_status;
+    let temp = TempDir::new().unwrap();
+    let marker = temp.path().join("bootstrap.complete");
+    fs::write(&marker, "deployment").unwrap();
+
+    let failing = fake_docker(temp.path(), "echo 'permission denied' >&2; exit 1");
+    assert!(matches!(
+        builder_status(temp.path(), &marker, &failing),
+        Err(HostLauncherError::MalformedInventory(_))
+    ));
+
+    let garbage = fake_docker(temp.path(), "echo not-a-container-id");
+    assert!(builder_status(temp.path(), &marker, &garbage).is_err());
+
+    let missing = temp.path().join("no-docker-here");
+    assert!(builder_status(temp.path(), &marker, missing.to_str().unwrap()).is_err());
+}
+
+#[test]
+fn test_builder_status_draining_and_unready() {
+    // Serialize with the other process-spawning tests so no fork inherits the script while it is open for writing.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use host_agent::host_launcher::builder_status;
+    let temp = TempDir::new().unwrap();
+    let marker = temp.path().join("bootstrap.complete");
+    // Docker is never consulted for a host that is not ready.
+    let docker = fake_docker(temp.path(), "exit 1");
+
+    assert_eq!(
+        builder_status(temp.path(), &marker, &docker).unwrap(),
+        "UNREADY 0 0 999.0"
+    );
+
+    fs::write(&marker, "deployment").unwrap();
+    fs::write(temp.path().join("example-rust-project-build-draining"), "").unwrap();
+    assert_eq!(
+        builder_status(temp.path(), &marker, &docker).unwrap(),
+        "DRAINING 0 0 999.0"
+    );
+}
+
+#[test]
+fn test_status_is_not_treated_as_a_project_build() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp = TempDir::new().unwrap();
+    let lock_root = temp.path().canonicalize().unwrap();
+    std::env::set_var("OXIDEX_LOCK_ROOT", lock_root.to_str().unwrap());
+    std::env::set_var("OXIDEX_ALLOW_UNPRIVILEGED", "1");
+
+    // The real bootstrap marker is absent here, so status reports UNREADY and exits 0
+    // without creating build state for a project named "status".
+    let code = host_agent::host_launcher::run(&["status".to_string()]).unwrap();
+    assert_eq!(code, 0);
+    assert!(!lock_root.join("oxidex-build.lock").exists());
+}

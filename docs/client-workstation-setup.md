@@ -61,17 +61,11 @@ fi
 echo "[INFO] Probing candidate dedicated builders for idle CPU and >= 28 GiB free RAM..." >&2
 
 for host in "${CANDIDATES[@]}"; do
+  # The launcher prints "OK|DRAINING|UNREADY <running builds> <MemAvailable KiB> <load1>" and fails
+  # if it cannot count running builds, so an unknown host is skipped rather than treated as idle.
   probe_out="$(
-    ssh -o ConnectTimeout=3 "${host}" '
-      if [[ ! -f /var/lib/example-rust-project-builder-bootstrap.complete ]] || [[ -f /run/example-rust-project-build-draining ]]; then
-        echo "UNREADY 0 0 999.0"
-        exit 0
-      fi
-      active="$(docker ps --filter label=example-rust-project.remote-build=true -q 2>/dev/null | wc -l | tr -d " ")"
-      avail_kib="$(awk "/^MemAvailable:/ {print \$2}" /proc/meminfo)"
-      load1="$(awk "{print \$1}" /proc/loadavg)"
-      echo "OK ${active} ${avail_kib} ${load1}"
-    ' 2>/dev/null || echo "UNREACHABLE 0 0 999.0"
+    ssh -o ConnectTimeout=3 "${host}" 'sudo -n /usr/local/bin/example-rust-project-remote-build status' 2>/dev/null \
+      || echo "UNREACHABLE 0 0 999.0"
   )"
 
   read -r state active avail_kib load1 <<< "${probe_out}"
@@ -84,14 +78,14 @@ for host in "${CANDIDATES[@]}"; do
 
   is_low_load="$(awk -v l="${load1}" -v m="${MAX_LOAD1}" 'BEGIN { print (l < m) ? 1 : 0 }')"
   if [[ "${active}" -eq 0 ]] && [[ "${avail_kib}" -ge "${MIN_AVAIL_KIB}" ]] && [[ "${is_low_load}" -eq 1 ]]; then
-    echo "[INFO]   ${host}: IDLE (active_containers=${active}, mem_avail=${avail_gib} GiB, load1=${load1}) -> selected" >&2
+    echo "[INFO]   ${host}: IDLE (builds=${active}, mem_avail=${avail_gib} GiB, load1=${load1}) -> selected" >&2
     if [[ "${VERBOSE}" == "--verbose" ]]; then
       echo "selected_host=${host}" >&2
     fi
     echo "${host}"
     exit 0
   else
-    echo "[INFO]   ${host}: BUSY (active_containers=${active}, mem_avail=${avail_gib} GiB, load1=${load1}) -> skipping" >&2
+    echo "[INFO]   ${host}: BUSY (builds=${active}, mem_avail=${avail_gib} GiB, load1=${load1}) -> skipping" >&2
   fi
 done
 
@@ -101,7 +95,7 @@ exit 75
 
 Why this check prevents build contention:
 
-1. **Zero active build containers (`active == 0`)**: verifies that no container with `example-rust-project.remote-build=true` is currently running on the host.
+1. **Zero running builds (`active == 0`)**: `sudo -n /usr/local/bin/example-rust-project-remote-build status` runs the root-owned launcher, which counts the build containers it started on the host. The uploader account has no Docker access of its own, and the launcher only needs the `sudo` rule that the builder bootstrap already installs for `prepare`, `cleanup`, and builds. If the launcher can't count the containers, the probe fails and the host is skipped.
 2. **Full 28 GiB memory headroom (`MemAvailable >= 29360128` KiB)**: confirms that the host has at least 28 GiB of reclaimable memory available before `host-agent docker-admission` launches the container.
 3. **Low CPU saturation (`load1 < 4.0`)**: confirms that background maintenance or a finishing build is not saturating the 16 vCPUs.
 4. **Atomic server-side lock**: even if two workstations probe the same builder within milliseconds, `host-agent host-launcher` acquires `/run/example-rust-project-build.lock` on the builder and returns exit code `75` (`EX_TEMPFAIL`) to the second caller rather than overcommitting the VM.
@@ -245,39 +239,74 @@ fi
 PROJECT="${EXAMPLE_RUST_PROJECT_NAME:-example-rust-project}"
 RUN_ID="$(date +%s)-$$"
 REMOTE_ROOT="/mnt/runner-data/remote-build"
+LAUNCHER="/usr/local/bin/example-rust-project-remote-build"
 HOST="$(~/.local/bin/select-idle-rust-builder)"
 
-profile_dir="debug"
+# Work out which target directory and binary a build writes from the Cargo arguments.
+profile="dev"
+bin="${PROJECT}"
+prev=""
 for arg in "$@"; do
-  if [[ "${arg}" == "--release" ]] || [[ "${arg}" == "-r" ]]; then
-    profile_dir="release"
-  fi
+  case "${prev}" in
+    --profile) profile="${arg}" ;;
+    --bin) bin="${arg}" ;;
+  esac
+  case "${arg}" in
+    --release | -r) profile="release" ;;
+    --profile=*) profile="${arg#--profile=}" ;;
+    --bin=*) bin="${arg#--bin=}" ;;
+  esac
+  prev="${arg}"
 done
+case "${profile}" in
+  dev | test) profile_dir="debug" ;;
+  bench) profile_dir="release" ;;
+  *) profile_dir="${profile}" ;;
+esac
+if [[ ! "${profile_dir}" =~ ^[A-Za-z0-9_-]+$ || ! "${bin}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "error: unsupported profile or binary name: ${profile} ${bin}" >&2
+  exit 64
+fi
 
-echo "[INFO] Syncing workspace and invoking cargo $* on ${HOST}..." >&2
+# Quote each argument so spaces and shell characters reach Cargo on the builder unchanged.
+cargo_args="$(printf ' %q' "$@")"
+export_bin=0
+if [[ "${1:-}" == "build" ]]; then
+  export_bin=1
+fi
+
+echo "[INFO] Syncing workspace and invoking cargo${cargo_args} on ${HOST}..." >&2
 rsync -az --mkpath --delete \
   --exclude 'target/' \
   --exclude '.git/' \
-  ./ "${HOST}:~/remote-staging-${RUN_ID}/"
+  ./ "${HOST}:~/remote-staging-${RUN_ID}/" >&2
 
-ssh "${HOST}" "flock -n -E 75 /tmp/${PROJECT}-tx.lock bash -euo pipefail -c '
-  trap \"rm -rf ~/remote-staging-${RUN_ID}; sudo -n /usr/local/bin/example-rust-project-remote-build cleanup ${PROJECT} >/dev/null 2>&1 || true\" EXIT
-  sudo -n /usr/local/bin/example-rust-project-remote-build prepare ${PROJECT}
-  rsync -a --delete ~/remote-staging-${RUN_ID}/ ${REMOTE_ROOT}/sources/${PROJECT}/
-  sudo -n /usr/local/bin/example-rust-project-remote-build ${PROJECT} cargo $*
-  if [[ \"${1:-}\" == \"build\" ]]; then
-    install -D -m 0755 ${REMOTE_ROOT}/targets/${PROJECT}/${profile_dir}/${PROJECT} ~/remote-exports-${RUN_ID}/${PROJECT}
-  fi
-'"
+# The wrapper, rsync, and launcher setup write to stderr. Stdout carries only the build: the container's
+# rustc and cargo version lines, then Cargo's own output.
+remote_script="$(cat <<REMOTE
+trap 'rm -rf ~/remote-staging-${RUN_ID}; sudo -n ${LAUNCHER} cleanup ${PROJECT} >/dev/null 2>&1 || true' EXIT
+sudo -n ${LAUNCHER} prepare ${PROJECT} >&2
+rsync -a --delete ~/remote-staging-${RUN_ID}/ ${REMOTE_ROOT}/sources/${PROJECT}/ >&2
+sudo -n ${LAUNCHER} ${PROJECT} cargo${cargo_args}
+if [[ ${export_bin} == 1 ]]; then
+  install -D -m 0755 ${REMOTE_ROOT}/targets/${PROJECT}/${profile_dir}/${bin} ~/remote-exports-${RUN_ID}/${bin} >&2
+fi
+REMOTE
+)"
+ssh "${HOST}" "flock -n -E 75 /tmp/${PROJECT}-tx.lock bash -euo pipefail -c $(printf '%q' "${remote_script}")"
 
-# If this was a build command, pull back the exported binary for the active profile
-if [[ "${1:-}" == "build" ]]; then
+# If this was a build command, pull back the binary for the selected profile
+if [[ "${export_bin}" == 1 ]]; then
   mkdir -p "./target/${profile_dir}"
   rsync -az --remove-source-files \
-    "${HOST}:~/remote-exports-${RUN_ID}/${PROJECT}" "./target/${profile_dir}/${PROJECT}"
-  echo "✓ Synced ${profile_dir} binary -> ./target/${profile_dir}/${PROJECT}" >&2
+    "${HOST}:~/remote-exports-${RUN_ID}/${bin}" "./target/${profile_dir}/${bin}" >&2
+  echo "✓ Synced ${profile_dir} binary -> ./target/${profile_dir}/${bin}" >&2
 fi
 ```
+
+The wrapper quotes every Cargo argument before it crosses SSH, reads `--release`, `-r`, and `--profile <name>` to find
+the target directory (`dev` and `test` write to `target/debug`, `bench` to `target/release`, and a custom profile to
+`target/<name>`), and copies back the binary named by `--bin`, or `${PROJECT}` when no `--bin` is given.
 
 ### 2. Add aliases to `.cargo/config.toml`
 
@@ -365,7 +394,7 @@ Create `.vscode/tasks.json` in your `example-rust-project` workspace:
 ```
 
 > [!TIP]
-> If you run `rust-analyzer` on a lightweight laptop with limited RAM, set `"rust-analyzer.check.overrideCommand": ["~/.local/bin/cargo-remote", "check", "--workspace", "--message-format=json-diagnostic-rendered-ansi"]` in `.vscode/settings.json` so save-time type checking also runs on an idle remote builder instead of spawning local `cargo check` processes.
+> If you run `rust-analyzer` on a lightweight laptop with limited RAM, set `"rust-analyzer.check.overrideCommand": ["~/.local/bin/cargo-remote", "check", "--workspace", "--message-format=json-diagnostic-rendered-ansi"]` in `.vscode/settings.json` so save-time type checking also runs on an idle remote builder instead of spawning local `cargo check` processes. `cargo-remote` sends its own progress output and the `rsync` and launcher setup output to stderr. Stdout carries the builder container's `rustc -vV` and `cargo -V` lines followed by Cargo's JSON messages; `rust-analyzer` skips lines that aren't JSON, so the version lines are harmless. Other JSON consumers, such as `jq`, should keep only JSON lines first: `cargo-remote build --message-format=json | grep '^{' | jq .`
 
 <figure class="shot" markdown>
   ![Visual Studio Code showing .vscode/tasks.json and integrated terminal building on an idle remote Spot VM](images/vscode-remote-build.png)
@@ -387,7 +416,7 @@ Add the following section to `AGENTS.md` and `CLAUDE.md` in the root of `example
 
 Do NOT run `cargo build`, `cargo test`, `cargo check`, or `cargo clippy` locally on this workstation. All Rust compilation and test execution MUST run on an idle dedicated `builder-*` Spot VM that does not already have an active Rust build consuming its CPU and RAM:
 
-1. Probe candidate builders and export an idle host (`0` active `example-rust-project.remote-build=true` containers, `>= 28 GiB` `MemAvailable`, 1-minute load `< 4.0`):
+1. Probe candidate builders and export an idle host (`0` running builds, `>= 28 GiB` `MemAvailable`, 1-minute load `< 4.0`):
    ```bash
    export REMOTE_BUILDER_HOST="$(~/.local/bin/select-idle-rust-builder --verbose)"
    ```
