@@ -63,7 +63,11 @@ async fn test_enqueue_poll_claim_complete_and_three_artifact_selection() {
     assert_eq!(body1["build_id"], 4553);
     assert_eq!(body1["build_status"], "queued");
     assert_eq!(body1["queue_position"], 1);
-    assert_eq!(body1["scaling_up"], false); // threshold is 2 by default
+    // No builder is running and min_instances is 1, so the first queued build
+    // bootstraps one, matching what the reconciler launches.
+    assert_eq!(body1["scaling_up"], true);
+    assert_eq!(body1["active_builders"], 0);
+    assert_eq!(body1["target_builders"], 1);
     assert_eq!(body1["eta_seconds"], 600); // default 600s avg * 1 wave
 
     // 2. Enqueue Build #2 (wants binary) -> hits queued_builds_threshold (2) -> triggers scale-up!

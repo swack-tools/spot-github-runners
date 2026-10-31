@@ -1666,7 +1666,7 @@ const st = APP_STATE.scaling_telemetry;
 const archSplit = (fs.x86_64_runner_vms || fs.arm64_runner_vms)
 ? `x86: ${fs.x86_64_runner_slots || 0} (${fs.x86_64_runner_vms || 0} VMs) · ARM64: ${fs.arm64_runner_slots || 0} (${fs.arm64_runner_vms || 0} VMs) · `
 : "";
-document.getElementById("kpi-runners-sub").textContent = `${archSplit}Min floor: ${APP_STATE.profiles.cicd_runner.min_runners} · ${st.queued_jobs} queued · ${st.jobs_ran_past_hour} runs/1h`;
+document.getElementById("kpi-runners-sub").textContent = `${archSplit}Min floor: ${APP_STATE.scaling.cicd_runner.min_runners} · ${st.queued_jobs} queued · ${reportedOr(st.jobs_ran_past_hour, v => `${v} runs/1h`, "runs/1h not reported")}`;
 const runningBuilders = allRunning.filter(i => i.role === "rust_builder");
 const runningBuilderVms = fs.running_builder_vms !== undefined ? fs.running_builder_vms : runningBuilders.length;
 document.getElementById("kpi-builders-online").textContent = `${runningBuilderVms} Builders Online`;
@@ -1677,7 +1677,7 @@ document.getElementById("kpi-qualifying-sub").textContent = `${cq.hardware_quali
 const se = APP_STATE.scaling_evaluation;
 const statusLabel = se.direction === "scale_up" ? `SCALE UP (${se.current_runners} → ${se.desired_runners})` : (se.direction === "scale_down" ? `SCALE DOWN (${se.current_runners} → ${se.desired_runners})` : `HOLD (${se.current_runners} runners)`);
 document.getElementById("kpi-scaling-status").textContent = statusLabel;
-document.getElementById("kpi-scaling-sub").textContent = (se.scale_up_reasons[0]?.summary || se.scale_down_reasons[0]?.summary || "Fleet within target bounds");
+document.getElementById("kpi-scaling-sub").textContent = (se.scale_up_reasons[0]?.summary || se.scale_down_reasons[0]?.summary || se.hold_reason || "Fleet within target bounds");
 const totalRunning = APP_STATE.regions.reduce((s, r) => s + r.running_instances.length, 0);
 document.getElementById("badge-map-count").textContent = `${totalRunning} live`;
 document.getElementById("badge-instances-count").textContent = `${iv.instances.length}`;
@@ -2406,19 +2406,19 @@ document.getElementById("sc-en-hourly-down").checked = Boolean(sc.enable_hourly_
 document.getElementById("sc-en-cpu").checked = Boolean(sc.enable_cpu_utilization_trigger);
 document.getElementById("sc-en-journal-oom").checked = Boolean(sc.enable_journal_oom_trigger);
 document.getElementById("sc-en-gh-oom").checked = Boolean(sc.enable_github_ci_oom_trigger);
-document.getElementById("sim-jobs-hour").value = st.jobs_ran_past_hour;
-document.getElementById("sim-jobs-prov").value = st.provisioned_jobs;
+document.getElementById("sim-jobs-hour").value = st.jobs_ran_past_hour ?? "";
+document.getElementById("sim-jobs-prov").value = st.provisioned_jobs ?? "";
 document.getElementById("sim-jobs-queued").value = st.queued_jobs;
 const ev = APP_STATE.scaling_evaluation;
 const reasons = [...ev.scale_up_reasons, ...ev.scale_down_reasons];
 document.getElementById("scaling-decision-box").innerHTML = `
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
 <div style="font-weight:700; font-size:var(--fs-lg);">Live Controller Evaluation: <span style="color:var(--info);">${esc(ev.direction.toUpperCase())}</span> (${ev.current_runners} → ${ev.desired_runners} CI/CD Runners / ${ev.desired_instances} VMs)</div>
-<span class="mono" style="font-size:var(--fs-sm); color:var(--success);">Projected: $${ev.projected_hourly_usd}/hr · $${ev.projected_daily_usd}/day · $${ev.projected_monthly_usd}/mo</span>
+<span class="mono" style="font-size:var(--fs-sm); color:var(--success);">Projected: ${reportedOr(ev.projected_hourly_usd, v => `$${v}/hr · $${ev.projected_daily_usd}/day · $${ev.projected_monthly_usd}/mo`)}</span>
 </div>
 ${ev.budget_capped ? `<div style="color:var(--warning); font-size:var(--fs-sm); margin-bottom:6px;">⚠️ ${esc(ev.budget_cap_note)}</div>` : ""}
 <div style="display:flex; flex-direction:column; gap:5px;">
-${reasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)} ${r.deep_link ? `<a href="${esc(safeUrl(r.deep_link))}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || '<div style="font-size:var(--fs-sm); color:var(--text-muted);">No scale change required.</div>'}
+${reasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)} ${r.deep_link ? `<a href="${esc(safeUrl(r.deep_link))}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || `<div style="font-size:var(--fs-sm); color:var(--text-muted);">${esc(ev.hold_reason || "No scale change required.")}</div>`}
 </div>
 `;
 const bsc = APP_STATE.scaling.rust_builder || {};
@@ -2435,7 +2435,7 @@ document.getElementById("sc-builder-en-queue").checked = bsc.enable_queue_trigge
 document.getElementById("sc-builder-en-cpu").checked = bsc.enable_cpu_utilization_trigger !== false;
 document.getElementById("sc-builder-en-oom").checked = bsc.enable_journal_oom_trigger !== false;
 document.getElementById("sc-builder-en-down").checked = bsc.enable_low_builds_scale_down !== false;
-document.getElementById("sim-builds-hour").value = st.builds_ran_past_hour ?? 6;
+document.getElementById("sim-builds-hour").value = st.builds_ran_past_hour ?? "";
 document.getElementById("sim-builds-active").value = st.active_builds ?? 1;
 document.getElementById("sim-builds-queued").value = st.queued_builds ?? 0;
 const bev = (APP_STATE.scaling_evaluations && APP_STATE.scaling_evaluations.rust_builder) || APP_STATE.builder_scaling_evaluation;
@@ -2444,11 +2444,11 @@ const breasons = [...(bev.scale_up_reasons || []), ...(bev.scale_down_reasons ||
 document.getElementById("builder-scaling-decision-box").innerHTML = `
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
 <div style="font-weight:700; font-size:var(--fs-md);">Rust Builder Evaluation: <span style="color:var(--violet);">${esc(bev.direction.toUpperCase())}</span> (${bev.current_instances} → ${bev.desired_instances} Builder VMs)</div>
-<span class="mono" style="font-size:var(--fs-sm); color:var(--success);">Projected: $${bev.projected_hourly_usd}/hr · $${bev.projected_daily_usd}/day · $${bev.projected_monthly_usd}/mo</span>
+<span class="mono" style="font-size:var(--fs-sm); color:var(--success);">Projected: ${reportedOr(bev.projected_hourly_usd, v => `$${v}/hr · $${bev.projected_daily_usd}/day · $${bev.projected_monthly_usd}/mo`)}</span>
 </div>
 ${bev.budget_capped ? `<div style="color:var(--warning); font-size:var(--fs-sm); margin-bottom:6px;">⚠️ ${esc(bev.budget_cap_note)}</div>` : ""}
 <div style="display:flex; flex-direction:column; gap:5px;">
-${breasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)}</div>`).join("") || '<div style="font-size:var(--fs-sm); color:var(--text-muted);">No builder scale change required.</div>'}
+${breasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)}</div>`).join("") || `<div style="font-size:var(--fs-sm); color:var(--text-muted);">${esc(bev.summary || "No builder scale change required.")}</div>`}
 </div>
 `;
 }
@@ -2521,8 +2521,8 @@ enable_journal_oom_trigger: document.getElementById("sc-en-journal-oom").checked
 enable_github_ci_oom_trigger: document.getElementById("sc-en-gh-oom").checked
 };
 const telemetry = {
-jobs_ran_past_hour: parseInt(document.getElementById("sim-jobs-hour").value || "14", 10),
-provisioned_jobs: parseInt(document.getElementById("sim-jobs-prov").value || "7", 10),
+jobs_ran_past_hour: parseInt(document.getElementById("sim-jobs-hour").value || "0", 10),
+provisioned_jobs: parseInt(document.getElementById("sim-jobs-prov").value || "0", 10),
 queued_jobs: parseInt(document.getElementById("sim-jobs-queued").value || "3", 10)
 };
 const res = await fetch("/api/scaling", {
