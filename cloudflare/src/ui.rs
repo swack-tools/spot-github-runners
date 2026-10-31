@@ -3757,7 +3757,7 @@ pub fn render_login_gate_html(
     };
 
     let device = if device_flow {
-        r#"<section><h2>Sign in with a device code</h2><button type="button" id="device-start">Get a GitHub device code</button><div id="device-box" hidden><p>Open <a id="device-link" target="_blank" rel="noopener noreferrer"></a> and enter code <code id="device-code"></code></p><p id="device-status">Waiting for approval...</p></div></section>"#
+        r#"<section><h2>Sign in with a device code</h2><button type="button" id="device-start">Get a GitHub device code</button><div id="device-box" hidden><p>Open <a id="device-link" target="_blank" rel="noopener noreferrer"></a> and enter code <code id="device-code"></code></p><p id="device-status">Waiting for approval...</p><p id="device-hint">After you approve, come back to this tab. It signs you in on its own, even if GitHub then shows a 404 page.</p></div></section>"#
     } else {
         ""
     };
@@ -3909,6 +3909,7 @@ mod tests {
         let gate = render_login_gate_html(true, true, false, "", "");
         assert!(gate.contains("/auth/github/login"));
         assert!(gate.contains("device-start"));
+        assert!(gate.contains("device-hint"));
     }
 
     #[test]
