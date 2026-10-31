@@ -206,6 +206,81 @@ pub fn source_not_mounted(source: &Path, target: &Path) -> Result<(), HostLaunch
     verify_mounts_not_active(source, target, &inspect_text)
 }
 
+pub const BOOTSTRAP_MARKER: &str = "/var/lib/oxidex-builder-bootstrap.complete";
+pub const BUILD_CONTAINER_LABEL: &str = "oxidex.remote-build=true";
+
+/// One-line readiness report for workstation builder selection: `STATE builds mem_available_kib load1`.
+/// STATE is OK, DRAINING, or UNREADY (bootstrap has not finished). Any failure to count running build
+/// containers is an error, so a caller never reads a host as idle when the count is unknown.
+pub fn builder_status(
+    lock_root: &Path,
+    bootstrap_marker: &Path,
+    docker: &str,
+) -> Result<String, HostLauncherError> {
+    if lock_root.join("oxidex-build-draining").exists()
+        || lock_root
+            .join("example-rust-project-build-draining")
+            .exists()
+    {
+        return Ok("DRAINING 0 0 999.0".to_string());
+    }
+    if !bootstrap_marker.exists() {
+        return Ok("UNREADY 0 0 999.0".to_string());
+    }
+
+    let builds = count_running_builds(docker)?;
+
+    let meminfo = fs::read_to_string("/proc/meminfo")?;
+    let mem_available_kib: u64 = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kib| kib.parse().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MemAvailable missing from /proc/meminfo",
+            )
+        })?;
+
+    let loadavg = fs::read_to_string("/proc/loadavg")?;
+    let load1: f64 = loadavg
+        .split_whitespace()
+        .next()
+        .and_then(|l| l.parse().ok())
+        .filter(|l: &f64| l.is_finite())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Malformed /proc/loadavg")
+        })?;
+
+    Ok(format!("OK {builds} {mem_available_kib} {load1:.2}"))
+}
+
+/// Counts running containers that the launcher started for builds.
+pub fn count_running_builds(docker: &str) -> Result<usize, HostLauncherError> {
+    let filter = format!("label={BUILD_CONTAINER_LABEL}");
+    let output = Command::new(docker)
+        .args(["ps", "-q", "--no-trunc", "--filter", &filter])
+        .output()?;
+    if !output.status.success() {
+        return Err(HostLauncherError::MalformedInventory(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+
+    let hex_re = Regex::new(r"^[0-9a-f]{64}$").unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut ids = HashSet::new();
+    for id in text.split_whitespace() {
+        if !hex_re.is_match(id) || !ids.insert(id) {
+            return Err(HostLauncherError::MalformedInventory(format!(
+                "Malformed or duplicate container ID: {id}"
+            )));
+        }
+    }
+    Ok(ids.len())
+}
+
 pub const TRUSTED_BIN_DIRS: &[&str] = &[
     "/usr/local/bin",
     "/usr/bin",
@@ -355,7 +430,7 @@ pub fn container_command(
 
 pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     if args.is_empty() {
-        eprintln!("host-launcher: expected subcommand (prepare, cleanup, build)");
+        eprintln!("host-launcher: expected subcommand (prepare, cleanup, status, build)");
         return Ok(1);
     }
 
@@ -380,6 +455,16 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         lr.join("oxidex-build-draining").exists()
             || lr.join("example-rust-project-build-draining").exists()
     };
+
+    if args[0] == "status" {
+        let line = builder_status(
+            &lock_root,
+            Path::new(BOOTSTRAP_MARKER),
+            &real_docker_binary(),
+        )?;
+        println!("{line}");
+        return Ok(0);
+    }
 
     enum LauncherAction<'a> {
         Prepare {

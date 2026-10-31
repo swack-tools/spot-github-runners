@@ -1,6 +1,8 @@
 name: Deploy Worker
 
 # Deploys the Cloudflare Worker (cloudflare/) only after a push to main has finished with every check green.
+# Run it by hand from main (Actions > Deploy Worker > Run workflow) to redeploy the current main tip; the same
+# gate applies, so a manual run deploys only when every check on that commit passed.
 #
 # Setup (repository settings):
 #   - Variable WORKER_AUTO_DEPLOY = true turns deploys on. Unset or any other value turns them off.
@@ -17,19 +19,22 @@ on:
     workflows: [CI]
     types: [completed]
     branches: [main]
+  workflow_dispatch:
 
 permissions: {}
 
 jobs:
   gate:
     name: Wait for green main
-    # Only a successful CI run from a push to main in this repository can start a deploy.
+    # Only a successful CI run from a push to main in this repository, or a manual run from main, can start a deploy.
     if: >-
-      vars.WORKER_AUTO_DEPLOY == 'true' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      vars.WORKER_AUTO_DEPLOY == 'true' && (
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.event == 'push' &&
+         github.event.workflow_run.head_branch == 'main' &&
+         github.event.workflow_run.head_repository.full_name == github.repository) ||
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -45,7 +50,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.event.workflow_run.head_sha }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
           SELF_PATH: .github/workflows/deploy-worker.yml
         run: |
           set -euo pipefail
@@ -119,13 +124,13 @@ jobs:
       name: worker-production
       url: https://spot.swacktech.com
     env:
-      SHA: ${{ github.event.workflow_run.head_sha }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - name: Check out the green commit
         # actions/checkout v7.0.1, pinned to the commit the tag resolved to on 2026-10-17.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ env.SHA }}
           persist-credentials: false
 
       - name: Set up Node.js

@@ -207,7 +207,13 @@ pub fn clean_target_with_env(
 ) -> Result<CleanOutcome, CleanTargetError> {
     checked_path(Path::new(work_root))?;
 
-    if env.get("OXIDEX_CLEAN_TARGET").map(String::as_str) != Some("1") {
+    // Cleanup runs only when at least one switch is set and every switch that is set says 1,
+    // so EXAMPLE_RUST_PROJECT_CLEAN_TARGET=0 turns it off even though the image sets OXIDEX_CLEAN_TARGET=1.
+    let switches: Vec<&str> = ["OXIDEX_CLEAN_TARGET", "EXAMPLE_RUST_PROJECT_CLEAN_TARGET"]
+        .iter()
+        .filter_map(|name| env.get(*name).map(String::as_str))
+        .collect();
+    if switches.is_empty() || switches.iter().any(|v| *v != "1") {
         return Ok(CleanOutcome::Disabled);
     }
 

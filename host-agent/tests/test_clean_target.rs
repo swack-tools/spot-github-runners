@@ -76,6 +76,36 @@ fn test_only_current_runner_target_removed() {
 }
 
 #[test]
+fn test_example_rust_project_clean_target_switch() {
+    let f = TestFixture::new();
+    let target = f.workspace.join("target");
+
+    // The documented switch turns cleanup off even when the runner image sets OXIDEX_CLEAN_TARGET=1.
+    fs::create_dir_all(&target).unwrap();
+    let mut env = f.env.clone();
+    env.insert("EXAMPLE_RUST_PROJECT_CLEAN_TARGET".into(), "0".into());
+    let outcome = clean_target_with_env(&f.work, &env).unwrap();
+    assert_eq!(outcome, CleanOutcome::Disabled);
+    assert!(target.exists());
+
+    // It also turns cleanup on by itself.
+    let mut env = f.env.clone();
+    env.remove("OXIDEX_CLEAN_TARGET");
+    env.insert("EXAMPLE_RUST_PROJECT_CLEAN_TARGET".into(), "1".into());
+    let outcome = clean_target_with_env(&f.work, &env).unwrap();
+    assert!(matches!(outcome, CleanOutcome::TargetRemoved { .. }));
+    assert!(!target.exists());
+
+    // With neither switch set, cleanup stays off.
+    fs::create_dir_all(&target).unwrap();
+    let mut env = f.env.clone();
+    env.remove("OXIDEX_CLEAN_TARGET");
+    let outcome = clean_target_with_env(&f.work, &env).unwrap();
+    assert_eq!(outcome, CleanOutcome::Disabled);
+    assert!(target.exists());
+}
+
+#[test]
 fn test_opt_in_repo_and_workspace_required() {
     let f = TestFixture::new();
     let target = f.workspace.join("target");
