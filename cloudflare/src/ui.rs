@@ -189,6 +189,7 @@ table{width:100%;border-collapse:collapse;font-size:var(--fs-sm);font-variant-nu
 th,td{padding:9px 11px;text-align:left;border-bottom:1px solid var(--border)}
 th{background:var(--bg-card);color:var(--text-muted);font-weight:600;font-size:var(--fs-xs);text-transform:uppercase;letter-spacing:0.04em;cursor:pointer;user-select:none;white-space:nowrap}
 th:hover{color:var(--text-strong);background:var(--bg-card-hover)}
+th:not(:empty):not(.ns)::after{content:" ↕";opacity:.4}th[aria-sort]:not(.ns)::after{content:" ▲";opacity:1;color:var(--accent-text)}th[aria-sort=descending]:not(.ns)::after{content:" ▼"}th.ns,th:empty{cursor:default}
 tr:hover td{background:var(--bg-card)}
 .mono{font-family:var(--font-mono)}
 .badge{display:inline-flex;align-items:center;gap:var(--space-1);padding:var(--space-0) var(--space-2);border-radius:var(--radius-pill);font-size:var(--fs-xs);font-weight:600;white-space:nowrap;border:1px solid transparent}
@@ -213,6 +214,7 @@ tr:hover td{background:var(--bg-card)}
 .target-dd-item{display:flex;align-items:center;gap:7px;padding:3px 5px;border-radius:5px;cursor:pointer;font-size:var(--fs-sm);user-select:none}
 .target-dd-item:hover{background:var(--bg-card)}
 .status-banner{position:fixed;top:0;left:0;right:0;z-index:10000;padding:10px var(--space-4);background:var(--warning-fill);color:var(--on-warning-fill);font-weight:600;text-align:center;box-shadow:var(--shadow-pop)}
+.hint{font-size:var(--fs-xs);color:var(--text-muted)}.hint-sm{font-size:var(--fs-sm);color:var(--text-muted)}.emph{font-weight:700;color:var(--text-strong)}.sm{font-size:var(--fs-sm)}
 </style>
 </head>
 <body>
@@ -505,19 +507,19 @@ Auto-refresh:
 <table>
 <thead>
 <tr>
-<th onclick="toggleInstanceSort('name')">Instance (X) ↕</th>
-<th onclick="toggleInstanceSort('status')">Status ↕</th>
-<th onclick="toggleInstanceSort('role')">Role ↕</th>
-<th onclick="toggleInstanceSort('display_location')">Location (Y) ↕</th>
-<th onclick="toggleInstanceSort('machine_type')">Specs &amp; Disk (V) ↕</th>
-<th onclick="toggleInstanceSort('benchmark_score')">CPU Bench ↕</th>
-<th onclick="toggleInstanceSort('runners_count')">Workload (M) ↕</th>
-<th onclick="toggleInstanceSort('runtime_hours')">Runtime ↕</th>
-<th onclick="toggleInstanceSort('active_hourly_usd')">Rate ($/hr) ↕</th>
-<th onclick="toggleInstanceSort('total_cost_in_window_usd')">Total Cost Paid ($YY.XX) ↕</th>
-<th onclick="toggleInstanceSort('started_epoch')">Started / Deleted (Local TZ) ↕</th>
-<th onclick="toggleInstanceSort('deletion_trigger')">Lifecycle / Deletion Trigger ↕</th>
-<th>Actions &amp; SSH</th>
+<th onclick="toggleInstanceSort('name')">Instance (X)</th>
+<th onclick="toggleInstanceSort('status')">Status</th>
+<th onclick="toggleInstanceSort('role')">Role</th>
+<th onclick="toggleInstanceSort('display_location')">Location (Y)</th>
+<th onclick="toggleInstanceSort('machine_type')">Specs &amp; Disk (V)</th>
+<th onclick="toggleInstanceSort('benchmark_score')">CPU Bench</th>
+<th onclick="toggleInstanceSort('runners_count')">Workload (M)</th>
+<th onclick="toggleInstanceSort('runtime_hours')">Runtime</th>
+<th onclick="toggleInstanceSort('active_hourly_usd')">Rate ($/hr)</th>
+<th onclick="toggleInstanceSort('total_cost_in_window_usd')">Total Cost Paid ($YY.XX)</th>
+<th onclick="toggleInstanceSort('started_epoch')">Started / Deleted (Local TZ)</th>
+<th onclick="toggleInstanceSort('deletion_trigger')">Lifecycle / Deletion Trigger</th>
+<th class="ns">Actions &amp; SSH</th>
 </tr>
 </thead>
 <tbody id="instances-table-body"></tbody>
@@ -658,7 +660,7 @@ Auto-refresh:
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
 <div>
 <div style="font-weight:700; font-size:var(--fs-lg); color:var(--violet);">🦀 Rust Remote Builders Autoscaling &amp; Idle Scale-Down</div>
-<div style="font-size:var(--fs-sm); color:var(--text-muted);">Configure dedicated Rust builder VM floor/ceiling, queue depth, CPU utilization, OOM triggers, and idle build scale-down.</div>
+<div class="hint-sm">Configure dedicated Rust builder VM floor/ceiling, queue depth, CPU utilization, OOM triggers, and idle build scale-down.</div>
 </div>
 <span class="badge badge-builder">rust_builder</span>
 </div>
@@ -1003,8 +1005,8 @@ Set as Active Template for Role
 <button class="btn btn-sm btn-secondary" id="rp-refresh">Load manifests</button>
 </div>
 </div>
-<p class="mono" id="rp-source" style="font-size:var(--fs-sm);"></p>
-<p id="rp-status" role="status" aria-live="polite" style="font-size:var(--fs-sm);"></p>
+<p class="mono sm" id="rp-source"></p>
+<p id="rp-status" role="status" aria-live="polite" class="sm"></p>
 <div style="display:grid; grid-template-columns:minmax(180px,240px) 1fr; gap:14px;">
 <ul id="rp-list" style="list-style:none; padding:0; margin:0;"></ul>
 <div>
@@ -1020,7 +1022,7 @@ Set as Active Template for Role
 <button class="btn btn-sm btn-secondary" id="rp-preview">Preview rollout impact</button>
 <button class="btn btn-sm btn-emerald" id="rp-save">Save as pull request</button>
 </div>
-<div class="mono" id="rp-effective-sha" style="font-size:var(--fs-sm);"></div>
+<div class="mono sm" id="rp-effective-sha"></div>
 <pre class="mono" id="rp-effective" style="font-size:var(--fs-sm); max-height:220px; overflow:auto;"></pre>
 <div class="table-wrap">
 <table>
@@ -1029,10 +1031,10 @@ Set as Active Template for Role
 </table>
 </div>
 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px;">
-<label style="font-size:var(--fs-sm);"><input type="checkbox" id="rp-confirm" /> I confirm hot-patching the running hosts listed above</label>
+<label class="sm"><input type="checkbox" id="rp-confirm" /> I confirm hot-patching the running hosts listed above</label>
 <button class="btn btn-sm btn-danger" id="rp-hotpatch" disabled>Hot-patch running fleet</button>
 </div>
-<p id="rp-executor" style="font-size:var(--fs-sm);"></p>
+<p id="rp-executor" class="sm"></p>
 </div>
 </div>
 </div>
@@ -1048,8 +1050,8 @@ Set as Active Template for Role
 <button class="btn btn-sm btn-secondary" id="adm-refresh">Reload</button>
 </div>
 </div>
-<p id="adm-status" role="status" aria-live="polite" style="font-size:var(--fs-sm);"></p>
-<p id="adm-exempt" style="font-size:var(--fs-sm);"></p>
+<p id="adm-status" role="status" aria-live="polite" class="sm"></p>
+<p id="adm-exempt" class="sm"></p>
 <h3 style="font-size:var(--fs-lg); margin:12px 0 6px;">Owners</h3>
 <div class="table-wrap">
 <table>
@@ -1126,9 +1128,9 @@ Set as Active Template for Role
 </div>
 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
 <span style="font-size:var(--fs-sm); color:var(--text-muted); font-weight:600;">Density Targets:</span>
-<label style="font-size:var(--fs-sm); color:var(--text-muted);">CPU % <input type="number" id="obs-density-cpu" value="80" min="30" max="95" style="width:58px; padding:3px 6px;" /></label>
-<label style="font-size:var(--fs-sm); color:var(--text-muted);">RAM % <input type="number" id="obs-density-mem" value="80" min="30" max="95" style="width:58px; padding:3px 6px;" /></label>
-<label style="font-size:var(--fs-sm); color:var(--text-muted);">Max/VM <input type="number" id="obs-density-max" value="8" min="1" max="32" style="width:54px; padding:3px 6px;" /></label>
+<label class="hint-sm">CPU % <input type="number" id="obs-density-cpu" value="80" min="30" max="95" style="width:58px; padding:3px 6px;" /></label>
+<label class="hint-sm">RAM % <input type="number" id="obs-density-mem" value="80" min="30" max="95" style="width:58px; padding:3px 6px;" /></label>
+<label class="hint-sm">Max/VM <input type="number" id="obs-density-max" value="8" min="1" max="32" style="width:54px; padding:3px 6px;" /></label>
 <button class="btn btn-sm btn-emerald" onclick="saveDynamicDensityPolicy()">Save Density Policy</button>
 </div>
 </div>
@@ -1137,28 +1139,28 @@ Set as Active Template for Role
 <div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:10px; padding:12px;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
 <strong style="font-size:var(--fs-sm); color:var(--info);">📊 CPU Utilization vs. Dynamic Density Target (%)</strong>
-<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">Host CPU · Container CPU · Target Ceiling</span>
+<span class="mono hint">Host CPU · Container CPU · Target Ceiling</span>
 </div>
 <svg id="obs-chart-cpu" viewBox="0 0 560 155" style="width:100%; height:155px; display:block;"></svg>
 </div>
 <div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:10px; padding:12px;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
 <strong style="font-size:var(--fs-sm); color:var(--violet);">🧠 Working-Set Memory vs. Cgroup Peak &amp; Free RAM (GiB)</strong>
-<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">Working Set · Peak Cgroup · Available GiB</span>
+<span class="mono hint">Working Set · Peak Cgroup · Available GiB</span>
 </div>
 <svg id="obs-chart-mem" viewBox="0 0 560 155" style="width:100%; height:155px; display:block;"></svg>
 </div>
 <div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:10px; padding:12px;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
 <strong style="font-size:var(--fs-sm); color:var(--success);">🚀 Dynamic GitHub Runner Density Slots &amp; Active Workflows</strong>
-<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">Active Slots · Recommended Dense Slots · Active Jobs</span>
+<span class="mono hint">Active Slots · Recommended Dense Slots · Active Jobs</span>
 </div>
 <svg id="obs-chart-density" viewBox="0 0 560 155" style="width:100%; height:155px; display:block;"></svg>
 </div>
 <div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:10px; padding:12px;">
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
 <strong style="font-size:var(--fs-sm); color:var(--chart-pink);">💾 Disk Throughput (MiB/s) &amp; Storage Utilization (%)</strong>
-<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">Read MiB/s · Write MiB/s · Used %</span>
+<span class="mono hint">Read MiB/s · Write MiB/s · Used %</span>
 </div>
 <svg id="obs-chart-disk" viewBox="0 0 560 155" style="width:100%; height:155px; display:block;"></svg>
 </div>
@@ -1185,7 +1187,7 @@ Set as Active Template for Role
 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px;">
 <div>
 <div style="font-weight:700; font-size:var(--fs-md); color:var(--warning);">🔍 Cloud Ops Agent Log Explorer &amp; GitHub Actions Workflow Correlation</div>
-<div style="font-size:var(--fs-sm); color:var(--text-muted);">Search across <code class="mono">google-cloud-ops-agent</code>, container stdout/stderr, <code class="mono">_diag/Worker_*.log</code>, and <code class="mono">systemd_journald</code>. Click any correlated workflow badge to open the exact GitHub Actions job run at that timestamp.</div>
+<div class="hint-sm">Search across <code class="mono">google-cloud-ops-agent</code>, container stdout/stderr, <code class="mono">_diag/Worker_*.log</code>, and <code class="mono">systemd_journald</code>. Click any correlated workflow badge to open the exact GitHub Actions job run at that timestamp.</div>
 </div>
 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
 <input type="text" id="obs-log-query" placeholder="Search logs (e.g. cargo, test, runner, job, error)..." style="width:280px;" oninput="debounceObsLogSearch()" onkeydown="if(event.key==='Enter'){event.preventDefault();loadObservabilityView();}" />
@@ -1794,7 +1796,7 @@ return `
 <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px; margin-bottom:8px;">
 <div>
 <div style="font-size:var(--fs-lg); font-weight:700; color:var(--text-strong);" class="mono">${esc(inst.name)}</div>
-<div style="font-size:var(--fs-sm); color:var(--text-muted);">Zone: <span class="mono">${esc(inst.zone)}</span> · Instance Type: <strong class="mono">${esc(inst.machine_type)}</strong> (${inst.vcpu} vCPU / ${inst.ram_gib} GiB RAM)</div>
+<div class="hint-sm">Zone: <span class="mono">${esc(inst.zone)}</span> · Instance Type: <strong class="mono">${esc(inst.machine_type)}</strong> (${inst.vcpu} vCPU / ${inst.ram_gib} GiB RAM)</div>
 </div>
 <span class="badge ${inst.role === 'cicd_runner' ? 'badge-runner' : 'badge-builder'}">${inst.role === 'cicd_runner' ? 'CI/CD Runner Host' : 'Rust Builder'}</span>
 </div>
@@ -1803,15 +1805,15 @@ return `
 </div>
 <div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-bottom:8px;">
 <div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:7px; padding:8px;">
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">SPOT PRICE / HOUR</div>
+<div class="hint">SPOT PRICE / HOUR</div>
 <div class="mono" style="font-size:var(--fs-xl); font-weight:700; color:var(--info);">${hasPricing ? `$${hr.toFixed(4)}/hr` : (hr > 0 ? `$${hr.toFixed(4)}/hr` : "Unknown")}</div>
 </div>
 <div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:7px; padding:8px;">
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">SPOT PRICE / DAY</div>
+<div class="hint">SPOT PRICE / DAY</div>
 <div class="mono" style="font-size:var(--fs-xl); font-weight:700; color:var(--success);">${hasPricing ? `$${day.toFixed(2)}/day` : (day > 0 ? `$${day.toFixed(2)}/day` : "Unknown")}</div>
 </div>
 <div style="background:var(--bg-sunken); border:1px solid var(--border); border-radius:7px; padding:8px;">
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">SPOT PRICE / MONTH</div>
+<div class="hint">SPOT PRICE / MONTH</div>
 <div class="mono" style="font-size:var(--fs-xl); font-weight:700; color:var(--violet);">${hasPricing ? `$${mo.toFixed(2)}/mo` : (mo > 0 ? `$${mo.toFixed(2)}/mo` : "Unknown")}</div>
 </div>
 </div>
@@ -1840,7 +1842,7 @@ panel.innerHTML = `
 </div>
 </div>
 <div style="display:flex; flex-direction:column; gap:8px; background:var(--bg-card); border:1px solid var(--border); padding:10px 12px; border-radius:9px; margin-bottom:12px;">
-<div style="font-size:var(--fs-sm); color:var(--text-muted);">Plan only: these controls check a scale change against budgets and caps and report what it would launch or retire. The dashboard never creates or deletes VMs; the autoscaler and the provisioning tools do.</div>
+<div class="hint-sm">Plan only: these controls check a scale change against budgets and caps and report what it would launch or retire. The dashboard never creates or deletes VMs; the autoscaler and the provisioning tools do.</div>
 <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
 <div style="font-size:var(--fs-sm); font-weight:600;">CI/CD Runner Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
 <div style="display:flex; align-items:center; gap:6px;">
@@ -2007,7 +2009,7 @@ bar.innerHTML = rows.map(r => {
 const active = SELECTED_TARGETS && SELECTED_TARGETS.size === 1 && SELECTED_TARGETS.has(r.target);
 const border = active ? "var(--info)" : "var(--border)";
 return `<div data-target="${esc(r.target)}" onclick="selectSingleTarget(this.dataset.target)" style="cursor:pointer; background:var(--bg-card); border:1px solid ${border}; border-radius:8px; padding:7px 11px; font-size:var(--fs-sm); display:flex; flex-direction:column; gap:2px;">
-<div style="font-weight:700; color:var(--text-strong);" class="mono">${esc(r.target)} <span class="badge badge-running" style="margin-left:4px;">${r.total_vms || 0} GCP Spot VM${(r.total_vms || 0) === 1 ? "" : "s"} · ${r.total_runner_slots || 0} Runner${(r.total_runner_slots || 0) === 1 ? "" : "s"}</span></div>
+<div class="mono emph">${esc(r.target)} <span class="badge badge-running" style="margin-left:4px;">${r.total_vms || 0} GCP Spot VM${(r.total_vms || 0) === 1 ? "" : "s"} · ${r.total_runner_slots || 0} Runner${(r.total_runner_slots || 0) === 1 ? "" : "s"}</span></div>
 <div style="color:var(--text-muted);">x86_64: <strong>${r.x86_64_vms || 0} VM${(r.x86_64_vms || 0) === 1 ? "" : "s"}</strong> (${r.x86_64_runner_slots || 0} slots) · ARM64: <strong>${r.arm64_vms || 0} VM${(r.arm64_vms || 0) === 1 ? "" : "s"}</strong> (${r.arm64_runner_slots || 0} slots) · ${r.total_vcpus || 0} vCPU / ${r.total_ram_gib || 0} GiB · $${Number(r.active_hourly_usd || 0).toFixed(2)}/hr</div>
 </div>`;
 }).join("");
@@ -2126,14 +2128,15 @@ const inventoryNote = fi.source === "gce"
 ? `Source: live Compute Engine inventory${fi.last_success_at ? ", last listed " + esc(formatLocalTime(fi.last_success_at)) : ", not listed yet"}${(fi.stale_reason || fi.last_error) ? ' · <span style="color:var(--danger);">' + esc(fi.stale_reason || fi.last_error) + "</span>" : ""}`
 : `Source: live Compute Engine inventory is not configured on this dashboard (set DASHBOARD_FLEET_INVENTORY=gce); no instances are shown`;
 summary.innerHTML = `${inventoryNote}<br>Showing <strong>${visibleInstances.length}</strong> instance(s) in the last <strong>${iv.window_hours} hours</strong> (${iv.running_count} running, ${iv.deleted_count} stopped or deleted) · Total Window Spend: <strong class="mono" style="color:var(--success);">$${iv.total_window_spend_usd.toFixed(2)}</strong> · Sorted by <code class="mono">${esc(iv.sort_by)} (${esc(iv.sort_dir.toUpperCase())})</code> · Timezone: <code class="mono">${esc(BROWSER_TZ)}</code>`;
+document.querySelectorAll("th[onclick]").forEach(h => h.getAttribute("onclick").includes(`'${iv.sort_by}'`) ? h.setAttribute("aria-sort", iv.sort_dir === "asc" ? "ascending" : "descending") : h.removeAttribute("aria-sort"));
 const tbody = document.getElementById("instances-table-body");
 tbody.innerHTML = visibleInstances.map(inst => {
 const isRunning = inst.status === "RUNNING";
 return `
 <tr>
 <td>
-<div class="mono" style="font-weight:700; color:var(--text-strong);">${esc(inst.name)}</div>
-<div class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">ID: ${esc(inst.instance_id || inst.id)} · ${esc(inst.target || APP_STATE.org || "swack-tools")}</div>
+<div class="mono emph">${esc(inst.name)}</div>
+<div class="mono hint">ID: ${esc(inst.instance_id || inst.id)} · ${esc(inst.target || APP_STATE.org || "swack-tools")}</div>
 </td>
 <td>
 <span class="badge ${isRunning ? 'badge-running' : 'badge-deleted'}">${esc(inst.status)}</span>
@@ -2143,29 +2146,29 @@ return `
 </td>
 <td>
 <div style="font-weight:600;">${esc(inst.display_location)}</div>
-<div class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(inst.zone)}</div>
+<div class="mono hint">${esc(inst.zone)}</div>
 </td>
 <td>
 <div class="mono" style="font-weight:600;">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)} (${inst.vcpu} vCPU / ${inst.ram_gib} GiB)</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(inst.cpu_platform || 'Unknown')} · ${inst.data_disk_gb != null ? `${inst.data_disk_gb}GB ${esc(inst.data_disk_type || '')} (${esc(inst.disk_category || '')})` : 'disk not reported'}</div>
+<div class="hint">${esc(inst.cpu_platform || 'Unknown')} · ${inst.data_disk_gb != null ? `${inst.data_disk_gb}GB ${esc(inst.data_disk_type || '')} (${esc(inst.disk_category || '')})` : 'disk not reported'}</div>
 </td>
 <td class="mono" style="font-weight:700; color:var(--info);">${inst.benchmark_score != null ? inst.benchmark_score : '—'}</td>
 <td>
 <div style="font-weight:600;">${inst.role === 'cicd_runner' ? inst.runners_count + ' GitHub Runners' : '1 Rust Builder'}</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">${inst.runner_limits_known === false ? "per-runner limits not recorded" : `${inst.runner_vcpu} vCPU / ${inst.runner_ram_gib} GiB each`}</div>
+<div class="hint">${inst.runner_limits_known === false ? "per-runner limits not recorded" : `${inst.runner_vcpu} vCPU / ${inst.runner_ram_gib} GiB each`}</div>
 </td>
 <td class="mono">
 <div>${inst.runtime_hours}h total</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">${inst.hours_in_window}h in window</div>
+<div class="hint">${inst.hours_in_window}h in window</div>
 </td>
 <td class="mono">
 <div>$${inst.active_hourly_usd.toFixed(4)}/hr</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">$${inst.active_daily_usd.toFixed(2)}/day</div>
+<div class="hint">$${inst.active_daily_usd.toFixed(2)}/day</div>
 </td>
 <td class="mono" style="font-size:var(--fs-lg); font-weight:700; color:var(--success);">
 $${inst.total_cost_in_window_usd.toFixed(2)}
 </td>
-<td style="font-size:var(--fs-sm);">
+<td class="sm">
 <div><strong>Start:</strong> ${esc(formatLocalTime(inst.started_at))}</div>
 <div><strong>End:</strong> ${inst.deleted_at ? esc(formatLocalTime(inst.deleted_at)) : inst.status === "DETACHED" ? '<span style="color:var(--warning);">Present (storage still billed)</span>' : inst.stopped_at ? 'Stopped ' + esc(formatLocalTime(inst.stopped_at)) : isRunning ? '<span style="color:var(--success);">Present (Running)</span>' : esc(inst.status)}</div>
 </td>
@@ -2363,10 +2366,10 @@ return inferArchClient(r.machine_type, r.arch) === GLOBAL_ARCH_FILTER;
 });
 tbody.innerHTML = archFilteredRows.slice(0, 60).map(r => `
 <tr>
-<td class="mono" style="font-weight:700; color:var(--text-strong);">${esc(r.machine_type)} ${archBadgeHtml(r.machine_type, r.arch)}</td>
+<td class="mono emph">${esc(r.machine_type)} ${archBadgeHtml(r.machine_type, r.arch)}</td>
 <td>
 <div style="font-weight:600;">${esc(r.display_location)}</div>
-<div class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(r.zone)} (${r.latency_ms} ms)</div>
+<div class="mono hint">${esc(r.zone)} (${r.latency_ms} ms)</div>
 </td>
 <td>${esc(r.cpu_platform)}</td>
 <td class="mono" style="font-weight:700; color:var(--info);">${r.benchmark_score}</td>
@@ -2418,7 +2421,7 @@ document.getElementById("scaling-decision-box").innerHTML = `
 </div>
 ${ev.budget_capped ? `<div style="color:var(--warning); font-size:var(--fs-sm); margin-bottom:6px;">⚠️ ${esc(ev.budget_cap_note)}</div>` : ""}
 <div style="display:flex; flex-direction:column; gap:5px;">
-${reasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)} ${r.deep_link ? `<a href="${esc(safeUrl(r.deep_link))}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || `<div style="font-size:var(--fs-sm); color:var(--text-muted);">${esc(ev.hold_reason || "No scale change required.")}</div>`}
+${reasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)} ${r.deep_link ? `<a href="${esc(safeUrl(r.deep_link))}" target="_blank" rel="noopener" class="mono">[Open Exact Build Step &amp; Line ↗]</a>` : ''}</div>`).join("") || `<div class="hint-sm">${esc(ev.hold_reason || "No scale change required.")}</div>`}
 </div>
 `;
 const bsc = APP_STATE.scaling.rust_builder || {};
@@ -2448,7 +2451,7 @@ document.getElementById("builder-scaling-decision-box").innerHTML = `
 </div>
 ${bev.budget_capped ? `<div style="color:var(--warning); font-size:var(--fs-sm); margin-bottom:6px;">⚠️ ${esc(bev.budget_cap_note)}</div>` : ""}
 <div style="display:flex; flex-direction:column; gap:5px;">
-${breasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)}</div>`).join("") || `<div style="font-size:var(--fs-sm); color:var(--text-muted);">${esc(bev.summary || "No builder scale change required.")}</div>`}
+${breasons.map(r => `<div style="font-size:var(--fs-sm); color:var(--text-main);">• <strong>[${esc(r.trigger)}]</strong> ${esc(r.summary)}</div>`).join("") || `<div class="hint-sm">${esc(bev.summary || "No builder scale change required.")}</div>`}
 </div>
 `;
 }
@@ -2463,7 +2466,7 @@ const btnCls = isOom ? "btn-danger" : "btn-secondary";
 return `
 <div style="background:var(--bg-card); border:1px solid ${borderCol}; border-left:4px solid ${leftCol}; border-radius:8px; padding:11px 13px;">
 <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:4px;">
-<div style="font-weight:700; color:var(--text-strong);">${esc(run.repository)} — ${esc(run.workflow_name || 'CI Workflow')} (<span class="mono">${esc(run.job_name || 'job')}</span>)</div>
+<div class="emph">${esc(run.repository)} — ${esc(run.workflow_name || 'CI Workflow')} (<span class="mono">${esc(run.job_name || 'job')}</span>)</div>
 <span class="badge ${badgeCls}">${esc(badgeLabel)}</span>
 </div>
 <div class="mono" style="font-size:var(--fs-sm); color:${textCol}; margin-bottom:6px;">${esc(run.error_excerpt)}</div>
@@ -2480,7 +2483,7 @@ document.getElementById("journal-oom-events-list").innerHTML = st.journal_oom_ev
 <div style="background:var(--bg-card); border:1px solid var(--warning-line); border-left:4px solid var(--warning); border-radius:8px; padding:10px 12px;">
 <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
 <strong>Host: <span class="mono">${esc(evt.instance_name)}</span> (${esc(evt.zone)}) — Process <span class="mono">${esc(evt.process)}</span> (PID ${esc(evt.pid)})</strong>
-<span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(formatLocalTime(evt.observed_at))}</span>
+<span class="mono hint">${esc(formatLocalTime(evt.observed_at))}</span>
 </div>
 <div class="mono" style="font-size:var(--fs-sm); color:var(--warning); background:var(--bg-sunken); padding:6px 8px; border-radius:6px;">${esc(evt.journal_line)}</div>
 </div>
@@ -2645,8 +2648,8 @@ srcSel.innerHTML = APP_STATE.instances_view.instances.map(i =>
 document.getElementById("vm-templates-list").innerHTML = APP_STATE.vm_templates.map(tpl => `
 <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:10px 12px; display:flex; justify-content:space-between; align-items:center; gap:8px;">
 <div>
-<div style="font-weight:700; color:var(--text-strong);">${esc(tpl.name)} ${archBadgeHtml(tpl.machine_type, tpl.arch)} <span class="mono" style="font-size:var(--fs-xs); color:var(--text-muted);">(${esc(tpl.id)})</span></div>
-<div style="font-size:var(--fs-sm); color:var(--text-muted);">Shape: <code class="mono">${esc(tpl.machine_type)}</code> (${tpl.vcpu} vCPU / ${tpl.ram_gib} GiB · ${esc(tpl.cpu_platform)} · Bench ${tpl.benchmark_score}) · Disk: <code class="mono">${tpl.data_disk_gb}GB ${esc(tpl.data_disk_type)}</code> (${esc(tpl.disk_category)}) · ${tpl.source_instance ? `Source: <code class="mono">${esc(tpl.source_instance)}</code>` : 'Preset shape'}</div>
+<div class="emph">${esc(tpl.name)} ${archBadgeHtml(tpl.machine_type, tpl.arch)} <span class="mono hint">(${esc(tpl.id)})</span></div>
+<div class="hint-sm">Shape: <code class="mono">${esc(tpl.machine_type)}</code> (${tpl.vcpu} vCPU / ${tpl.ram_gib} GiB · ${esc(tpl.cpu_platform)} · Bench ${tpl.benchmark_score}) · Disk: <code class="mono">${tpl.data_disk_gb}GB ${esc(tpl.data_disk_type)}</code> (${esc(tpl.disk_category)}) · ${tpl.source_instance ? `Source: <code class="mono">${esc(tpl.source_instance)}</code>` : 'Preset shape'}</div>
 </div>
 <span class="badge ${tpl.role === 'cicd_runner' ? 'badge-runner' : 'badge-builder'}">${tpl.role === 'cicd_runner' ? 'Runner Template' : 'Builder Template'}</span>
 </div>
@@ -2703,7 +2706,7 @@ stagesBox.innerHTML = (parsed.stages || []).map(st => `
 <span class="badge badge-runner">${esc(st.summary)}</span>
 </div>
 <div class="stage-items">
-${(st.items || []).map(item => `<span class="stage-chip">${esc(item)}</span>`).join("") || '<span style="font-size:var(--fs-sm); color:var(--text-muted);">No items in this stage</span>'}
+${(st.items || []).map(item => `<span class="stage-chip">${esc(item)}</span>`).join("") || '<span class="hint-sm">No items in this stage</span>'}
 </div>
 </div>
 `).join("");
@@ -2822,19 +2825,19 @@ return `
 <span>${r.enabled ? "Enabled" : "Deselected"}</span>
 </label>
 </td>
-<td class="mono" style="font-weight:700; color:var(--text-strong);">
+<td class="mono emph">
 ${esc(r.region)}
 <div style="font-size:var(--fs-xs); color:var(--text-muted); font-weight:400;">${esc(r.zones.join(", "))}</div>
 </td>
 <td>
 <div style="font-weight:600;">${esc(r.display_name)}</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(r.continent)}</div>
+<div class="hint">${esc(r.continent)}</div>
 </td>
 <td class="mono" style="font-weight:700; color:${r.latency_ms < 60 ? 'var(--success)' : (r.latency_ms < 140 ? 'var(--info)' : 'var(--warning)')};">
 ${r.latency_ms} ms
 </td>
-<td class="mono" style="font-size:var(--fs-sm);">${esc(r.families.join(", "))}</td>
-<td style="font-size:var(--fs-sm);">${esc(r.cpu_platforms.join(", "))}</td>
+<td class="mono sm">${esc(r.families.join(", "))}</td>
+<td class="sm">${esc(r.cpu_platforms.join(", "))}</td>
 <td class="mono" style="font-size:var(--fs-xs);">${esc(r.disk_types.join(", "))}</td>
 <td class="mono">${runningVms.length} running</td>
 </tr>
@@ -2957,47 +2960,47 @@ const geoAsnIsp = (geo.asn || geo.isp)
 return `
 <tr>
 <td>
-<div class="mono" style="font-weight:700; color:var(--text-strong);">${esc(b.build_id)} <span style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(b.status)}</span></div>
-<div style="font-size:var(--fs-sm); color:var(--text-muted);">${esc(b.project_name || "project not reported")}${b.profile ? ` (<code class="mono">--${esc(b.profile)}</code>)` : ""} · <code class="mono">${esc(b.commit_sha ? b.commit_sha.slice(0, 8) : "commit not reported")}</code></div>
+<div class="mono emph">${esc(b.build_id)} <span class="hint">${esc(b.status)}</span></div>
+<div class="hint-sm">${esc(b.project_name || "project not reported")}${b.profile ? ` (<code class="mono">--${esc(b.profile)}</code>)` : ""} · <code class="mono">${esc(b.commit_sha ? b.commit_sha.slice(0, 8) : "commit not reported")}</code></div>
 </td>
-<td style="font-size:var(--fs-sm);">
+<td class="sm" data-s="${tsMs(b.requested_at)}">
 <div><strong>Req:</strong> ${esc(formatLocalTime(b.requested_at))}</div>
 <div><strong>Fin:</strong> ${esc(formatLocalTime(b.finished_at))}</div>
 <div><strong>Del:</strong> ${esc(formatLocalTime(b.delivered_at))}</div>
 </td>
 <td class="mono">
-<div style="font-weight:700; color:var(--text-strong);">${reportedOr(b.total_duration_seconds, v => `${v}s total`, "duration not reported")}</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">${reportedOr(b.delivery_duration_seconds, v => `${b.compile_duration_seconds}s compile + ${v}s delivery`, reportedOr(b.compile_duration_seconds, c => (["QUEUED", "PENDING", "WAITING", "RUNNING", "COMPILING", "ACTIVE", "IN_PROGRESS", "BUILDING"].includes(String(b.status).toUpperCase()) ? `${c}s compile so far` : `${c}s compile · not delivered`), "compile/delivery split not reported"))}</div>
+<div class="emph">${reportedOr(b.total_duration_seconds, v => `${v}s total`, "duration not reported")}</div>
+<div class="hint">${reportedOr(b.delivery_duration_seconds, v => `${b.compile_duration_seconds}s compile + ${v}s delivery`, reportedOr(b.compile_duration_seconds, c => (["QUEUED", "PENDING", "WAITING", "RUNNING", "COMPILING", "ACTIVE", "IN_PROGRESS", "BUILDING"].includes(String(b.status).toUpperCase()) ? `${c}s compile so far` : `${c}s compile · not delivered`), "compile/delivery split not reported"))}</div>
 </td>
 <td class="mono">
 <div style="font-weight:700; color:var(--success);">${reportedOr(b.cache_hit_rate_percent, v => `${b.cache_hits} / ${b.total_crates} (${v}%)`, `${reportedOr(b.cache_hits, h => `${h} hits`, "cache not reported")}`)}</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">${reportedOr(b.cache_misses, v => `${v} misses`)}</div>
+<div class="hint">${reportedOr(b.cache_misses, v => `${v} misses`)}</div>
 </td>
 <td>
 <div class="mono" style="font-weight:700; color:var(--violet);">${esc(b.instance_name || "host not reported")}</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(b.machine_type || "shape not reported")} (${esc(b.zone || "zone not reported")}) · Bench: <strong class="mono">${esc(reportedOr(b.instance_benchmark_score, v => v, "—"))}</strong></div>
+<div class="hint">${esc(b.machine_type || "shape not reported")} (${esc(b.zone || "zone not reported")}) · Bench: <strong class="mono">${esc(reportedOr(b.instance_benchmark_score, v => v, "—"))}</strong></div>
 </td>
 <td class="mono">
-<div style="font-weight:700; color:var(--text-strong);">${esc(b.origin_ip || "not reported")}</div>
+<div class="emph">${esc(b.origin_ip || "not reported")}</div>
 <div style="font-size:var(--fs-xs); color:var(--accent-text);">${esc(b.origin_hostname || "")}</div>
 </td>
 <td>
 <div style="font-weight:600;">${geoCityCountry}</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">${geoAsnIsp}</div>
+<div class="hint">${geoAsnIsp}</div>
 </td>
 <td>
 <span class="badge ${badgeClass}">${esc(ns.badge_text || "N/A")}</span>
 </td>
 <td class="mono">
 <div style="font-weight:700; color:var(--warning);">${reportedOr(b.peak_ram_gib, v => `${v.toFixed(2)} GiB active`)}</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">OOM floor (cap ${b.container_ram_cap_gib || "—"} GiB)</div>
+<div class="hint">OOM floor (cap ${b.container_ram_cap_gib || "—"} GiB)</div>
 </td>
 <td class="mono" style="font-weight:700;">
 ${reportedOr(b.cpu_time_seconds, v => `${v.toLocaleString()} CPU-s`)}
 </td>
 <td class="mono">
 <div style="font-size:var(--fs-md); font-weight:700; color:var(--info);">${reportedOr(b.cpu_points, v => `${v.toLocaleString()} pts`)}</div>
-<div style="font-size:var(--fs-xs); color:var(--text-muted);">${esc(b.cpu_points_formula || "")}</div>
+<div class="hint">${esc(b.cpu_points_formula || "")}</div>
 </td>
 </tr>
 `;
@@ -3282,7 +3285,7 @@ clear(admins);
 (data.admins || []).forEach(a => {
 const tr = node("tr");
 const chk = a.override_target_check ? "Overridden (exempt)" : "Verified all targets";
-[a.login, a.uid, chk, a.added_by || "", a.added_at ? formatLocalTime(a.added_at) : ""].forEach(v => tr.appendChild(node("td", v)));
+[a.login, a.uid, chk, a.added_by || "", a.added_at ? formatLocalTime(a.added_at) : ""].forEach((v, i) => { const td = node("td", v); if (i === 4) td.dataset.s = tsMs(a.added_at); tr.appendChild(td); });
 const td = node("td");
 const b = node("button", "Remove");
 b.type = "button";
@@ -3566,23 +3569,23 @@ const roleBadge = inst.role === "rust_builder" ? '<span class="badge badge-build
 const wfs = (inst.active_workflows || []).map(w => `<a href="${esc(safeUrl(w.github_workflow_url))}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="margin:2px 2px 0 0;text-decoration:none;" title="Open GitHub Actions Run #${esc(w.run_number)} (${esc(w.job_name)})">🔗 ${esc(w.repository)} #${esc(w.run_number)} · ${esc(w.job_name)} ↗</a>`).join(" ") || '<span style="color:var(--text-muted);font-size:var(--fs-sm);">Idle / Listening</span>';
 if (inst.ops_agent_status === "no_telemetry") {
 return `<tr>
-<td class="mono"><strong>${esc(inst.instance_name)}</strong><div style="font-size:var(--fs-xs);color:var(--text-muted);">${esc(inst.zone)}</div></td>
+<td class="mono"><strong>${esc(inst.instance_name)}</strong><div class="hint">${esc(inst.zone)}</div></td>
 <td>${roleBadge}<div class="mono" style="font-size:var(--fs-xs);margin-top:3px;">${esc(inst.repository || inst.organization)}</div></td>
-<td class="mono">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)}<div style="font-size:var(--fs-xs);color:var(--text-muted);">${inst.vcpu} vCPU · ${inst.ram_gib} GiB</div></td>
+<td class="mono">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)}<div class="hint">${inst.vcpu} vCPU · ${inst.ram_gib} GiB</div></td>
 <td class="mono" colspan="4" style="color:var(--text-muted);font-size:var(--fs-sm);">No host-agent telemetry received from this instance yet.</td>
-<td style="font-size:var(--fs-sm);"><span class="badge badge-warn">no telemetry</span></td>
+<td class="sm"><span class="badge badge-warn">no telemetry</span></td>
 </tr>`;
 }
 const extraBadge = inst.extra_runners_unlocked > 0 ? `<span class="badge badge-running">+${inst.extra_runners_unlocked} dense slots</span>` : '<span class="badge badge-direct">optimal</span>';
 return `<tr>
-<td class="mono"><strong>${esc(inst.instance_name)}</strong><div style="font-size:var(--fs-xs);color:var(--text-muted);">${esc(inst.zone)}</div></td>
+<td class="mono"><strong>${esc(inst.instance_name)}</strong><div class="hint">${esc(inst.zone)}</div></td>
 <td>${roleBadge}<div class="mono" style="font-size:var(--fs-xs);margin-top:3px;">${esc(inst.repository || inst.organization)}</div></td>
-<td class="mono">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)}<div style="font-size:var(--fs-xs);color:var(--text-muted);">${inst.vcpu} vCPU · ${inst.ram_gib} GiB</div></td>
-<td class="mono"><strong>${inst.cpu_utilization_pct.toFixed(1)}%</strong><div style="font-size:var(--fs-xs);color:var(--text-muted);">load 1m: ${inst.loadavg_1m.toFixed(2)}</div></td>
+<td class="mono">${esc(inst.machine_type)} ${archBadgeHtml(inst.machine_type, inst.arch)}<div class="hint">${inst.vcpu} vCPU · ${inst.ram_gib} GiB</div></td>
+<td class="mono"><strong>${inst.cpu_utilization_pct.toFixed(1)}%</strong><div class="hint">load 1m: ${inst.loadavg_1m.toFixed(2)}</div></td>
 <td class="mono"><strong>${inst.mem_used_gib.toFixed(2)} / ${inst.ram_gib} GiB (${inst.mem_utilization_pct.toFixed(1)}%)</strong><div style="font-size:var(--fs-xs);color:var(--violet);">peak working set: ${inst.observed_peak_working_set_gib.toFixed(2)} GiB/slot</div></td>
 <td class="mono"><strong>${inst.baseline_runners} → ${inst.current_runners} → ${inst.recommended_runners}</strong><div>${extraBadge}</div></td>
 <td>${wfs}</td>
-<td style="font-size:var(--fs-sm);"><span class="badge badge-running">${esc(inst.ops_agent_status)}</span><div style="color:var(--text-muted);margin-top:3px;">${esc(inst.density_reason)}</div></td>
+<td class="sm"><span class="badge badge-running">${esc(inst.ops_agent_status)}</span><div style="color:var(--text-muted);margin-top:3px;">${esc(inst.density_reason)}</div></td>
 </tr>`;
 }).join("") || '<tr><td colspan="8" style="color:var(--text-muted);font-size:var(--fs-sm);text-align:center;padding:14px;">No running instances. The fleet is scaled to zero or the control plane has not listed any VMs yet.</td></tr>';
 }
@@ -3596,9 +3599,9 @@ const wfHtml = l.github_workflow_url
 ? `<a href="${esc(safeUrl(l.github_workflow_url))}" target="_blank" rel="noopener noreferrer" class="badge badge-running" style="text-decoration:none;" title="Jump directly to GitHub Actions workflow job at ${esc(l.timestamp)}">🔗 ${esc(l.repository)} · ${esc(l.workflow_name)} #${esc(l.run_number || l.run_id)} (${esc(l.job_name)}) ↗</a>`
 : `<span class="mono" style="color:var(--text-muted);font-size:var(--fs-xs);">${esc(l.repository || l.organization || "host-daemon")}</span>`;
 return `<tr>
-<td class="mono" style="white-space:nowrap;font-size:var(--fs-sm);">${esc(formatLocalTime(l.timestamp || l.epoch))}</td>
+<td class="mono" style="white-space:nowrap;font-size:var(--fs-sm);" data-s="${tsMs(l.timestamp || l.epoch)}">${esc(formatLocalTime(l.timestamp || l.epoch))}</td>
 <td><span class="badge ${sevClass}">${esc(l.severity)}</span><div class="mono" style="font-size:var(--fs-xs);color:var(--text-muted);margin-top:2px;">${esc(l.source)}</div></td>
-<td class="mono" style="font-size:var(--fs-sm);"><strong>${esc(l.instance_name)}</strong><div style="font-size:var(--fs-xs);color:var(--text-muted);">${esc(l.runner_name)} · ${esc(l.container_id)}</div></td>
+<td class="mono sm"><strong>${esc(l.instance_name)}</strong><div class="hint">${esc(l.runner_name)} · ${esc(l.container_id)}</div></td>
 <td>${wfHtml}</td>
 <td class="mono" style="font-size:var(--fs-sm);color:var(--text-main);word-break:break-word;">${esc(l.message)}</td>
 </tr>`;
@@ -3627,6 +3630,32 @@ await loadObservabilityView();
 showToast("Failed to update Dynamic Runner Density policy");
 }
 }
+const TSORT = {};
+const tsMs = v => (typeof v === "number" ? v * 1000 : Date.parse(v)) || "";
+function sortKey(r, i) { for (const c of r.cells) { if (i < c.colSpan) return c.dataset.s ?? c.textContent.trim(); i -= c.colSpan; } return ""; }
+function sortNum(v) { const m = /^[$~+]?(-?[\d,]*\.?\d+)/.exec(v); return m ? parseFloat(m[1].replace(/,/g, "")) : NaN; }
+function sortTable(b) {
+const s = TSORT[b.id];
+if (!s || b.rows.length < 2) return;
+const rows = [...b.rows].map(r => { const k = sortKey(r, s.i); return [r, k, sortNum(k)]; });
+rows.sort(([, a, p], [, c, q]) => p === p ? (q === q ? (p - q) * s.d : -1) : q === q ? 1 : a.localeCompare(c, undefined, { numeric: true }) * s.d);
+b.append(...rows.map(x => x[0]));
+}
+function sortByHeader(h) {
+if (h.onclick) return h.click();
+const b = h.closest("table").tBodies[0];
+if (!b || !b.id || h.matches(":empty,.ns")) return;
+const i = h.cellIndex, s = TSORT[b.id], d = s && s.i === i ? -s.d : 1;
+TSORT[b.id] = { i, d };
+for (const c of h.parentNode.cells) c.removeAttribute("aria-sort");
+h.setAttribute("aria-sort", d > 0 ? "ascending" : "descending");
+sortTable(b);
+}
+document.addEventListener("click", e => { const h = e.target.closest && e.target.closest("th"); if (h && !h.onclick) sortByHeader(h); });
+document.addEventListener("keydown", e => { const h = e.target.closest && e.target.closest("th"); if (h && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); sortByHeader(h); } });
+document.querySelectorAll("th:not(:empty):not(.ns)").forEach(h => h.tabIndex = 0);
+const SORT_OBS = new MutationObserver(ms => { new Set(ms.map(m => m.target)).forEach(sortTable); SORT_OBS.takeRecords(); });
+document.querySelectorAll("tbody[id]").forEach(b => SORT_OBS.observe(b, { childList: true }));
 window.addEventListener("DOMContentLoaded", async () => {
 RunnerPatches.init();
 DashboardAdmins.init();
@@ -3954,5 +3983,20 @@ mod tests {
         assert!(DASHBOARD_HTML.contains(r#"id="obs-grafana-grid""#));
         assert!(DASHBOARD_HTML.contains(r#"id="obs-log-query""#));
         assert!(DASHBOARD_HTML.contains(r#"github_workflow_url"#));
+    }
+
+    #[test]
+    fn test_every_dashboard_table_sorts_from_its_headers() {
+        // One delegated handler sorts any table body with an id, and an
+        // observer re-applies the chosen order after each re-render.
+        assert!(DASHBOARD_HTML.contains("function sortTable(b)"));
+        assert!(DASHBOARD_HTML.contains(r#"document.querySelectorAll("tbody[id]").forEach(b => SORT_OBS.observe(b, { childList: true }));"#));
+        assert!(DASHBOARD_HTML.contains(r#"th[aria-sort=descending]:not(.ns)::after"#));
+        // Every table body is observable, so every table is sortable.
+        let tables = DASHBOARD_HTML.matches("<table>").count();
+        assert!(tables >= 9, "expected at least 9 tables, found {tables}");
+        assert_eq!(tables, DASHBOARD_HTML.matches(r#"<tbody id=""#).count());
+        // CSS draws the sort arrows, so headers must not repeat them as text.
+        assert!(!DASHBOARD_HTML.contains("↕</th>"));
     }
 }

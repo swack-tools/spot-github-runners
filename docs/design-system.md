@@ -44,11 +44,15 @@ Text tokens meet a 4.5:1 contrast ratio on the surfaces they're used on. `border
 | Navigation tab | `.nav-tabs`, `.tab-btn`, and `.tab-badge` |
 | Segmented control | `.arch-pill-group` and `.arch-pill-btn` |
 | Field | `.form-grid`, `.field`, `.toggle-label`, and `.budget-input-group` |
-| Table | `.table-wrap` around a `<table>` |
+| Table | `.table-wrap` around a `<table>`; give a header `.ns` to stop it from sorting |
 | Code block | `.ssh-block` |
 | Stage card | `.stage-list`, `.stage-card`, and `.stage-chip` |
 | Toast | `.toast` inside `#toast-container` |
 | Status banner | `.status-banner` |
+
+Text helpers replace repeated inline styles: `.hint` (extra-small muted text), `.hint-sm` (small muted text), `.emph` (bold strong text), and `.sm` (small text).
+
+Every table sorts when you click a column header, or focus it and press Enter or Space. A second click reverses the order, and the sorted header shows ▲ or ▼. Numbers, prices, and durations sort by value, timestamp cells sort by their `data-s` epoch value, and other text sorts alphabetically. The order survives data refreshes. The instances table sorts on the server, so its headers keep their own `onclick` handlers.
 
 Charts draw axis text with `.chart-text` and gridlines with `.chart-grid`. SVG presentation attributes such as `fill="…"` can't read custom properties, so set chart colors through `style` or a class.
 
