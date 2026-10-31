@@ -101,6 +101,7 @@ The Worker supports two authentication workflows:
 2. **Device authorization flow**:
    - `/auth/device/code` requests a user code from GitHub (`https://github.com/login/device/code`) and returns it with a signed, expiring handle that wraps GitHub's device code.
    - `/auth/device/token` and `/auth/device/poll` verify the handle, poll GitHub's token endpoint, pass GitHub's `slow_down` interval through, and issue the session cookie once an administrator account approves. The GitHub access token never leaves the Worker.
+   - After an administrator approves the code, GitHub sometimes shows its own 404 page at `github.com/login/device/authorize`. The approval still counts, and the sign-in page finishes signing in on its own. The Worker never links to that address, and no OAuth app setting changes it, so the gate tells people to return to the dashboard tab.
    - GitHub issues device codes only when **Enable Device Flow** is turned on in the OAuth app's settings. Without it, the sign-in gate reports that device sign-in is off.
 
 ### Dashboard administrators
