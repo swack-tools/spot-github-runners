@@ -68,6 +68,11 @@ jobs:
 
 The **Runner pools** panel shows each pool's `runs-on` line with a **Copy** button.
 
+<figure class="shot" markdown>
+![Finding cheap 2 vCPU hosts, launching a pool, and pointing a workflow at it](images/runner-pools-launch-small.gif)
+<figcaption markdown>Sizing the matrix for 2 vCPU, 6 GiB runners, launching a spin-down pool on the cheapest host, `n4a-standard-2`, with the extra label `small`, and pasting its `runs-on` line into a workflow in `example-org/service-a`. The pool then sees the queued job and starts a host.</figcaption>
+</figure>
+
 ## How a pool spins up and down
 
 On every run, every 5 minutes, the reconciler does the following for a pool that spins down when idle:
@@ -121,6 +126,11 @@ The pool keeps a copy of the template you pick. On each run, the reconciler repl
 
 Editing a template on the templates page doesn't change pools that use it. Click **Change** and pick the template again to roll out the edited version.
 
+<figure class="shot" markdown>
+![Creating a runner setup template and rolling it onto a running pool](images/runner-pools-template.gif)
+<figcaption markdown>Creating the template `Protobuf and jq tools` from the starter script, then switching a running `e2-standard-2` pool for `example-org` to it with **Change**.</figcaption>
+</figure>
+
 ### Template limits
 
 - The template must be a shell script. `#cloud-config` YAML templates are listed but can't be picked, because these hosts don't run cloud-init.
@@ -139,6 +149,11 @@ Each row in **Runner pools** shows:
 - **Cost**: the estimated Spot price of the hosts running now, and of the pool with every host running.
 
 The **Status** column can lag by up to one reconciler run. Click **Refresh** to reload the panel. It also refreshes every minute while the page is open.
+
+<figure class="shot" markdown>
+![Checking pools while jobs run and again after they spun down](images/runner-pools-spun-down.gif)
+<figcaption markdown>Two pools for `example-org` with hosts running during builds, and the same pools after the builds: no hosts running, the last spin-down time, and `$0/hr now`.</figcaption>
+</figure>
 
 All pools together, at their most hosts, must stay under the hourly limit in the dashboard's **Max Budget** settings. The dashboard refuses a new pool that would go over it.
 
