@@ -2,7 +2,7 @@
 const { open, close, BASE } = require('./rec');
 (async () => {
   const r = await open('template');
-  const { page, click, type, caption, wait, scrollTo, moveTo, shot } = r;
+  const { page, click, type, caption, wait, moveTo, shot } = r;
   await page.goto(BASE + '/', { waitUntil: 'networkidle' });
   await moveTo(140, 400, 1);
   await caption('1. Open Cloud-Init & Templates', 900);

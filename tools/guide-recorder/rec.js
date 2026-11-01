@@ -119,17 +119,14 @@ async function open(name, opts = {}) {
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
   page.on('dialog', d => (opts.onDialog ? opts.onDialog(d) : d.accept()));
-  const t0 = Date.now();
   const h = helpers(page);
-  return { browser, ctx, page, errors, t0, frames, cdp, ...h };
+  return { browser, ctx, page, errors, frames, cdp, ...h };
 }
 
 function helpers(page) {
-  let pos = { x: W / 2, y: H / 2 };
   const wait = ms => page.waitForTimeout(ms);
   async function moveTo(x, y, steps = 18) {
     await page.mouse.move(x, y, { steps });
-    pos = { x, y };
   }
   async function box(sel) {
     const el = typeof sel === 'string' ? page.locator(sel).first() : sel;
@@ -221,7 +218,7 @@ function helpers(page) {
   return { wait, moveTo, click, type, caption, card, scrollTo, box, shot, shotRange, fakeDialog };
 }
 
-async function close(r, outName, trimStartSec = 0) {
+async function close(r, outName) {
   await r.page.waitForTimeout(400);
   await r.cdp.send('Page.stopScreencast').catch(() => {});
   // Concat list: each frame shows until the next one arrived.

@@ -2,7 +2,7 @@
 const { open, close, BASE, OVERLAY } = require('./rec');
 (async () => {
   const r = await open('workflow');
-  const { page, click, caption, wait, scrollTo, moveTo, shot } = r;
+  const { page, click, caption, wait, moveTo, shot } = r;
   await page.goto(BASE + '/', { waitUntil: 'networkidle' });
   await page.click('[data-tab="tab-sizing"]');
   await page.click('#sidebar-toggle-btn');
