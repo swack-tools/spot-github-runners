@@ -85,6 +85,13 @@ pub struct DashboardState {
     pub controlled_targets: Vec<String>,
     #[serde(default)]
     pub overview: Option<serde_json::Value>,
+    /// Runner pools administrators launched from the dashboard (see `runner_pools.rs`).
+    #[serde(default)]
+    pub runner_pools: Vec<crate::runner_pools::RunnerPool>,
+    /// The reconciler's last view of each pool, by pool id.
+    #[serde(default)]
+    pub runner_pool_status:
+        std::collections::BTreeMap<String, crate::runner_pools::RunnerPoolStatus>,
 }
 
 // ============================================================================
@@ -875,6 +882,14 @@ fn backfill_missing_hardware_meta(
     if disk_cat_missing {
         obj.insert("disk_category".to_string(), serde_json::json!(disk_cat));
     }
+}
+
+/// Estimated Spot cost of one runner host per hour (compute and its data disk), from the same
+/// table the qualification matrix uses. `None` when the table doesn't list the machine type.
+pub fn machine_type_hourly_usd(machine_type: &str) -> Option<f64> {
+    fallback_machine_type_pricing(machine_type, false)
+        .and_then(|v| v.get("total_hourly_usd").and_then(|x| x.as_f64()))
+        .filter(|x| x.is_finite() && *x >= 0.0)
 }
 
 fn fallback_machine_type_pricing(
@@ -5805,6 +5820,8 @@ pub fn default_dashboard_bundle(now: u64) -> Result<DashboardBundle, StateError>
         dashboard_admins_history: Vec::new(),
         controlled_targets: Vec::new(),
         overview: None,
+        runner_pools: Vec::new(),
+        runner_pool_status: std::collections::BTreeMap::new(),
     };
 
     let fp = compute_state_fingerprint(&state)?;

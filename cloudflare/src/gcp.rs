@@ -1267,10 +1267,18 @@ pub fn build_spot_runner_vm_request(
     }
 
     let mut labels = BTreeMap::new();
-    labels.insert(
-        "spot-target".into(),
-        cfg.target.replace('/', "-").to_lowercase(),
-    );
+    // GCE label values allow only [a-z0-9_-] and 63 characters; repository names may hold '.'.
+    let target_label: String = cfg
+        .target
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '_' | '-' => c,
+            _ => '-',
+        })
+        .take(63)
+        .collect();
+    labels.insert("spot-target".into(), target_label);
     labels.insert("spot-role".into(), "cicd_runner".into());
 
     let nic_type = if boot_disk_type == "hyperdisk-balanced" {
