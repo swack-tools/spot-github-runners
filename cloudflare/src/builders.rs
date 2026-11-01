@@ -427,6 +427,33 @@ pub fn is_live_builder(inst: &crate::gcp::GceBuilderInstance) -> bool {
     !inst.status.eq_ignore_ascii_case("TERMINATED") && !inst.status.eq_ignore_ascii_case("STOPPING")
 }
 
+/// What the dashboard shows for a builder's insert operation: whether it finished, and why it failed.
+pub fn launch_status(op: &crate::gcp::GceOperation) -> serde_json::Value {
+    let error = op.error.as_ref().map(|err| {
+        let messages: Vec<String> = err
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .map(|errors| {
+                errors
+                    .iter()
+                    .take(2)
+                    .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if messages.is_empty() {
+            "GCE reported an unknown error".to_string()
+        } else {
+            messages.join("; ")
+        }
+    });
+    serde_json::json!({
+        "done": op.status.eq_ignore_ascii_case("DONE"),
+        "error": error,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

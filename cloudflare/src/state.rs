@@ -757,6 +757,10 @@ pub fn infer_machine_type_vcpu_ram(machine_type: &str, is_builder: bool) -> (u32
         .next()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(16);
+    if vcpu == 2 {
+        let ram = if mt.contains("-highcpu-") { 4 } else { 8 };
+        return (2, ram);
+    }
     if vcpu == 4 {
         let ram = if mt.contains("-highcpu-") { 8 } else { 16 };
         return (4, ram);

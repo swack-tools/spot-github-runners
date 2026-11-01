@@ -8,7 +8,7 @@
 pub const BUILDERS_JS: &str = r#####"(function () {
 "use strict";
 const KEY_STORE = "spot.builder.sshPublicKey";
-const S = { data: null, loading: false };
+const S = { data: null, loading: false, launchError: null };
 
 function h(tag, attrs, children) {
   const n = document.createElement(tag);
@@ -106,8 +106,28 @@ function openBuilderLaunch(row) {
     try { localStorage.setItem(KEY_STORE, key); } catch (_e) {}
     toast(`Launching ${d.name} in ${d.zone}`);
     dlg.close();
+    S.launchError = null;
     refresh();
+    watchLaunch(d);
   });
+}
+
+// GCE takes the request first and reports quota or capacity failures a few seconds later.
+async function watchLaunch(launch) {
+  if (!launch.operation) return;
+  const query = "zone=" + encodeURIComponent(launch.zone) + "&operation=" + encodeURIComponent(launch.operation);
+  for (let i = 0; i < 40; i++) {
+    await new Promise(done => setTimeout(done, 5000));
+    const [res, d] = await api("/api/builders/launch-status?" + query);
+    if (!res.ok) return;
+    if (!d.done) continue;
+    if (d.error) {
+      S.launchError = `${launch.name} didn't start in ${launch.zone}: ${d.error}`;
+      toast(S.launchError);
+    }
+    refresh();
+    return;
+  }
 }
 
 // ---------------------------------------------------------------- connect
@@ -185,6 +205,9 @@ function render() {
   }
   if (d.error) {
     panel.appendChild(h("p", { class: "hint", text: "Could not list builders: " + d.error }));
+  }
+  if (S.launchError) {
+    panel.appendChild(h("p", { class: "hint", role: "alert", style: "color:var(--danger);", text: S.launchError }));
   }
   const builders = Array.isArray(d.builders) ? d.builders : [];
   if (!builders.length) {
