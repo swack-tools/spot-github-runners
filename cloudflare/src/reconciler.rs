@@ -271,6 +271,16 @@ pub trait GcpReconcilerClient {
         current_metadata: &GceMetadata,
         now: u64,
     ) -> Result<GceOperation, ReconcilerError>;
+    /// Reads a zone operation. `Ok(None)` means the client can't look operations up.
+    async fn get_zone_operation(
+        &self,
+        _project: &str,
+        _zone: &str,
+        _operation: &str,
+        _now: u64,
+    ) -> Result<Option<GceOperation>, ReconcilerError> {
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -368,6 +378,19 @@ impl<T: crate::gcp::GcpHttpTransport> GcpReconcilerClient for crate::gcp::GceCom
     ) -> Result<GceOperation, ReconcilerError> {
         self.delete_instance(zone, instance, now)
             .await
+            .map_err(|e| ReconcilerError::Gcp(e.to_string()))
+    }
+
+    async fn get_zone_operation(
+        &self,
+        _project: &str,
+        zone: &str,
+        operation: &str,
+        now: u64,
+    ) -> Result<Option<GceOperation>, ReconcilerError> {
+        self.get_zone_operation(zone, operation, now)
+            .await
+            .map(Some)
             .map_err(|e| ReconcilerError::Gcp(e.to_string()))
     }
 
@@ -1086,14 +1109,15 @@ pub fn compute_fleet_fingerprint(
 // Runner Pool Host Launch
 // ============================================================================
 
-/// Launches one host for a runner pool and returns its name, or why it couldn't.
+/// Launches one host for a runner pool and returns its name and the GCE insert operation's name,
+/// or why it couldn't.
 async fn launch_pool_host<G, H>(
     gcp: &G,
     gh: &H,
     project: &str,
     pool: &crate::runner_pools::RunnerPool,
     now: u64,
-) -> Result<String, String>
+) -> Result<(String, Option<String>), String>
 where
     G: GcpReconcilerClient,
     H: GitHubReconcilerClient,
@@ -1191,10 +1215,63 @@ where
     req.labels
         .insert(rp::POOL_METADATA_KEY.to_string(), pool.id.clone());
 
-    gcp.insert_instance(project, &pool.zone, &req, None, now)
+    let op = gcp
+        .insert_instance(project, &pool.zone, &req, None, now)
         .await
         .map_err(|e| format!("VM create failed: {}", e))?;
-    Ok(host_name)
+    // An insert can fail inside the operation (no capacity, quota) after the call succeeded.
+    if op.status.eq_ignore_ascii_case("DONE") {
+        if let Some(err) = op.error.as_ref() {
+            return Err(launch_operation_error(&pool.zone, err));
+        }
+    }
+    Ok((host_name, op.name.filter(|n| !n.is_empty())))
+}
+
+/// How long a pool waits on an unfinished create operation before it launches again.
+const POOL_LAUNCH_OPERATION_WAIT_SECS: u64 = 30 * 60;
+
+/// Records why a pool's launch failed; the time changes only when the reason does.
+fn set_pool_error(status: &mut crate::runner_pools::RunnerPoolStatus, reason: &str, now: u64) {
+    if status.last_error.as_deref() != Some(reason) {
+        status.last_error_at = Some(now);
+    }
+    status.last_error = Some(reason.to_string());
+}
+
+/// Describes a failed GCE operation's `error` object, such as
+/// `{"errors":[{"code":"ZONE_RESOURCE_POOL_EXHAUSTED","message":"..."}]}`, in one short line.
+fn launch_operation_error(zone: &str, error: &serde_json::Value) -> String {
+    let parts: Vec<String> = error
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .map(|errors| {
+            errors
+                .iter()
+                .take(2)
+                .map(|e| {
+                    let code = e.get("code").and_then(|c| c.as_str()).unwrap_or("");
+                    let message = e.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                    match (code.is_empty(), message.is_empty()) {
+                        (false, false) => format!("{}: {}", code, message),
+                        (false, true) => code.to_string(),
+                        (true, false) => message.to_string(),
+                        (true, true) => "unknown error".to_string(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let detail = if parts.is_empty() {
+        "unknown error".to_string()
+    } else {
+        parts.join("; ")
+    };
+    let mut line = format!("VM create failed in {}: {}", zone, detail);
+    if line.chars().count() > 300 {
+        line = line.chars().take(297).collect::<String>() + "...";
+    }
+    line
 }
 
 // ============================================================================
@@ -1803,6 +1880,55 @@ where
                 continue;
             }
 
+            // A create call only queues the VM: GCE reports capacity and quota failures (for
+            // example ZONE_RESOURCE_POOL_EXHAUSTED) in the operation, so read it while the host
+            // it should have made is still missing.
+            let mut launch_pending = false;
+            if let Some(op_name) = status.last_launch_op.clone() {
+                let host_listed = status
+                    .last_launch_host
+                    .as_deref()
+                    .map(|h| hosts.iter().any(|i| i.name == h))
+                    .unwrap_or(false);
+                if host_listed {
+                    status.last_launch_op = None;
+                    status.last_error = None;
+                    status.last_error_at = None;
+                } else {
+                    match gcp
+                        .get_zone_operation(&project, &pool.zone, &op_name, now)
+                        .await
+                    {
+                        Ok(Some(op)) if op.status.eq_ignore_ascii_case("DONE") => {
+                            status.last_launch_op = None;
+                            match op.error.as_ref() {
+                                Some(err) => {
+                                    let reason = launch_operation_error(&pool.zone, err);
+                                    set_pool_error(&mut status, &reason, now);
+                                    held_floor_targets.push(format!(
+                                        "pool {} ({}): {}",
+                                        pool.id, pool.target, reason
+                                    ));
+                                }
+                                None => {
+                                    status.last_error = None;
+                                    status.last_error_at = None;
+                                }
+                            }
+                        }
+                        // Still running: wait for it rather than start a second host for the same
+                        // slot, unless it has run for far longer than a create takes.
+                        Ok(Some(_)) => {
+                            launch_pending = status
+                                .last_launch_at
+                                .map(|t| now.saturating_sub(t) < POOL_LAUNCH_OPERATION_WAIT_SECS)
+                                .unwrap_or(false);
+                        }
+                        Ok(None) | Err(_) => status.last_launch_op = None,
+                    }
+                }
+            }
+
             // Scale down: delete hosts above the pool's size, newest idle hosts first. Hosts already
             // stopping (deleted last tick, or preempted) don't count. Nothing is deleted without a
             // good runner list, because an empty list would make every host look idle. A host's
@@ -1870,24 +1996,27 @@ where
             }
 
             // One launch per pool per tick: the new host shows in the next tick's instance list.
+            // A started create keeps the last error on show until its operation succeeds or the
+            // pool is full, because GCE can still refuse the VM after the call returns.
             if (hosts.len() as u32) < pool.hosts {
-                match launch_pool_host(gcp, gh, &project, pool, now).await {
-                    Ok(host_name) => {
-                        status.last_launch_host = Some(host_name.clone());
-                        status.last_launch_at = Some(now);
-                        status.last_error = None;
-                        status.last_error_at = None;
-                        launched_hosts.push(host_name);
-                    }
-                    Err(reason) => {
-                        if status.last_error.as_deref() != Some(reason.as_str()) {
-                            status.last_error_at = Some(now);
+                if !launch_pending {
+                    match launch_pool_host(gcp, gh, &project, pool, now).await {
+                        Ok((host_name, op_name)) => {
+                            status.last_launch_host = Some(host_name.clone());
+                            status.last_launch_at = Some(now);
+                            status.last_launch_op = op_name;
+                            launched_hosts.push(host_name);
                         }
-                        status.last_error = Some(reason.clone());
-                        held_floor_targets
-                            .push(format!("pool {} ({}): {}", pool.id, pool.target, reason));
+                        Err(reason) => {
+                            set_pool_error(&mut status, &reason, now);
+                            held_floor_targets
+                                .push(format!("pool {} ({}): {}", pool.id, pool.target, reason));
+                        }
                     }
                 }
+            } else {
+                status.last_error = None;
+                status.last_error_at = None;
             }
             pool_statuses.insert(pool.id.clone(), status);
         }

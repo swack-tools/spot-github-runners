@@ -977,6 +977,53 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
         Ok(op)
     }
 
+    /// Read a zone operation, such as the one an instance insert returned. GCE reports capacity
+    /// and quota failures (for example `ZONE_RESOURCE_POOL_EXHAUSTED`) here, after the insert call
+    /// itself has succeeded.
+    pub async fn get_zone_operation(
+        &self,
+        zone: &str,
+        operation: &str,
+        now: u64,
+    ) -> Result<GceOperation, GcpError> {
+        let safe = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        if !safe(zone) || !safe(operation) {
+            return Err(GcpError::Api(
+                400,
+                "zoneOperations.get".into(),
+                "invalid zone or operation name".into(),
+            ));
+        }
+        let url = format!(
+            "{}/projects/{}/zones/{}/operations/{}",
+            COMPUTE_API_BASE, self.project, zone, operation
+        );
+
+        let headers = self.auth_headers(now).await?;
+        let header_refs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+        let (status, bytes) = self
+            .transport
+            .request("GET", &url, &header_refs, None)
+            .await?;
+        if status != 200 {
+            return Err(GcpError::Api(
+                status,
+                "zoneOperations.get".into(),
+                String::from_utf8_lossy(&bytes).into(),
+            ));
+        }
+
+        let op: GceOperation = serde_json::from_slice(&bytes)?;
+        Ok(op)
+    }
+
     /// Delete an instance with deleteDisk=ALL.
     pub async fn delete_instance(
         &self,

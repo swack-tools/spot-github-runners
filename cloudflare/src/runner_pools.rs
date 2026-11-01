@@ -79,11 +79,15 @@ pub struct RunnerPoolStatus {
     pub last_launch_host: Option<String>,
     #[serde(default)]
     pub last_launch_at: Option<u64>,
-    /// Why the last launch attempt failed; cleared by the next successful launch.
+    /// Why the last launch attempt failed, including a create GCE refused after the call
+    /// returned (no capacity, quota). Cleared once a launch succeeds or the pool is full.
     #[serde(default)]
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_error_at: Option<u64>,
+    /// The GCE operation of the last create, until the reconciler has read its outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_launch_op: Option<String>,
 }
 
 /// Body of `POST /api/runner-pools`.
