@@ -1,0 +1,36 @@
+// Guide: set budget caps and autoscaling triggers, and test them.
+const { open, close, BASE } = require('./rec');
+const { withFleet } = require('./demo-fleet');
+(async () => {
+  const r = await open('scaling', { transform(p, j, req) { return p === '/api/overview' ? withFleet(j, req) : j; } });
+  const { page, click, type, caption, wait, moveTo, shot, scrollTo } = r;
+  await page.goto(BASE + '/', { waitUntil: 'networkidle' });
+  r.frames.length = 0;
+  await moveTo(400, 75, 1);
+  await caption('1. The budget bar caps what the whole fleet may spend', 1800);
+  await click("button:has-text('Apply Budget')", 1500);
+  await caption('2. Open Autoscaling & OOM', 700);
+  await click('[data-tab="tab-scaling"]', 800);
+  await page.click('#sidebar-toggle-btn');
+  await page.click('button:has-text("Hide KPIs")');
+  await wait(500);
+  await caption('3. Set the runner range, and what makes the fleet scale up or down');
+  await scrollTo('#sc-min-runners', 'center');
+  await type('#sc-min-runners', '2', 150);
+  await type('#sc-max-runners', '16', 150);
+  await type('#sc-queued-thresh', '25', 150);
+  await wait(800);
+  await shot('set-autoscaling', 'runner-policy', '#tab-scaling .two-col > .panel:first-child', 4);
+  await caption('4. Enter a test load, then click Save Policy & Evaluate Scaling');
+  await scrollTo('#sim-jobs-queued', 'center');
+  await type('#sim-jobs-queued', '30', 150);
+  await click("button[onclick='saveAndEvaluateScaling()'], button[onclick=\"saveAndEvaluateScaling()\"]", 1700);
+  await caption('The result says what the fleet would do, and why', 3000);
+  await shot('set-autoscaling', 'scale-decision');
+  await caption('5. Rust builders have their own range and triggers');
+  await scrollTo('#sc-builder-min-inst', 'center');
+  await type('#sc-builder-max-inst', '2', 150);
+  await click("button[onclick='saveAndEvaluateBuilderScaling()'], button[onclick=\"saveAndEvaluateBuilderScaling()\"]", 1700);
+  await caption('', 300);
+  console.log(await close(r, 'set-autoscaling'));
+})();

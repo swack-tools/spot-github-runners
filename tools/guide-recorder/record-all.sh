@@ -13,6 +13,10 @@ scenes=(
   g_signin:sign-in g_cheap:find-cheap-hosts g_launch:launch-a-pool g_workflow:use-a-pool-in-a-workflow
   g_template:make-a-runner-template g_change_tpl:change-a-pool-template g_check:check-a-pool
   g_resize:resize-or-remove-a-pool g_admins:add-an-administrator
+  g_tour:tour-the-dashboard g_builder:launch-a-builder g_map:explore-the-fleet-map
+  g_instances:review-instances-and-cost g_regions:choose-regions g_scaling:set-autoscaling
+  g_observability:read-observability-and-logs g_patches:edit-a-runner-patch g_rust:track-rust-builds
+  g_vmtpl:save-a-vm-template
 )
 for pair in "${scenes[@]}"; do
   scene="${pair%%:*}"; guide="${pair##*:}"

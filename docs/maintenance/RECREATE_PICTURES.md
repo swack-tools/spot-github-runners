@@ -107,6 +107,7 @@ The [How-to guides](../guides/index.md) each have one GIF and a few step screens
 How the recorder keeps the pictures accurate and small:
 
 - Every response from the local Worker is rewritten to the synthetic names in the sanitization table, and pool status that a local Worker can't produce, such as running hosts or a capacity error, is set by the scene that shows it.
+- `tools/guide-recorder/demo-fleet.js` holds the example hosts, regions, and telemetry for scenes that need a running fleet. Scenes answer calls that need GCP or GitHub, such as launching a builder or saving a patch, themselves.
 - The browser runs at a 1440 by 900 viewport. A yellow dot shows the pointer, and a caption bar names each step.
 - Native `confirm` and `prompt` boxes never appear in a recording, so the scene shows a plain stand-in with the same text first.
 - Frames come from the DevTools screencast as PNG, not from Playwright's video, which is lossy. Unchanged parts of the screen stay identical between frames, which keeps each GIF near 1 MB at 960 pixels wide and 8 frames per second.
