@@ -77,7 +77,7 @@ function buildDialog() {
       field("Runners on each host", num("rp-rph", 1, 8, 2)),
       field("vCPU per runner", num("rp-vcpu", 1, 64, 7)),
       field("RAM per runner (GiB)", num("rp-ram", 1, 256, 14)),
-      field("Most hosts", num("rp-hosts", 1, 10, 1), "The pool never runs more Spot hosts than this."),
+      field("Most hosts", num("rp-max-hosts", 1, 10, 1), "The pool never runs more Spot hosts than this."),
       field("Spin down when idle", el("input", { type: "checkbox", id: "rp-auto", checked: "" }), "Start hosts when jobs for these runners queue; delete hosts that sit idle."),
       field("Fewest hosts", num("rp-min", 0, 10, 0), "Hosts kept even when idle. 0 costs nothing while no jobs run."),
       field("Idle minutes before spin-down", num("rp-idle", 5, 240, 10)),
@@ -104,7 +104,7 @@ function buildDialog() {
   $("rp-auto").addEventListener("change", () => { autoFields(); check(); });
   targetOther.closest(".field").id = "rp-target-other-field";
   target.addEventListener("change", () => { $("rp-target-other-field").hidden = target.value !== "__other"; check(); });
-  for (const id of ["rp-target-other", "rp-rph", "rp-vcpu", "rp-ram", "rp-hosts", "rp-labels", "rp-min", "rp-idle"]) $(id).addEventListener("input", check);
+  for (const id of ["rp-target-other", "rp-rph", "rp-vcpu", "rp-ram", "rp-max-hosts", "rp-labels", "rp-min", "rp-idle"]) $(id).addEventListener("input", check);
   tpl.addEventListener("change", () => { showTemplate(); check(); });
   form.addEventListener("submit", (ev) => { ev.preventDefault(); submitPool(); });
   return dlg;
@@ -173,7 +173,7 @@ function check() {
   const rph = parseInt($("rp-rph").value, 10) || 0;
   const vcpu = parseInt($("rp-vcpu").value, 10) || 0;
   const ram = parseInt($("rp-ram").value, 10) || 0;
-  const hosts = parseInt($("rp-hosts").value, 10) || 0;
+  const hosts = parseInt($("rp-max-hosts").value, 10) || 0;
   const auto = $("rp-auto").checked;
   const minHosts = parseInt($("rp-min").value, 10);
   const idle = parseInt($("rp-idle").value, 10);
@@ -220,7 +220,7 @@ async function openRunnerLaunch(row) {
   $("rp-rph").value = String(Math.min(row.units_per_instance || 1, 8));
   $("rp-vcpu").value = String(row.unit_vcpu || 7);
   $("rp-ram").value = String(row.unit_ram_gib || 14);
-  $("rp-hosts").value = "2";
+  $("rp-max-hosts").value = "2";
   $("rp-labels").value = "";
   $("rp-auto").checked = true;
   $("rp-min").value = "0";
@@ -240,7 +240,7 @@ async function submitPool() {
       target: currentTarget(),
       machine_type: ROW.machine_type,
       zone: ROW.zone,
-      hosts: parseInt($("rp-hosts").value, 10),
+      hosts: parseInt($("rp-max-hosts").value, 10),
       runners_per_host: parseInt($("rp-rph").value, 10),
       runner_vcpu: parseInt($("rp-vcpu").value, 10),
       runner_ram_gib: parseInt($("rp-ram").value, 10),
@@ -279,13 +279,13 @@ function buildPanel() {
       el("div", {},
         el("div", { class: "panel-title", text: "Runner pools" }),
         el("div", { class: "panel-subtitle", text: "Spot hosts launched with the Launch button above. The reconciler keeps each pool at its host count and replaces hosts Spot takes back. Remove deletes the hosts and their runner registrations." })),
-      el("button", { type: "button", class: "btn btn-sm btn-secondary", id: "rp-refresh", text: "Refresh" })),
+      el("button", { type: "button", class: "btn btn-sm btn-secondary", id: "rp-pools-refresh", text: "Refresh" })),
     el("div", { class: "table-wrap" },
       el("table", {},
         el("thead", {}, el("tr", {}, ...["Pool", "Org or repository", "Machine / zone", "Runners", "Labels", "Template", "Status", "Cost", ""].map((h) => el("th", { text: h })))),
         el("tbody", { id: "rp-body" }))));
   anchor.after(panel);
-  $("rp-refresh").addEventListener("click", refreshPools);
+  $("rp-pools-refresh").addEventListener("click", refreshPools);
   $("rp-body").addEventListener("click", (ev) => {
     const b = ev.target.closest("button[data-remove]");
     if (b) removePool(b.getAttribute("data-remove"));

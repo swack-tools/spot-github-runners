@@ -1068,6 +1068,29 @@ fn pool_script_stays_small_and_uses_safe_dom_helpers() {
     assert!(html.contains("onclick=\"launchQualRow(${i})\""));
 }
 
+#[test]
+fn pool_script_ids_do_not_clash_with_the_dashboard() {
+    // getElementById returns the first match, so a clashing id would wire the pool dialog to a
+    // dashboard element (as the rollout preview's rp-hosts and rp-refresh once did).
+    use spot_dashboard_edge::ui_runner_pools::RUNNER_POOLS_JS;
+    let html = spot_dashboard_edge::ui::DASHBOARD_HTML;
+    let mut checked = 0;
+    for marker in ["id: \"", "num(\""] {
+        let mut rest = RUNNER_POOLS_JS;
+        while let Some(i) = rest.find(marker) {
+            rest = &rest[i + marker.len()..];
+            let id = &rest[..rest.find('"').unwrap()];
+            assert!(
+                !html.contains(&format!("id=\"{}\"", id)),
+                "id {} is used by both the dashboard and the pool script",
+                id
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 20, "{checked}");
+}
+
 fn legacy_blob_with(pools: &[RunnerPool]) -> String {
     // A state blob written before pools moved to their own key.
     let mut v = serde_json::to_value(base_state()).unwrap();
