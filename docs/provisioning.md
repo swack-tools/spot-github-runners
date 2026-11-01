@@ -29,8 +29,10 @@ The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 
 - **Floor target maintenance**: ensures at least one 16-vCPU Spot runner host per configured controlled target (`controlled_targets`).
 - **Backlog scale-up**: launches additional runner hosts when queued job backlog reaches or exceeds 20 jobs (`queued_jobs >= 20`).
-- **JIT configuration minting**: requests 2-slot Just-in-Time (JIT) configurations from GitHub Actions API (`generate-jitconfig`)
-  with automatic fallback to registration tokens.
+- **Runner registration**: requests a runner registration token for the target. The startup script registers two
+  persistent runners with it, and the reconciler removes the script and its token from metadata once they're online.
+  If GitHub refuses the token, or Compute Engine refuses the VM, the reconciler holds that target and reports why
+  instead of booting a host that can't register.
 - **Preempted VM cleanup**: detects instances in `TERMINATED` status and cleans up orphaned resources.
 
 ## Startup bootstrap and host agent installation
@@ -56,10 +58,27 @@ The edge reconciler evaluates runner demand on a 5-minute cron cadence:
 When a new runner host boots, `cloud-init/startup.sh` executes the bootstrap sequence:
 
 1. **Storage formatting**: formats the persistent data disk with ext4, mounts it to `/mnt/runner-data`, and sets permissions.
-2. **Host agent installation**: downloads and installs the native `host-agent` binary to `/usr/local/bin/host-agent`.
+2. **Host agent installation**: downloads the static `host-agent` build for the VM's architecture from this
+   repository's GitHub releases, checks it against the SHA-256 that the Worker pinned, and installs it to
+   `/usr/local/bin/host-agent`. A missing release or a checksum mismatch stops the bootstrap.
 3. **Symlink configuration**: creates symlinks for `/usr/local/bin/clean-target`, `/usr/local/bin/host-admission`, and `/usr/local/bin/docker-wrapper`.
 4. **Admission daemon setup**: starts the `gha-admission` systemd service listening on Unix domain socket `/run/gha-admission/socket`.
 5. **Container launcher**: launches the runner container listeners with `host-agent docker-wrapper`.
+
+## Release a new host agent
+
+The Worker pins the `host-agent` checksums in `cloudflare/src/host_agent_release.rs`. The build is reproducible,
+so a pull request that changes `host-agent/` must update the pin in the same pull request:
+
+1. Run `host-agent/release-build.sh`. It builds `x86_64` and `aarch64` static binaries and compares their
+   checksums with the pin.
+2. If they differ, copy the two `pub const` lines it prints into `cloudflare/src/host_agent_release.rs`.
+3. Merge as usual. The **Host agent release** workflow checks the pin on every pull request. On `main` it
+   publishes release `host-agent-<first 12 hex digits of the x86_64 checksum>` before the Worker deploy, which
+   waits for every check, starts.
+
+Don't delete or edit a published `host-agent-*` release. A deployed Worker keeps installing the release it pins,
+so every new runner VM would fail its bootstrap.
 
 ## Storage architecture
 

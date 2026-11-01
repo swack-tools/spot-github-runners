@@ -163,10 +163,34 @@ fn test_spot_runner_vm_request_builder_permitted_machine_types() {
             runner_2_jitconfig: Some("jit2"),
             source_image: None,
             golden_image_family: None,
-            boot_disk_type: Some("pd-balanced"),
+            boot_disk_type: None,
         };
         let req = build_spot_runner_vm_request("test-proj", &cfg).unwrap();
         assert_eq!(req.name, "test-vm-1");
+        // C4D, N4D and N4 take only Hyperdisk; C2D keeps Persistent Disk. Both disks share the type.
+        let expected_disk = if mt.starts_with("c2d-") {
+            "pd-balanced"
+        } else {
+            "hyperdisk-balanced"
+        };
+        for disk in &req.disks {
+            assert_eq!(
+                disk.initialize_params.as_ref().unwrap().disk_type,
+                format!("zones/us-central1-a/diskTypes/{}", expected_disk)
+            );
+        }
+        if mt.starts_with("c2d-") {
+            continue;
+        }
+        let pd_cfg = RunnerVmConfig {
+            boot_disk_type: Some("pd-balanced"),
+            ..cfg
+        };
+        assert!(
+            build_spot_runner_vm_request("test-proj", &pd_cfg).is_err(),
+            "{} must refuse Persistent Disk",
+            mt
+        );
         assert_eq!(
             req.machine_type,
             format!("zones/us-central1-a/machineTypes/{}", mt)

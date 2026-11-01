@@ -663,3 +663,42 @@ fn test_render_dockerfile_layer_follows_the_toolchain_install() {
         "dockerfile_run can use the installed toolchain"
     );
 }
+
+#[test]
+fn test_render_startup_script_installs_pinned_host_agent_and_sizes_admission() {
+    let params = StartupParams {
+        disk_device_name: "oxidex-runners-test-data",
+        instance_name: "oxidex-runners-test",
+        deployment_id: "dep-1",
+        org: "xbmc4lyfe/rustnzb",
+        runner_prefix: "oxidex",
+        runner_group: "default",
+        runner_labels: "self-hosted,Linux,X64,spot",
+        registration_token: "tok",
+        runner_count: 2,
+        runner_memory_gb: 14,
+        runner_cpu_limit: "7",
+        tiered: true,
+        strict_heavy_pool: false,
+        resource_monitoring: true,
+    };
+    let script = render_startup_script(&params, None).unwrap();
+    let pin = spot_dashboard_edge::host_agent_release::current().unwrap();
+
+    assert!(script.contains(&format!("host_agent_sha256='{}'", pin.sha256_x86_64)));
+    assert!(script.contains(&format!("host_agent_sha256='{}'", pin.sha256_aarch64)));
+    assert!(script.contains(&format!(
+        "'{}'\"/$host_agent_asset\"",
+        pin.download_base_url()
+    )));
+    assert!(script.contains("sha256sum --check"));
+    // The install runs before anything copies or links host-agent.
+    let install = script.find("install -m 0755 -o root -g root").unwrap();
+    let first_use = script
+        .find("cp /usr/local/bin/host-agent /opt/gha-runners/build/host-agent")
+        .unwrap();
+    assert!(install < first_use);
+    // The admission pool holds every runner's lease (2 x 14 GiB), not 0.
+    assert!(script.contains("--argjson work_gib 28"));
+    assert!(!script.contains("--argjson work_gib 0"));
+}

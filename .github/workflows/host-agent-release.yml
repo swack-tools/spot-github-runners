@@ -1,0 +1,98 @@
+name: Host agent release
+
+# Runner VMs boot stock Debian and download host-agent from this repository's releases. The Worker pins the
+# SHA-256 of each binary in cloudflare/src/host_agent_release.rs, and the VM refuses any other bytes.
+#
+# - Every pull request and push rebuilds the binaries with host-agent/release-build.sh (a reproducible build)
+#   and fails if the pinned checksums don't match, so a host-agent change must update the pin with it.
+# - A push to main then publishes the binaries as release host-agent-<first 12 hex of the x86_64 SHA-256>,
+#   unless that release already exists. The Worker deploy waits for every check on the commit, this one
+#   included, so the release is up before a Worker that pins it can launch a VM.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: host-agent-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Pinned host-agent matches source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        # actions/checkout v7.0.1, pinned to the commit the tag resolved to on 2026-10-17.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Build and check the pin
+        run: host-agent/release-build.sh "$RUNNER_TEMP/host-agent-assets"
+
+  publish:
+    name: Publish host-agent release
+    needs: verify
+    if: >-
+      github.repository == 'swack-tools/spot-github-runners' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        # actions/checkout v7.0.1, pinned to the commit the tag resolved to on 2026-10-17.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Build and check the pin
+        run: host-agent/release-build.sh "$RUNNER_TEMP/host-agent-assets"
+
+      - name: Publish the release if it is missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        working-directory: ${{ runner.temp }}/host-agent-assets
+        run: |
+          set -euo pipefail
+          x86_64_sum=$(awk '$2 == "host-agent-x86_64-linux-musl" {print $1}' SHA256SUMS)
+          tag="host-agent-${x86_64_sum:0:12}"
+
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            # Same tag means same x86_64 bytes. Check the published sums too, so a tampered or partial
+            # release fails here rather than on a VM.
+            mkdir published
+            gh release download "$tag" --repo "$REPO" --pattern SHA256SUMS --dir published
+            if ! cmp -s SHA256SUMS published/SHA256SUMS; then
+              echo "::error::Release $tag exists but its SHA256SUMS differ from this build" >&2
+              exit 1
+            fi
+            echo "Release $tag already published"
+            exit 0
+          fi
+
+          {
+            echo "Static host-agent binaries for runner VMs, built from ${SHA} by host-agent/release-build.sh."
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >notes.md
+          gh release create "$tag" \
+            host-agent-x86_64-linux-musl host-agent-aarch64-linux-musl SHA256SUMS \
+            --repo "$REPO" --target "$SHA" --title "$tag" --notes-file notes.md --latest=false

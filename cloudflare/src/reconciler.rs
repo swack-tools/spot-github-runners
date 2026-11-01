@@ -424,15 +424,14 @@ impl GitHubReconcilerClient for crate::github::GitHubActionsClient {
         runner_group_id: u32,
         labels: &[String],
     ) -> Result<RunnerBootstrapConfig, ReconcilerError> {
-        self.mint_2slot_runner_configs(
-            target_api_path,
-            vm_name,
-            runner_prefix,
-            runner_group_id,
-            labels,
-        )
-        .await
-        .map_err(|e| ReconcilerError::Github(e.to_string()))
+        // The startup script registers persistent runners with `config.sh --token` and keeps them on the
+        // data disk; it has no use for just-in-time configs, which would leave it without a token. The runner
+        // names, group and labels go to `config.sh` through the script.
+        let _ = (vm_name, runner_prefix, runner_group_id, labels);
+        self.mint_registration_token(target_api_path)
+            .await
+            .map(|token| RunnerBootstrapConfig::RegistrationToken { token })
+            .map_err(|e| ReconcilerError::Github(e.to_string()))
     }
 
     async fn count_queued_jobs(&self, owner: &str, repo: &str) -> Result<u32, ReconcilerError> {
@@ -1486,12 +1485,29 @@ where
                     Some(runner_1_jitconfig),
                     Some(runner_2_jitconfig),
                 ),
-                Ok(RunnerBootstrapConfig::RegistrationToken { token }) => (token, None, None),
-                Err(_) => ("".to_string(), None, None),
+                Ok(RunnerBootstrapConfig::RegistrationToken { token }) if !token.is_empty() => {
+                    (token, None, None)
+                }
+                Ok(RunnerBootstrapConfig::RegistrationToken { .. }) => {
+                    held_floor_targets.push(format!(
+                        "{}: GitHub returned an empty runner registration token",
+                        target
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    // A host booted without a token never registers and still counts as the floor.
+                    held_floor_targets.push(format!(
+                        "{}: runner registration token unavailable: {}",
+                        target, e
+                    ));
+                    continue;
+                }
             };
 
+            let data_disk_device = crate::gcp::runner_data_disk_device_name(&host_name);
             let startup_params = crate::github::StartupParams {
-                disk_device_name: &host_name,
+                disk_device_name: &data_disk_device,
                 instance_name: &host_name,
                 deployment_id: &deployment_id,
                 org: target,
@@ -1546,30 +1562,40 @@ where
                 runner_2_jitconfig: jit2.as_deref(),
                 source_image: None,
                 golden_image_family: None,
-                boot_disk_type: Some("pd-balanced"),
+                // The machine series picks the disk type (C4D takes only Hyperdisk).
+                boot_disk_type: None,
             };
 
-            if let Ok(req) = crate::gcp::build_spot_runner_vm_request(&project, &vm_cfg) {
-                let _ = gcp
-                    .insert_instance(&project, DEFAULT_ZONE, &req, None, now)
-                    .await;
-                launched_hosts.push(host_name.clone());
-
-                ACTIVE_LAUNCHES.lock().unwrap().push(LaunchOperation {
-                    target: target.clone(),
-                    host_name: host_name.clone(),
-                    zone: DEFAULT_ZONE.to_string(),
-                    machine_type: DEFAULT_MACHINE_TYPE.to_string(),
-                    phase: LaunchPhase::Creating,
-                    deployment_id,
-                    started_at: now,
-                    instance_id: None,
-                    expected_runners: vec![
-                        format!("{}-{}-1", runner_prefix, host_name),
-                        format!("{}-{}-2", runner_prefix, host_name),
-                    ],
-                });
+            let req = match crate::gcp::build_spot_runner_vm_request(&project, &vm_cfg) {
+                Ok(req) => req,
+                Err(e) => {
+                    held_floor_targets.push(format!("{}: VM request invalid: {}", target, e));
+                    continue;
+                }
+            };
+            if let Err(e) = gcp
+                .insert_instance(&project, DEFAULT_ZONE, &req, None, now)
+                .await
+            {
+                held_floor_targets.push(format!("{}: VM create failed: {}", target, e));
+                continue;
             }
+            launched_hosts.push(host_name.clone());
+
+            ACTIVE_LAUNCHES.lock().unwrap().push(LaunchOperation {
+                target: target.clone(),
+                host_name: host_name.clone(),
+                zone: DEFAULT_ZONE.to_string(),
+                machine_type: DEFAULT_MACHINE_TYPE.to_string(),
+                phase: LaunchPhase::Creating,
+                deployment_id,
+                started_at: now,
+                instance_id: None,
+                expected_runners: vec![
+                    format!("{}-{}-1", runner_prefix, host_name),
+                    format!("{}-{}-2", runner_prefix, host_name),
+                ],
+            });
         }
     }
 
@@ -1626,13 +1652,15 @@ where
             Err(_) => ("".to_string(), None, None),
         };
 
+        let data_disk_device = crate::gcp::runner_data_disk_device_name(&scale_host);
         let startup_params = crate::github::StartupParams {
-            disk_device_name: &scale_host,
+            disk_device_name: &data_disk_device,
             instance_name: &scale_host,
             deployment_id: &deployment_id,
             org: &org,
             runner_prefix,
-            runner_group: "default",
+            // The org's controller group (ID 10), the same one org floor hosts join.
+            runner_group: "swack-runners",
             runner_labels: &labels.join(","),
             registration_token: &reg_token,
             runner_count: RUNNERS_PER_HOST,
@@ -1653,9 +1681,12 @@ where
         let runner_patch =
             serde_json::from_value::<crate::patch::RunnerPatch>(manifest_val.clone()).ok();
 
-        let rendered_script =
-            crate::github::render_startup_script(&startup_params, runner_patch.as_ref())
-                .unwrap_or_else(|_| "#!/bin/bash\nexit 0".to_string());
+        // A host that can't register (no token) or can't boot (no script) would cost money and serve nothing.
+        let rendered_script = if reg_token.is_empty() && jit1.is_none() {
+            None
+        } else {
+            crate::github::render_startup_script(&startup_params, runner_patch.as_ref()).ok()
+        };
 
         let vm_cfg = crate::gcp::RunnerVmConfig {
             instance_name: &scale_host,
@@ -1663,21 +1694,26 @@ where
             zone: DEFAULT_ZONE,
             target: "swack-tools",
             runner_prefix,
-            startup_script: &rendered_script,
+            startup_script: rendered_script.as_deref().unwrap_or_default(),
             patch_sha256: &patch_sha,
             patch_json: &patch_json_str,
             runner_1_jitconfig: jit1.as_deref(),
             runner_2_jitconfig: jit2.as_deref(),
             source_image: None,
             golden_image_family: None,
-            boot_disk_type: Some("pd-balanced"),
+            boot_disk_type: None,
         };
 
-        if let Ok(req) = crate::gcp::build_spot_runner_vm_request(&project, &vm_cfg) {
-            let _ = gcp
-                .insert_instance(&project, DEFAULT_ZONE, &req, None, now)
-                .await;
-            launched_hosts.push(scale_host);
+        if rendered_script.is_some() {
+            if let Ok(req) = crate::gcp::build_spot_runner_vm_request(&project, &vm_cfg) {
+                if gcp
+                    .insert_instance(&project, DEFAULT_ZONE, &req, None, now)
+                    .await
+                    .is_ok()
+                {
+                    launched_hosts.push(scale_host);
+                }
+            }
         }
     }
 
