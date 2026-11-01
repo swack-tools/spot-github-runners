@@ -1842,7 +1842,7 @@ panel.innerHTML = `
 </div>
 </div>
 <div style="display:flex; flex-direction:column; gap:8px; background:var(--bg-card); border:1px solid var(--border); padding:10px 12px; border-radius:9px; margin-bottom:12px;">
-<div class="hint-sm">Plan only: these controls check a scale change against budgets and caps and report what it would launch or retire. The dashboard never creates or deletes VMs; the autoscaler and the provisioning tools do.</div>
+<div class="hint-sm">Plan only: these controls check a scale change against budgets and caps and report what it would launch or retire. They don't create or delete VMs.</div>
 <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
 <div style="font-size:var(--fs-sm); font-weight:600;">CI/CD Runner Hosts (<span class="mono">${esc(reg.region)}</span>):</div>
 <div style="display:flex; align-items:center; gap:6px;">
@@ -3703,6 +3703,7 @@ switchTab(normalized);
 }
 });
 </script>
+<script src="/ui/builders.js" defer></script>
 </body>
 </html>
 "##;

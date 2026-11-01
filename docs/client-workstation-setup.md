@@ -9,6 +9,37 @@ Every build pathway on this page enforces a single capacity rule before dispatch
   <figcaption markdown>End-to-end client dispatch flow showing how `select-idle-rust-builder` probes candidate `builder-*` VMs over SSH, skips any host with a running build container or less than 28 GiB of available RAM, and routes `just`, `cargo`, Visual Studio Code, and AI agent builds to an idle builder.</figcaption>
 </figure>
 
+## Use a builder launched from the dashboard
+
+If you launched a builder from the dashboard (see
+[Launch a builder from the dashboard](dedicated-builders.md#launch-a-builder-from-the-dashboard)), press
+**Use from my Mac** next to it. The dialog gives you three things to paste, all filled in with that builder's
+address and SSH account:
+
+1. A `Host spot-builder` entry for `~/.ssh/config`.
+2. A `~/.local/bin/cargo-remote` helper. It copies the project to the builder, runs Cargo inside the pinned
+   Rust 1.99.0 container, and copies the Linux x86_64 binary back into `target/`.
+3. Cargo aliases for `~/.cargo/config.toml`:
+
+    ```toml
+    [alias]
+    rb = ["remote", "build", "--release"]
+    rbd = ["remote", "build"]
+    rt = ["remote", "test"]
+    ```
+
+Then build any Cargo project from its folder:
+
+```bash
+cargo new hello-spot && cd hello-spot
+cargo rb
+file target/release/hello-spot
+```
+
+Builders compile only with Rust 1.99.0. If the project has no `rust-toolchain.toml`, the helper adds one on
+the builder; if the project pins another version, the helper stops and asks you to change it. The rest of
+this page covers several builders, idle-builder selection, `just`, and editor integration.
+
 ## Prerequisites
 
 Before configuring build triggers on your development workstation, verify the following items:

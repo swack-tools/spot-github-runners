@@ -73,7 +73,7 @@ Zero Python files exist in the repository; all legacy control VMs (`spot-control
 
 | Entry point | Purpose | Creates or changes resources? |
 | --- | --- | --- |
-| `cloudflare/src/lib.rs` (`#[event(fetch)]`) | Edge Web UI, session auth, login gate, and REST APIs (`/api/overview`, `/api/health`, `/api/scaling`, `/api/admins`, `/api/patch-console/*`) | Read-only; patch save opens a pull request |
+| `cloudflare/src/lib.rs` (`#[event(fetch)]`) | Edge Web UI, session auth, login gate, and REST APIs (`/api/overview`, `/api/health`, `/api/scaling`, `/api/admins`, `/api/patch-console/*`) | Mostly read-only; patch save opens a pull request, and the owner can launch and delete dedicated builders (`/api/builders/*`) |
 | `cloudflare/src/lib.rs` (`#[event(scheduled)]`) | 5-minute cron reconciler maintaining floor targets, scaling on queued backlog (>=20 jobs), cleaning terminated VMs, and syncing KV | Yes (manages GCP Spot VMs and GitHub runner registrations) |
 | `host-agent clean-target <path>` | Descriptor-relative safe cleanup of Cargo `target/` directory using `unlinkat`, refusing symlinks | Modifies local workspace files only |
 | `host-agent host-admission <subcommand>` | Memory lease daemon (`serve`), reservation (`acquire`), release (`release`), and headroom calculation (`headroom`) | Updates `/var/lib/gha-admission/leases.json` |

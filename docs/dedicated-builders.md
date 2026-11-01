@@ -23,6 +23,32 @@ The website audit must separately prove an actual browser launch and rendering. 
 tool proof before an existing host is upgraded; they do not establish that
 website tools are installed on previously launched builders.
 
+## Launch a builder from the dashboard
+
+The dashboard owner can start a builder without `gcloud`. Open **Machine Qualification** and press
+**Launch builder** in the **Your Rust builders** panel.
+
+1. Enter the zone, for example `us-central1-a`. Builders always use the reviewed `n4-highcpu-16` shape.
+2. Paste one Ed25519 public key line, the contents of `~/.ssh/id_ed25519.pub`. The dashboard refuses private
+   keys and other key types, and it drops the key comment.
+3. Press **Launch builder**.
+
+The Worker renders `cloud-init/builder-startup.sh` itself. It fills in the pinned `host-agent` release and
+its SHA-256 checksums, the builder image files from `builder/standalone/`, and an approved uploader mapping
+(`root-approved-ssh-mapping-v1`). The mapping names a Linux account derived from your GitHub login, with UID
+2000. The VM gets the same launcher, Docker admission, and container limits as a builder you render by hand.
+Its 375 GB `hyperdisk-balanced` cache disk is `auto-delete=no`.
+
+Setup takes about 15 to 25 minutes because the VM installs Docker and builds the Rust 1.99.0 image. The panel
+shows the VM's external address and SSH account. Press **Use from my Mac** for an `~/.ssh/config` entry, a
+`cargo-remote` helper, and `.cargo/config.toml` aliases that already contain that address. See
+[Client workstation setup](client-workstation-setup.md#use-a-builder-launched-from-the-dashboard).
+
+Only the owner can launch or delete builders; added administrators can see the panel. The dashboard runs at
+most four builders at once. **Delete** removes the VM and keeps its cache disk, which then appears under
+**Leftover cache disks** until you delete it there. A preempted builder is deleted the same way, so check that
+list for disks you no longer need.
+
 ## Render once, launch with one command
 
 <div class="carousel" markdown>

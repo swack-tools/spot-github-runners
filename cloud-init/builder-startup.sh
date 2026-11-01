@@ -170,7 +170,7 @@ if [[ "$uploader_raw" =~ ^\{\{.*\}\}$ || -z "$uploader_raw" ]]; then
   if [[ -f /etc/oxidex-builder-uploader.json ]]; then
     uploader_raw=$(cat /etc/oxidex-builder-uploader.json)
   else
-    echo "Approved uploader mapping is absent: {{UPLOADER_CONFIG}} unrendered and /etc/oxidex-builder-uploader.json missing: hold" >&2
+    echo "Approved uploader mapping is absent: the uploader placeholder is unrendered and /etc/oxidex-builder-uploader.json is missing: hold" >&2
     exit 78
   fi
 fi
@@ -236,6 +236,9 @@ chown 0:1001 "$MOUNT_POINT" "$MOUNT_POINT/remote-build"
 chmod 0710 "$MOUNT_POINT" "$MOUNT_POINT/remote-build"
 # Restricted uploaders can traverse targets for owned artifact export.
 install -d -o0 -g1001 -m0710 "$MOUNT_POINT/remote-build/targets"
+# Uploaders can traverse sources to reach their own project directory (the launcher makes it 02770).
+# Bootstrap runs under umask 077, so the launcher's first prepare would otherwise create this 0700 root:root.
+install -d -o0 -g1001 -m0710 "$MOUNT_POINT/remote-build/sources"
 install -d -m0755 /opt/gha-runners /opt/oxidex-builder/image
 install -d -m0700 /var/lib/oxidex-builder
 install -d -o root -g root -m 0755 /opt/oxidex-builder/qualification_trust /etc/oxidex-remote-build

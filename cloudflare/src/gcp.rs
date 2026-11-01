@@ -393,6 +393,72 @@ pub struct GceInstancesScopedList {
     pub instances: Vec<GceInstance>,
 }
 
+/// The fields of a builder VM that the dashboard shows: where it runs and how to reach it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GceBuilderInstance {
+    pub name: String,
+    pub zone: String,
+    #[serde(default)]
+    pub machine_type: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub creation_timestamp: Option<String>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub network_interfaces: Vec<GceBuilderNetworkInterface>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GceBuilderNetworkInterface {
+    #[serde(default)]
+    pub access_configs: Vec<GceBuilderAccessConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GceBuilderAccessConfig {
+    #[serde(default, rename = "natIP")]
+    pub nat_ip: Option<String>,
+}
+
+impl GceBuilderInstance {
+    pub fn zone_short(&self) -> &str {
+        self.zone.rsplit('/').next().unwrap_or(&self.zone)
+    }
+
+    pub fn machine_type_short(&self) -> &str {
+        self.machine_type
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.machine_type)
+    }
+
+    /// A dedicated builder: `builder-` name and the `spot-role=rust_builder` label.
+    pub fn is_builder(&self) -> bool {
+        self.name.starts_with("builder-")
+            && self.labels.get("spot-role").map(String::as_str) == Some("rust_builder")
+    }
+
+    /// The first external IPv4 address, if Compute Engine has assigned one.
+    pub fn external_ip(&self) -> Option<&str> {
+        self.network_interfaces
+            .iter()
+            .flat_map(|n| n.access_configs.iter())
+            .filter_map(|a| a.nat_ip.as_deref())
+            .find(|ip| !ip.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GceBuilderInstancesScopedList {
+    #[serde(default)]
+    pub instances: Vec<GceBuilderInstance>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct GceDisksScopedList {
     #[serde(default)]
@@ -798,6 +864,55 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
         Ok(disks)
     }
 
+    /// List dedicated builder VMs (`builder-` name, label `spot-role=rust_builder`) with their external addresses.
+    pub async fn list_builder_instances(
+        &self,
+        now: u64,
+    ) -> Result<Vec<GceBuilderInstance>, GcpError> {
+        let mut instances = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        loop {
+            let mut url = format!(
+                "{}/projects/{}/aggregated/instances?returnPartialSuccess=true&maxResults=500",
+                COMPUTE_API_BASE, self.project
+            );
+            if let Some(ref pt) = page_token {
+                url.push_str("&pageToken=");
+                url.push_str(pt);
+            }
+
+            let headers = self.auth_headers(now).await?;
+            let header_refs: Vec<(&str, &str)> =
+                headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+            let (status, bytes) = self
+                .transport
+                .request("GET", &url, &header_refs, None)
+                .await?;
+            if status != 200 {
+                return Err(GcpError::Api(
+                    status,
+                    "instances.aggregatedList".into(),
+                    String::from_utf8_lossy(&bytes).into(),
+                ));
+            }
+
+            let page: GceAggregatedListEnvelope<GceBuilderInstancesScopedList> =
+                serde_json::from_slice(&bytes)?;
+            for scoped in page.items.into_values() {
+                instances.extend(scoped.instances.into_iter().filter(|i| i.is_builder()));
+            }
+
+            match page.next_page_token {
+                Some(tok) if !tok.is_empty() => page_token = Some(tok),
+                _ => break,
+            }
+        }
+
+        Ok(instances)
+    }
+
     /// Identify orphan runner disks (unattached disks matching runner naming prefix).
     pub async fn list_orphan_runner_disks(&self, now: u64) -> Result<Vec<GceDisk>, GcpError> {
         let disks = self.list_disks(now).await?;
@@ -871,6 +986,38 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
     ) -> Result<GceOperation, GcpError> {
         let url = format!(
             "{}/projects/{}/zones/{}/instances/{}?deleteDisk=ALL",
+            COMPUTE_API_BASE, self.project, zone, instance
+        );
+
+        let headers = self.auth_headers(now).await?;
+        let header_refs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+        let (status, bytes) = self
+            .transport
+            .request("DELETE", &url, &header_refs, None)
+            .await?;
+        if status != 200 {
+            return Err(GcpError::Api(
+                status,
+                "instances.delete".into(),
+                String::from_utf8_lossy(&bytes).into(),
+            ));
+        }
+
+        let op: GceOperation = serde_json::from_slice(&bytes)?;
+        Ok(op)
+    }
+
+    /// Delete an instance and leave disks marked `auto-delete=no` (a builder's cache disk) in place.
+    pub async fn delete_instance_keep_disks(
+        &self,
+        zone: &str,
+        instance: &str,
+        now: u64,
+    ) -> Result<GceOperation, GcpError> {
+        let url = format!(
+            "{}/projects/{}/zones/{}/instances/{}",
             COMPUTE_API_BASE, self.project, zone, instance
         );
 

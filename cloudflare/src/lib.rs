@@ -2,6 +2,7 @@
 //! Pure-Rust Cloudflare Worker serving the Web UI, Auth, Edge State, and Fleet Controller.
 
 pub mod auth;
+pub mod builders;
 pub mod gcp;
 pub mod github;
 pub mod host_agent_release;
@@ -12,6 +13,7 @@ pub mod reconciler;
 pub mod repo_spec;
 pub mod state;
 pub mod ui;
+pub mod ui_builders;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -157,6 +159,31 @@ async fn require_administrator<K: state::KvStoreBackend>(
             error_response(403, "forbidden", "Administrator permissions required").map(Some)
         }
     }
+}
+
+/// Compute Engine client for the builder routes, from the Worker's service account key.
+fn builder_gcp_client(
+    env: &Env,
+) -> std::result::Result<gcp::GceComputeClient<gcp::WorkerGcpTransport>, String> {
+    let sa_key = env
+        .secret("GCP_SERVICE_ACCOUNT_KEY")
+        .map(|s| s.to_string())
+        .or_else(|_| env.var("GCP_SERVICE_ACCOUNT_KEY").map(|v| v.to_string()))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "The Worker has no GCP service account key".to_string())?;
+    let creds: gcp::GcpCredentials = serde_json::from_str(&sa_key)
+        .map_err(|_| "The Worker's GCP service account key is not valid JSON".to_string())?;
+    let project = creds
+        .project_id
+        .clone()
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| "The GCP service account key has no project_id".to_string())?;
+    Ok(gcp::GceComputeClient::new(
+        creds,
+        project,
+        gcp::WorkerGcpTransport,
+    ))
 }
 
 fn is_global_admins_enabled(env: &Env) -> bool {
@@ -1337,6 +1364,276 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
         }
 
         // Rust Build Telemetry
+        (Method::Get, "/ui/builders.js") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            let headers = Headers::new();
+            headers.set("Content-Type", "text/javascript; charset=utf-8")?;
+            headers.set("Cache-Control", "no-store, no-cache, must-revalidate")?;
+            headers.set("X-Content-Type-Options", "nosniff")?;
+            Ok(Response::ok(ui_builders::BUILDERS_JS)?.with_headers(headers))
+        }
+
+        (Method::Get, "/api/builders") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            let is_owner = verified_session
+                .as_ref()
+                .map(|s| s.uid == state::OWNER_UID)
+                .unwrap_or(false);
+            let client = match builder_gcp_client(&env) {
+                Ok(c) => c,
+                Err(msg) => {
+                    return json_response(
+                        200,
+                        &serde_json::json!({
+                            "configured": false,
+                            "message": msg,
+                            "builders": [],
+                            "leftover_cache_disks": [],
+                            "can_manage": is_owner,
+                            "docs_url": builders::CLIENT_SETUP_DOCS_URL,
+                            "max_live_builders": builders::MAX_LIVE_BUILDERS,
+                        }),
+                    )
+                }
+            };
+            let instances = match client.list_builder_instances(now).await {
+                Ok(list) => list,
+                Err(e) => return error_response(502, "gcp_error", &e.to_string()),
+            };
+            let disks = match client.list_disks(now).await {
+                Ok(list) => list,
+                Err(e) => return error_response(502, "gcp_error", &e.to_string()),
+            };
+            let builders_view: Vec<Value> =
+                instances.iter().map(builders::builder_summary).collect();
+            let leftover: Vec<Value> = disks
+                .iter()
+                .filter(|d| builders::is_leftover_builder_cache_disk(d))
+                .map(|d| {
+                    serde_json::json!({
+                        "name": d.name,
+                        "zone": d.zone_short(),
+                        "size_gb": d.size_gb,
+                        "created_at": d.creation_timestamp,
+                    })
+                })
+                .collect();
+            json_response(
+                200,
+                &serde_json::json!({
+                    "configured": true,
+                    "builders": builders_view,
+                    "leftover_cache_disks": leftover,
+                    "can_manage": is_owner,
+                    "docs_url": builders::CLIENT_SETUP_DOCS_URL,
+                    "machine_type": builders::BUILDER_MACHINE_TYPE,
+                    "max_live_builders": builders::MAX_LIVE_BUILDERS,
+                }),
+            )
+        }
+
+        (Method::Post, "/api/builders/launch") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            if session.uid != state::OWNER_UID {
+                return error_response(
+                    403,
+                    "forbidden",
+                    "Only the dashboard owner can launch builders",
+                );
+            }
+            #[derive(serde::Deserialize)]
+            struct LaunchBody {
+                zone: String,
+                ssh_public_key: String,
+            }
+            let body: LaunchBody = match req.json().await {
+                Ok(b) => b,
+                Err(e) => return error_response(400, "bad_request", &e.to_string()),
+            };
+            let zone = body.zone.trim().to_string();
+            if let Err(msg) = builders::validate_zone(&zone) {
+                return error_response(400, "validation_error", &msg);
+            }
+            if let Err(msg) = builders::normalize_ed25519_public_key(&body.ssh_public_key) {
+                return error_response(400, "validation_error", &msg);
+            }
+            let client = match builder_gcp_client(&env) {
+                Ok(c) => c,
+                Err(msg) => return error_response(503, "gcp_not_configured", &msg),
+            };
+            let live = match client.list_builder_instances(now).await {
+                Ok(list) => list.iter().filter(|i| builders::is_live_builder(i)).count(),
+                Err(e) => return error_response(502, "gcp_error", &e.to_string()),
+            };
+            if live >= builders::MAX_LIVE_BUILDERS {
+                return error_response(
+                    409,
+                    "too_many_builders",
+                    &format!(
+                        "{live} builders are already running; delete one first (limit {})",
+                        builders::MAX_LIVE_BUILDERS
+                    ),
+                );
+            }
+            let mut suffix_bytes = [0u8; 3];
+            if getrandom::getrandom(&mut suffix_bytes).is_err() {
+                return error_response(500, "internal_error", "No randomness for the builder name");
+            }
+            let suffix = hex::encode(suffix_bytes);
+            let instance_name = match builders::builder_instance_name(&zone, &suffix) {
+                Ok(n) => n,
+                Err(msg) => return error_response(400, "validation_error", &msg),
+            };
+            let queue_token =
+                match auth::mint_builder_queue_token(session_secret, &instance_name, now) {
+                    Ok(t) => t,
+                    Err(msg) => return error_response(500, "internal_error", &msg),
+                };
+            let plan = match builders::plan_builder_launch(&builders::BuilderLaunchInput {
+                project: &client.project,
+                zone: &zone,
+                login: &session.sub,
+                github_uid: session.uid,
+                ssh_public_key: &body.ssh_public_key,
+                queue_token: Some(&queue_token),
+                suffix: &suffix,
+                now,
+            }) {
+                Ok(p) => p,
+                Err(msg) => return error_response(500, "launch_plan_failed", &msg),
+            };
+            if let Err(e) = client
+                .insert_instance(&plan.zone, &plan.request, None, now)
+                .await
+            {
+                return error_response(502, "gcp_error", &e.to_string());
+            }
+            json_response(
+                200,
+                &serde_json::json!({
+                    "launched": true,
+                    "name": plan.instance_name,
+                    "zone": plan.zone,
+                    "machine_type": builders::BUILDER_MACHINE_TYPE,
+                    "cache_disk": plan.cache_disk_name,
+                    "ssh_user": plan.ssh_user,
+                }),
+            )
+        }
+
+        (Method::Post, "/api/builders/delete") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            if session.uid != state::OWNER_UID {
+                return error_response(
+                    403,
+                    "forbidden",
+                    "Only the dashboard owner can delete builders",
+                );
+            }
+            #[derive(serde::Deserialize)]
+            struct DeleteBody {
+                name: String,
+                zone: String,
+            }
+            let body: DeleteBody = match req.json().await {
+                Ok(b) => b,
+                Err(e) => return error_response(400, "bad_request", &e.to_string()),
+            };
+            let client = match builder_gcp_client(&env) {
+                Ok(c) => c,
+                Err(msg) => return error_response(503, "gcp_not_configured", &msg),
+            };
+            let instances = match client.list_builder_instances(now).await {
+                Ok(list) => list,
+                Err(e) => return error_response(502, "gcp_error", &e.to_string()),
+            };
+            // Only a VM that is a builder (by label and name) can be deleted through this route.
+            let Some(inst) = instances.iter().find(|i| {
+                i.name == body.name
+                    && i.zone_short() == body.zone
+                    && i.name.starts_with("builder-")
+                    && i.labels.get("spot-role").map(String::as_str) == Some("rust_builder")
+            }) else {
+                return error_response(404, "not_found", "No builder with that name in that zone");
+            };
+            if let Err(e) = client
+                .delete_instance_keep_disks(inst.zone_short(), &inst.name, now)
+                .await
+            {
+                return error_response(502, "gcp_error", &e.to_string());
+            }
+            json_response(
+                200,
+                &serde_json::json!({
+                    "deleting": inst.name,
+                    "zone": inst.zone_short(),
+                    "cache_disk_kept": format!("{}-cache", inst.name),
+                }),
+            )
+        }
+
+        (Method::Post, "/api/builders/delete-cache-disk") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            if session.uid != state::OWNER_UID {
+                return error_response(
+                    403,
+                    "forbidden",
+                    "Only the dashboard owner can delete builder disks",
+                );
+            }
+            #[derive(serde::Deserialize)]
+            struct DeleteDiskBody {
+                name: String,
+                zone: String,
+            }
+            let body: DeleteDiskBody = match req.json().await {
+                Ok(b) => b,
+                Err(e) => return error_response(400, "bad_request", &e.to_string()),
+            };
+            let client = match builder_gcp_client(&env) {
+                Ok(c) => c,
+                Err(msg) => return error_response(503, "gcp_not_configured", &msg),
+            };
+            let disks = match client.list_disks(now).await {
+                Ok(list) => list,
+                Err(e) => return error_response(502, "gcp_error", &e.to_string()),
+            };
+            // Only an unattached builder cache disk can be deleted through this route.
+            let Some(disk) = disks.iter().find(|d| {
+                d.name == body.name
+                    && d.zone_short() == body.zone
+                    && builders::is_leftover_builder_cache_disk(d)
+            }) else {
+                return error_response(
+                    404,
+                    "not_found",
+                    "No unattached builder cache disk with that name in that zone",
+                );
+            };
+            if let Err(e) = client.delete_disk(disk.zone_short(), &disk.name, now).await {
+                return error_response(502, "gcp_error", &e.to_string());
+            }
+            json_response(
+                200,
+                &serde_json::json!({ "deleting": disk.name, "zone": disk.zone_short() }),
+            )
+        }
+
         (Method::Get, "/api/rust-builds") => {
             if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
             {
