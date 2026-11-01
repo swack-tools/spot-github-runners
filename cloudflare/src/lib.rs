@@ -1286,6 +1286,25 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             }
         }
 
+        (Method::Post, "/api/runner-pools/resize") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            let resize_req: runner_pools::ResizeRunnerPoolRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            match runner_pools::handle_resize_runner_pool(&kv, resize_req, now).await {
+                Ok(body) => json_response(200, &body),
+                Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
         // The dashboard's Launch dialog and pools panel, kept out of DASHBOARD_HTML's size budget.
         (Method::Get, "/ui/runner-pools.js") => {
             if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?

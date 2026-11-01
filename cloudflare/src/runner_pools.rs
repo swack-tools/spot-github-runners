@@ -113,6 +113,13 @@ pub struct RemoveRunnerPoolRequest {
     pub id: String,
 }
 
+/// Body of `POST /api/runner-pools/resize`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResizeRunnerPoolRequest {
+    pub id: String,
+    pub hosts: u32,
+}
+
 /// vCPU and RAM (GiB) of each machine type a pool may use: the runner allowlists in `patch.rs`.
 pub fn machine_shape(machine_type: &str) -> Option<(u32, u32)> {
     Some(match machine_type {
@@ -712,6 +719,73 @@ pub async fn handle_remove_runner_pool<K: KvStoreBackend>(
     if !pool.removing {
         pool.removing = true;
         save_pools(kv, &bundle.state.runner_pools).await?;
+    }
+    Ok(pools_view(&bundle.state))
+}
+
+/// Why a pool can't be resized to `hosts`, if it can't: the size limits, a removal in progress,
+/// and the hourly budget cap across all pools.
+pub fn resize_refusal(state: &DashboardState, pool: &RunnerPool, hosts: u32) -> Option<String> {
+    if hosts == 0 || hosts > MAX_HOSTS_PER_POOL {
+        return Some(format!(
+            "Hosts must be 1 to {}; use Remove to delete the pool",
+            MAX_HOSTS_PER_POOL
+        ));
+    }
+    if pool.removing {
+        return Some(format!("Pool '{}' is being removed", pool.id));
+    }
+    let cap = state.global_budget.max_hourly_usd;
+    if let Some(host_cost) = pool.host_hourly_usd {
+        let others: f64 = state
+            .runner_pools
+            .iter()
+            .filter(|p| !p.removing && p.id != pool.id)
+            .filter_map(|p| p.host_hourly_usd.map(|c| c * p.hosts as f64))
+            .sum();
+        let total = others + host_cost * hosts as f64;
+        if hosts > pool.hosts && cap.is_finite() && cap > 0.0 && !(total <= cap + 1e-9) {
+            return Some(format!(
+                "All pools together would cost about ${:.4}/hr, above the ${:.2}/hr budget cap",
+                total, cap
+            ));
+        }
+    }
+    None
+}
+
+pub async fn handle_resize_runner_pool<K: KvStoreBackend>(
+    kv: &K,
+    req: ResizeRunnerPoolRequest,
+    now: u64,
+) -> Result<serde_json::Value, StateError> {
+    // The budget cap comes from the stored state, not the isolate's cached copy.
+    let (mut bundle, _) = load_authoritative_state(kv, now).await?;
+    bundle.state.runner_pools = load_pools(kv).await?;
+    let id = req.id.trim();
+    let Some(idx) = bundle.state.runner_pools.iter().position(|p| p.id == id) else {
+        return Err(StateError::NotFound(format!("Pool '{}' not found", id)));
+    };
+    let pool = bundle.state.runner_pools[idx].clone();
+    if let Some(reason) = resize_refusal(&bundle.state, &pool, req.hosts) {
+        return Err(StateError::Validation(reason));
+    }
+    if pool.hosts != req.hosts {
+        // Read the list again right before writing and change only this pool's host count, so a
+        // pool created or removed meanwhile isn't undone.
+        let mut pools = load_pools(kv).await?;
+        let Some(fresh) = pools.iter_mut().find(|p| p.id == id) else {
+            return Err(StateError::NotFound(format!("Pool '{}' not found", id)));
+        };
+        if fresh.removing {
+            return Err(StateError::Validation(format!(
+                "Pool '{}' is being removed",
+                id
+            )));
+        }
+        fresh.hosts = req.hosts;
+        save_pools(kv, &pools).await?;
+        bundle.state.runner_pools = pools;
     }
     Ok(pools_view(&bundle.state))
 }

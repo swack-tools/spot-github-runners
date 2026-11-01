@@ -146,6 +146,7 @@ struct Gh {
     deleted: Arc<Mutex<Vec<u64>>>,
     minted: Arc<Mutex<Vec<(String, u32, Vec<String>)>>>,
     fail_list: Arc<Mutex<bool>>,
+    refuse_delete: Arc<Mutex<Vec<u64>>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -163,6 +164,10 @@ impl GitHubReconcilerClient for Gh {
             .unwrap_or_default())
     }
     async fn delete_runner(&self, _path: &str, id: u64) -> Result<(), ReconcilerError> {
+        if self.refuse_delete.lock().unwrap().contains(&id) {
+            // GitHub answers 422 when the runner is running a job.
+            return Err(ReconcilerError::Github("runner is busy".into()));
+        }
         self.deleted.lock().unwrap().push(id);
         Ok(())
     }
@@ -1047,4 +1052,260 @@ async fn a_state_save_from_a_legacy_blob_keeps_its_pools() {
     save_state(&kv, &mut bundle, NOW + 1).await.unwrap();
     assert!(!kv.data.lock().unwrap()[KV_STATE_KEY].contains("legacy"));
     assert_eq!(kv.pools(), vec![old]);
+}
+
+// ============================================================================
+// Resize
+// ============================================================================
+
+#[tokio::test]
+async fn resize_changes_the_host_count_within_limits_and_budget() {
+    let _g = lock();
+    invalidate_state_cache();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, axion_request("swack-tools")).await;
+
+    let view = handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 3,
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!(view["pools"][0]["hosts"], 3);
+    assert_eq!(kv.pools()[0].hosts, 3);
+
+    for bad in [0, MAX_HOSTS_PER_POOL + 1] {
+        let err = handle_resize_runner_pool(
+            &kv,
+            ResizeRunnerPoolRequest {
+                id: id.clone(),
+                hosts: bad,
+            },
+            NOW,
+        )
+        .await;
+        assert!(matches!(err, Err(StateError::Validation(_))), "{}", bad);
+    }
+    let missing = handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: "nope00".into(),
+            hosts: 1,
+        },
+        NOW,
+    )
+    .await;
+    assert!(matches!(missing, Err(StateError::NotFound(_))));
+
+    // Growing past the budget cap is refused; shrinking always works.
+    let mut b = kv.bundle();
+    b.state.global_budget.max_hourly_usd = 0.10;
+    kv.store(&b);
+    invalidate_state_cache();
+    let over = handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 10,
+        },
+        NOW,
+    )
+    .await;
+    assert!(
+        matches!(&over, Err(StateError::Validation(m)) if m.contains("budget")),
+        "{:?}",
+        over
+    );
+    handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 1,
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert_eq!(kv.pools()[0].hosts, 1);
+
+    // A pool being removed can't be resized.
+    handle_remove_runner_pool(&kv, RemoveRunnerPoolRequest { id: id.clone() }, NOW)
+        .await
+        .unwrap();
+    let err = handle_resize_runner_pool(&kv, ResizeRunnerPoolRequest { id, hosts: 2 }, NOW).await;
+    assert!(matches!(err, Err(StateError::Validation(_))));
+}
+
+fn pool_runner(id: u64, host: &str, n: u32, busy: bool) -> SimpleGitHubRunner {
+    SimpleGitHubRunner {
+        id,
+        name: format!("oxidex-{}-{}", host, n),
+        status: "online".into(),
+        busy,
+    }
+}
+
+#[tokio::test]
+async fn scaling_down_deletes_the_newest_idle_hosts_and_keeps_busy_ones() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, axion_request("swack-tools")).await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+    let old = format!("{}{}-aaaa", pool_host_name_prefix(&id), NOW);
+    let mid = format!("{}{}-bbbb", pool_host_name_prefix(&id), NOW + 300);
+    let new = format!("{}{}-cccc", pool_host_name_prefix(&id), NOW + 600);
+    for n in [&old, &mid, &new] {
+        gcp.instances.lock().unwrap().push(host(n, &id, "RUNNING"));
+    }
+    // The newest host is running a job; the other two are idle.
+    gh.runners.lock().unwrap().insert(
+        "orgs/swack-tools".into(),
+        vec![
+            pool_runner(1, &old, 1, false),
+            pool_runner(2, &mid, 1, false),
+            pool_runner(3, &new, 1, true),
+            pool_runner(4, &new, 2, false),
+        ],
+    );
+    handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 2,
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+
+    // GitHub's runner list fails: every host would look idle, so nothing is deleted.
+    *gh.fail_list.lock().unwrap() = true;
+    run_reconciliation(&kv, &gcp, &gh, NOW + 700).await.unwrap();
+    assert!(gcp.deleted.lock().unwrap().is_empty());
+    assert!(gcp.inserted.lock().unwrap().is_empty());
+
+    // With a good list, one host goes: the newest idle one, not the busy newest one.
+    *gh.fail_list.lock().unwrap() = false;
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 1000)
+        .await
+        .unwrap();
+    assert_eq!(gcp.deleted.lock().unwrap().clone(), vec![mid.clone()]);
+    assert!(r.cleaned_vms.contains(&mid));
+    assert_eq!(gh.deleted.lock().unwrap().clone(), vec![2]);
+    assert!(gcp.inserted.lock().unwrap().is_empty());
+
+    // Down to 1 with only the busy host left above it: the idle old host goes, the busy one stays.
+    gcp.instances.lock().unwrap().retain(|i| i.name != mid);
+    handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 1,
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, NOW + 1400)
+        .await
+        .unwrap();
+    assert_eq!(gcp.deleted.lock().unwrap().clone(), vec![mid, old]);
+
+    // Scaling back up launches a host again.
+    gcp.instances.lock().unwrap().retain(|i| i.name == new);
+    handle_resize_runner_pool(&kv, ResizeRunnerPoolRequest { id, hosts: 2 }, NOW)
+        .await
+        .unwrap();
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 1800)
+        .await
+        .unwrap();
+    assert_eq!(r.launched_hosts.len(), 1, "{:?}", r);
+}
+
+#[tokio::test]
+async fn scaling_down_keeps_a_host_whose_runner_took_a_job_since_the_list() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, axion_request("swack-tools")).await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+    let old = format!("{}{}-aaaa", pool_host_name_prefix(&id), NOW);
+    let new = format!("{}{}-cccc", pool_host_name_prefix(&id), NOW + 600);
+    // A host deleted last tick and still stopping doesn't count toward the pool.
+    let stopping = format!("{}{}-dddd", pool_host_name_prefix(&id), NOW + 900);
+    gcp.instances
+        .lock()
+        .unwrap()
+        .push(host(&old, &id, "RUNNING"));
+    gcp.instances
+        .lock()
+        .unwrap()
+        .push(host(&new, &id, "RUNNING"));
+    gcp.instances
+        .lock()
+        .unwrap()
+        .push(host(&stopping, &id, "STOPPING"));
+    gh.runners.lock().unwrap().insert(
+        "orgs/swack-tools".into(),
+        vec![
+            pool_runner(1, &old, 1, false),
+            pool_runner(2, &new, 1, false),
+        ],
+    );
+    // The newest host's runner picked up a job after the list: GitHub refuses to remove it.
+    gh.refuse_delete.lock().unwrap().push(2);
+    handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 1,
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+
+    run_reconciliation(&kv, &gcp, &gh, NOW + 1000)
+        .await
+        .unwrap();
+    // The busy newest host stays; the older idle one goes instead. The stopping host is left alone.
+    assert_eq!(gcp.deleted.lock().unwrap().clone(), vec![old]);
+    assert_eq!(gh.deleted.lock().unwrap().clone(), vec![1]);
+}
+
+#[tokio::test]
+async fn resize_does_not_undo_a_remove_saved_meanwhile() {
+    let _g = lock();
+    invalidate_state_cache();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, axion_request("swack-tools")).await;
+    let other = seed_other_pool(&kv).await;
+    handle_remove_runner_pool(&kv, RemoveRunnerPoolRequest { id: other.clone() }, NOW)
+        .await
+        .unwrap();
+    handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 2,
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+    let pools = kv.pools();
+    assert!(pools.iter().any(|p| p.id == other && p.removing));
+    assert!(pools.iter().any(|p| p.id == id && p.hosts == 2));
 }
