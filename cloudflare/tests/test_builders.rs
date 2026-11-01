@@ -647,4 +647,6 @@ fn builder_startup_claims_gid_1001_before_installing_docker() {
         .expect("docker is installed");
     assert!(claim < docker);
     assert!(script.contains("docker | lxd)"));
+    // getent exits 2 for an unused GID, which pipefail and set -e must not turn into a failed setup.
+    assert!(script.contains("holder=$(getent group 1001 | cut -d: -f1) || true"));
 }

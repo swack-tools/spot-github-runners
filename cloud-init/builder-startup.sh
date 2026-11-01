@@ -73,7 +73,7 @@ export DEBIAN_FRONTEND=noninteractive
 # before this script runs, so move those aside. Any other group holding 1001 stops the setup.
 claim_build_gid() {
   local holder gid=1100
-  holder=$(getent group 1001 | cut -d: -f1)
+  holder=$(getent group 1001 | cut -d: -f1) || true
   case "$holder" in
     oxidex-build) return 0 ;;
     docker | lxd)
