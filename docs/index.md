@@ -80,6 +80,7 @@ The scheduled edge reconciler is the autonomous component that manages runner ho
 
 ## Where to start
 
+- **Using the dashboard to run jobs on cheap Spot runners?** Follow the [How-to guides](guides/index.md). Each one walks through a task with a short animation and a screenshot per step.
 - **New to the repository?** Start with [Getting started](getting-started.md), then run the read-only commands.
 - **Operating the fleet?** Read [Fleet and autoscaler](fleet-and-autoscaler.md) and
   [Operations and troubleshooting](operations.md).

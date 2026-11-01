@@ -1,0 +1,37 @@
+// Guide: resize and remove a pool.
+const { open, close, BASE } = require('./rec');
+const answers = [];
+(async () => {
+  const r = await open('resize', { onDialog(d) { const a = answers.shift(); if (d.type() === 'prompt') d.accept(a); else d.accept(); } });
+  const { page, click, caption, wait, moveTo, shot, fakeDialog } = r;
+  await page.goto(BASE + '/', { waitUntil: 'networkidle' });
+  await page.click('[data-tab="tab-sizing"]');
+  await page.click('#sidebar-toggle-btn');
+  await page.locator('#rp-panel').evaluate(e => e.scrollIntoView({ block: 'start' }));
+  await page.evaluate(() => window.scrollBy({ top: -100 }));
+  await wait(600);
+  await moveTo(700, 500, 1);
+  const row = '#rp-body tr:first-child';
+  const p = await page.evaluate(async () => (await (await fetch('/api/runner-pools')).json()).pools[0]);
+  await caption('To change the number of hosts, click Resize');
+  await click(`${row} button[data-resize]`, 300);
+  await caption('Enter the most hosts the pool may run');
+  await fakeDialog(`Most hosts for pool ${p.id} (1 to 10, now ${p.hosts}). Scaling down deletes idle hosts first; a host running a job stays until the job ends.`, '4');
+  await caption('For a pool that spins down, also enter the fewest hosts');
+  await fakeDialog(`Fewest hosts for pool ${p.id} (0 to 4, now ${p.min_hosts}). The pool keeps these hosts even when no jobs run; 4 turns spin-down off.`, '0');
+  answers.push('4', '0');
+  await page.evaluate(id => document.querySelector(`button[data-resize="${id}"]`).click(), p.id);
+  await wait(1500);
+  await caption('The pool now runs 0 to 4 hosts. The reconciler adds or deletes hosts on its next runs', 2800);
+  await shot('resize-or-remove-a-pool', 'resized', row, 6);
+  await caption('To delete the pool, click Remove');
+  await click(`${row} button[data-remove]`, 300);
+  await fakeDialog(`Remove pool ${p.id}? This deletes its 4 host(s) for ${p.target} and their runner registrations. Running jobs on them stop.`, null, 2400);
+  answers.push(null);
+  await page.evaluate(id => document.querySelector(`button[data-remove="${id}"]`).click(), p.id);
+  await wait(1500);
+  await caption('The pool shows Removing… until its hosts and runner registrations are gone', 3000);
+  await shot('resize-or-remove-a-pool', 'removing', row, 6);
+  await caption('', 300);
+  console.log(await close(r, 'resize-or-remove-a-pool'));
+})();

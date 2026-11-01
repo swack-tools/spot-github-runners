@@ -58,6 +58,10 @@ document.head.append(el("style", { text: `
 #rp-tpl-dialog{margin:auto;max-width:620px;width:calc(100% - 32px);background:var(--bg-panel);color:var(--text-main);border:1px solid var(--border);border-radius:var(--radius-lg,12px);padding:var(--space-5,20px)}
 #rp-tpl-dialog::backdrop{background:rgba(0,0,0,.6)}
 #rp-tpl-dialog pre{max-height:180px;overflow:auto;background:var(--bg-sunken);border:1px solid var(--border);border-radius:8px;padding:8px;white-space:pre-wrap;font-size:12px}
+/* Keep the matrix's Launch column in view when the table scrolls sideways. */
+.table-wrap:has(#qualification-table-body) :is(td,th):last-child{position:sticky;right:0}
+.table-wrap:has(#qualification-table-body) td:last-child{background:var(--bg-panel);box-shadow:-10px 0 10px -10px rgba(0,0,0,.6)}
+.table-wrap:has(#qualification-table-body) tr:hover td:last-child{background:var(--bg-card)}
 #ci-pool-hint{margin-top:12px;padding:10px 12px;border-radius:8px;background:var(--bg-card);border:1px solid var(--border)}
 ` }));
 
@@ -457,6 +461,9 @@ function setupTemplateTab() {
   const row = saveBtn.parentElement;
   const btn = el("button", { type: "button", class: "btn btn-secondary", id: "ci-new-script", text: "＋ New runner setup script" });
   btn.addEventListener("click", () => {
+    // A new script isn't any saved template: clear the picker so Save Current Template can't
+    // overwrite the template that was selected before.
+    $("ci-editor-select").value = "";
     $("ci-editor-role").value = "cicd_runner";
     $("ci-editor-name").value = "Runner tools";
     $("ci-editor-textarea").value = STARTER_SCRIPT;

@@ -87,6 +87,30 @@ The dashboard UI is embedded in `cloudflare/src/ui.rs` as two raw HTML strings (
      - A dark pill `<rect>` (`#0f172a`) with a colored status dot and bold white label text.
    - Remove `#__doc_callout` immediately after `.screenshot()` completes.
 
+## Recreate the how-to guide animations and screenshots
+
+The [How-to guides](../guides/index.md) each have one GIF and a few step screenshots under `docs/images/<guide-name>/`. They're recorded from a local Worker, never from the live dashboard, by the scripts in `tools/guide-recorder/`:
+
+1. Start a local Worker with empty state and mock sign-in. Delete the state directory first, because the scenes build on each other: the launch scene creates the pool that later scenes change and remove.
+
+    ```bash
+    rm -rf /tmp/guide-state
+    cd cloudflare
+    npx wrangler dev --local --port 8787 --persist-to /tmp/guide-state \
+      --var SPOT_ALLOW_MOCK_AUTH:1 --var GITHUB_ORG:example-org \
+      --var SESSION_SECRET:local-dev-session-secret-0123456789abcdef
+    ```
+
+1. In another terminal, run `tools/guide-recorder/record-all.sh`. It needs Node.js with Playwright, `ffmpeg`, `gifsicle`, and Python with Pillow. Don't edit `cloudflare/src` while it runs: `wrangler dev` rebuilds on every change and the scene that's running fails.
+1. Review every GIF and screenshot before committing.
+
+How the recorder keeps the pictures accurate and small:
+
+- Every response from the local Worker is rewritten to the synthetic names in the sanitization table, and pool status that a local Worker can't produce, such as running hosts or a capacity error, is set by the scene that shows it.
+- The browser runs at a 1440 by 900 viewport. A yellow dot shows the pointer, and a caption bar names each step.
+- Native `confirm` and `prompt` boxes never appear in a recording, so the scene shows a plain stand-in with the same text first.
+- Frames come from the DevTools screencast as PNG, not from Playwright's video, which is lossy. Unchanged parts of the screen stay identical between frames, which keeps each GIF near 1 MB at 960 pixels wide and 8 frames per second.
+
 ## Recreate the 20 terminal captures and VS Code screenshot
 
 To recreate the `term-*.png` images and `vscode-remote-build.png` when command-line tool flags, test counts, or API shapes change:

@@ -68,9 +68,11 @@ jobs:
 
 The **Runner pools** panel shows each pool's `runs-on` line with a **Copy** button.
 
-<figure class="shot" markdown>
-![Finding cheap 2 vCPU hosts, launching a pool, and pointing a workflow at it](images/runner-pools-launch-small.gif)
-<figcaption markdown>Sizing the matrix for 2 vCPU, 6 GiB runners, launching a spin-down pool on the cheapest host, `n4a-standard-2`, with the extra label `small`, and pasting its `runs-on` line into a workflow in `example-org/service-a`. The pool then sees the queued job and starts a host.</figcaption>
+For step-by-step walkthroughs with pictures, see [Find the cheapest hosts](guides/find-cheap-hosts.md), [Launch a runner pool](guides/launch-a-pool.md), and [Point a workflow at a pool](guides/use-a-pool-in-a-workflow.md).
+
+<figure class="shot walkthrough" markdown>
+![Launching a runner pool from the matrix](images/launch-a-pool/launch-a-pool.gif)
+<figcaption markdown>Launching a spin-down pool on `n4a-standard-2` for `example-org` with the extra label `small`.</figcaption>
 </figure>
 
 ## How a pool spins up and down
@@ -126,10 +128,7 @@ The pool keeps a copy of the template you pick. On each run, the reconciler repl
 
 Editing a template on the templates page doesn't change pools that use it. Click **Change** and pick the template again to roll out the edited version.
 
-<figure class="shot" markdown>
-![Creating a runner setup template and rolling it onto a running pool](images/runner-pools-template.gif)
-<figcaption markdown>Creating the template `Protobuf and jq tools` from the starter script, then switching a running `e2-standard-2` pool for `example-org` to it with **Change**.</figcaption>
-</figure>
+For walkthroughs with pictures, see [Make a runner setup template](guides/make-a-runner-template.md) and [Roll a template onto a running pool](guides/change-a-pool-template.md).
 
 ### Template limits
 
@@ -150,9 +149,9 @@ Each row in **Runner pools** shows:
 
 The **Status** column can lag by up to one reconciler run. Click **Refresh** to reload the panel. It also refreshes every minute while the page is open.
 
-<figure class="shot" markdown>
-![Checking pools while jobs run and again after they spun down](images/runner-pools-spun-down.gif)
-<figcaption markdown>Two pools for `example-org` with hosts running during builds, and the same pools after the builds: no hosts running, the last spin-down time, and `$0/hr now`.</figcaption>
+<figure class="shot walkthrough" markdown>
+![Checking a pool while jobs run and after it spun down](images/check-a-pool/check-a-pool.gif)
+<figcaption markdown>A pool with two hosts running jobs, and the same pool after its hosts sat idle and were deleted. See [Check on a pool](guides/check-a-pool.md).</figcaption>
 </figure>
 
 All pools together, at their most hosts, must stay under the hourly limit in the dashboard's **Max Budget** settings. The dashboard refuses a new pool that would go over it.

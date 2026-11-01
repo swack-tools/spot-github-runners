@@ -2045,3 +2045,30 @@ async fn small_e2_and_t2d_hosts_attach_disks_over_scsi() {
         }
     }
 }
+
+#[test]
+fn a_new_runner_script_cannot_overwrite_the_selected_template() {
+    // The New runner setup script button loads the starter script; it must also clear the
+    // template picker, or Save Current Template would write the script over the template
+    // that was selected before.
+    use spot_dashboard_edge::ui_runner_pools::RUNNER_POOLS_JS;
+    let start = RUNNER_POOLS_JS
+        .find(r#"btn.addEventListener("click", () => {"#)
+        .expect("new script handler");
+    let handler = &RUNNER_POOLS_JS[start..start + 600];
+    let clear = handler
+        .find(r#"$("ci-editor-select").value = "";"#)
+        .expect("picker cleared");
+    let load = handler
+        .find(r#"$("ci-editor-textarea").value = STARTER_SCRIPT;"#)
+        .expect("starter loaded");
+    assert!(clear < load);
+}
+
+#[test]
+fn the_matrix_launch_column_stays_in_view() {
+    use spot_dashboard_edge::ui_runner_pools::RUNNER_POOLS_JS;
+    assert!(RUNNER_POOLS_JS.contains(
+        ".table-wrap:has(#qualification-table-body) :is(td,th):last-child{position:sticky;right:0}"
+    ));
+}
