@@ -383,6 +383,59 @@ async fn test_instances_delete_includes_delete_disk_all() {
 }
 
 #[tokio::test]
+async fn test_zone_operation_get_reads_the_operation_error() {
+    let creds = make_test_credentials();
+    let transport = MockGcpHttpTransport::new();
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport.clone());
+    let now = 1700000000;
+    transport.set_json_response(
+        "/operations/operation-1730-abc",
+        200,
+        &serde_json::json!({
+            "id": "1",
+            "name": "operation-1730-abc",
+            "status": "DONE",
+            "error": {"errors": [{"code": "ZONE_RESOURCE_POOL_EXHAUSTED", "message": "no room"}]}
+        }),
+    );
+
+    let op = client
+        .get_zone_operation("us-west1-a", "operation-1730-abc", now)
+        .await
+        .unwrap();
+    assert_eq!(op.status, "DONE");
+    assert_eq!(
+        op.error.unwrap()["errors"][0]["code"],
+        "ZONE_RESOURCE_POOL_EXHAUSTED"
+    );
+    let calls = transport.calls.lock().unwrap();
+    let last_call = calls.last().unwrap();
+    assert_eq!(last_call.0, "GET");
+    assert!(last_call
+        .1
+        .ends_with("/projects/example-project/zones/us-west1-a/operations/operation-1730-abc"));
+}
+
+#[tokio::test]
+async fn test_zone_operation_get_refuses_names_that_change_the_path() {
+    let creds = make_test_credentials();
+    let transport = MockGcpHttpTransport::new();
+    let client = GceComputeClient::new(creds, "example-project".to_string(), transport.clone());
+    for (zone, name) in [
+        ("us-west1-a", "../instances/x"),
+        ("us-west1-a", "op?x=1"),
+        ("us-west1-a", ""),
+        ("us-west1-a/../..", "op"),
+    ] {
+        assert!(client
+            .get_zone_operation(zone, name, 1700000000)
+            .await
+            .is_err());
+    }
+    assert!(transport.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_instances_scrub_startup_script() {
     let creds = make_test_credentials();
     let transport = MockGcpHttpTransport::new();

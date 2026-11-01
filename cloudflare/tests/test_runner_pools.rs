@@ -75,6 +75,27 @@ struct Gcp {
     deleted: Arc<Mutex<Vec<String>>>,
     fail_list: Arc<Mutex<bool>>,
     fail_inserts: Arc<Mutex<bool>>,
+    /// Operations `get_zone_operation` returns, by name; others read as unknown.
+    ops: Arc<Mutex<HashMap<String, GceOperation>>>,
+    /// An error the insert's own (already finished) operation carries.
+    insert_op_error: Arc<Mutex<Option<serde_json::Value>>>,
+}
+
+fn capacity_error() -> serde_json::Value {
+    serde_json::json!({"errors": [{
+        "code": "ZONE_RESOURCE_POOL_EXHAUSTED",
+        "message": "The zone does not have enough resources available to fulfill the request."
+    }]})
+}
+
+fn named_op(name: &str, status: &str, error: Option<serde_json::Value>) -> GceOperation {
+    GceOperation {
+        id: Some(name.into()),
+        name: Some(name.into()),
+        status: status.into(),
+        target_link: None,
+        error,
+    }
 }
 
 fn op() -> GceOperation {
@@ -116,7 +137,18 @@ impl GcpReconcilerClient for Gcp {
             .lock()
             .unwrap()
             .push((zone.to_string(), req.clone()));
-        Ok(op())
+        let error = self.insert_op_error.lock().unwrap().clone();
+        let status = if error.is_some() { "DONE" } else { "RUNNING" };
+        Ok(named_op(&format!("op-{}", req.name), status, error))
+    }
+    async fn get_zone_operation(
+        &self,
+        _project: &str,
+        _zone: &str,
+        operation: &str,
+        _now: u64,
+    ) -> Result<Option<GceOperation>, ReconcilerError> {
+        Ok(self.ops.lock().unwrap().get(operation).cloned())
     }
     async fn delete_instance(
         &self,
@@ -1308,4 +1340,139 @@ async fn resize_does_not_undo_a_remove_saved_meanwhile() {
     let pools = kv.pools();
     assert!(pools.iter().any(|p| p.id == other && p.removing));
     assert!(pools.iter().any(|p| p.id == id && p.hosts == 2));
+}
+
+// ============================================================================
+// Create operations that fail after the call returns
+// ============================================================================
+
+#[tokio::test]
+async fn capacity_errors_from_the_create_operation_show_on_the_pool() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, axion_request("swack-tools")).await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+
+    // The create call succeeds; its operation is still running.
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 60).await.unwrap();
+    assert_eq!(r.launched_hosts.len(), 1);
+    let first = gcp.inserted.lock().unwrap()[0].1.name.clone();
+    let status = kv.bundle().state.runner_pool_status[&id].clone();
+    assert_eq!(status.last_launch_op, Some(format!("op-{}", first)));
+    assert!(status.last_error.is_none());
+
+    // GCE finished the operation with no capacity: the pool shows why, and tries again.
+    gcp.ops.lock().unwrap().insert(
+        format!("op-{}", first),
+        named_op(&format!("op-{}", first), "DONE", Some(capacity_error())),
+    );
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 400).await.unwrap();
+    let status = kv.bundle().state.runner_pool_status[&id].clone();
+    let err = status.last_error.clone().unwrap();
+    assert!(
+        err.starts_with("VM create failed in us-west1-a: ZONE_RESOURCE_POOL_EXHAUSTED: "),
+        "{}",
+        err
+    );
+    assert_eq!(status.last_error_at, Some(NOW + 400));
+    assert!(r
+        .held_floor_targets
+        .iter()
+        .any(|h| h.contains(&id) && h.contains("ZONE_RESOURCE")));
+    assert_eq!(r.launched_hosts.len(), 1, "{:?}", r);
+    let second = gcp.inserted.lock().unwrap()[1].1.name.clone();
+    assert_eq!(status.last_launch_op, Some(format!("op-{}", second)));
+
+    // The retry fails the same way: the error and its first time stay.
+    gcp.ops.lock().unwrap().insert(
+        format!("op-{}", second),
+        named_op(&format!("op-{}", second), "DONE", Some(capacity_error())),
+    );
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, NOW + 800).await.unwrap();
+    let status = kv.bundle().state.runner_pool_status[&id].clone();
+    assert_eq!(status.last_error.as_deref(), Some(err.as_str()));
+    assert_eq!(status.last_error_at, Some(NOW + 400));
+    let third = gcp.inserted.lock().unwrap()[2].1.name.clone();
+
+    // The third create works: its host shows up, the pool is full, and the error clears.
+    gcp.instances
+        .lock()
+        .unwrap()
+        .push(host(&third, &id, "RUNNING"));
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 1200)
+        .await
+        .unwrap();
+    assert!(r.launched_hosts.is_empty(), "{:?}", r);
+    let status = kv.bundle().state.runner_pool_status[&id].clone();
+    assert!(status.last_error.is_none(), "{:?}", status);
+    assert!(status.last_error_at.is_none());
+    assert!(status.last_launch_op.is_none());
+}
+
+#[tokio::test]
+async fn a_create_whose_operation_already_failed_is_reported_at_once() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, axion_request("swack-tools")).await;
+    let gcp = Gcp::default();
+    *gcp.insert_op_error.lock().unwrap() = Some(serde_json::json!({"errors": [
+        {"code": "QUOTA_EXCEEDED", "message": "Quota 'C4A_CPUS' exceeded."},
+        {"code": "SECOND", "message": "x"},
+        {"code": "THIRD", "message": "y"}
+    ]}));
+    let gh = Gh::default();
+
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 60).await.unwrap();
+    assert!(r.launched_hosts.is_empty(), "{:?}", r);
+    let status = kv.bundle().state.runner_pool_status[&id].clone();
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some(
+            "VM create failed in us-west1-a: QUOTA_EXCEEDED: Quota 'C4A_CPUS' exceeded.; SECOND: x"
+        )
+    );
+    assert!(status.last_launch_host.is_none());
+    assert!(status.last_launch_op.is_none());
+}
+
+#[tokio::test]
+async fn a_running_create_is_not_doubled_until_it_is_long_overdue() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, axion_request("swack-tools")).await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+
+    run_reconciliation(&kv, &gcp, &gh, NOW + 60).await.unwrap();
+    let first = gcp.inserted.lock().unwrap()[0].1.name.clone();
+    gcp.ops.lock().unwrap().insert(
+        format!("op-{}", first),
+        named_op(&format!("op-{}", first), "RUNNING", None),
+    );
+
+    // Still running five minutes later: no second host.
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 400).await.unwrap();
+    assert!(r.launched_hosts.is_empty(), "{:?}", r);
+    assert_eq!(gcp.inserted.lock().unwrap().len(), 1);
+    let status = kv.bundle().state.runner_pool_status[&id].clone();
+    assert_eq!(status.last_launch_op, Some(format!("op-{}", first)));
+
+    // Half an hour later it no longer holds the slot.
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 60 + 1800)
+        .await
+        .unwrap();
+    assert_eq!(r.launched_hosts.len(), 1, "{:?}", r);
+    assert_eq!(gcp.inserted.lock().unwrap().len(), 2);
 }

@@ -64,6 +64,8 @@ The dialog shows the first lines of the template you pick. Keep these limits in 
 Each row in **Runner pools** shows:
 
 - **Status**: running hosts out of the pool's host count, and online runners out of the number the pool should have. A red line shows why the last launch failed, for example `VM create failed` when GCP refused the VM, or `runner registration token unavailable` when GitHub refused the token.
+  GCP can also refuse a VM a few seconds after it accepts the request. The reconciler reads that outcome on its next run and shows it the same way, for example `VM create failed in us-west1-a: ZONE_RESOURCE_POOL_EXHAUSTED` when the zone has no Spot capacity for the machine. The reconciler keeps trying every 5 minutes. If the error stays, remove the pool and launch it in another zone.
+  The red line clears when a new host starts or the pool reaches its host count.
 - **Cost**: the estimated Spot price of all the pool's hosts per hour, from the same price table as the matrix.
 
 Click **Refresh** to reload the panel. It also refreshes every minute while the page is open.
