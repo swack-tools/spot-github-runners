@@ -85,8 +85,11 @@ pub struct DashboardState {
     pub controlled_targets: Vec<String>,
     #[serde(default)]
     pub overview: Option<serde_json::Value>,
-    /// Runner pools administrators launched from the dashboard (see `runner_pools.rs`).
-    #[serde(default)]
+    /// Runner pools administrators launched from the dashboard (see `runner_pools.rs`). Only a
+    /// working copy: the list is stored under its own KV key (`runner_pools::KV_RUNNER_POOLS_KEY`)
+    /// and never in this blob, so saving an older copy of the state can't undo a create or a
+    /// remove. Handlers fill it with `runner_pools::load_pools` when they need it.
+    #[serde(default, skip_serializing)]
     pub runner_pools: Vec<crate::runner_pools::RunnerPool>,
     /// The reconciler's last view of each pool, by pool id.
     #[serde(default)]
@@ -1756,9 +1759,9 @@ fn enrich_arm64_catalog_and_qualifications(
             8,
             16,
             1635,
-            "us-west8",
-            "us-west8-a",
-            "Phoenix, Arizona",
+            "us-west1",
+            "us-west1-a",
+            "The Dalles, Oregon",
             "North America",
             28,
             0.0336,
@@ -1774,9 +1777,9 @@ fn enrich_arm64_catalog_and_qualifications(
             8,
             32,
             1600,
-            "us-west8",
-            "us-west8-a",
-            "Phoenix, Arizona",
+            "us-west1",
+            "us-west1-a",
+            "The Dalles, Oregon",
             "North America",
             28,
             0.0399,
@@ -1828,9 +1831,9 @@ fn enrich_arm64_catalog_and_qualifications(
             16,
             32,
             2980,
-            "us-west8",
-            "us-west8-a",
-            "Phoenix, Arizona",
+            "us-west1",
+            "us-west1-a",
+            "The Dalles, Oregon",
             "North America",
             28,
             0.0673,
@@ -1901,7 +1904,7 @@ fn enrich_arm64_catalog_and_qualifications(
             32,
             1129,
             "asia-southeast1",
-            "asia-southeast1-a",
+            "asia-southeast1-b",
             "Jurong West, Singapore",
             "Asia Pacific",
             45,
@@ -1921,9 +1924,9 @@ fn enrich_arm64_catalog_and_qualifications(
             16,
             32,
             2980,
-            "us-west8",
-            "us-west8-a",
-            "Phoenix, Arizona",
+            "us-west1",
+            "us-west1-a",
+            "The Dalles, Oregon",
             "North America",
             28,
             0.0673,
@@ -1939,9 +1942,9 @@ fn enrich_arm64_catalog_and_qualifications(
             16,
             64,
             2910,
-            "us-west8",
-            "us-west8-a",
-            "Phoenix, Arizona",
+            "us-west1",
+            "us-west1-a",
+            "The Dalles, Oregon",
             "North America",
             28,
             0.0798,

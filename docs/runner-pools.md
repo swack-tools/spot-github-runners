@@ -75,6 +75,7 @@ All pools together must stay under the hourly limit in the dashboard's **Max Bud
 1. In **Runner pools**, click **Remove** on the pool's row and confirm.
 1. On its next run, the reconciler deletes the pool's hosts and removes their idle runner registrations. Jobs that are running on those hosts stop.
 1. When no hosts or runners are left, the pool disappears from the panel.
+   A pool that never started a host disappears on the next run, even if GitHub refuses to list its runners.
 
 To change a pool's machine, size, labels, or template, remove the pool. Then launch a new one.
 

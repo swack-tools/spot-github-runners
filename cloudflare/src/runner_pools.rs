@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::state::{
-    load_authoritative_state, load_state, save_state, CloudInitTemplate, DashboardState,
-    KvStoreBackend, StateError,
+    load_authoritative_state, load_state, CloudInitTemplate, DashboardState, KvStoreBackend,
+    StateError,
 };
 
 /// Host names start with this, so the dashboard's instance views and stale-runner cleanup treat
@@ -179,7 +179,42 @@ pub fn is_valid_target(target: &str) -> bool {
     owner_ok && repo_ok
 }
 
-/// A GCE zone name such as `us-west8-a`.
+/// Every GCE zone the project can use (`gcloud compute zones list`, 2026-11-01), separated by
+/// spaces. A zone outside this list would only fail later, at VM create, so pools refuse it.
+pub const KNOWN_GCE_ZONES: &str = "\
+    africa-south1-a africa-south1-b africa-south1-c asia-east1-a asia-east1-b asia-east1-c \
+    asia-east2-a asia-east2-b asia-east2-c asia-northeast1-a asia-northeast1-b \
+    asia-northeast1-c asia-northeast2-a asia-northeast2-b asia-northeast2-c \
+    asia-northeast3-a asia-northeast3-b asia-northeast3-c asia-south1-a asia-south1-b \
+    asia-south1-c asia-south2-a asia-south2-b asia-south2-c asia-southeast1-a \
+    asia-southeast1-b asia-southeast1-c asia-southeast2-a asia-southeast2-b \
+    asia-southeast2-c asia-southeast3-a asia-southeast3-b asia-southeast3-c \
+    australia-southeast1-a australia-southeast1-b australia-southeast1-c \
+    australia-southeast2-a australia-southeast2-b australia-southeast2-c europe-central2-a \
+    europe-central2-b europe-central2-c europe-north1-a europe-north1-b europe-north1-c \
+    europe-north2-a europe-north2-b europe-north2-c europe-southwest1-a europe-southwest1-b \
+    europe-southwest1-c europe-west1-b europe-west1-c europe-west1-d europe-west10-a \
+    europe-west10-b europe-west10-c europe-west12-a europe-west12-b europe-west12-c \
+    europe-west2-a europe-west2-b europe-west2-c europe-west3-a europe-west3-b \
+    europe-west3-c europe-west4-a europe-west4-b europe-west4-c europe-west6-a \
+    europe-west6-b europe-west6-c europe-west8-a europe-west8-b europe-west8-c \
+    europe-west9-a europe-west9-b europe-west9-c me-central1-a me-central1-b me-central1-c \
+    me-central2-a me-central2-b me-central2-c me-west1-a me-west1-b me-west1-c \
+    northamerica-northeast1-a northamerica-northeast1-b northamerica-northeast1-c \
+    northamerica-northeast2-a northamerica-northeast2-b northamerica-northeast2-c \
+    northamerica-south1-a northamerica-south1-b northamerica-south1-c southamerica-east1-a \
+    southamerica-east1-b southamerica-east1-c southamerica-west1-a southamerica-west1-b \
+    southamerica-west1-c us-central1-a us-central1-b us-central1-c us-central1-f us-east1-b \
+    us-east1-c us-east1-d us-east4-a us-east4-b us-east4-c us-east5-a us-east5-b us-east5-c \
+    us-south1-a us-south1-b us-south1-c us-west1-a us-west1-b us-west1-c us-west2-a \
+    us-west2-b us-west2-c us-west3-a us-west3-b us-west3-c us-west4-a us-west4-b us-west4-c ";
+
+/// Whether `zone` is in [`KNOWN_GCE_ZONES`].
+pub fn is_known_gce_zone(zone: &str) -> bool {
+    KNOWN_GCE_ZONES.split_whitespace().any(|z| z == zone)
+}
+
+/// A GCE zone name such as `us-west1-a`.
 pub fn is_valid_zone(zone: &str) -> bool {
     let parts: Vec<&str> = zone.split('-').collect();
     zone.len() <= 32
@@ -355,6 +390,9 @@ pub fn validate_create_request(
     if !is_valid_zone(zone) {
         return Err(format!("'{}' isn't a zone name", zone));
     }
+    if !is_known_gce_zone(zone) {
+        return Err(format!("'{}' isn't a GCE zone this project can use", zone));
+    }
     if req.hosts == 0 || req.hosts > MAX_HOSTS_PER_POOL {
         return Err(format!("Hosts must be 1 to {}", MAX_HOSTS_PER_POOL));
     }
@@ -407,9 +445,9 @@ pub fn validate_create_request(
         // A label that names another architecture would send jobs to hosts that can't run them.
         let lower = label.to_ascii_lowercase();
         let other_arch = if is_arm64_machine_type(machine_type) {
-            ["x64", "x86_64", "amd64"].contains(&lower.as_str())
+            ["x64", "x86", "x86_64", "x86-64", "amd64", "i386", "i686"].contains(&lower.as_str())
         } else {
-            ["arm64", "aarch64"].contains(&lower.as_str())
+            ["arm64", "aarch64", "arm"].contains(&lower.as_str())
         };
         if other_arch {
             return Err(format!(
@@ -573,12 +611,46 @@ pub fn pools_view(state: &DashboardState) -> serde_json::Value {
     })
 }
 
+/// KV key that holds the pool list. Pools live outside the dashboard state blob because many
+/// routes save that blob from a copy that can be up to a minute old; a pool created or removed in
+/// the meantime would be undone. Only the pool routes and the reconciler write this key.
+pub const KV_RUNNER_POOLS_KEY: &str = "dashboard:runner-pools";
+
+/// The stored pool list (empty when no pool was ever created).
+pub async fn load_pools<K: KvStoreBackend>(kv: &K) -> Result<Vec<RunnerPool>, StateError> {
+    match kv.get(KV_RUNNER_POOLS_KEY).await? {
+        Some(raw) => Ok(serde_json::from_str(&raw)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+pub async fn save_pools<K: KvStoreBackend>(kv: &K, pools: &[RunnerPool]) -> Result<(), StateError> {
+    let raw = serde_json::to_string(pools)?;
+    kv.put(KV_RUNNER_POOLS_KEY, &raw).await
+}
+
+/// Drops the pools whose removal the reconciler finished. The list is read again right before the
+/// write, so a pool created while the tick ran is kept. Returns the pools that remain.
+pub async fn finish_pool_removals<K: KvStoreBackend>(
+    kv: &K,
+    finished: &[String],
+) -> Result<Vec<RunnerPool>, StateError> {
+    let mut pools = load_pools(kv).await?;
+    let before = pools.len();
+    pools.retain(|p| !(p.removing && finished.contains(&p.id)));
+    if pools.len() != before {
+        save_pools(kv, &pools).await?;
+    }
+    Ok(pools)
+}
+
 pub async fn handle_get_runner_pools<K: KvStoreBackend>(
     kv: &K,
     now: u64,
 ) -> Result<serde_json::Value, StateError> {
-    // The panel polls every minute; the isolate cache (at most 60 s old) is fresh enough.
-    let (bundle, _) = load_state(kv, now).await?;
+    // Templates and statuses: the isolate cache (at most 60 s old) is fresh enough.
+    let (mut bundle, _) = load_state(kv, now).await?;
+    bundle.state.runner_pools = load_pools(kv).await?;
     Ok(pools_view(&bundle.state))
 }
 
@@ -589,11 +661,11 @@ pub async fn handle_create_runner_pool<K: KvStoreBackend>(
     now: u64,
 ) -> Result<serde_json::Value, StateError> {
     let (mut bundle, _) = load_authoritative_state(kv, now).await?;
+    bundle.state.runner_pools = load_pools(kv).await?;
     let pool = validate_create_request(&req, &bundle.state, created_by, now)
         .map_err(StateError::Validation)?;
     bundle.state.runner_pools.push(pool.clone());
-    bundle.state.updated_at = now;
-    save_state(kv, &mut bundle, now).await?;
+    save_pools(kv, &bundle.state.runner_pools).await?;
     let mut view = pools_view(&bundle.state);
     if let Some(obj) = view.as_object_mut() {
         obj.insert("created".to_string(), serde_json::json!(pool.id));
@@ -606,36 +678,28 @@ pub async fn handle_remove_runner_pool<K: KvStoreBackend>(
     req: RemoveRunnerPoolRequest,
     now: u64,
 ) -> Result<serde_json::Value, StateError> {
-    let (mut bundle, _) = load_authoritative_state(kv, now).await?;
+    let (mut bundle, _) = load_state(kv, now).await?;
+    bundle.state.runner_pools = load_pools(kv).await?;
     let id = req.id.trim();
     let Some(pool) = bundle.state.runner_pools.iter_mut().find(|p| p.id == id) else {
         return Err(StateError::NotFound(format!("Pool '{}' not found", id)));
     };
     if !pool.removing {
         pool.removing = true;
-        bundle.state.updated_at = now;
-        save_state(kv, &mut bundle, now).await?;
+        save_pools(kv, &bundle.state.runner_pools).await?;
     }
     Ok(pools_view(&bundle.state))
 }
 
-/// Folds the reconciler's view of pools into the state it is about to save: pool definitions come
-/// from `fresh` (the latest stored state, so a pool created or removed during the tick isn't lost),
-/// removals the reconciler finished are dropped, and statuses are kept for remaining pools only.
-pub fn merge_reconciled_pools(
+/// Sets the statuses the reconciler saves with the dashboard state: one per remaining pool, from
+/// this tick when it has one, otherwise the stored one. Statuses of removed pools are dropped.
+pub fn merge_pool_statuses(
     state: &mut DashboardState,
-    fresh_pools: Option<Vec<RunnerPool>>,
+    pools: &[RunnerPool],
     statuses: &BTreeMap<String, RunnerPoolStatus>,
-    finished_removals: &[String],
 ) {
-    if let Some(pools) = fresh_pools {
-        state.runner_pools = pools;
-    }
-    state
-        .runner_pools
-        .retain(|p| !(p.removing && finished_removals.contains(&p.id)));
     let mut kept: BTreeMap<String, RunnerPoolStatus> = BTreeMap::new();
-    for p in &state.runner_pools {
+    for p in pools {
         if let Some(s) = statuses
             .get(&p.id)
             .or_else(|| state.runner_pool_status.get(&p.id))
