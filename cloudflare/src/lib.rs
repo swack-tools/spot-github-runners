@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod gcp;
 pub mod github;
+pub mod host_agent_release;
 pub mod observability;
 pub mod patch;
 pub mod patch_console;

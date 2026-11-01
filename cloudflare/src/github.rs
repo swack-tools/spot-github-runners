@@ -599,11 +599,24 @@ pub fn render_startup_script(
 ) -> Result<String, String> {
     let mut script = RAW_STARTUP_SCRIPT.to_string();
     let dockerfile = render_dockerfile(RUNNER_DOCKERFILE, patch)?;
+    // Stock Debian has no host-agent; the script downloads this pinned build and checks its SHA-256.
+    let host_agent = crate::host_agent_release::current()?;
+    // The admission pool must hold every runner's lease at once: the listeners are sized to fit the host.
+    let admission_work_gib = params
+        .runner_count
+        .checked_mul(params.runner_memory_gb)
+        .ok_or_else(|| "runner_count x runner_memory_gb overflows".to_string())?;
 
     let disk_device = format!("/dev/disk/by-id/google-{}", params.disk_device_name);
 
-    // 31 Canonical Replacements
-    let replacements: [(&str, String); 31] = [
+    // 34 Canonical Replacements
+    let replacements: [(&str, String); 34] = [
+        ("HOST_AGENT_BASE_URL", host_agent.download_base_url()),
+        ("HOST_AGENT_SHA256_X86_64", host_agent.sha256_x86_64.clone()),
+        (
+            "HOST_AGENT_SHA256_AARCH64",
+            host_agent.sha256_aarch64.clone(),
+        ),
         ("DISK_DEVICE", disk_device),
         ("DOCKERFILE_B64", B64_STANDARD.encode(dockerfile.as_bytes())),
         (
@@ -655,7 +668,7 @@ pub fn render_startup_script(
             "STRICT_HEAVY_POOL",
             if params.strict_heavy_pool { "1" } else { "0" }.to_string(),
         ),
-        ("ADMISSION_WORK_GIB", "0".to_string()),
+        ("ADMISSION_WORK_GIB", admission_work_gib.to_string()),
     ];
 
     for (k, v) in replacements {

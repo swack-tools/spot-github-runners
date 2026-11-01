@@ -488,7 +488,7 @@ async fn test_tier5_adversarial_gcp_instances_insert_url_params_and_precedence()
         runner_2_jitconfig: None,
         source_image: Some("golden-custom-image-2026"),
         golden_image_family: Some("golden-family-2026"),
-        boot_disk_type: Some("pd-balanced"),
+        boot_disk_type: None,
     };
     let req_both = build_spot_runner_vm_request("example-project", &cfg_both).unwrap();
     let img_both = req_both.disks[0]

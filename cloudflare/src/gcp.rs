@@ -44,6 +44,26 @@ pub const SCRUBBED_BOOTSTRAP_METADATA_KEYS: &[&str] =
 pub const TOKEN_CACHE_TTL_SECS: u64 = 3300; // 55 minutes
 pub const JWT_EXPIRY_SECS: u64 = 3600; // 1 hour
 pub const DEFAULT_BOOT_DISK_SIZE_GB: u64 = 40;
+/// Runner data disk: Docker, containerd, runner state and job workspaces live here, not on the boot disk.
+pub const DEFAULT_RUNNER_DATA_DISK_SIZE_GB: u64 = 100;
+/// Scopes on runner VM tokens: the Ops Agent writes logs and metrics, nothing else. Job containers cannot
+/// reach the metadata server at all (the startup script blocks it), so only host services hold the token.
+pub const RUNNER_SERVICE_ACCOUNT_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/logging.write",
+    "https://www.googleapis.com/auth/monitoring.write",
+];
+
+/// Machine series that only take Hyperdisk (and gVNIC): C4, C4A, C4D, N4, N4A and N4D.
+pub fn machine_type_requires_hyperdisk(machine_type: &str) -> bool {
+    ["c4-", "c4a-", "c4d-", "n4-", "n4a-", "n4d-"]
+        .iter()
+        .any(|p| machine_type.starts_with(p))
+}
+
+/// Device name of a runner VM's data disk; the startup script finds it at `/dev/disk/by-id/google-<name>`.
+pub fn runner_data_disk_device_name(instance_name: &str) -> String {
+    format!("{}-data", instance_name)
+}
 pub const DEBIAN_13_IMAGE_FAMILY: &str = "projects/debian-cloud/global/images/family/debian-13";
 pub const DEBIAN_13_ARM64_IMAGE_FAMILY: &str =
     "projects/debian-cloud/global/images/family/debian-13-arm64";
@@ -982,8 +1002,7 @@ pub fn build_spot_runner_vm_request(
     let is_arm64 = cfg.machine_type.starts_with("c4a-")
         || cfg.machine_type.starts_with("n4a-")
         || cfg.machine_type.starts_with("t2a-");
-    let is_hyperdisk_native =
-        cfg.machine_type.starts_with("c4a-") || cfg.machine_type.starts_with("n4a-");
+    let is_hyperdisk_native = machine_type_requires_hyperdisk(cfg.machine_type);
 
     // 2. Resolve Boot Disk Image (Golden Image -> Image Family -> Debian 13 x86_64/arm64 fallback)
     let source_image = if let Some(img) = cfg.source_image {
@@ -1010,8 +1029,34 @@ pub fn build_spot_runner_vm_request(
         "pd-balanced"
     };
     let boot_disk_type = cfg.boot_disk_type.unwrap_or(default_disk_type);
+    if is_hyperdisk_native && boot_disk_type != "hyperdisk-balanced" {
+        return Err(GcpError::Validation(format!(
+            "Machine type '{}' requires hyperdisk-balanced disks (got boot='{}')",
+            cfg.machine_type, boot_disk_type
+        )));
+    }
     let full_boot_disk_type = format!("zones/{}/diskTypes/{}", cfg.zone, boot_disk_type);
     let full_machine_type = format!("zones/{}/machineTypes/{}", cfg.zone, cfg.machine_type);
+
+    // Auto-delete data disk named after the instance. The startup script refuses to start runners unless
+    // Docker and containerd sit on it.
+    let data_disk_device_name = runner_data_disk_device_name(cfg.instance_name);
+    let data_disk = GceAttachedDisk {
+        boot: false,
+        auto_delete: true,
+        device_name: Some(data_disk_device_name.clone()),
+        source: None,
+        disk_size_gb: Some(DEFAULT_RUNNER_DATA_DISK_SIZE_GB.to_string()),
+        r#type: Some("PERSISTENT".to_string()),
+        mode: Some("READ_WRITE".to_string()),
+        interface: Some("NVME".to_string()),
+        initialize_params: Some(GceDiskInitializeParams {
+            disk_name: data_disk_device_name,
+            disk_size_gb: DEFAULT_RUNNER_DATA_DISK_SIZE_GB.to_string(),
+            disk_type: full_boot_disk_type.clone(),
+            source_image: None,
+        }),
+    };
 
     let boot_disk = GceAttachedDisk {
         boot: true,
@@ -1100,14 +1145,21 @@ pub fn build_spot_runner_vm_request(
         name: cfg.instance_name.to_string(),
         machine_type: full_machine_type,
         scheduling: GceScheduling::default(),
-        disks: vec![boot_disk],
+        disks: vec![boot_disk, data_disk],
         network_interfaces: vec![network],
         metadata: GceMetadata {
             fingerprint: None,
             items: metadata_items,
         },
         labels,
-        service_accounts: Vec::new(),
+        // The project's default compute service account, as builders use, limited to log and metric writes.
+        service_accounts: vec![GceServiceAccount {
+            email: "default".to_string(),
+            scopes: RUNNER_SERVICE_ACCOUNT_SCOPES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }],
     })
 }
 
@@ -1158,10 +1210,7 @@ pub fn build_spot_builder_vm_request(
     let is_arm64 = cfg.machine_type.starts_with("c4a-")
         || cfg.machine_type.starts_with("n4a-")
         || cfg.machine_type.starts_with("t2a-");
-    let is_hyperdisk_native = cfg.machine_type.starts_with("n4-")
-        || cfg.machine_type.starts_with("c4-")
-        || cfg.machine_type.starts_with("c4a-")
-        || cfg.machine_type.starts_with("n4a-");
+    let is_hyperdisk_native = machine_type_requires_hyperdisk(cfg.machine_type);
 
     let source_image = if is_arm64 {
         DEBIAN_13_ARM64_IMAGE_FAMILY.to_string()

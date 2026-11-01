@@ -122,11 +122,28 @@ printf '%s' '{{ENTRYPOINT_B64}}' | base64 -d >/opt/gha-runners/build/entrypoint.
 printf '%s' '{{JOB_COMPLETED_B64}}' | base64 -d >/opt/gha-runners/build/job-completed.sh
 printf '%s' '{{JOB_STARTED_B64}}' | base64 -d >/opt/gha-runners/build/job-started.sh
 
-# Pure-Rust host-agent binary placement and symlink setup
+# Install the pinned pure-Rust host-agent. The image is stock Debian, so download the static build the Worker
+# pinned and refuse to go on unless its SHA-256 matches: admission, the Docker wrapper and the runner image
+# all depend on it.
 install -d -m 0755 /usr/local/bin
-if [[ -x /usr/local/bin/host-agent ]]; then
-  cp /usr/local/bin/host-agent /opt/gha-runners/build/host-agent
-fi
+case "$(uname -m)" in
+  x86_64) host_agent_asset=host-agent-x86_64-linux-musl; host_agent_sha256='{{HOST_AGENT_SHA256_X86_64}}' ;;
+  aarch64) host_agent_asset=host-agent-aarch64-linux-musl; host_agent_sha256='{{HOST_AGENT_SHA256_AARCH64}}' ;;
+  *) echo "No host-agent build for $(uname -m)" >&2; exit 1 ;;
+esac
+[[ "$host_agent_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "host-agent checksum is not pinned" >&2; exit 1; }
+host_agent_download=$(mktemp)
+# Retry brief GitHub errors, including a 404 while a release is still being published, for at most 10 minutes
+# so the registration token (valid for an hour) is still good when the runners register.
+curl --proto '=https' --tlsv1.2 -fsSL --retry 20 --retry-delay 15 --retry-all-errors --retry-max-time 600 --max-time 120 \
+  -o "$host_agent_download" '{{HOST_AGENT_BASE_URL}}'"/$host_agent_asset"
+printf '%s  %s\n' "$host_agent_sha256" "$host_agent_download" | sha256sum --check --status ||
+  { echo "host-agent download does not match its pinned SHA-256" >&2; rm -f "$host_agent_download"; exit 1; }
+install -m 0755 -o root -g root "$host_agent_download" /usr/local/bin/host-agent
+rm -f "$host_agent_download"
+
+# host-agent symlink setup
+cp /usr/local/bin/host-agent /opt/gha-runners/build/host-agent
 for alias in clean-target host-admission docker-wrapper docker-admission \
              host-launcher builder-entrypoint worktree-commands toolchain-probe \
              telemetry gha-host-telemetry host-telemetry \

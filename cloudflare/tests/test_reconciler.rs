@@ -52,6 +52,8 @@ pub struct MockGcpReconciler {
     pub deleted_instances: Arc<Mutex<Vec<String>>>,
     pub scrubbed_instances: Arc<Mutex<Vec<String>>>,
     pub inserted_instances: Arc<Mutex<Vec<GceInsertInstanceRequest>>>,
+    /// When set, every insert fails the way a GCE quota or disk-type error does.
+    pub fail_inserts: Arc<Mutex<bool>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -72,6 +74,11 @@ impl GcpReconcilerClient for MockGcpReconciler {
         _source_instance_template: Option<&str>,
         _now: u64,
     ) -> Result<GceOperation, ReconcilerError> {
+        if *self.fail_inserts.lock().unwrap() {
+            return Err(ReconcilerError::Gcp(
+                "GCE API error (status 400): disk type not supported".into(),
+            ));
+        }
         self.inserted_instances.lock().unwrap().push(req.clone());
         Ok(GceOperation {
             id: Some("op-insert-1".into()),
@@ -133,6 +140,8 @@ pub struct MockGitHubReconciler {
     /// Config-repo patches by target; a target missing here reads as "no config repo" (Ok(None)).
     pub patches: Arc<Mutex<HashMap<String, Result<RunnerPatch, String>>>>,
     pub minted_labels: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+    /// API paths whose registration token request fails.
+    pub mint_failures: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -168,6 +177,17 @@ impl GitHubReconcilerClient for MockGitHubReconciler {
             .lock()
             .unwrap()
             .push((target_api_path.to_string(), labels.to_vec()));
+        if self
+            .mint_failures
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p == target_api_path)
+        {
+            return Err(ReconcilerError::Github(
+                "GitHub API error (status 403): Resource not accessible".into(),
+            ));
+        }
         Ok(RunnerBootstrapConfig::JitConfig {
             runner_1_jitconfig: "jit1-token-xyz".to_string(),
             runner_2_jitconfig: "jit2-token-xyz".to_string(),
@@ -1062,4 +1082,94 @@ async fn test_zero_max_runners_disables_backlog_scale_up() {
     let report = run_reconciliation(&kv, &gcp, &gh, now).await.unwrap();
     assert!(report.launched_hosts.is_empty());
     assert!(gcp.inserted_instances.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_floor_host_boots_with_a_data_disk_host_agent_and_full_admission_budget() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+
+    run_reconciliation(&kv, &gcp, &gh, 1700000000)
+        .await
+        .unwrap();
+    let inserted = gcp.inserted_instances.lock().unwrap();
+    let host = inserted_for(&inserted, "xbmc4lyfe/rustnzb").expect("rustnzb floor host");
+
+    // C4D takes only Hyperdisk; the data disk is the one the startup script mounts.
+    assert_eq!(host.disks.len(), 2);
+    for disk in &host.disks {
+        assert!(disk
+            .initialize_params
+            .as_ref()
+            .unwrap()
+            .disk_type
+            .ends_with("/hyperdisk-balanced"));
+    }
+    let data_device = host.disks[1].device_name.clone().unwrap();
+    assert!(data_device.ends_with("-data"));
+    let script = host.metadata.get("startup-script").unwrap();
+    assert!(script.contains(&format!(
+        "DEVICE=\"/dev/disk/by-id/google-{}\"",
+        data_device
+    )));
+
+    // The pinned host-agent build, and an admission pool that holds both 14 GiB runners.
+    let pin = spot_dashboard_edge::host_agent_release::current().unwrap();
+    assert!(script.contains(&pin.sha256_x86_64));
+    assert!(script.contains(&pin.download_base_url()));
+    assert!(script.contains("--argjson work_gib 28"));
+    assert_eq!(host.service_accounts.len(), 1);
+}
+
+#[tokio::test]
+async fn test_a_failed_registration_token_holds_only_that_floor_target() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    let gh = MockGitHubReconciler::default();
+    gh.mint_failures
+        .lock()
+        .unwrap()
+        .push("repos/xbmc4lyfe/rustnzb".into());
+
+    let report = run_reconciliation(&kv, &gcp, &gh, 1700000000)
+        .await
+        .unwrap();
+    assert_eq!(report.launched_hosts.len(), 3);
+    assert_eq!(report.held_floor_targets.len(), 1);
+    assert!(report.held_floor_targets[0]
+        .starts_with("xbmc4lyfe/rustnzb: runner registration token unavailable"));
+    let inserted = gcp.inserted_instances.lock().unwrap();
+    assert!(inserted_for(&inserted, "xbmc4lyfe/rustnzb").is_none());
+}
+
+#[tokio::test]
+async fn test_a_failed_vm_create_is_reported_and_not_tracked_as_a_launch() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    invalidate_state_cache();
+    reset_reconciler_state();
+
+    let kv = MockKvStore::new();
+    let gcp = MockGcpReconciler::default();
+    *gcp.fail_inserts.lock().unwrap() = true;
+    let gh = MockGitHubReconciler::default();
+
+    let report = run_reconciliation(&kv, &gcp, &gh, 1700000000)
+        .await
+        .unwrap();
+    assert!(report.launched_hosts.is_empty());
+    assert_eq!(report.held_floor_targets.len(), 4);
+    assert!(report
+        .held_floor_targets
+        .iter()
+        .all(|h| h.contains("VM create failed")));
+    assert!(get_active_launches().is_empty());
 }

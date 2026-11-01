@@ -217,8 +217,33 @@ async fn test_source_instance_template_query_param_and_body_construction() {
     assert_eq!(req.scheduling.on_host_maintenance, "TERMINATE");
     assert!(!req.scheduling.automatic_restart);
 
-    // Boot disk configuration
-    assert_eq!(req.disks.len(), 1);
+    // Boot disk plus the auto-delete runner data disk the startup script mounts
+    assert_eq!(req.disks.len(), 2);
+    assert!(!req.disks[1].boot);
+    assert!(req.disks[1].auto_delete);
+    assert_eq!(
+        req.disks[1].device_name.as_deref(),
+        Some("oxidex-runners-us-central1-a-tpl-data")
+    );
+    let data_params = req.disks[1].initialize_params.as_ref().unwrap();
+    assert_eq!(data_params.disk_size_gb, "100");
+    assert_eq!(
+        data_params.disk_type,
+        "zones/us-central1-a/diskTypes/hyperdisk-balanced"
+    );
+    assert!(data_params.source_image.is_none());
+
+    // Log and metric writes only, so the Ops Agent can ship logs
+    assert_eq!(req.service_accounts.len(), 1);
+    assert_eq!(req.service_accounts[0].email, "default");
+    assert_eq!(
+        req.service_accounts[0].scopes,
+        vec![
+            "https://www.googleapis.com/auth/logging.write".to_string(),
+            "https://www.googleapis.com/auth/monitoring.write".to_string(),
+        ]
+    );
+
     assert!(req.disks[0].boot);
     assert!(req.disks[0].auto_delete);
     assert_eq!(req.disks[0].r#type.as_deref(), Some("PERSISTENT"));
