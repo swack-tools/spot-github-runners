@@ -606,7 +606,7 @@ Auto-refresh:
 <div class="table-wrap">
 <table>
 <thead>
-<tr><th>Machine Shape</th><th>Region / Zone</th><th>CPU Platform</th><th>CPU Benchmark</th><th>Host vCPU / RAM</th><th>Runners / Host</th><th>Hosts for Floor</th><th>Disk Type</th><th>Compute ($/hr · $/day)</th><th>All-In w/ Disk ($/hr · $/day · $/mo)</th><th>Spot Price Qualifies?</th></tr>
+<tr><th>Machine Shape</th><th>Region / Zone</th><th>CPU Platform</th><th>CPU Benchmark</th><th>Host vCPU / RAM</th><th>Runners / Host</th><th>Hosts for Floor</th><th>Disk Type</th><th>Compute ($/hr · $/day)</th><th>All-In w/ Disk ($/hr · $/day · $/mo)</th><th>Spot Price Qualifies?</th><th></th></tr>
 </thead>
 <tbody id="qualification-table-body"></tbody>
 </table>
@@ -2364,7 +2364,8 @@ if (typeof r.latency_ms === "number" && r.latency_ms > maxLat) return false;
 if (!GLOBAL_ARCH_FILTER || GLOBAL_ARCH_FILTER === "all") return true;
 return inferArchClient(r.machine_type, r.arch) === GLOBAL_ARCH_FILTER;
 });
-tbody.innerHTML = archFilteredRows.slice(0, 60).map(r => `
+window.QUAL_ROWS = archFilteredRows.slice(0, 60);
+tbody.innerHTML = QUAL_ROWS.map((r, i) => `
 <tr>
 <td class="mono emph">${esc(r.machine_type)} ${archBadgeHtml(r.machine_type, r.arch)}</td>
 <td>
@@ -2384,6 +2385,7 @@ ${r.price_qualifies
 ? '<span class="badge badge-running">✓ Qualifies on Spot</span>'
 : '<span class="badge badge-deleted">Exceeds Budget Cap</span>'}
 </td>
+<td><button class="btn btn-sm" onclick="launchQualRow(${i})">Launch</button></td>
 </tr>
 `).join("");
 }
@@ -3703,7 +3705,7 @@ switchTab(normalized);
 }
 });
 </script>
-<script src="/ui/builders.js" defer></script>
+<script src=/ui/runner-pools.js></script><script src="/ui/builders.js" defer></script>
 </body>
 </html>
 "##;
@@ -3882,6 +3884,16 @@ fn set_page_security_headers(headers: &Headers) -> Result<()> {
     headers.set("Referrer-Policy", "same-origin")?;
     headers.set("Strict-Transport-Security", "max-age=31536000")?;
     Ok(())
+}
+
+/// Serve a JavaScript asset the dashboard loads with a `<script src>` tag. Callers check the
+/// administrator session first.
+pub fn script_response(js: &str) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("Content-Type", "text/javascript; charset=utf-8")?;
+    headers.set("Cache-Control", "no-store")?;
+    set_page_security_headers(&headers)?;
+    Ok(Response::ok(js)?.with_headers(headers))
 }
 
 /// Serve the single-page dashboard HTML document (handling GET and HEAD requests).

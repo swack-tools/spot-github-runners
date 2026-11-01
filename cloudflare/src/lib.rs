@@ -11,9 +11,11 @@ pub mod patch;
 pub mod patch_console;
 pub mod reconciler;
 pub mod repo_spec;
+pub mod runner_pools;
 pub mod state;
 pub mod ui;
 pub mod ui_builders;
+pub mod ui_runner_pools;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -1232,6 +1234,65 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 }
             });
             json_response(200, &resp)
+        }
+
+        // Runner pools: Spot hosts administrators launch from the Qualifying Instances table.
+        (Method::Get, "/api/runner-pools") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            match runner_pools::handle_get_runner_pools(&kv, now).await {
+                Ok(body) => json_response(200, &body),
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        (Method::Post, "/api/runner-pools") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            let created_by = verified_session
+                .as_ref()
+                .map(|s| s.sub.clone())
+                .unwrap_or_default();
+            let create_req: runner_pools::CreateRunnerPoolRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            match runner_pools::handle_create_runner_pool(&kv, create_req, &created_by, now).await {
+                Ok(body) => json_response(200, &body),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        (Method::Post, "/api/runner-pools/delete") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            let remove_req: runner_pools::RemoveRunnerPoolRequest = match req.json().await {
+                Ok(parsed) => parsed,
+                Err(err) => return error_response(400, "bad_request", &err.to_string()),
+            };
+            match runner_pools::handle_remove_runner_pool(&kv, remove_req, now).await {
+                Ok(body) => json_response(200, &body),
+                Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
+        // The dashboard's Launch dialog and pools panel, kept out of DASHBOARD_HTML's size budget.
+        (Method::Get, "/ui/runner-pools.js") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            ui::script_response(ui_runner_pools::RUNNER_POOLS_JS)
         }
 
         (Method::Post, "/api/profile/cicd_runner" | "/api/profile/rust_builder") => {

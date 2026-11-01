@@ -227,6 +227,10 @@ The **Runner Patches** tab and `/api/patches` routes (aliased under `/api/patch-
 | `POST /api/patches/preview` | Evaluates running hosts and classifies required actions (`noop`, `hot_patch`, `recreate_containers`, `replace_vm`). Aliased as `/api/patch-console/preview`. |
 | `GET /api/repo-specs` | Reports each repository target's `.github/spot-runners.yml`: status, errors, pools, and which pool a floor host serves. See [Repository runner specs](repo-runner-specs.md). |
 | `POST /api/repo-specs/validate` | Validates spec text sent as `{"text": "<YAML>"}` without reading GitHub. |
+| `GET /api/runner-pools` | Lists runner pools with their status, plus the templates, targets, and machine types the **Launch** dialog offers. See [Launch runners from the dashboard](runner-pools.md). |
+| `POST /api/runner-pools` | Creates a runner pool from `target`, `machine_type`, `zone`, `hosts`, `runners_per_host`, `runner_vcpu`, `runner_ram_gib`, `labels`, and `cloud_init_template_id`. |
+| `POST /api/runner-pools/delete` | Marks the pool `{"id": "<pool>"}` for removal; the reconciler deletes its hosts and runner registrations. |
+| `GET /ui/runner-pools.js` | The dashboard script for the **Launch** dialog and the **Runner pools** panel. |
 | `POST /api/patches/save` | Opens a pull request on the configuration repository with the updated manifest. Aliased as `/api/patch-console/save`. |
 
 Direct live hot-patching via `POST /api/patches/hot-patch` is deprecated. The patch console bootstrap endpoint indicates `executor.available=false`, explaining that the serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick.

@@ -1083,6 +1083,121 @@ pub fn compute_fleet_fingerprint(
 }
 
 // ============================================================================
+// Runner Pool Host Launch
+// ============================================================================
+
+/// Launches one host for a runner pool and returns its name, or why it couldn't.
+async fn launch_pool_host<G, H>(
+    gcp: &G,
+    gh: &H,
+    project: &str,
+    pool: &crate::runner_pools::RunnerPool,
+    now: u64,
+) -> Result<String, String>
+where
+    G: GcpReconcilerClient,
+    H: GitHubReconcilerClient,
+{
+    use crate::runner_pools as rp;
+
+    let host_name = rp::pool_host_name(&pool.id, now, &generate_unique_suffix(now));
+    let labels = rp::pool_labels(pool);
+    let gh_target = rp::target_api_path(&pool.target);
+    let (runner_group, runner_group_id) = rp::runner_group_for(&pool.target);
+
+    let token = match gh
+        .mint_2slot_runner_configs(
+            &gh_target,
+            &host_name,
+            rp::POOL_RUNNER_PREFIX,
+            runner_group_id,
+            &labels,
+        )
+        .await
+    {
+        Ok(RunnerBootstrapConfig::RegistrationToken { token }) if !token.is_empty() => token,
+        Ok(RunnerBootstrapConfig::RegistrationToken { .. }) => {
+            return Err("GitHub returned an empty runner registration token".to_string())
+        }
+        Ok(RunnerBootstrapConfig::JitConfig { .. }) => {
+            return Err(
+                "pool hosts need a registration token, not just-in-time configs".to_string(),
+            )
+        }
+        Err(e) => return Err(format!("runner registration token unavailable: {}", e)),
+    };
+
+    let patch = rp::pool_runner_patch(pool);
+    let manifest_val = match &patch {
+        Some(p) => serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+        None => serde_json::json!({}),
+    };
+    let patch_sha = patch
+        .as_ref()
+        .map(|p| p.patch_sha256())
+        .unwrap_or_else(|| "0".repeat(64));
+    let patch_json = serde_json::to_string(&manifest_val).unwrap_or_else(|_| "{}".to_string());
+
+    let data_disk_device = crate::gcp::runner_data_disk_device_name(&host_name);
+    let deployment_id = format!("dep-pool-{}-{}", pool.id, now);
+    let runner_cpu_limit = pool.runner_vcpu.to_string();
+    let labels_csv = labels.join(",");
+    let startup_params = crate::github::StartupParams {
+        disk_device_name: &data_disk_device,
+        instance_name: &host_name,
+        deployment_id: &deployment_id,
+        org: &pool.target,
+        runner_prefix: rp::POOL_RUNNER_PREFIX,
+        runner_group,
+        runner_labels: &labels_csv,
+        registration_token: &token,
+        runner_count: pool.runners_per_host,
+        runner_memory_gb: pool.runner_ram_gib,
+        runner_cpu_limit: &runner_cpu_limit,
+        tiered: true,
+        strict_heavy_pool: false,
+        resource_monitoring: true,
+    };
+    let script = crate::github::render_startup_script(&startup_params, patch.as_ref())
+        .map_err(|e| format!("startup script render failed: {}", e))?;
+
+    let vm_cfg = crate::gcp::RunnerVmConfig {
+        instance_name: &host_name,
+        machine_type: &pool.machine_type,
+        zone: &pool.zone,
+        target: &pool.target,
+        runner_prefix: rp::POOL_RUNNER_PREFIX,
+        startup_script: &script,
+        patch_sha256: &patch_sha,
+        patch_json: &patch_json,
+        runner_1_jitconfig: None,
+        runner_2_jitconfig: None,
+        source_image: None,
+        golden_image_family: None,
+        // The machine series picks the disk type (C4A, C4D, N4, N4A and N4D take only Hyperdisk).
+        boot_disk_type: None,
+    };
+    let mut req = crate::gcp::build_spot_runner_vm_request(project, &vm_cfg)
+        .map_err(|e| format!("VM request invalid: {}", e))?;
+    for item in req.metadata.items.iter_mut() {
+        if item.key == "spot-runner-count" {
+            item.value = pool.runners_per_host.to_string();
+        }
+    }
+    req.metadata.items.push(crate::gcp::GceMetadataItem {
+        key: rp::POOL_METADATA_KEY.to_string(),
+        value: pool.id.clone(),
+    });
+    req.labels
+        .insert(rp::POOL_METADATA_KEY.to_string(), pool.id.clone());
+
+    gcp.insert_instance(project, &pool.zone, &req, None, now)
+        .await
+        .map_err(|e| format!("VM create failed: {}", e))?;
+    Ok(host_name)
+}
+
+// ============================================================================
 // Core Reconciliation Runner
 // ============================================================================
 
@@ -1159,9 +1274,20 @@ where
         bundle.state.controlled_targets.clone()
     };
 
+    // Runner pools come from the latest stored state, not the isolate's cached copy, so a pool an
+    // administrator just created or removed is acted on in this tick.
+    let runner_pools: Vec<crate::runner_pools::RunnerPool> =
+        match crate::state::load_authoritative_state(kv, now).await {
+            Ok((fresh, _)) => fresh.state.runner_pools,
+            Err(_) => bundle.state.runner_pools.clone(),
+        };
+
     // Build target-aware list of API targets used for provisioning
     let mut target_paths = vec![format!("orgs/{}", org)];
-    for target in &controlled_targets {
+    for target in controlled_targets
+        .iter()
+        .chain(runner_pools.iter().map(|p| &p.target))
+    {
         let path = if target.contains('/') {
             format!("repos/{}", target)
         } else {
@@ -1177,8 +1303,11 @@ where
     let mut runner_target_map: std::collections::HashMap<u64, String> =
         std::collections::HashMap::new();
 
+    let mut listed_target_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for target_path in &target_paths {
         if let Ok(target_runners) = gh.list_runners(target_path).await {
+            listed_target_paths.insert(target_path.clone());
             for r in target_runners {
                 if !runner_target_map.contains_key(&r.id) {
                     runner_target_map.insert(r.id, target_path.clone());
@@ -1339,6 +1468,13 @@ where
                 }
                 if i.name.starts_with("builder-")
                     || i.metadata.get("spot-role") == Some("rust_builder")
+                {
+                    return false;
+                }
+                // Runner pool hosts belong to their pool, not to the floor.
+                if i.metadata
+                    .get(crate::runner_pools::POOL_METADATA_KEY)
+                    .is_some()
                 {
                     return false;
                 }
@@ -1599,6 +1735,103 @@ where
         }
     }
 
+    // 8b. Runner pools (dashboard-launched). Only with a fresh instance list: an empty list after a
+    // failed GCE call would look like every host is missing.
+    let mut pool_statuses: std::collections::BTreeMap<
+        String,
+        crate::runner_pools::RunnerPoolStatus,
+    > = std::collections::BTreeMap::new();
+    let mut finished_pool_removals: Vec<String> = Vec::new();
+    if gcp_list_succeeded {
+        for pool in &runner_pools {
+            let mut status = bundle
+                .state
+                .runner_pool_status
+                .get(&pool.id)
+                .cloned()
+                .unwrap_or_default();
+            let hosts: Vec<&SimpleGceInstance> = instances
+                .iter()
+                .filter(|i| {
+                    !i.status.eq_ignore_ascii_case("TERMINATED")
+                        && i.metadata.get(crate::runner_pools::POOL_METADATA_KEY)
+                            == Some(pool.id.as_str())
+                })
+                .collect();
+            let host_prefix = crate::runner_pools::pool_host_name_prefix(&pool.id);
+            let pool_runners: Vec<&SimpleGitHubRunner> = runners
+                .iter()
+                .filter(|r| r.name.contains(&host_prefix))
+                .collect();
+            status.hosts_running = hosts.len() as u32;
+            status.runners_online = pool_runners
+                .iter()
+                .filter(|r| r.status.eq_ignore_ascii_case("online"))
+                .count() as u32;
+
+            if pool.removing {
+                for host in &hosts {
+                    if gcp
+                        .delete_instance(&project, host.zone_short(), &host.name, now)
+                        .await
+                        .is_ok()
+                    {
+                        cleaned_vms.push(host.name.clone());
+                    }
+                }
+                // Busy runners finish their job first; GitHub refuses to remove them.
+                let mut runners_left = 0usize;
+                for r in &pool_runners {
+                    let path = runner_target_map
+                        .get(&r.id)
+                        .cloned()
+                        .unwrap_or_else(|| crate::runner_pools::target_api_path(&pool.target));
+                    if !r.busy && gh.delete_runner(&path, r.id).await.is_ok() {
+                        cleaned_runners.push(r.name.clone());
+                    } else {
+                        runners_left += 1;
+                    }
+                }
+                // An unlisted target may still hold registrations, so finish only after a good list.
+                let runners_listed = listed_target_paths
+                    .contains(&crate::runner_pools::target_api_path(&pool.target));
+                if hosts.is_empty() && runners_left == 0 && runners_listed {
+                    finished_pool_removals.push(pool.id.clone());
+                }
+                pool_statuses.insert(pool.id.clone(), status);
+                continue;
+            }
+
+            // One launch per pool per tick: the new host shows in the next tick's instance list.
+            if (hosts.len() as u32) < pool.hosts {
+                match launch_pool_host(gcp, gh, &project, pool, now).await {
+                    Ok(host_name) => {
+                        status.last_launch_host = Some(host_name.clone());
+                        status.last_launch_at = Some(now);
+                        status.last_error = None;
+                        status.last_error_at = None;
+                        launched_hosts.push(host_name);
+                    }
+                    Err(reason) => {
+                        if status.last_error.as_deref() != Some(reason.as_str()) {
+                            status.last_error_at = Some(now);
+                        }
+                        status.last_error = Some(reason.clone());
+                        held_floor_targets
+                            .push(format!("pool {} ({}): {}", pool.id, pool.target, reason));
+                    }
+                }
+            }
+            pool_statuses.insert(pool.id.clone(), status);
+        }
+    }
+    let pools_changed = gcp_list_succeeded
+        && (!finished_pool_removals.is_empty()
+            || runner_pools != bundle.state.runner_pools
+            || runner_pools
+                .iter()
+                .any(|p| pool_statuses.get(&p.id) != bundle.state.runner_pool_status.get(&p.id)));
+
     // 9. Backlog Scale-Up Policy (Triggered ONLY when queued_jobs >= 20)
     let max_instances = (bundle.state.scaling.cicd_runner.max_runners / RUNNERS_PER_HOST).max(1);
     let current_live = instances
@@ -1607,6 +1840,9 @@ where
             !i.status.eq_ignore_ascii_case("TERMINATED")
                 && !i.name.starts_with("builder-")
                 && i.metadata.get("spot-role") != Some("rust_builder")
+                && i.metadata
+                    .get(crate::runner_pools::POOL_METADATA_KEY)
+                    .is_none()
         })
         .count();
 
@@ -1921,6 +2157,7 @@ where
         || !launched_hosts.is_empty()
         || recovered_builds > 0
         || overview_changed
+        || pools_changed
         || (last_fp_guard.as_ref() != Some(&current_fingerprint));
 
     let heartbeat_elapsed = now.saturating_sub(bundle.written_at) >= HEARTBEAT_INTERVAL_SECS;
@@ -1949,6 +2186,19 @@ where
         if bundle.state.rust_builds.get("queue").is_some() {
             let _ = crate::state::evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
         }
+        // Pool definitions belong to the dashboard: take them from the latest stored state so a
+        // pool created or removed while this tick ran survives this write, even when the GCE list
+        // failed and this tick left the pools alone.
+        let fresh_pools = crate::state::load_authoritative_state(kv, now)
+            .await
+            .ok()
+            .map(|(fresh, _)| fresh.state.runner_pools);
+        crate::runner_pools::merge_reconciled_pools(
+            &mut bundle.state,
+            fresh_pools,
+            &pool_statuses,
+            &finished_pool_removals,
+        );
         bundle.state.updated_at = now;
 
         save_state(kv, &mut bundle, now).await?;

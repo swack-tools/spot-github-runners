@@ -1,0 +1,647 @@
+//! Runner pools: Spot hosts an administrator launches from the dashboard.
+//!
+//! A pool names one machine shape in one zone, how many hosts to keep, how many runners each host
+//! runs and how big each runner is, the organization or repository the runners register with,
+//! extra labels, and optionally a cloud-init template whose shell commands run while the runner
+//! image builds. The administrator creates a pool with `POST /api/runner-pools`; the reconciler
+//! then launches one missing host per pool on each tick and replaces hosts Spot takes back.
+//! `POST /api/runner-pools/delete` marks a pool as removing; the reconciler deletes its hosts and
+//! runner registrations and then drops the record.
+//!
+//! Pools use the built-in runner bootstrap (`cloud-init/startup.sh`). Config-repo patches and
+//! repository specs apply to floor hosts only.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use crate::state::{
+    load_authoritative_state, load_state, save_state, CloudInitTemplate, DashboardState,
+    KvStoreBackend, StateError,
+};
+
+/// Host names start with this, so the dashboard's instance views and stale-runner cleanup treat
+/// pool hosts like other runner hosts.
+pub const POOL_HOST_PREFIX: &str = "oxidex-runners-pool-";
+/// Instance metadata key and label that tie a host to its pool.
+pub const POOL_METADATA_KEY: &str = "spot-pool";
+/// Runner names start with this (`<prefix>-<host>-<n>`), which stale-runner cleanup recognises.
+pub const POOL_RUNNER_PREFIX: &str = "oxidex";
+
+pub const MAX_POOLS: usize = 20;
+pub const MAX_HOSTS_PER_POOL: u32 = 10;
+pub const MAX_RUNNERS_PER_HOST: u32 = 8;
+pub const MAX_EXTRA_LABELS: usize = 10;
+pub const MAX_SETUP_SCRIPT_BYTES: usize = 64 * 1024;
+/// Memory left for Debian, Docker, the admission service and the Ops Agent.
+pub const HOST_RESERVED_RAM_GIB: u32 = 2;
+pub const POOL_ID_LEN: usize = 6;
+
+/// One pool, as an administrator created it. The reconciler never edits these fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunnerPool {
+    pub id: String,
+    /// `org` or `owner/repo`.
+    pub target: String,
+    pub machine_type: String,
+    pub zone: String,
+    pub hosts: u32,
+    pub runners_per_host: u32,
+    pub runner_vcpu: u32,
+    pub runner_ram_gib: u32,
+    /// Labels added to the built-in ones (self-hosted, Linux, X64 or ARM64, spot, shape, zone).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Empty for the built-in runner setup only.
+    #[serde(default)]
+    pub cloud_init_template_id: String,
+    #[serde(default)]
+    pub cloud_init_template_name: String,
+    /// The template's shell commands as they were when the pool was created, so editing the
+    /// template later doesn't change hosts the pool launches.
+    #[serde(default)]
+    pub setup_script: String,
+    /// Estimated Spot cost of one host (compute and data disk), when the price table knows it.
+    #[serde(default)]
+    pub host_hourly_usd: Option<f64>,
+    pub created_at: u64,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub removing: bool,
+}
+
+/// What the reconciler last saw for a pool. Written by the reconciler only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RunnerPoolStatus {
+    pub hosts_running: u32,
+    pub runners_online: u32,
+    #[serde(default)]
+    pub last_launch_host: Option<String>,
+    #[serde(default)]
+    pub last_launch_at: Option<u64>,
+    /// Why the last launch attempt failed; cleared by the next successful launch.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_at: Option<u64>,
+}
+
+/// Body of `POST /api/runner-pools`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreateRunnerPoolRequest {
+    pub target: String,
+    pub machine_type: String,
+    pub zone: String,
+    #[serde(default = "default_hosts")]
+    pub hosts: u32,
+    pub runners_per_host: u32,
+    pub runner_vcpu: u32,
+    pub runner_ram_gib: u32,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub cloud_init_template_id: String,
+}
+
+fn default_hosts() -> u32 {
+    1
+}
+
+/// Body of `POST /api/runner-pools/delete`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RemoveRunnerPoolRequest {
+    pub id: String,
+}
+
+/// vCPU and RAM (GiB) of each machine type a pool may use: the runner allowlists in `patch.rs`.
+pub fn machine_shape(machine_type: &str) -> Option<(u32, u32)> {
+    Some(match machine_type {
+        "c4d-highcpu-16" => (16, 30),
+        "n4d-highcpu-16" => (16, 32),
+        "n4-highcpu-16" => (16, 32),
+        "c2d-highcpu-16" => (16, 32),
+        "c4a-highcpu-16" => (16, 32),
+        "c4a-standard-16" => (16, 64),
+        "c4a-highcpu-8" => (8, 16),
+        "c4a-standard-8" => (8, 32),
+        "n4a-highcpu-16" => (16, 32),
+        "n4a-standard-16" => (16, 64),
+        "n4a-highcpu-8" => (8, 16),
+        "n4a-standard-8" => (8, 32),
+        "t2a-standard-16" => (16, 64),
+        "t2a-standard-8" => (8, 32),
+        _ => return None,
+    })
+}
+
+/// Machine types a pool can launch, in a stable order.
+pub fn launchable_machine_types() -> Vec<&'static str> {
+    crate::patch::PERMITTED_MACHINE_TYPES
+        .iter()
+        .chain(crate::patch::PERMITTED_ARM64_MACHINE_TYPES.iter())
+        .copied()
+        .filter(|mt| machine_shape(mt).is_some())
+        .collect()
+}
+
+pub fn is_arm64_machine_type(machine_type: &str) -> bool {
+    machine_type.starts_with("c4a-")
+        || machine_type.starts_with("n4a-")
+        || machine_type.starts_with("t2a-")
+}
+
+/// `org` or `owner/repo`, in GitHub's character set. The value reaches the startup script, the
+/// GitHub API path and instance metadata, so nothing else is allowed.
+pub fn is_valid_target(target: &str) -> bool {
+    let mut parts = target.split('/');
+    let owner = parts.next().unwrap_or("");
+    let repo = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    let owner_ok = !owner.is_empty()
+        && owner.len() <= 39
+        && !owner.starts_with('-')
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let repo_ok = match repo {
+        None => true,
+        Some(r) => {
+            !r.is_empty()
+                && r.len() <= 100
+                && r != "."
+                && r != ".."
+                && r.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        }
+    };
+    owner_ok && repo_ok
+}
+
+/// A GCE zone name such as `us-west8-a`.
+pub fn is_valid_zone(zone: &str) -> bool {
+    let parts: Vec<&str> = zone.split('-').collect();
+    zone.len() <= 32
+        && parts.len() == 3
+        && !parts[0].is_empty()
+        && parts[0].bytes().all(|b| b.is_ascii_lowercase())
+        && parts[1].len() >= 2
+        && parts[1]
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && parts[1].bytes().any(|b| b.is_ascii_digit())
+        && parts[2].len() == 1
+        && parts[2].bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// A runner label: GitHub's API and the startup script (inside single quotes) both accept these.
+pub fn is_valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 64
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The labels every pool host's runners carry.
+pub fn builtin_labels(machine_type: &str, zone: &str) -> Vec<String> {
+    vec![
+        "self-hosted".to_string(),
+        "Linux".to_string(),
+        if is_arm64_machine_type(machine_type) {
+            "ARM64"
+        } else {
+            "X64"
+        }
+        .to_string(),
+        "spot".to_string(),
+        machine_type.to_string(),
+        zone.to_string(),
+    ]
+}
+
+/// Built-in labels followed by the pool's own, without case-insensitive duplicates.
+pub fn pool_labels(pool: &RunnerPool) -> Vec<String> {
+    let mut labels = builtin_labels(&pool.machine_type, &pool.zone);
+    for label in &pool.labels {
+        if !labels.iter().any(|l| l.eq_ignore_ascii_case(label)) {
+            labels.push(label.clone());
+        }
+    }
+    labels
+}
+
+/// Host names for a pool start with this; the instance name adds `<epoch>-<8 hex>`.
+pub fn pool_host_name_prefix(pool_id: &str) -> String {
+    format!("{}{}-", POOL_HOST_PREFIX, pool_id)
+}
+
+pub fn pool_host_name(pool_id: &str, now: u64, suffix: &str) -> String {
+    format!("{}{}-{}", pool_host_name_prefix(pool_id), now, suffix)
+}
+
+/// GitHub API path for registering and listing the pool's runners.
+pub fn target_api_path(target: &str) -> String {
+    if target.contains('/') {
+        format!("repos/{}", target)
+    } else {
+        format!("orgs/{}", target)
+    }
+}
+
+/// Runner group name for `config.sh --runnergroup`, and the group id the GitHub client takes.
+/// The swack-tools organization keeps its runners in `swack-runners`; other organizations use
+/// their default group, and repository runners have no group.
+pub fn runner_group_for(target: &str) -> (&'static str, u32) {
+    if target.contains('/') {
+        ("", 1)
+    } else if target.eq_ignore_ascii_case("swack-tools") {
+        ("swack-runners", 10)
+    } else {
+        ("", 1)
+    }
+}
+
+/// Targets the dashboard offers in the dropdown: the fleet's own targets, then any target a pool
+/// already uses. Other organizations or repositories can still be typed in.
+pub fn suggested_targets(state: &DashboardState) -> Vec<String> {
+    let mut out: Vec<String> = if state.controlled_targets.is_empty() {
+        crate::patch::CONTROLLED_TARGETS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        state.controlled_targets.clone()
+    };
+    for t in crate::patch::ON_DEMAND_TARGETS {
+        if !out.iter().any(|o| o == t) {
+            out.push(t.to_string());
+        }
+    }
+    for p in &state.runner_pools {
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(&p.target)) {
+            out.push(p.target.clone());
+        }
+    }
+    out
+}
+
+/// Why a template can't be used as a pool's setup commands, if it can't.
+pub fn template_unusable_reason(t: &CloudInitTemplate) -> Option<String> {
+    if t.role != "cicd_runner" {
+        return Some(format!("template is for {}, not CI/CD runners", t.role));
+    }
+    let body = t.content.trim_start();
+    if body.starts_with("#cloud-config") {
+        return Some(
+            "cloud-config YAML can't run on these hosts; use a shell script template".to_string(),
+        );
+    }
+    if body.is_empty() {
+        return Some("template is empty".to_string());
+    }
+    if t.content.len() > MAX_SETUP_SCRIPT_BYTES {
+        return Some(format!(
+            "template is {} bytes; pools take at most {}",
+            t.content.len(),
+            MAX_SETUP_SCRIPT_BYTES
+        ));
+    }
+    None
+}
+
+fn new_pool_id(existing: &[RunnerPool], now: u64) -> String {
+    for attempt in 0u64..16 {
+        let mut bytes = [0u8; 3];
+        let id = if getrandom::getrandom(&mut bytes).is_ok() {
+            hex::encode(bytes)
+        } else {
+            format!(
+                "{:06x}",
+                (now.wrapping_add(attempt.wrapping_mul(7919))) & 0xff_ffff
+            )
+        };
+        if !existing.iter().any(|p| p.id == id) {
+            return id;
+        }
+    }
+    format!("{:06x}", now & 0xff_ffff)
+}
+
+/// Checks a create request against the current state and returns the pool to store.
+pub fn validate_create_request(
+    req: &CreateRunnerPoolRequest,
+    state: &DashboardState,
+    created_by: &str,
+    now: u64,
+) -> Result<RunnerPool, String> {
+    let target = req.target.trim();
+    if !is_valid_target(target) {
+        return Err(format!(
+            "'{}' isn't an organization or owner/repository name",
+            target
+        ));
+    }
+    let machine_type = req.machine_type.trim();
+    let Some((host_vcpu, host_ram)) = machine_shape(machine_type) else {
+        return Err(format!(
+            "{} can't be launched as a runner host yet; pick one of: {}",
+            machine_type,
+            launchable_machine_types().join(", ")
+        ));
+    };
+    let zone = req.zone.trim();
+    if !is_valid_zone(zone) {
+        return Err(format!("'{}' isn't a zone name", zone));
+    }
+    if req.hosts == 0 || req.hosts > MAX_HOSTS_PER_POOL {
+        return Err(format!("Hosts must be 1 to {}", MAX_HOSTS_PER_POOL));
+    }
+    if req.runners_per_host == 0 || req.runners_per_host > MAX_RUNNERS_PER_HOST {
+        return Err(format!(
+            "Runners per host must be 1 to {}",
+            MAX_RUNNERS_PER_HOST
+        ));
+    }
+    if req.runner_vcpu == 0 || req.runner_ram_gib == 0 {
+        return Err("Each runner needs at least 1 vCPU and 1 GiB".to_string());
+    }
+    let vcpu_needed = req.runners_per_host.saturating_mul(req.runner_vcpu);
+    if vcpu_needed > host_vcpu {
+        return Err(format!(
+            "{} runners x {} vCPU = {} vCPU, but {} has {}",
+            req.runners_per_host, req.runner_vcpu, vcpu_needed, machine_type, host_vcpu
+        ));
+    }
+    let ram_needed = req.runners_per_host.saturating_mul(req.runner_ram_gib);
+    let ram_free = host_ram.saturating_sub(HOST_RESERVED_RAM_GIB);
+    if ram_needed > ram_free {
+        return Err(format!(
+            "{} runners x {} GiB = {} GiB, but {} has {} GiB and keeps {} GiB for the host",
+            req.runners_per_host,
+            req.runner_ram_gib,
+            ram_needed,
+            machine_type,
+            host_ram,
+            HOST_RESERVED_RAM_GIB
+        ));
+    }
+
+    if req.labels.len() > MAX_EXTRA_LABELS {
+        return Err(format!("At most {} extra labels", MAX_EXTRA_LABELS));
+    }
+    let builtin = builtin_labels(machine_type, zone);
+    let mut labels: Vec<String> = Vec::new();
+    for raw in &req.labels {
+        let label = raw.trim();
+        if label.is_empty() {
+            continue;
+        }
+        if !is_valid_label(label) {
+            return Err(format!(
+                "Label '{}' may use only letters, digits, '.', '_' and '-' (64 at most)",
+                label
+            ));
+        }
+        // A label that names another architecture would send jobs to hosts that can't run them.
+        let lower = label.to_ascii_lowercase();
+        let other_arch = if is_arm64_machine_type(machine_type) {
+            ["x64", "x86_64", "amd64"].contains(&lower.as_str())
+        } else {
+            ["arm64", "aarch64"].contains(&lower.as_str())
+        };
+        if other_arch {
+            return Err(format!(
+                "Label '{}' names another architecture than {}",
+                label, machine_type
+            ));
+        }
+        if builtin.iter().any(|b| b.eq_ignore_ascii_case(label))
+            || labels.iter().any(|l| l.eq_ignore_ascii_case(label))
+        {
+            continue;
+        }
+        labels.push(label.to_string());
+    }
+
+    let template_id = req.cloud_init_template_id.trim();
+    let (template_name, setup_script) = if template_id.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let Some(t) = state
+            .cloud_init_templates
+            .iter()
+            .find(|t| t.id == template_id)
+        else {
+            return Err(format!("Template '{}' not found", template_id));
+        };
+        if let Some(reason) = template_unusable_reason(t) {
+            return Err(format!("Template '{}' can't be used: {}", t.name, reason));
+        }
+        (t.name.clone(), t.content.clone())
+    };
+
+    let active: Vec<&RunnerPool> = state.runner_pools.iter().filter(|p| !p.removing).collect();
+    if active.len() >= MAX_POOLS {
+        return Err(format!("At most {} pools", MAX_POOLS));
+    }
+
+    let host_hourly_usd = crate::state::machine_type_hourly_usd(machine_type);
+    if let Some(host_cost) = host_hourly_usd {
+        let committed: f64 = active
+            .iter()
+            .filter_map(|p| p.host_hourly_usd.map(|c| c * p.hosts as f64))
+            .sum();
+        let total = committed + host_cost * req.hosts as f64;
+        let cap = state.global_budget.max_hourly_usd;
+        if cap.is_finite() && cap > 0.0 && total > cap + 1e-9 {
+            return Err(format!(
+                "All pools together would cost about ${:.4}/hr, above the ${:.2}/hr budget cap",
+                total, cap
+            ));
+        }
+    }
+
+    Ok(RunnerPool {
+        id: new_pool_id(&state.runner_pools, now),
+        target: target.to_string(),
+        machine_type: machine_type.to_string(),
+        zone: zone.to_string(),
+        hosts: req.hosts,
+        runners_per_host: req.runners_per_host,
+        runner_vcpu: req.runner_vcpu,
+        runner_ram_gib: req.runner_ram_gib,
+        labels,
+        cloud_init_template_id: template_id.to_string(),
+        cloud_init_template_name: template_name,
+        setup_script,
+        host_hourly_usd,
+        created_at: now,
+        created_by: created_by.to_string(),
+        removing: false,
+    })
+}
+
+/// The runner patch a pool host's image gets: only the template's commands, run as root while the
+/// runner image builds, so jobs see what they install.
+pub fn pool_runner_patch(pool: &RunnerPool) -> Option<crate::patch::RunnerPatch> {
+    if pool.setup_script.trim().is_empty() {
+        return None;
+    }
+    let mut patch = crate::patch::RunnerPatch::default();
+    if pool.target.contains('/') {
+        patch.repository = pool.target.clone();
+    }
+    patch.container.dockerfile_run = pool.setup_script.clone();
+    Some(patch)
+}
+
+/// The pool list the dashboard shows: definitions without the setup script body, with status.
+pub fn pools_view(state: &DashboardState) -> serde_json::Value {
+    let pools: Vec<serde_json::Value> = state
+        .runner_pools
+        .iter()
+        .map(|p| {
+            let status = state
+                .runner_pool_status
+                .get(&p.id)
+                .cloned()
+                .unwrap_or_default();
+            serde_json::json!({
+                "id": p.id,
+                "target": p.target,
+                "machine_type": p.machine_type,
+                "zone": p.zone,
+                "arch": if is_arm64_machine_type(&p.machine_type) { "arm64" } else { "x86_64" },
+                "hosts": p.hosts,
+                "runners_per_host": p.runners_per_host,
+                "runner_vcpu": p.runner_vcpu,
+                "runner_ram_gib": p.runner_ram_gib,
+                "labels": pool_labels(p),
+                "cloud_init_template_id": p.cloud_init_template_id,
+                "cloud_init_template_name": p.cloud_init_template_name,
+                "host_hourly_usd": p.host_hourly_usd,
+                "created_at": p.created_at,
+                "created_by": p.created_by,
+                "removing": p.removing,
+                "status": status,
+            })
+        })
+        .collect();
+    let templates: Vec<serde_json::Value> = state
+        .cloud_init_templates
+        .iter()
+        .filter(|t| t.role == "cicd_runner")
+        .map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "name": t.name,
+                "description": t.description,
+                "usable": template_unusable_reason(t).is_none(),
+                "reason": template_unusable_reason(t),
+                "preview": t.content.chars().take(1200).collect::<String>(),
+            })
+        })
+        .collect();
+    let machine_types: Vec<serde_json::Value> = launchable_machine_types()
+        .into_iter()
+        .map(|mt| {
+            let (vcpu, ram) = machine_shape(mt).unwrap_or((0, 0));
+            serde_json::json!({
+                "machine_type": mt,
+                "vcpu": vcpu,
+                "ram_gib": ram,
+                "usable_ram_gib": ram.saturating_sub(HOST_RESERVED_RAM_GIB),
+                "arch": if is_arm64_machine_type(mt) { "arm64" } else { "x86_64" },
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "pools": pools,
+        "templates": templates,
+        "targets": suggested_targets(state),
+        "machine_types": machine_types,
+        "budget_max_hourly_usd": state.global_budget.max_hourly_usd,
+        "limits": {
+            "max_pools": MAX_POOLS,
+            "max_hosts_per_pool": MAX_HOSTS_PER_POOL,
+            "max_runners_per_host": MAX_RUNNERS_PER_HOST,
+            "max_extra_labels": MAX_EXTRA_LABELS,
+            "host_reserved_ram_gib": HOST_RESERVED_RAM_GIB,
+        },
+    })
+}
+
+pub async fn handle_get_runner_pools<K: KvStoreBackend>(
+    kv: &K,
+    now: u64,
+) -> Result<serde_json::Value, StateError> {
+    // The panel polls every minute; the isolate cache (at most 60 s old) is fresh enough.
+    let (bundle, _) = load_state(kv, now).await?;
+    Ok(pools_view(&bundle.state))
+}
+
+pub async fn handle_create_runner_pool<K: KvStoreBackend>(
+    kv: &K,
+    req: CreateRunnerPoolRequest,
+    created_by: &str,
+    now: u64,
+) -> Result<serde_json::Value, StateError> {
+    let (mut bundle, _) = load_authoritative_state(kv, now).await?;
+    let pool = validate_create_request(&req, &bundle.state, created_by, now)
+        .map_err(StateError::Validation)?;
+    bundle.state.runner_pools.push(pool.clone());
+    bundle.state.updated_at = now;
+    save_state(kv, &mut bundle, now).await?;
+    let mut view = pools_view(&bundle.state);
+    if let Some(obj) = view.as_object_mut() {
+        obj.insert("created".to_string(), serde_json::json!(pool.id));
+    }
+    Ok(view)
+}
+
+pub async fn handle_remove_runner_pool<K: KvStoreBackend>(
+    kv: &K,
+    req: RemoveRunnerPoolRequest,
+    now: u64,
+) -> Result<serde_json::Value, StateError> {
+    let (mut bundle, _) = load_authoritative_state(kv, now).await?;
+    let id = req.id.trim();
+    let Some(pool) = bundle.state.runner_pools.iter_mut().find(|p| p.id == id) else {
+        return Err(StateError::NotFound(format!("Pool '{}' not found", id)));
+    };
+    if !pool.removing {
+        pool.removing = true;
+        bundle.state.updated_at = now;
+        save_state(kv, &mut bundle, now).await?;
+    }
+    Ok(pools_view(&bundle.state))
+}
+
+/// Folds the reconciler's view of pools into the state it is about to save: pool definitions come
+/// from `fresh` (the latest stored state, so a pool created or removed during the tick isn't lost),
+/// removals the reconciler finished are dropped, and statuses are kept for remaining pools only.
+pub fn merge_reconciled_pools(
+    state: &mut DashboardState,
+    fresh_pools: Option<Vec<RunnerPool>>,
+    statuses: &BTreeMap<String, RunnerPoolStatus>,
+    finished_removals: &[String],
+) {
+    if let Some(pools) = fresh_pools {
+        state.runner_pools = pools;
+    }
+    state
+        .runner_pools
+        .retain(|p| !(p.removing && finished_removals.contains(&p.id)));
+    let mut kept: BTreeMap<String, RunnerPoolStatus> = BTreeMap::new();
+    for p in &state.runner_pools {
+        if let Some(s) = statuses
+            .get(&p.id)
+            .or_else(|| state.runner_pool_status.get(&p.id))
+        {
+            kept.insert(p.id.clone(), s.clone());
+        }
+    }
+    state.runner_pool_status = kept;
+}

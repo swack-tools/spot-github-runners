@@ -71,6 +71,7 @@ nav:
       - Serverless edge reconciler: cloud-run-autoscaler.md
       - Runner patches: runner-patches.md
       - Repository runner specs: repo-runner-specs.md
+      - Launch runners from the dashboard: runner-pools.md
   - Dashboard:
       - Dashboard: dashboard.md
       - Serverless edge dashboard: edge-dashboard.md
