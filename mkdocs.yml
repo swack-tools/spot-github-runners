@@ -64,6 +64,17 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting started: getting-started.md
+  - How-to guides:
+      - Overview: guides/index.md
+      - Sign in to the dashboard: guides/sign-in.md
+      - Find the cheapest hosts: guides/find-cheap-hosts.md
+      - Launch a runner pool: guides/launch-a-pool.md
+      - Point a workflow at a pool: guides/use-a-pool-in-a-workflow.md
+      - Check on a pool: guides/check-a-pool.md
+      - Make a runner setup template: guides/make-a-runner-template.md
+      - Roll a template onto a pool: guides/change-a-pool-template.md
+      - Resize or remove a pool: guides/resize-or-remove-a-pool.md
+      - Add an administrator: guides/add-an-administrator.md
   - Spot pricing and offers: spot-pricing.md
   - Runner fleet:
       - Provision runner hosts: provisioning.md

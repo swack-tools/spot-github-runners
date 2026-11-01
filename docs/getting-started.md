@@ -150,6 +150,7 @@ The health response reports the reconciliation status and fleet inventory.
 
 ## Next steps
 
+- To run your workflows on dashboard runner pools, follow the [How-to guides](guides/index.md).
 - Read [Fleet and autoscaler](fleet-and-autoscaler.md) for how edge reconciliation works.
 - Read [Operations and troubleshooting](operations.md) for the safety rules that apply to a live fleet.
 - To build Rust on a dedicated VM, follow [Set up a builder](dedicated-builders.md).

@@ -289,3 +289,23 @@ fn a_saved_profile_takes_only_well_formed_fields() {
     assert!(!p.budget.include_disk_costs);
     assert_eq!(p.budget.max_daily_usd, base.budget.max_daily_usd);
 }
+
+#[test]
+fn only_the_newest_matrix_preview_draws_the_table() {
+    // Every keystroke in the sizing form starts a preview. An earlier, slower answer must not
+    // replace the rows for what the form says now.
+    let html = spot_dashboard_edge::ui::DASHBOARD_HTML;
+    let start = html
+        .find("async function previewQualification(role)")
+        .expect("previewQualification");
+    let body = &html[start..start + 900];
+    let seq = body
+        .find("const seq = ++QUAL_PREVIEW_SEQ[role];")
+        .expect("sequence taken");
+    let fetch = body.find("await fetch(\"/api/qualify\"").expect("fetch");
+    let guard = body
+        .find("if (seq !== QUAL_PREVIEW_SEQ[role]) return;")
+        .expect("stale answers dropped");
+    let draw = body.find("renderQualificationTable()").expect("draw");
+    assert!(seq < fetch && fetch < guard && guard < draw);
+}

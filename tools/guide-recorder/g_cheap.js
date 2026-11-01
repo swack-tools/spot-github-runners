@@ -1,0 +1,38 @@
+// Guide: find the cheapest Spot host for small runners.
+const { open, close, BASE } = require('./rec');
+(async () => {
+  const r = await open('cheap');
+  const { page, click, type, caption, wait, scrollTo, moveTo, shot, shotRange } = r;
+  await page.goto(BASE + '/', { waitUntil: 'networkidle' });
+  await moveTo(140, 280, 1);
+  await caption('1. Open Machine Qualification', 900);
+  await click('[data-tab="tab-sizing"]', 900);
+  await caption('2. Describe one runner and the smallest host you accept');
+  await scrollTo('#runner-unit-vcpu', 'center');
+  await type('#runner-unit-vcpu', '2', 140);
+  await type('#runner-unit-ram', '6', 140);
+  await type('#runner-min-inst-vcpu', '2', 140);
+  await type('#runner-min-inst-ram', '8', 140);
+  await caption('Leave Min CPU Benchmark Score at 0 unless your jobs need a fast CPU', 1600);
+  await page.selectOption('#runner-disk-cat', 'any');
+  await page.evaluate(() => previewQualification('cicd_runner'));
+  await wait(900);
+  await shot('find-cheap-hosts', 'runner-sizing', '#tab-sizing .two-col > .panel:first-child', 4);
+  await caption('Hide the menu with ☰ to make room for the matrix');
+  await click('#sidebar-toggle-btn', 900);
+  await caption('3. Scroll down to the Qualifying Instances Matrix');
+  await scrollTo('#qualification-table-body', 'start');
+  await page.evaluate(() => window.scrollBy({ top: -140, behavior: 'smooth' }));
+  await wait(900);
+  await caption('It lists every host that fits, cheapest Spot price first', 2200);
+  const first = await page.locator('#qualification-table-body tr:first-child').boundingBox();
+  await moveTo(first.x + first.width * 0.7, first.y + first.height / 2);
+  await caption('Each row shows the price per hour, runners per host, and hosts needed', 2600);
+  await shotRange('find-cheap-hosts', 'matrix', 'table:has(#qualification-table-body) thead', '#qualification-table-body tr:nth-child(5)', 4);
+  await caption('4. Optional: save the sizing so the matrix opens with it next time');
+  await scrollTo("button[onclick=\"saveProfile('cicd_runner')\"]", 'center');
+  await click("button[onclick=\"saveProfile('cicd_runner')\"]", 1800);
+  await shot('find-cheap-hosts', 'profile-saved');
+  await caption('', 300);
+  console.log(await close(r, 'find-cheap-hosts'));
+})();

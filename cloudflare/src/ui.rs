@@ -2310,9 +2310,11 @@ tax_rate_percent: curBudget.tax_rate_percent !== undefined ? Number(curBudget.ta
 }
 };
 }
+const QUAL_PREVIEW_SEQ = { cicd_runner: 0, rust_builder: 0 };
 async function previewQualification(role) {
 updateSizingMathBanners();
 QUAL_ACTIVE_ROLE = role;
+const seq = ++QUAL_PREVIEW_SEQ[role];
 const payload = collectProfileForm(role);
 const res = await fetch("/api/qualify", {
 method: "POST",
@@ -2320,6 +2322,7 @@ headers: { "Content-Type": "application/json" },
 body: JSON.stringify(payload)
 });
 const data = await res.json();
+if (seq !== QUAL_PREVIEW_SEQ[role]) return;
 if (!res.ok || data.error) {
 showToast(`Error previewing qualification: ${data.error || res.statusText}`);
 return;
@@ -2328,6 +2331,7 @@ LAST_QUAL_DATA[role] = data.qualification || data;
 renderQualificationTable();
 }
 async function saveProfile(role) {
+const seq = ++QUAL_PREVIEW_SEQ[role];
 const payload = collectProfileForm(role);
 const res = await fetch(`/api/profile/${role}`, {
 method: "POST",
@@ -2339,7 +2343,7 @@ if (!res.ok || data.error) {
 showToast(`Error saving profile: ${data.error || res.statusText}`);
 return;
 }
-LAST_QUAL_DATA[role] = data.qualification;
+if (seq === QUAL_PREVIEW_SEQ[role]) LAST_QUAL_DATA[role] = data.qualification;
 showToast(`Saved ${role === 'cicd_runner' ? 'CI/CD Runner' : 'Rust Builder'} profile (${data.qualification.spot_price_qualifying_count} Spot offers qualify)`);
 await loadOverview();
 }
@@ -3314,13 +3318,13 @@ clear(history);
 history.appendChild(node("li", `${h.at || ""} ${h.actor || ""} ${h.action || ""} ${h.login || ""} (ID ${h.uid})`));
 });
 el("badge-admins").textContent = String((data.admins || []).length);
-if (data.error) setStatus(data.error);
+if (data.error) setStatus(data.message || data.error);
 }
 async function refresh() {
 if (!S.owner) return;
 setStatus("Loading administrators...");
 const [res, d] = await api("/api/admins");
-if (!res.ok) { setStatus(d.error || `Could not load administrators (HTTP ${res.status})`); return; }
+if (!res.ok) { setStatus(d.message || d.error || `Could not load administrators (HTTP ${res.status})`); return; }
 render(d);
 if (!d.error) setStatus("");
 }
@@ -3337,7 +3341,7 @@ try {
 setStatus(`Looking up ${login} and checking repository permissions on GitHub...`);
 let [res, d] = await postChange("/api/admins/add", { login, confirm: true });
 if (d.retry_same_key === true) {
-setStatus((d.error || "GitHub did not answer.") + " Click Add again to retry.");
+setStatus((d.message || d.error || "GitHub did not answer.") + " Click Add again to retry.");
 return;
 }
 if (d && d.requires_target_override === true) {
@@ -3355,7 +3359,7 @@ confirm: true,
 override_target_check: true
 });
 }
-if (!res.ok) { setStatus(d.error || d.message || `Could not add ${login} (HTTP ${res.status})`); return; }
+if (!res.ok) { setStatus(d.message || d.error || `Could not add ${login} (HTTP ${res.status})`); return; }
 el("adm-login").value = "";
 render(d);
 setStatus(`Added ${d.admin.login} (GitHub user ID ${d.admin.uid})${d.admin.override_target_check ? " (per-target check overridden)" : ""}.`);
@@ -3366,7 +3370,7 @@ el("adm-add").disabled = false;
 async function remove(admin) {
 if (!window.confirm(`Remove ${admin.login} (GitHub user ID ${admin.uid})? Their sessions stop working immediately.`)) return;
 const [res, d] = await postChange("/api/admins/remove", { uid: admin.uid, confirm: true });
-if (!res.ok) { setStatus(d.error || `Could not remove ${admin.login} (HTTP ${res.status})`); return; }
+if (!res.ok) { setStatus(d.message || d.error || `Could not remove ${admin.login} (HTTP ${res.status})`); return; }
 render(d);
 setStatus(`Removed ${d.admin.login} (GitHub user ID ${d.admin.uid}).`);
 }

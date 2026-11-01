@@ -40,6 +40,10 @@
   color: var(--md-accent-fg-color);
 }
 
+.md-typeset figure.shot.walkthrough figcaption::before {
+  content: "Walkthrough — ";
+}
+
 .md-typeset .carousel {
   position: relative;
   margin: 1.2em 0;

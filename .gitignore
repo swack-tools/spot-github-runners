@@ -27,11 +27,16 @@
 !docs/*.md
 !docs/maintenance/
 !docs/maintenance/*.md
+!docs/guides/
+!docs/guides/*.md
 !docs/requirements.txt
 !docs/images/
 !docs/images/*.png
 !docs/images/*.svg
 !docs/images/*.gif
+!docs/images/*/
+!docs/images/*/*.png
+!docs/images/*/*.gif
 !docs/stylesheets/
 !docs/stylesheets/*.css
 !docs/javascripts/
@@ -44,6 +49,8 @@
 !cloudflare/tests/**
 !cloudflare/build/worker/shim.mjs
 !tools/edge_dashboard_probe.js
+!tools/guide-recorder/
+!tools/guide-recorder/*.js
 !tests/fixtures/*.json
 
 # Secrets, generated files, and local-only artifacts
