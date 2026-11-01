@@ -566,6 +566,9 @@ pub async fn save_state<K: KvStoreBackend>(
     bundle: &mut DashboardBundle,
     now: u64,
 ) -> Result<(), StateError> {
+    // A blob read before pools moved to their own key still carries them; keep them before this
+    // save drops them (`runner_pools` isn't serialized).
+    crate::runner_pools::adopt_legacy_pools(kv, &bundle.state.runner_pools).await?;
     bundle.state_version += 1;
     bundle.written_at = now;
     bundle.writer_slot = WRITER_SLOT_EDGE.to_string();

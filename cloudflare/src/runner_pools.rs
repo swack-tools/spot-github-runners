@@ -616,12 +616,37 @@ pub fn pools_view(state: &DashboardState) -> serde_json::Value {
 /// the meantime would be undone. Only the pool routes and the reconciler write this key.
 pub const KV_RUNNER_POOLS_KEY: &str = "dashboard:runner-pools";
 
-/// The stored pool list (empty when no pool was ever created).
+/// The stored pool list. Without the key, it adopts any pools a state blob written before pools
+/// moved out of it still holds, and writes them to the key, so later state saves (which no longer
+/// carry pools) can't lose them. Until the first pool exists, this costs one extra KV read.
 pub async fn load_pools<K: KvStoreBackend>(kv: &K) -> Result<Vec<RunnerPool>, StateError> {
-    match kv.get(KV_RUNNER_POOLS_KEY).await? {
-        Some(raw) => Ok(serde_json::from_str(&raw)?),
-        None => Ok(Vec::new()),
+    if let Some(raw) = kv.get(KV_RUNNER_POOLS_KEY).await? {
+        return Ok(serde_json::from_str(&raw)?);
     }
+    let legacy = match kv.get(crate::state::KV_STATE_KEY).await? {
+        Some(raw) => {
+            serde_json::from_str::<crate::state::DashboardBundle>(&raw)?
+                .state
+                .runner_pools
+        }
+        None => Vec::new(),
+    };
+    if !legacy.is_empty() {
+        save_pools(kv, &legacy).await?;
+    }
+    Ok(legacy)
+}
+
+/// Called before a state blob is saved: if the blob was read before pools moved out of it, its pools
+/// go to the pool key first, unless the key already exists.
+pub async fn adopt_legacy_pools<K: KvStoreBackend>(
+    kv: &K,
+    legacy: &[RunnerPool],
+) -> Result<(), StateError> {
+    if legacy.is_empty() || kv.get(KV_RUNNER_POOLS_KEY).await?.is_some() {
+        return Ok(());
+    }
+    save_pools(kv, legacy).await
 }
 
 pub async fn save_pools<K: KvStoreBackend>(kv: &K, pools: &[RunnerPool]) -> Result<(), StateError> {

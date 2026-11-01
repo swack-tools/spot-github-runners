@@ -998,3 +998,53 @@ fn pool_script_stays_small_and_uses_safe_dom_helpers() {
     assert!(html.contains("<script src=/ui/runner-pools.js></script>"));
     assert!(html.contains("onclick=\"launchQualRow(${i})\""));
 }
+
+fn legacy_blob_with(pools: &[RunnerPool]) -> String {
+    // A state blob written before pools moved to their own key.
+    let mut v = serde_json::to_value(base_state()).unwrap();
+    v["state"]["runner_pools"] = serde_json::to_value(pools).unwrap();
+    v.to_string()
+}
+
+#[tokio::test]
+async fn pools_in_a_legacy_state_blob_are_adopted_on_first_read() {
+    let _g = lock();
+    invalidate_state_cache();
+    let kv = Kv::default();
+    let state = base_state().state;
+    let mut old = validate_create_request(&axion_request("swack-tools"), &state, "o", NOW).unwrap();
+    old.id = "legacy".into();
+    kv.data
+        .lock()
+        .unwrap()
+        .insert(KV_STATE_KEY.to_string(), legacy_blob_with(&[old.clone()]));
+
+    let listed = handle_get_runner_pools(&kv, NOW).await.unwrap();
+    assert_eq!(listed["pools"][0]["id"], "legacy");
+    assert_eq!(kv.pools(), vec![old]);
+
+    // Once the key exists, an empty list stays empty; the blob isn't consulted again.
+    kv.store_pools(&[]);
+    assert!(load_pools(&kv).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_state_save_from_a_legacy_blob_keeps_its_pools() {
+    let _g = lock();
+    invalidate_state_cache();
+    let kv = Kv::default();
+    let state = base_state().state;
+    let mut old = validate_create_request(&axion_request("swack-tools"), &state, "o", NOW).unwrap();
+    old.id = "legacy".into();
+    let raw = legacy_blob_with(&[old.clone()]);
+    kv.data
+        .lock()
+        .unwrap()
+        .insert(KV_STATE_KEY.to_string(), raw.clone());
+
+    // Some route saves the blob before anything read the pool key.
+    let mut bundle: DashboardBundle = serde_json::from_str(&raw).unwrap();
+    save_state(&kv, &mut bundle, NOW + 1).await.unwrap();
+    assert!(!kv.data.lock().unwrap()[KV_STATE_KEY].contains("legacy"));
+    assert_eq!(kv.pools(), vec![old]);
+}
