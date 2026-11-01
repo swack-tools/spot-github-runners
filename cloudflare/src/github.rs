@@ -143,6 +143,67 @@ pub enum GitHubError {
 // GitHub Actions Client
 // ============================================================================
 
+/// One report per repository target on its `.github/spot-runners.yml`: missing, invalid (with
+/// every error), unreadable, or valid with each pool's floor-host fit. Organization targets are
+/// skipped: a spec lives in a repository.
+pub async fn repo_specs_report(
+    client: &GitHubActionsClient,
+    targets: &[String],
+) -> serde_json::Value {
+    let mut out = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for target in targets {
+        if !target.contains('/') || seen.iter().any(|t| t.eq_ignore_ascii_case(target)) {
+            continue;
+        }
+        seen.push(target.clone());
+        let mut entry = match client.fetch_repo_spec(target).await {
+            Ok(RepoSpecFetch::Found(spec)) => crate::repo_spec::spec_report(&spec),
+            Ok(RepoSpecFetch::Invalid(errors)) => serde_json::json!({
+                "status": "invalid",
+                "pools": [],
+                "floor_pool": serde_json::Value::Null,
+                "errors": errors,
+            }),
+            Ok(RepoSpecFetch::Missing) => serde_json::json!({
+                "status": "missing",
+                "pools": [],
+                "floor_pool": serde_json::Value::Null,
+                "errors": [],
+            }),
+            Err(e) => serde_json::json!({
+                "status": "unreadable",
+                "pools": [],
+                "floor_pool": serde_json::Value::Null,
+                "errors": [e.to_string()],
+            }),
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target));
+            obj.insert(
+                "path".to_string(),
+                serde_json::json!(crate::repo_spec::SPEC_PATH),
+            );
+        }
+        out.push(entry);
+    }
+    serde_json::json!({
+        "schema": crate::repo_spec::SPEC_SCHEMA,
+        "path": crate::repo_spec::SPEC_PATH,
+        "repositories": out,
+    })
+}
+
+/// What a repository's `.github/spot-runners.yml` held when it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoSpecFetch {
+    /// No spec (or a private repository the token can't read).
+    Missing,
+    /// A spec that failed validation, with every error found.
+    Invalid(Vec<String>),
+    Found(crate::repo_spec::RepoRunnerSpec),
+}
+
 pub struct GitHubActionsClient {
     token: String,
     transport: Arc<dyn GitHubTransport>,
@@ -213,11 +274,30 @@ impl GitHubActionsClient {
     /// Read one file of the config repo (`spot-runners-config`) at its default branch.
     /// Returns `Ok(None)` when the file doesn't exist (HTTP 404).
     async fn read_config_file(&self, file_path: &str) -> Result<Option<String>, GitHubError> {
-        let path = format!(
-            "repos/{}/contents/{}",
+        self.read_repo_file(
             crate::patch_console::CONFIG_REPO,
-            file_path
-        );
+            file_path,
+            crate::patch_console::MAX_MANIFEST_BYTES,
+        )
+        .await
+    }
+
+    /// Read one file of `owner/repo` at its default branch, refusing files over `max_bytes`.
+    /// Returns `Ok(None)` when the file doesn't exist (HTTP 404). GitHub also answers 404 for a
+    /// private repository the token can't read.
+    async fn read_repo_file(
+        &self,
+        repo: &str,
+        file_path: &str,
+        max_bytes: usize,
+    ) -> Result<Option<String>, GitHubError> {
+        if !crate::repo_spec::is_repo_target(repo) {
+            return Err(GitHubError::Validation(format!(
+                "{:?} is not an owner/repo name",
+                repo
+            )));
+        }
+        let path = format!("repos/{}/contents/{}", repo, file_path);
         let auth_hdr = format!("Bearer {}", self.token);
         let headers = [
             ("Authorization", auth_hdr.as_str()),
@@ -239,7 +319,7 @@ impl GitHubActionsClient {
                 message: String::from_utf8_lossy(&bytes).to_string(),
             });
         }
-        if bytes.len() > crate::patch_console::MAX_MANIFEST_BYTES * 2 {
+        if bytes.len() > max_bytes * 2 {
             return Err(GitHubError::Validation(format!(
                 "{} is larger than the manifest limit",
                 file_path
@@ -253,9 +333,40 @@ impl GitHubActionsClient {
         let raw = B64_STANDARD
             .decode(content.replace(['\n', '\r', ' '], ""))
             .map_err(|e| GitHubError::Validation(format!("{} is not base64: {}", file_path, e)))?;
+        if raw.len() > max_bytes {
+            return Err(GitHubError::Validation(format!(
+                "{} is {} bytes; the limit is {}",
+                file_path,
+                raw.len(),
+                max_bytes
+            )));
+        }
         String::from_utf8(raw)
             .map(Some)
             .map_err(|_| GitHubError::Validation(format!("{} is not UTF-8", file_path)))
+    }
+
+    /// The runner spec a repository keeps at `.github/spot-runners.yml` on its default branch.
+    /// Organization targets have none. A spec that doesn't parse or validate is
+    /// `RepoSpecFetch::Invalid`, so the caller can hold the launch and show why.
+    pub async fn fetch_repo_spec(&self, target: &str) -> Result<RepoSpecFetch, GitHubError> {
+        if !target.contains('/') {
+            return Ok(RepoSpecFetch::Missing);
+        }
+        let text = self
+            .read_repo_file(
+                target,
+                crate::repo_spec::SPEC_PATH,
+                crate::repo_spec::MAX_SPEC_BYTES,
+            )
+            .await?;
+        Ok(match text {
+            None => RepoSpecFetch::Missing,
+            Some(text) => match crate::repo_spec::parse_spec(&text) {
+                Ok(spec) => RepoSpecFetch::Found(spec),
+                Err(errors) => RepoSpecFetch::Invalid(errors),
+            },
+        })
     }
 
     /// The effective runner patch of a controlled target from the config repo: `defaults.yaml`
@@ -298,6 +409,77 @@ impl GitHubActionsClient {
                 patch = crate::patch::merge_patches(&defaults, &repo_patch);
             }
             patch.repository = target.to_string();
+
+            // The repository's own spec, layered on top: the first pool a floor host can serve
+            // adds its labels, CPU features, packages and toolchains. A spec that is invalid or
+            // that no floor host can serve holds the launch, like an unreadable patch does.
+            let fetched = match self.fetch_repo_spec(target).await {
+                // A token without Contents access gets 403 (404 for a private repository). Treat
+                // both as "no spec" so a token scope gap can't hold every repository's floor;
+                // GET /api/repo-specs shows the 403.
+                // A rate-limit 403 still holds, like any other failed read.
+                Err(GitHubError::Api {
+                    status: 403,
+                    ref message,
+                }) if !message.to_ascii_lowercase().contains("rate limit") => {
+                    RepoSpecFetch::Missing
+                }
+                other => other?,
+            };
+            match fetched {
+                RepoSpecFetch::Missing => {}
+                RepoSpecFetch::Invalid(errors) => {
+                    // The reason goes to the reconciler's report and log, so name the first few errors.
+                    let mut shown = errors
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    if errors.len() > 5 {
+                        shown.push_str(&format!("; and {} more", errors.len() - 5));
+                    }
+                    return Err(GitHubError::Validation(format!(
+                        "{} in {} is invalid: {}",
+                        crate::repo_spec::SPEC_PATH,
+                        target,
+                        shown
+                    )));
+                }
+                RepoSpecFetch::Found(spec) => {
+                    let pool = crate::repo_spec::select_floor_pool(&spec).map_err(|e| {
+                        GitHubError::Validation(format!(
+                            "{} in {}: {}",
+                            crate::repo_spec::SPEC_PATH,
+                            target,
+                            e
+                        ))
+                    })?;
+                    let overlay = crate::repo_spec::pool_to_patch(pool, target);
+                    // The operator's arch wins: a spec can't move a target the config repo pins
+                    // to another architecture.
+                    let central = patch.hardware.arch.to_ascii_lowercase();
+                    let central = if central == "aarch64" {
+                        "arm64".to_string()
+                    } else if central == "amd64" {
+                        "x86_64".to_string()
+                    } else {
+                        central
+                    };
+                    if !central.is_empty() && central != overlay.hardware.arch {
+                        return Err(GitHubError::Validation(format!(
+                            "{} in {}: pool {} is {}, but the config repository sets {}",
+                            crate::repo_spec::SPEC_PATH,
+                            target,
+                            pool.name,
+                            overlay.hardware.arch,
+                            patch.hardware.arch
+                        )));
+                    }
+                    patch = crate::patch::merge_patches(&patch, &overlay);
+                    patch.repository = target.to_string();
+                }
+            }
         }
         crate::patch::validate_patch_constraints(&patch)
             .map_err(|errs| GitHubError::Validation(errs.join("; ")))?;

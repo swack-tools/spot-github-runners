@@ -1079,17 +1079,23 @@ fn split_flow_items(inner: &str) -> Vec<String> {
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
+    // Whether `current` holds only whitespace so far. Tracked as a flag rather than by
+    // re-trimming `current` per character, which made splitting quadratic on long items.
+    let mut at_start = true;
     for c in inner.chars() {
         // A quote opens a quoted item only at the item's start, as in YAML (`[it's, b]`).
-        let at_start = current.trim().is_empty();
         match c {
             '\'' if !in_double && (in_single || at_start) => in_single = !in_single,
             '"' if !in_single && (in_double || at_start) => in_double = !in_double,
             ',' if !in_single && !in_double => {
                 items.push(std::mem::take(&mut current));
+                at_start = true;
                 continue;
             }
             _ => {}
+        }
+        if !c.is_whitespace() {
+            at_start = false;
         }
         current.push(c);
     }
@@ -1100,7 +1106,17 @@ fn split_flow_items(inner: &str) -> Vec<String> {
     items
 }
 
+/// Flow collections nest at most this deep; anything deeper stays a plain string. Bounds the
+/// recursion (and its rescanning) on text from repositories.
+const MAX_FLOW_DEPTH: usize = 16;
+/// Block mappings and lists nest at most this deep.
+const MAX_BLOCK_DEPTH: usize = 32;
+
 fn parse_yaml_scalar(s: &str) -> Value {
+    parse_yaml_scalar_at(s, 0)
+}
+
+fn parse_yaml_scalar_at(s: &str, depth: usize) -> Value {
     let s = s.trim();
     if s.is_empty() {
         return Value::Null;
@@ -1109,7 +1125,8 @@ fn parse_yaml_scalar(s: &str) -> Value {
         return Value::Null;
     }
     // Flat flow collections, as the config repo writes them: `[]`, `[a, b]`, `{}`, `{k: v}`.
-    if s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
+    let nested_ok = depth < MAX_FLOW_DEPTH;
+    if nested_ok && s.starts_with('[') && s.ends_with(']') && s.len() >= 2 {
         let inner = s[1..s.len() - 1].trim();
         if inner.is_empty() {
             return Value::Array(Vec::new());
@@ -1117,11 +1134,11 @@ fn parse_yaml_scalar(s: &str) -> Value {
         return Value::Array(
             split_flow_items(inner)
                 .iter()
-                .map(|i| parse_yaml_scalar(i))
+                .map(|i| parse_yaml_scalar_at(i, depth + 1))
                 .collect(),
         );
     }
-    if s.starts_with('{') && s.ends_with('}') && s.len() >= 2 {
+    if nested_ok && s.starts_with('{') && s.ends_with('}') && s.len() >= 2 {
         let inner = s[1..s.len() - 1].trim();
         let mut map = serde_json::Map::new();
         for item in split_flow_items(inner) {
@@ -1130,11 +1147,11 @@ fn parse_yaml_scalar(s: &str) -> Value {
             }
             match item.split_once(':') {
                 Some((k, v)) => {
-                    let key = match parse_yaml_scalar(k) {
+                    let key = match parse_yaml_scalar_at(k, depth + 1) {
                         Value::String(k) => k,
                         other => other.to_string(),
                     };
-                    map.insert(key, parse_yaml_scalar(v));
+                    map.insert(key, parse_yaml_scalar_at(v, depth + 1));
                 }
                 None => return Value::String(s.to_string()),
             }
@@ -1165,6 +1182,16 @@ fn parse_yaml_scalar(s: &str) -> Value {
 
 /// Lightweight parser for YAML manifests or JSON strings.
 pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
+    parse_manifest_inner(text, false)
+}
+
+/// Like [`parse_manifest_to_value`], but refuses a document with lines the parser would skip
+/// (a mis-indented key, a stray list item), so a typo can't silently drop a setting.
+pub fn parse_manifest_to_value_strict(text: &str) -> Result<Value, String> {
+    parse_manifest_inner(text, true)
+}
+
+fn parse_manifest_inner(text: &str, strict: bool) -> Result<Value, String> {
     let stripped = text.trim();
     if stripped.is_empty() {
         return Err("Manifest is empty".to_string());
@@ -1195,7 +1222,15 @@ pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
         base_indent: usize,
         raw_lines: &[&str],
         n: usize,
+        depth: usize,
     ) -> Result<(Value, usize), String> {
+        if depth > MAX_BLOCK_DEPTH {
+            return Err(format!(
+                "Manifest nests deeper than {} levels near line {}",
+                MAX_BLOCK_DEPTH,
+                start + 1
+            ));
+        }
         let next_nonempty = |start: usize| -> Option<(usize, usize, String)> {
             let mut i = start;
             while i < n {
@@ -1232,7 +1267,7 @@ pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
                 if after_dash.is_empty() {
                     if let Some(sub) = next_nonempty(i) {
                         if sub.1 > indent {
-                            let (val, next_i) = parse_block(i, sub.1, raw_lines, n)?;
+                            let (val, next_i) = parse_block(i, sub.1, raw_lines, n, depth + 1)?;
                             items.push(val);
                             i = next_i;
                         } else {
@@ -1289,7 +1324,7 @@ pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
                         item_dict.insert(k, parse_yaml_scalar(v_str));
                     } else if let Some(sub) = next_nonempty(i) {
                         if sub.1 > indent {
-                            let (val, next_i) = parse_block(i, sub.1, raw_lines, n)?;
+                            let (val, next_i) = parse_block(i, sub.1, raw_lines, n, depth + 1)?;
                             item_dict.insert(k, val);
                             i = next_i;
                         } else {
@@ -1303,7 +1338,11 @@ pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
                         if sub.1 <= indent {
                             break;
                         }
-                        let (sub_map, next_i) = parse_block(i, sub.1, raw_lines, n)?;
+                        let (sub_map, next_i) = parse_block(i, sub.1, raw_lines, n, depth + 1)?;
+                        // A line the sub-block can't take (such as `-x`) would repeat forever.
+                        if next_i <= i {
+                            break;
+                        }
                         if let Value::Object(obj) = sub_map {
                             for (sk, sv) in obj {
                                 item_dict.insert(sk, sv);
@@ -1375,7 +1414,7 @@ pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
                 mapping.insert(key, parse_yaml_scalar(val_part));
             } else if let Some(sub) = next_nonempty(i) {
                 if sub.1 > indent {
-                    let (val, next_i) = parse_block(i, sub.1, raw_lines, n)?;
+                    let (val, next_i) = parse_block(i, sub.1, raw_lines, n, depth + 1)?;
                     mapping.insert(key, val);
                     i = next_i;
                 } else {
@@ -1389,9 +1428,18 @@ pub fn parse_manifest_to_value(text: &str) -> Result<Value, String> {
     }
 
     let first = next_nonempty(0).ok_or_else(|| "Manifest text is empty".to_string())?;
-    let (res, _) = parse_block(0, first.1, &raw_lines, n)?;
+    let (res, end) = parse_block(0, first.1, &raw_lines, n, 0)?;
     if !res.is_object() {
         return Err("Manifest root must be a mapping".to_string());
+    }
+    if strict {
+        if let Some((line_idx, _, content)) = next_nonempty(end) {
+            return Err(format!(
+                "line {} is not part of the document (check its indentation): {}",
+                line_idx + 1,
+                content
+            ));
+        }
     }
     Ok(res)
 }

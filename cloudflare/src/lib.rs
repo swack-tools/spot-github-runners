@@ -9,6 +9,7 @@ pub mod observability;
 pub mod patch;
 pub mod patch_console;
 pub mod reconciler;
+pub mod repo_spec;
 pub mod state;
 pub mod ui;
 
@@ -1112,6 +1113,50 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             )
             .await;
             json_response(status_code, &body)
+        }
+
+        (Method::Get, "/api/repo-specs") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            let (bundle, _) = state::load_state(&kv, now)
+                .await
+                .map_err(|e| Error::RustError(e.to_string()))?;
+            let mut targets: Vec<String> = if bundle.state.controlled_targets.is_empty() {
+                patch::CONTROLLED_TARGETS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                bundle.state.controlled_targets.clone()
+            };
+            targets.extend(patch::ON_DEMAND_TARGETS.iter().map(|s| s.to_string()));
+            let gh_token = env
+                .secret("SPOT_CONFIG_GH_TOKEN")
+                .map(|s| s.to_string())
+                .or_else(|_| env.var("SPOT_CONFIG_GH_TOKEN").map(|v| v.to_string()))
+                .or_else(|_| env.secret("GH_TOKEN").map(|s| s.to_string()))
+                .or_else(|_| env.var("GH_TOKEN").map(|v| v.to_string()))
+                .unwrap_or_default();
+            let client = github::GitHubActionsClient::new(
+                gh_token,
+                std::sync::Arc::new(patch_console::WorkerGitHubTransport),
+            );
+            let body = github::repo_specs_report(&client, &targets).await;
+            json_response(200, &body)
+        }
+
+        (Method::Post, "/api/repo-specs/validate") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            let body_val: Value = req.json().await.unwrap_or(Value::Null);
+            let Some(text) = body_val.get("text").and_then(|v| v.as_str()) else {
+                return error_response(400, "bad_request", "Send {\"text\": \"<spec YAML>\"}");
+            };
+            json_response(200, &repo_spec::validate_text_report(text))
         }
 
         (Method::Post | Method::Get, "/api/patches/preview" | "/api/patch-console/preview") => {
