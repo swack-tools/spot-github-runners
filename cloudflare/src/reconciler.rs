@@ -1274,13 +1274,12 @@ where
         bundle.state.controlled_targets.clone()
     };
 
-    // Runner pools come from the latest stored state, not the isolate's cached copy, so a pool an
-    // administrator just created or removed is acted on in this tick.
-    let runner_pools: Vec<crate::runner_pools::RunnerPool> =
-        match crate::state::load_authoritative_state(kv, now).await {
-            Ok((fresh, _)) => fresh.state.runner_pools,
-            Err(_) => bundle.state.runner_pools.clone(),
-        };
+    // Runner pools have their own KV key, read fresh every tick, so a pool an administrator just
+    // created or removed is acted on in this tick. If it can't be read, pools are left alone.
+    let (runner_pools, pools_loaded) = match crate::runner_pools::load_pools(kv).await {
+        Ok(pools) => (pools, true),
+        Err(_) => (Vec::new(), false),
+    };
 
     // Build target-aware list of API targets used for provisioning
     let mut target_paths = vec![format!("orgs/{}", org)];
@@ -1742,7 +1741,7 @@ where
         crate::runner_pools::RunnerPoolStatus,
     > = std::collections::BTreeMap::new();
     let mut finished_pool_removals: Vec<String> = Vec::new();
-    if gcp_list_succeeded {
+    if gcp_list_succeeded && pools_loaded {
         for pool in &runner_pools {
             let mut status = bundle
                 .state
@@ -1795,7 +1794,9 @@ where
                 // An unlisted target may still hold registrations, so finish only after a good list.
                 let runners_listed = listed_target_paths
                     .contains(&crate::runner_pools::target_api_path(&pool.target));
-                if hosts.is_empty() && runners_left == 0 && runners_listed {
+                // A pool that never started a host has no registrations to wait for.
+                let never_launched = status.last_launch_host.is_none();
+                if hosts.is_empty() && runners_left == 0 && (runners_listed || never_launched) {
                     finished_pool_removals.push(pool.id.clone());
                 }
                 pool_statuses.insert(pool.id.clone(), status);
@@ -1825,9 +1826,21 @@ where
             pool_statuses.insert(pool.id.clone(), status);
         }
     }
+    // Finished removals leave the pool list now; the statuses saved with the state follow the
+    // pools that remain.
+    let mut remaining_pools = runner_pools.clone();
+    if !finished_pool_removals.is_empty() {
+        if let Ok(pools) =
+            crate::runner_pools::finish_pool_removals(kv, &finished_pool_removals).await
+        {
+            remaining_pools = pools;
+        } else {
+            remaining_pools.retain(|p| !finished_pool_removals.contains(&p.id));
+        }
+    }
     let pools_changed = gcp_list_succeeded
+        && pools_loaded
         && (!finished_pool_removals.is_empty()
-            || runner_pools != bundle.state.runner_pools
             || runner_pools
                 .iter()
                 .any(|p| pool_statuses.get(&p.id) != bundle.state.runner_pool_status.get(&p.id)));
@@ -2186,19 +2199,14 @@ where
         if bundle.state.rust_builds.get("queue").is_some() {
             let _ = crate::state::evaluate_rust_builder_queue_scaling(&mut bundle.state, now);
         }
-        // Pool definitions belong to the dashboard: take them from the latest stored state so a
-        // pool created or removed while this tick ran survives this write, even when the GCE list
-        // failed and this tick left the pools alone.
-        let fresh_pools = crate::state::load_authoritative_state(kv, now)
-            .await
-            .ok()
-            .map(|(fresh, _)| fresh.state.runner_pools);
-        crate::runner_pools::merge_reconciled_pools(
-            &mut bundle.state,
-            fresh_pools,
-            &pool_statuses,
-            &finished_pool_removals,
-        );
+        // Pool definitions live under their own key; only the statuses go in this blob.
+        if pools_loaded {
+            crate::runner_pools::merge_pool_statuses(
+                &mut bundle.state,
+                &remaining_pools,
+                &pool_statuses,
+            );
+        }
         bundle.state.updated_at = now;
 
         save_state(kv, &mut bundle, now).await?;

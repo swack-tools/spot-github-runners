@@ -13,8 +13,8 @@ use spot_dashboard_edge::patch::RunnerPatch;
 use spot_dashboard_edge::reconciler::*;
 use spot_dashboard_edge::runner_pools::*;
 use spot_dashboard_edge::state::{
-    default_dashboard_bundle, invalidate_state_cache, CloudInitTemplate, DashboardBundle,
-    DashboardState, KvStoreBackend, StateError, KV_STATE_KEY,
+    default_dashboard_bundle, invalidate_state_cache, save_state, CloudInitTemplate,
+    DashboardBundle, DashboardState, KvStoreBackend, StateError, KV_STATE_KEY,
 };
 
 // ============================================================================
@@ -45,6 +45,20 @@ impl KvStoreBackend for Kv {
 impl Kv {
     fn bundle(&self) -> DashboardBundle {
         serde_json::from_str(self.data.lock().unwrap().get(KV_STATE_KEY).unwrap()).unwrap()
+    }
+    fn pools(&self) -> Vec<RunnerPool> {
+        self.data
+            .lock()
+            .unwrap()
+            .get(KV_RUNNER_POOLS_KEY)
+            .map(|raw| serde_json::from_str(raw).unwrap())
+            .unwrap_or_default()
+    }
+    fn store_pools(&self, pools: &[RunnerPool]) {
+        self.data.lock().unwrap().insert(
+            KV_RUNNER_POOLS_KEY.to_string(),
+            serde_json::to_string(pools).unwrap(),
+        );
     }
     fn store(&self, bundle: &DashboardBundle) {
         self.data.lock().unwrap().insert(
@@ -197,7 +211,7 @@ fn axion_request(target: &str) -> CreateRunnerPoolRequest {
     CreateRunnerPoolRequest {
         target: target.into(),
         machine_type: "c4a-highcpu-16".into(),
-        zone: "us-west8-a".into(),
+        zone: "us-west1-a".into(),
         hosts: 1,
         runners_per_host: 2,
         runner_vcpu: 7,
@@ -222,8 +236,8 @@ fn host(name: &str, pool: &str, status: &str) -> SimpleGceInstance {
     SimpleGceInstance {
         id: Some(format!("id-{}", name)),
         name: name.into(),
-        zone: "zones/us-west8-a".into(),
-        machine_type: "zones/us-west8-a/machineTypes/c4a-highcpu-16".into(),
+        zone: "zones/us-west1-a".into(),
+        machine_type: "zones/us-west1-a/machineTypes/c4a-highcpu-16".into(),
         status: status.into(),
         metadata: GceMetadata {
             fingerprint: None,
@@ -268,7 +282,7 @@ fn accepts_the_axion_row_with_two_runners() {
             "ARM64",
             "spot",
             "c4a-highcpu-16",
-            "us-west8-a",
+            "us-west1-a",
             "rust",
             "big"
         ]
@@ -307,8 +321,8 @@ fn rejects_unknown_shapes_bad_targets_zones_and_labels() {
         Box::new(|r| r.target = "".into()),
         Box::new(|r| r.target = "-bad".into()),
         Box::new(|r| r.target = "owner/..".into()),
-        Box::new(|r| r.zone = "us-west8".into()),
-        Box::new(|r| r.zone = "us-west8-a'; echo".into()),
+        Box::new(|r| r.zone = "us-west1".into()),
+        Box::new(|r| r.zone = "us-west1-a'; echo".into()),
         Box::new(|r| r.labels = vec!["has space".into()]),
         Box::new(|r| r.labels = vec!["it's".into()]),
         Box::new(|r| r.labels = vec!["X64".into()]), // ARM64 host
@@ -456,7 +470,7 @@ async fn create_list_and_remove_round_trip() {
         .await
         .unwrap();
     assert_eq!(removed["pools"][0]["removing"], true);
-    assert!(kv.bundle().state.runner_pools[0].removing);
+    assert!(kv.pools()[0].removing);
 
     let missing = handle_remove_runner_pool(
         &kv,
@@ -526,12 +540,12 @@ async fn reconciler_launches_a_missing_pool_host_on_its_shape_and_zone() {
     assert_eq!(report.launched_hosts.len(), 1, "{:?}", report);
     let inserted = gcp.inserted.lock().unwrap().clone();
     let (zone, req) = &inserted[0];
-    assert_eq!(zone, "us-west8-a");
+    assert_eq!(zone, "us-west1-a");
     assert!(req.name.starts_with(&pool_host_name_prefix(&id)));
     assert!(req.name.len() + "-data".len() <= 63, "{}", req.name);
     assert_eq!(
         req.machine_type,
-        "zones/us-west8-a/machineTypes/c4a-highcpu-16"
+        "zones/us-west1-a/machineTypes/c4a-highcpu-16"
     );
     assert_eq!(req.metadata.get(POOL_METADATA_KEY), Some(id.as_str()));
     assert_eq!(req.metadata.get("spot-runner-count"), Some("2"));
@@ -556,7 +570,7 @@ async fn reconciler_launches_a_missing_pool_host_on_its_shape_and_zone() {
     assert!(script.contains("ORG_URL=https://github.com/swack-tools"));
     assert!(script.contains("REGISTRATION_TOKEN=AREGTOKEN123"));
     assert!(script.contains(
-        "RUNNER_LABELS='self-hosted,Linux,ARM64,spot,c4a-highcpu-16,us-west8-a,rust,big'"
+        "RUNNER_LABELS='self-hosted,Linux,ARM64,spot,c4a-highcpu-16,us-west1-a,rust,big'"
     ));
     // The template runs inside the runner image build.
     let marker = "printf '%s' '";
@@ -582,7 +596,7 @@ async fn reconciler_launches_a_missing_pool_host_on_its_shape_and_zone() {
     let status = &kv.bundle().state.runner_pool_status[&id];
     assert_eq!(status.last_launch_host.as_deref(), Some(req.name.as_str()));
     assert!(status.last_error.is_none());
-    assert!(!kv.bundle().state.runner_pools.is_empty());
+    assert!(!kv.pools().is_empty());
 }
 
 #[tokio::test]
@@ -702,12 +716,7 @@ async fn removing_a_pool_deletes_its_hosts_then_its_record() {
     assert!(r.cleaned_vms.contains(&name));
     // The busy runner is left to finish; the idle one is removed.
     assert_eq!(gh.deleted.lock().unwrap().clone(), vec![1]);
-    assert!(kv
-        .bundle()
-        .state
-        .runner_pools
-        .iter()
-        .any(|p| p.id == id && p.removing));
+    assert!(kv.pools().iter().any(|p| p.id == id && p.removing));
 
     // Next tick: the host is gone and the busy runner finished, so the record goes too.
     gcp.instances.lock().unwrap().retain(|i| i.name != name);
@@ -717,7 +726,7 @@ async fn removing_a_pool_deletes_its_hosts_then_its_record() {
         .insert("orgs/swack-tools".into(), vec![]);
     reset_reconciler_state();
     run_reconciliation(&kv, &gcp, &gh, NOW + 400).await.unwrap();
-    let pools = kv.bundle().state.runner_pools;
+    let pools = kv.pools();
     assert!(!pools.iter().any(|p| p.id == id), "{:?}", pools);
     assert!(pools.iter().any(|p| p.id == other));
     assert!(!kv.bundle().state.runner_pool_status.contains_key(&id));
@@ -730,21 +739,96 @@ async fn a_removal_waits_for_a_good_runner_list() {
     reset_reconciler_state();
     let kv = Kv::default();
     let id = seed_pool(&kv, |_| {}, axion_request("swack-tools")).await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+    // The pool starts a host (gone again by the next list), so it may have registered runners.
+    run_reconciliation(&kv, &gcp, &gh, NOW + 60).await.unwrap();
+    assert!(kv.bundle().state.runner_pool_status[&id]
+        .last_launch_host
+        .is_some());
+    handle_remove_runner_pool(&kv, RemoveRunnerPoolRequest { id: id.clone() }, NOW + 100)
+        .await
+        .unwrap();
+
+    // No hosts, but GitHub's runner list failed: registrations may remain, so keep the record.
+    *gh.fail_list.lock().unwrap() = true;
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, NOW + 400).await.unwrap();
+    assert!(kv.pools().iter().any(|p| p.id == id));
+
+    *gh.fail_list.lock().unwrap() = false;
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, NOW + 800).await.unwrap();
+    assert!(!kv.pools().iter().any(|p| p.id == id));
+}
+
+#[tokio::test]
+async fn a_pool_that_never_launched_is_removed_even_if_runners_cannot_be_listed() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    // For example a repository the Worker's token can't manage: every launch failed at the token.
+    let id = seed_pool(&kv, |_| {}, axion_request("xbmc4lyfe/newznab-tmux")).await;
     handle_remove_runner_pool(&kv, RemoveRunnerPoolRequest { id: id.clone() }, NOW)
         .await
         .unwrap();
     let gcp = Gcp::default();
     let gh = Gh::default();
-
-    // No hosts, but GitHub's runner list failed: registrations may remain, so keep the record.
     *gh.fail_list.lock().unwrap() = true;
     run_reconciliation(&kv, &gcp, &gh, NOW + 60).await.unwrap();
-    assert!(kv.bundle().state.runner_pools.iter().any(|p| p.id == id));
+    assert!(!kv.pools().iter().any(|p| p.id == id));
+}
 
-    *gh.fail_list.lock().unwrap() = false;
-    reset_reconciler_state();
-    run_reconciliation(&kv, &gcp, &gh, NOW + 400).await.unwrap();
-    assert!(!kv.bundle().state.runner_pools.iter().any(|p| p.id == id));
+#[test]
+fn rejects_zones_the_project_does_not_have_and_other_arch_labels() {
+    let state = base_state().state;
+    let mut req = axion_request("swack-tools");
+    req.zone = "us-west8-a".into();
+    let err = validate_create_request(&req, &state, "o", NOW).unwrap_err();
+    assert!(err.contains("isn't a GCE zone"), "{}", err);
+    assert_eq!(KNOWN_GCE_ZONES.split_whitespace().count(), 130);
+    assert!(is_known_gce_zone("us-west1-a") && is_known_gce_zone("asia-southeast1-b"));
+    assert!(!is_known_gce_zone("us-west1") && !is_known_gce_zone(""));
+    for label in ["x86", "X86", "amd64", "i686"] {
+        let mut req = axion_request("swack-tools");
+        req.labels = vec![label.into()];
+        assert!(
+            validate_create_request(&req, &state, "o", NOW).is_err(),
+            "{}",
+            label
+        );
+    }
+    let mut req = axion_request("swack-tools");
+    req.machine_type = "c4d-highcpu-16".into();
+    req.runner_ram_gib = 14;
+    req.labels = vec!["arm".into()];
+    assert!(validate_create_request(&req, &state, "o", NOW).is_err());
+}
+
+#[test]
+fn every_zone_in_the_qualification_catalog_is_a_known_zone() {
+    // Every quoted zone literal ("region-a") in state.rs must be a zone the
+    // project has, or the dashboard offers rows that can never launch.
+    let src = include_str!("../src/state.rs");
+    let mut checked = 0;
+    for piece in src.split('"').skip(1).step_by(2) {
+        let parts: Vec<&str> = piece.split('-').collect();
+        let looks_like_zone = parts.len() == 3
+            && parts[0].chars().all(|c| c.is_ascii_lowercase())
+            && parts[1].chars().any(|c| c.is_ascii_digit())
+            && parts[1].chars().all(|c| c.is_ascii_alphanumeric())
+            && parts[2].len() == 1
+            && parts[2].chars().all(|c| c.is_ascii_lowercase());
+        if looks_like_zone {
+            assert!(
+                spot_dashboard_edge::runner_pools::is_known_gce_zone(piece),
+                "state.rs offers zone {piece}, which the project doesn't have"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "found no zone literals in state.rs");
 }
 
 #[tokio::test]
@@ -809,19 +893,14 @@ async fn a_pool_created_during_a_tick_survives_the_reconciler_write() {
     let mut extra =
         validate_create_request(&axion_request("xbmc4lyfe/rustnzb"), &b.state, "o", NOW).unwrap();
     extra.id = "abc123".into();
-    b.state.runner_pools.push(extra);
-    kv.store(&b);
+    let mut pools = kv.pools();
+    pools.push(extra);
+    kv.store_pools(&pools);
 
     // Fail the listed host's launch path so the tick has something to write.
     reset_reconciler_state();
     run_reconciliation(&kv, &gcp, &gh, NOW + 400).await.unwrap();
-    let ids: Vec<String> = kv
-        .bundle()
-        .state
-        .runner_pools
-        .iter()
-        .map(|p| p.id.clone())
-        .collect();
+    let ids: Vec<String> = kv.pools().iter().map(|p| p.id.clone()).collect();
     assert!(
         ids.contains(&first) && ids.contains(&"abc123".to_string()),
         "{:?}",
@@ -830,14 +909,17 @@ async fn a_pool_created_during_a_tick_survives_the_reconciler_write() {
 }
 
 #[test]
-fn merge_keeps_fresh_definitions_and_drops_finished_removals() {
+fn statuses_follow_the_remaining_pools() {
     let mut state = base_state().state;
     let mut a = validate_create_request(&axion_request("swack-tools"), &state, "o", NOW).unwrap();
     a.id = "aaaaaa".into();
-    let mut b = a.clone();
-    b.id = "bbbbbb".into();
-    b.removing = true;
-    state.runner_pools = vec![a.clone()];
+    state.runner_pool_status.insert(
+        "bbbbbb".to_string(),
+        RunnerPoolStatus {
+            hosts_running: 2,
+            ..Default::default()
+        },
+    );
     let mut statuses = std::collections::BTreeMap::new();
     statuses.insert(
         "aaaaaa".to_string(),
@@ -846,18 +928,62 @@ fn merge_keeps_fresh_definitions_and_drops_finished_removals() {
             ..Default::default()
         },
     );
-    statuses.insert("bbbbbb".to_string(), RunnerPoolStatus::default());
-    merge_reconciled_pools(
-        &mut state,
-        Some(vec![a.clone(), b.clone()]),
-        &statuses,
-        &["bbbbbb".to_string(), "aaaaaa".to_string()],
-    );
-    // "aaaaaa" isn't removing, so a stray finished id can't drop it.
-    assert_eq!(state.runner_pools.len(), 1);
-    assert_eq!(state.runner_pools[0].id, "aaaaaa");
+    merge_pool_statuses(&mut state, &[a], &statuses);
+    // "bbbbbb" is no longer a pool, so its stored status goes.
     assert_eq!(state.runner_pool_status.len(), 1);
     assert_eq!(state.runner_pool_status["aaaaaa"].hosts_running, 1);
+}
+
+#[tokio::test]
+async fn saving_an_older_copy_of_the_state_keeps_pools_and_removals() {
+    let _g = lock();
+    invalidate_state_cache();
+    let kv = Kv::default();
+    kv.store(&base_state());
+    // Another route holds a copy of the state taken before the pool existed.
+    let mut stale = kv.bundle();
+
+    let view = handle_create_runner_pool(&kv, axion_request("swack-tools"), "o", NOW)
+        .await
+        .unwrap();
+    let id = view["created"].as_str().unwrap().to_string();
+    save_state(&kv, &mut stale, NOW + 1).await.unwrap();
+    assert!(kv.pools().iter().any(|p| p.id == id && !p.removing));
+    // The pool list never goes into the state blob.
+    let raw = kv.data.lock().unwrap().get(KV_STATE_KEY).cloned().unwrap();
+    assert!(!raw.contains(&id), "{}", raw);
+
+    handle_remove_runner_pool(&kv, RemoveRunnerPoolRequest { id: id.clone() }, NOW + 2)
+        .await
+        .unwrap();
+    save_state(&kv, &mut stale, NOW + 3).await.unwrap();
+    assert!(kv.pools().iter().any(|p| p.id == id && p.removing));
+    let listed = handle_get_runner_pools(&kv, NOW + 4).await.unwrap();
+    assert_eq!(listed["pools"][0]["removing"], true);
+}
+
+#[tokio::test]
+async fn finishing_a_removal_keeps_a_pool_created_meanwhile() {
+    let _g = lock();
+    invalidate_state_cache();
+    let kv = Kv::default();
+    kv.store(&base_state());
+    let state = base_state().state;
+    let mut gone =
+        validate_create_request(&axion_request("swack-tools"), &state, "o", NOW).unwrap();
+    gone.id = "aaaaaa".into();
+    gone.removing = true;
+    let mut fresh = gone.clone();
+    fresh.id = "bbbbbb".into();
+    fresh.removing = false;
+    kv.store_pools(&[gone, fresh]);
+    let left = finish_pool_removals(&kv, &["aaaaaa".to_string(), "bbbbbb".to_string()])
+        .await
+        .unwrap();
+    // "bbbbbb" isn't being removed, so a stray finished id can't drop it.
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, "bbbbbb");
+    assert_eq!(kv.pools().len(), 1);
 }
 
 #[test]
@@ -871,4 +997,54 @@ fn pool_script_stays_small_and_uses_safe_dom_helpers() {
     let html = spot_dashboard_edge::ui::DASHBOARD_HTML;
     assert!(html.contains("<script src=/ui/runner-pools.js></script>"));
     assert!(html.contains("onclick=\"launchQualRow(${i})\""));
+}
+
+fn legacy_blob_with(pools: &[RunnerPool]) -> String {
+    // A state blob written before pools moved to their own key.
+    let mut v = serde_json::to_value(base_state()).unwrap();
+    v["state"]["runner_pools"] = serde_json::to_value(pools).unwrap();
+    v.to_string()
+}
+
+#[tokio::test]
+async fn pools_in_a_legacy_state_blob_are_adopted_on_first_read() {
+    let _g = lock();
+    invalidate_state_cache();
+    let kv = Kv::default();
+    let state = base_state().state;
+    let mut old = validate_create_request(&axion_request("swack-tools"), &state, "o", NOW).unwrap();
+    old.id = "legacy".into();
+    kv.data
+        .lock()
+        .unwrap()
+        .insert(KV_STATE_KEY.to_string(), legacy_blob_with(&[old.clone()]));
+
+    let listed = handle_get_runner_pools(&kv, NOW).await.unwrap();
+    assert_eq!(listed["pools"][0]["id"], "legacy");
+    assert_eq!(kv.pools(), vec![old]);
+
+    // Once the key exists, an empty list stays empty; the blob isn't consulted again.
+    kv.store_pools(&[]);
+    assert!(load_pools(&kv).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_state_save_from_a_legacy_blob_keeps_its_pools() {
+    let _g = lock();
+    invalidate_state_cache();
+    let kv = Kv::default();
+    let state = base_state().state;
+    let mut old = validate_create_request(&axion_request("swack-tools"), &state, "o", NOW).unwrap();
+    old.id = "legacy".into();
+    let raw = legacy_blob_with(&[old.clone()]);
+    kv.data
+        .lock()
+        .unwrap()
+        .insert(KV_STATE_KEY.to_string(), raw.clone());
+
+    // Some route saves the blob before anything read the pool key.
+    let mut bundle: DashboardBundle = serde_json::from_str(&raw).unwrap();
+    save_state(&kv, &mut bundle, NOW + 1).await.unwrap();
+    assert!(!kv.data.lock().unwrap()[KV_STATE_KEY].contains("legacy"));
+    assert_eq!(kv.pools(), vec![old]);
 }
