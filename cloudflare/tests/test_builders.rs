@@ -357,3 +357,257 @@ fn builder_script_writes_server_data_only_as_text() {
     assert!(!js.contains("eval("));
     assert!(js.contains("window.openBuilderLaunch = openBuilderLaunch"));
 }
+
+#[test]
+fn install_command_takes_only_plain_project_ids() {
+    let cmd = install_command("my-project-123").expect("valid project");
+    assert_eq!(
+        cmd,
+        format!("curl -fsSL {CARGO_REMOTE_URL} | bash -s -- install --project my-project-123")
+    );
+    for bad in [
+        "",
+        "short",
+        "Upper-case",
+        "1starts-with-digit",
+        "ends-with-",
+        "has space",
+        "semi;colon",
+        "x$(id)xxxx",
+        "a-very-long-project-id-over-30-chars",
+    ] {
+        assert!(install_command(bad).is_none(), "{bad:?} must be refused");
+    }
+}
+
+const CARGO_REMOTE: &str = include_str!("../../docs/cargo-remote.sh");
+
+#[test]
+fn cargo_remote_is_published_where_the_install_line_points() {
+    assert!(CARGO_REMOTE_URL.ends_with("/cargo-remote.sh"));
+    assert!(CARGO_REMOTE.contains(&format!("URL=\"{CARGO_REMOTE_URL}\"")));
+    // The docs site is public: no deployment identifiers in the script.
+    for secret_ish in ["homelab", "330135650610", "spot.swacktech.com", "@homelab"] {
+        assert!(
+            !CARGO_REMOTE.contains(secret_ish),
+            "{secret_ish} leaked into the public script"
+        );
+    }
+    // It must not edit the user's SSH configuration (comments may mention it).
+    let code: String = CARGO_REMOTE
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!code.contains(".ssh/config"));
+    assert!(!code.contains("ssh-keygen -R"));
+}
+
+/// Runs docs/cargo-remote.sh against stub gcloud, ssh, and rsync in a temporary HOME.
+struct Sandbox {
+    dir: std::path::PathBuf,
+}
+
+impl Sandbox {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("cargo-remote-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in [
+            "bin",
+            "home/.cargo/bin",
+            "home/.ssh",
+            "remote",
+            "proj-a",
+            "proj-b",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let d = dir.display();
+        let stub = |name: &str, body: String| {
+            let p = dir.join("bin").join(name);
+            std::fs::write(&p, body).unwrap();
+            std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(&p)
+                .status()
+                .unwrap();
+        };
+        stub(
+            "gcloud",
+            format!(
+                "#!/usr/bin/env bash\necho \"$*\" >> {d}/gcloud.log\nprintf 'builder-z-bbb\\tdev\\t10.0.0.2\\nbuilder-z-aaa\\tdev\\t10.0.0.1\\nrunner-x\\tdev\\t10.0.0.9\\nbuilder-z-ccc\\tdev\\t\\n'\n"
+            ),
+        );
+        stub(
+            "ssh",
+            format!(
+                "#!/usr/bin/env bash\nargs=(\"$@\"); n=${{#args[@]}}; t=\"${{args[$((n-2))]}}\"; c=\"${{args[$((n-1))]}}\"\necho \"$t :: $c\" >> {d}/ssh.log\necho \"$*\" >> {d}/ssh-args.log\n[[ -f {d}/down-$t ]] && {{ echo 'Connection refused' >&2; exit 255; }}\n[[ -f {d}/busy-$t && \"$c\" == *' cargo '* ]] && exit 75\n[[ -f {d}/fail-$t && \"$c\" == *' cargo '* ]] && exit 101\ncase \"$c\" in *' status') echo 'OK 0' ;; *' prepare '*) mkdir -p {d}/remote/sources/\"${{c##* }}\" ;; printf*) bash -c \"${{c//\\/mnt\\/runner-data\\/remote-build/{d}/remote}}\" ;; esac\n"
+            ),
+        );
+        stub(
+            "rsync",
+            format!(
+                "#!/usr/bin/env bash\necho \"rsync $*\" >> {d}/rsync.log\nsrc=\"${{@: -2:1}}\"; dst=\"${{@: -1}}\"\nif [[ \"$src\" == *:* ]]; then mkdir -p \"$(dirname \"$dst\")\"; echo ELF > \"$dst\"; fi\n"
+            ),
+        );
+        std::fs::write(dir.join("home/.ssh/config"), "Host keep-me\n").unwrap();
+        std::fs::write(
+            dir.join("proj-a/Cargo.toml"),
+            "[package]\nname = \"alpha\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("proj-b/Cargo.toml"),
+            "[package]\nname = \"beta\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("cargo-remote.sh"), CARGO_REMOTE).unwrap();
+        Sandbox { dir }
+    }
+
+    fn run(&self, cwd: &str, args: &[&str]) -> std::process::Output {
+        let path = format!(
+            "{}:{}",
+            self.dir.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        );
+        std::process::Command::new("bash")
+            .arg(self.dir.join("cargo-remote.sh"))
+            .args(args)
+            .current_dir(self.dir.join(cwd))
+            .env("PATH", path)
+            .env("HOME", self.dir.join("home"))
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("SPOT_BUILDERS")
+            .env_remove("SPOT_GCP_PROJECT")
+            .env_remove("SPOT_BUILDER_PROJECT")
+            .env_remove("SPOT_BUILDER_KEY")
+            .output()
+            .expect("bash")
+    }
+
+    fn read(&self, rel: &str) -> String {
+        std::fs::read_to_string(self.dir.join(rel)).unwrap_or_default()
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn ok(out: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "cargo-remote failed: {err}");
+    err
+}
+
+#[test]
+fn cargo_remote_installs_into_cargo_bin_and_records_the_project() {
+    let sb = Sandbox::new("install");
+    ok(&sb.run(".", &["install", "--project", "my-project-123"]));
+    assert_eq!(
+        sb.read("home/.config/spot-builder/project").trim(),
+        "my-project-123"
+    );
+    assert_eq!(sb.read("home/.cargo/bin/cargo-remote"), CARGO_REMOTE);
+    let bad = sb.run(".", &["install", "--project", "x;id"]);
+    assert!(!bad.status.success());
+    // A crate named like a launcher subcommand would be misrouted on the builder.
+    std::fs::write(
+        sb.dir.join("proj-a/Cargo.toml"),
+        "[package]\nname = \"status\"\n",
+    )
+    .unwrap();
+    let out = sb.run("proj-a", &["remote", "build"]);
+    assert_eq!(out.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserves the name status"));
+}
+
+#[test]
+fn cargo_remote_spreads_projects_keeps_them_sticky_and_fails_over() {
+    let sb = Sandbox::new("rr");
+    ok(&sb.run(".", &["install", "--project", "my-project-123"]));
+
+    // First project gets the first builder by name, the next project the next one.
+    let err = ok(&sb.run("proj-a", &["remote", "build", "--release"]));
+    assert!(err.contains("built on builder-z-aaa"), "{err}");
+    assert_eq!(sb.read("proj-a/target/release/alpha"), "ELF\n");
+    assert_eq!(
+        sb.read("remote/sources/alpha/rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.99.0\"\n"
+    );
+    let err = ok(&sb.run("proj-b", &["remote", "build"]));
+    assert!(err.contains("built on builder-z-bbb"), "{err}");
+    assert_eq!(sb.read("proj-b/target/debug/beta"), "ELF\n");
+
+    // A project stays on its builder.
+    let err = ok(&sb.run("proj-a", &["remote", "build", "--release"]));
+    assert!(err.contains("built on builder-z-aaa"), "{err}");
+
+    // When its builder is unreachable it moves to the next one and stays there.
+    std::fs::write(sb.dir.join("down-dev@10.0.0.1"), "").unwrap();
+    let err = ok(&sb.run("proj-a", &["remote", "build", "--release"]));
+    assert!(err.contains("builder-z-aaa is not ready"), "{err}");
+    assert!(err.contains("built on builder-z-bbb"), "{err}");
+    assert_eq!(
+        sb.read("home/.config/spot-builder/assign/alpha").trim(),
+        "builder-z-bbb"
+    );
+
+    // A busy builder (launcher exit 75) passes the build to the next one; a failed build is reported, not retried.
+    std::fs::remove_file(sb.dir.join("down-dev@10.0.0.1")).unwrap();
+    std::fs::write(sb.dir.join("busy-dev@10.0.0.2"), "").unwrap();
+    let err = ok(&sb.run("proj-a", &["remote", "build", "--release"]));
+    assert!(err.contains("builder-z-bbb is busy"), "{err}");
+    assert!(err.contains("built on builder-z-aaa"), "{err}");
+    std::fs::write(sb.dir.join("fail-dev@10.0.0.1"), "").unwrap();
+    let out = sb.run("proj-a", &["remote", "build", "--release"]);
+    assert_eq!(out.status.code(), Some(101));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("builder-z-bbb"), "{err}");
+
+    // Builders without an address and non-builder VMs are ignored; gcloud output is cached.
+    assert!(!sb.read("ssh.log").contains("10.0.0.9"));
+    assert_eq!(sb.read("gcloud.log").lines().count(), 1);
+    assert!(sb.read("gcloud.log").contains("--project my-project-123"));
+    assert!(sb
+        .read("gcloud.log")
+        .contains("labels.spot-role=rust_builder"));
+
+    // Builds go through the launcher; the user's SSH config is untouched.
+    assert!(sb.read("ssh.log").contains(
+        "dev@10.0.0.2 :: sudo -n /usr/local/bin/oxidex-remote-build alpha cargo build --release"
+    ));
+    assert_eq!(sb.read("home/.ssh/config"), "Host keep-me\n");
+    assert!(sb.read("rsync.log").contains("UserKnownHostsFile="));
+    assert!(sb.read("rsync.log").contains("HostKeyAlias=builder-z-aaa"));
+    assert!(sb
+        .read("ssh-args.log")
+        .contains("HostKeyAlias=builder-z-bbb"));
+}
+
+#[test]
+fn cargo_remote_refuses_another_rust_version_and_reports_no_ready_builder() {
+    let sb = Sandbox::new("refuse");
+    std::fs::write(
+        sb.dir.join("proj-a/rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.98.0\"\n",
+    )
+    .unwrap();
+    let out = sb.run("proj-a", &["remote", "build"]);
+    assert_eq!(out.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1.99.0"));
+
+    std::fs::write(
+        sb.dir.join("proj-a/rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.99.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(sb.dir.join("down-dev@10.0.0.1"), "").unwrap();
+    std::fs::write(sb.dir.join("down-dev@10.0.0.2"), "").unwrap();
+    let out = sb.run("proj-a", &["remote", "build"]);
+    assert_eq!(out.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no builder is free"));
+}

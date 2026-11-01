@@ -26,6 +26,21 @@ pub const LAUNCHED_BY_LABEL: &str = "spot-launched-by";
 /// Public guide for pointing Cargo on a workstation at a builder.
 pub const CLIENT_SETUP_DOCS_URL: &str =
     "https://swack-tools.github.io/spot-github-runners/client-workstation-setup/";
+/// Where the docs site publishes `docs/cargo-remote.sh`, the workstation helper the dashboard's install line fetches.
+pub const CARGO_REMOTE_URL: &str =
+    "https://swack-tools.github.io/spot-github-runners/cargo-remote.sh";
+
+/// The one line an administrator pastes on a workstation to install `cargo-remote` for this deployment's
+/// project. Returns `None` for anything that isn't a plain GCP project ID, so nothing else reaches a shell.
+pub fn install_command(project: &str) -> Option<String> {
+    let ok = (6..=30).contains(&project.len())
+        && project.starts_with(|c: char| c.is_ascii_lowercase())
+        && !project.ends_with('-')
+        && project
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    ok.then(|| format!("curl -fsSL {CARGO_REMOTE_URL} | bash -s -- install --project {project}"))
+}
 
 const BUILDER_DOCKERFILE: &str = include_str!("../../builder/standalone/Dockerfile");
 const WEBSITE_PACKAGE_JSON: &str = include_str!("../../builder/standalone/website-package.json");

@@ -1493,6 +1493,7 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     "leftover_cache_disks": leftover,
                     "can_manage": is_owner,
                     "docs_url": builders::CLIENT_SETUP_DOCS_URL,
+                    "install_command": builders::install_command(&client.project),
                     "machine_type": builders::BUILDER_MACHINE_TYPE,
                     "max_live_builders": builders::MAX_LIVE_BUILDERS,
                 }),
