@@ -39,10 +39,15 @@ its SHA-256 checksums, the builder image files from `builder/standalone/`, and a
 2000. The VM gets the same launcher, Docker admission, and container limits as a builder you render by hand.
 Its 375 GB `hyperdisk-balanced` cache disk is `auto-delete=no`.
 
-Setup takes about 15 to 25 minutes because the VM installs Docker and builds the Rust 1.99.0 image. The panel
-shows the VM's external address and SSH account. Press **Use from my Mac** for an `~/.ssh/config` entry, a
-`cargo-remote` helper, and `.cargo/config.toml` aliases that already contain that address. See
+Setup takes about 15 to 25 minutes because the VM installs Docker and builds the Rust 1.99.0 image. Press
+**Use from my Mac** for the one line that installs `cargo-remote` on your workstation, then run
+`cargo remote build --release` in any Cargo project. See
 [Client workstation setup](client-workstation-setup.md#use-a-builder-launched-from-the-dashboard).
+
+The service account in the Worker's `GCP_SERVICE_ACCOUNT_KEY` needs two grants before a launch can succeed:
+`roles/compute.instanceAdmin.v1` on the project, and `roles/iam.serviceAccountUser` on the project's default
+Compute Engine service account, which each builder runs as. Without them the launch dialog shows a Compute API
+403 error for `compute.instances.create`, and nothing is created.
 
 Only the owner can launch or delete builders; added administrators can see the panel. The dashboard runs at
 most four builders at once. **Delete** removes the VM and keeps its cache disk, which then appears under

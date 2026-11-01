@@ -11,34 +11,41 @@ Every build pathway on this page enforces a single capacity rule before dispatch
 
 ## Use a builder launched from the dashboard
 
-If you launched a builder from the dashboard (see
+If you launched builders from the dashboard (see
 [Launch a builder from the dashboard](dedicated-builders.md#launch-a-builder-from-the-dashboard)), press
-**Use from my Mac** next to it. The dialog gives you three things to paste, all filled in with that builder's
-address and SSH account:
+**Use from my Mac** in the **Your Rust builders** panel and paste the line it shows into a terminal once. The
+line has this form, with your project filled in:
 
-1. A `Host spot-builder` entry for `~/.ssh/config`.
-2. A `~/.local/bin/cargo-remote` helper. It copies the project to the builder, runs Cargo inside the pinned
-   Rust 1.99.0 container, and copies the Linux x86_64 binary back into `target/`.
-3. Cargo aliases for `~/.cargo/config.toml`:
+```bash
+curl -fsSL https://swack-tools.github.io/spot-github-runners/cargo-remote.sh | bash -s -- install --project PROJECT
+```
 
-    ```toml
-    [alias]
-    rb = ["remote", "build", "--release"]
-    rbd = ["remote", "build"]
-    rt = ["remote", "test"]
-    ```
-
-Then build any Cargo project from its folder:
+It installs [`cargo-remote`](cargo-remote.sh) into `~/.cargo/bin`. Then build any Cargo project from its
+folder:
 
 ```bash
 cargo new hello-spot && cd hello-spot
-cargo rb
-file target/release/hello-spot
+cargo remote build --release
+file target/release/hello-spot   # ELF 64-bit LSB pie executable, x86-64
 ```
 
-Builders compile only with Rust 1.99.0. If the project has no `rust-toolchain.toml`, the helper adds one on
-the builder; if the project pins another version, the helper stops and asks you to change it. The rest of
-this page covers several builders, idle-builder selection, `just`, and editor integration.
+`cargo-remote` works like this:
+
+- It finds your running builders with `gcloud compute instances list`, so `gcloud` must be signed in. To skip
+  `gcloud`, set `SPOT_BUILDERS="user@address user@address"`.
+- Each project gets the next builder in turn and stays on it, so its Cargo cache stays warm. When that builder
+  is gone, still setting up, or busy with another build, the build moves to the next builder.
+- It copies the project to the builder, runs Cargo inside the pinned Rust 1.99.0 container, and copies the
+  Linux x86_64 binary back into `target/`. `cargo remote test` runs tests the same way.
+- It never edits `~/.ssh/config`. It keeps its settings and the builders' host keys in
+  `~/.config/spot-builder/`, and signs in with `~/.ssh/id_ed25519` (set `SPOT_BUILDER_KEY` for another key).
+- `cargo remote status` lists your builders and whether each one is ready.
+
+Builders compile only with Rust 1.99.0. If the project has no `rust-toolchain.toml`, `cargo-remote` adds one
+on the builder; if the project pins another version, it stops and asks you to change it. To shorten the
+commands, add aliases such as `rb = ["remote", "build", "--release"]` under `[alias]` in
+`.cargo/config.toml`. The rest of this page covers hand-rendered builders, idle-builder selection, `just`, and
+editor integration.
 
 ## Prerequisites
 
