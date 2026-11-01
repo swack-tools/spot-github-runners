@@ -303,6 +303,15 @@ pub trait GitHubReconcilerClient {
         labels: &[String],
     ) -> Result<RunnerBootstrapConfig, ReconcilerError>;
     async fn count_queued_jobs(&self, owner: &str, repo: &str) -> Result<u32, ReconcilerError>;
+    /// The `runs-on` labels of jobs waiting in GitHub's queue for `target` (`org` or
+    /// `owner/repo`). Autoscaling runner pools start hosts for the ones their runners can take.
+    async fn queued_job_labels(
+        &self,
+        _target: &str,
+        _now: u64,
+    ) -> Result<Vec<Vec<String>>, ReconcilerError> {
+        Ok(Vec::new())
+    }
     /// The target's effective runner patch from the config repo. `Ok(None)` means this client
     /// has no config repo to read (simulation and test doubles), and the floor keeper falls back
     /// to its built-in template manifest.
@@ -459,6 +468,16 @@ impl GitHubReconcilerClient for crate::github::GitHubActionsClient {
 
     async fn count_queued_jobs(&self, owner: &str, repo: &str) -> Result<u32, ReconcilerError> {
         self.count_queued_jobs_for_repo(owner, repo)
+            .await
+            .map_err(|e| ReconcilerError::Github(e.to_string()))
+    }
+
+    async fn queued_job_labels(
+        &self,
+        target: &str,
+        now: u64,
+    ) -> Result<Vec<Vec<String>>, ReconcilerError> {
+        crate::github::GitHubActionsClient::queued_job_labels(self, target, now)
             .await
             .map_err(|e| ReconcilerError::Github(e.to_string()))
     }
@@ -1201,7 +1220,7 @@ where
         // The machine series picks the disk type (C4A, C4D, N4, N4A and N4D take only Hyperdisk).
         boot_disk_type: None,
     };
-    let mut req = crate::gcp::build_spot_runner_vm_request(project, &vm_cfg)
+    let mut req = crate::gcp::build_pool_runner_vm_request(project, &vm_cfg)
         .map_err(|e| format!("VM request invalid: {}", e))?;
     for item in req.metadata.items.iter_mut() {
         if item.key == "spot-runner-count" {
@@ -1226,6 +1245,54 @@ where
         }
     }
     Ok((host_name, op.name.filter(|n| !n.is_empty())))
+}
+
+/// Deletes one pool host: its runner registrations first, then the VM. Returns false (and keeps the
+/// VM) when GitHub refuses a registration, which means the runner took a job since the list.
+#[allow(clippy::too_many_arguments)]
+async fn retire_pool_host<G, H>(
+    gcp: &G,
+    gh: &H,
+    project: &str,
+    pool: &crate::runner_pools::RunnerPool,
+    host: &SimpleGceInstance,
+    pool_runners: &[&SimpleGitHubRunner],
+    runner_target_map: &std::collections::HashMap<u64, String>,
+    now: u64,
+    cleaned_runners: &mut Vec<String>,
+    cleaned_vms: &mut Vec<String>,
+) -> bool
+where
+    G: GcpReconcilerClient,
+    H: GitHubReconcilerClient,
+{
+    let mut unregistered = true;
+    for r in pool_runners
+        .iter()
+        .filter(|r| r.name.contains(host.name.as_str()))
+    {
+        let path = runner_target_map
+            .get(&r.id)
+            .cloned()
+            .unwrap_or_else(|| crate::runner_pools::target_api_path(&pool.target));
+        if gh.delete_runner(&path, r.id).await.is_ok() {
+            cleaned_runners.push(r.name.clone());
+        } else {
+            unregistered = false;
+        }
+    }
+    if !unregistered {
+        return false;
+    }
+    if gcp
+        .delete_instance(project, host.zone_short(), &host.name, now)
+        .await
+        .is_ok()
+    {
+        cleaned_vms.push(host.name.clone());
+        return true;
+    }
+    false
 }
 
 /// How long a pool waits on an unfinished create operation before it launches again.
@@ -1818,6 +1885,9 @@ where
         crate::runner_pools::RunnerPoolStatus,
     > = std::collections::BTreeMap::new();
     let mut finished_pool_removals: Vec<String> = Vec::new();
+    // Queued jobs per target, read once per tick for the autoscaling pools that need them.
+    let mut queued_by_target: std::collections::HashMap<String, Option<Vec<Vec<String>>>> =
+        std::collections::HashMap::new();
     if gcp_list_succeeded && pools_loaded {
         for pool in &runner_pools {
             let mut status = bundle
@@ -1929,11 +1999,7 @@ where
                 }
             }
 
-            // Scale down: delete hosts above the pool's size, newest idle hosts first. Hosts already
-            // stopping (deleted last tick, or preempted) don't count. Nothing is deleted without a
-            // good runner list, because an empty list would make every host look idle. A host's
-            // runner registrations go first; if GitHub refuses one (it took a job since the list),
-            // the host stays and the next idle host is tried.
+            // Hosts already stopping (deleted last tick, or preempted) don't count.
             let active: Vec<&SimpleGceInstance> = hosts
                 .iter()
                 .copied()
@@ -1943,62 +2009,172 @@ where
                         .any(|s| h.status.eq_ignore_ascii_case(s))
                 })
                 .collect();
-            if active.len() > pool.hosts as usize {
-                let runners_listed = listed_target_paths
-                    .contains(&crate::runner_pools::target_api_path(&pool.target));
+            // Nothing is deleted without a good runner list, because an empty list would make
+            // every host look idle.
+            let runners_listed =
+                listed_target_paths.contains(&crate::runner_pools::target_api_path(&pool.target));
+            let host_busy = |h: &SimpleGceInstance| {
+                pool_runners
+                    .iter()
+                    .any(|r| r.busy && r.name.contains(h.name.as_str()))
+            };
+            // A host whose runners never came online is still setting up for a while; after that
+            // it counts as idle, so a host whose setup failed doesn't run forever.
+            let host_booting = |h: &SimpleGceInstance| {
+                let online = pool_runners.iter().any(|r| {
+                    r.name.contains(h.name.as_str()) && r.status.eq_ignore_ascii_case("online")
+                });
+                !online
+                    && crate::state::parse_launch_epoch_from_name(&h.name).map_or(true, |t| {
+                        now.saturating_sub(t) < crate::runner_pools::HOST_BOOT_GRACE_SECS
+                    })
+            };
+            let busy_runners = pool_runners.iter().filter(|r| r.busy).count() as u32;
+
+            // How many hosts the pool wants. A fixed-size pool wants its size. An autoscaling pool
+            // wants enough hosts for its busy runners and the queued jobs its runners can take,
+            // between its minimum and its size.
+            let max_hosts = pool.hosts;
+            let mut desired = max_hosts;
+            let mut queue_known = true;
+            if pool.autoscales() {
+                let labels = crate::runner_pools::pool_labels(pool);
+                if !queued_by_target.contains_key(&pool.target) {
+                    let fetched = gh.queued_job_labels(&pool.target, now).await.ok();
+                    queued_by_target.insert(pool.target.clone(), fetched);
+                }
+                let queued = match queued_by_target.get(&pool.target) {
+                    Some(Some(jobs)) => Some(
+                        jobs.iter()
+                            .filter(|j| crate::runner_pools::job_fits_labels(j, &labels))
+                            .count() as u32,
+                    ),
+                    _ => None,
+                };
+                queue_known = queued.is_some();
+                let rph = pool.runners_per_host.max(1);
+                let runners_needed = busy_runners + queued.unwrap_or(0);
+                let mut wanted = runners_needed.div_ceil(rph);
+                if !queue_known {
+                    // Without the queue, keep what's there rather than guess.
+                    wanted = wanted.max(active.len() as u32);
+                }
+                desired = wanted.clamp(pool.min_hosts(), max_hosts);
+                status.queued_jobs = queued;
+                status.desired_hosts = Some(desired);
+                let mut idle_since = std::collections::BTreeMap::new();
+                for h in &active {
+                    if !host_busy(h) && !host_booting(h) {
+                        let since = status.idle_since.get(&h.name).copied().unwrap_or(now);
+                        idle_since.insert(h.name.clone(), since);
+                    }
+                }
+                status.idle_since = idle_since;
+            } else {
+                status.queued_jobs = None;
+                status.desired_hosts = None;
+                status.idle_since.clear();
+            }
+
+            // Scale down: delete hosts above what the pool wants, newest first. A fixed-size pool
+            // deletes any idle host; an autoscaling pool deletes hosts above its size the same
+            // way, and below that only hosts idle for its idle time. A host's runner registrations
+            // go first; if GitHub refuses one (it took a job since the list), the host stays and
+            // the next one is tried.
+            if active.len() > desired as usize {
                 if runners_listed {
-                    let mut idle: Vec<&SimpleGceInstance> = active
-                        .iter()
-                        .copied()
-                        .filter(|h| {
-                            !pool_runners
-                                .iter()
-                                .any(|r| r.busy && r.name.contains(h.name.as_str()))
-                        })
-                        .collect();
+                    let idle_secs = u64::from(pool.idle_minutes()) * 60;
+                    let mut idle: Vec<&SimpleGceInstance> =
+                        active.iter().copied().filter(|h| !host_busy(h)).collect();
                     // Host names end in their launch time, so the newest sort last.
                     idle.sort_by(|a, b| b.name.cmp(&a.name));
-                    let excess = active.len() - pool.hosts as usize;
+                    let over_size = active.len().saturating_sub(max_hosts as usize);
+                    let excess = active.len() - desired as usize;
                     let mut deleted = 0usize;
                     for host in idle {
                         if deleted >= excess {
                             break;
                         }
-                        let mut unregistered = true;
-                        for r in pool_runners
-                            .iter()
-                            .filter(|r| r.name.contains(host.name.as_str()))
+                        let idle_long_enough = status
+                            .idle_since
+                            .get(&host.name)
+                            .map_or(false, |t| now.saturating_sub(*t) >= idle_secs);
+                        // Below the pool's size, an autoscaling pool deletes only hosts that sat
+                        // idle long enough, and only while it can read the queue.
+                        if pool.autoscales()
+                            && deleted >= over_size
+                            && (!idle_long_enough || !queue_known)
                         {
-                            let path = runner_target_map.get(&r.id).cloned().unwrap_or_else(|| {
-                                crate::runner_pools::target_api_path(&pool.target)
-                            });
-                            if gh.delete_runner(&path, r.id).await.is_ok() {
-                                cleaned_runners.push(r.name.clone());
-                            } else {
-                                unregistered = false;
-                            }
-                        }
-                        if !unregistered {
                             continue;
                         }
-                        if gcp
-                            .delete_instance(&project, host.zone_short(), &host.name, now)
-                            .await
-                            .is_ok()
+                        if retire_pool_host(
+                            gcp,
+                            gh,
+                            &project,
+                            pool,
+                            host,
+                            &pool_runners,
+                            &runner_target_map,
+                            now,
+                            &mut cleaned_runners,
+                            &mut cleaned_vms,
+                        )
+                        .await
                         {
-                            cleaned_vms.push(host.name.clone());
                             deleted += 1;
+                            status.idle_since.remove(&host.name);
                         }
+                    }
+                    if deleted > 0 {
+                        status.last_scale_down_at = Some(now);
                     }
                 }
                 pool_statuses.insert(pool.id.clone(), status);
                 continue;
             }
 
+            // After a template change, replace one idle host started before it at a time; the
+            // launch below (on a later tick) starts its replacement with the new template. Only a
+            // full pool with no host stopping or booting gives one up, so the pool is never more
+            // than one host short.
+            if let Some(changed_at) = pool.setup_updated_at {
+                let settled = hosts.len() as u32 >= desired
+                    && hosts.len() == active.len()
+                    && !active.iter().any(|h| host_booting(h));
+                if runners_listed && !launch_pending && settled {
+                    let stale = active.iter().copied().find(|h| {
+                        !host_busy(h)
+                            && !host_booting(h)
+                            && crate::state::parse_launch_epoch_from_name(&h.name)
+                                .map_or(false, |t| t < changed_at)
+                    });
+                    if let Some(host) = stale {
+                        if retire_pool_host(
+                            gcp,
+                            gh,
+                            &project,
+                            pool,
+                            host,
+                            &pool_runners,
+                            &runner_target_map,
+                            now,
+                            &mut cleaned_runners,
+                            &mut cleaned_vms,
+                        )
+                        .await
+                        {
+                            status.idle_since.remove(&host.name);
+                            pool_statuses.insert(pool.id.clone(), status);
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // One launch per pool per tick: the new host shows in the next tick's instance list.
             // A started create keeps the last error on show until its operation succeeds or the
             // pool is full, because GCE can still refuse the VM after the call returns.
-            if (hosts.len() as u32) < pool.hosts {
+            if (hosts.len() as u32) < desired {
                 if !launch_pending {
                     match launch_pool_host(gcp, gh, &project, pool, now).await {
                         Ok((host_name, op_name)) => {

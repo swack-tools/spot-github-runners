@@ -9,6 +9,7 @@ pub mod host_agent_release;
 pub mod observability;
 pub mod patch;
 pub mod patch_console;
+pub mod qualify;
 pub mod reconciler;
 pub mod repo_spec;
 pub mod runner_pools;
@@ -1212,28 +1213,12 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             let role = qual_req
                 .get("role")
                 .and_then(|v| v.as_str())
-                .unwrap_or("cicd_runner");
-            let resp = serde_json::json!({
-                "status": "ok",
-                "qualification": {
-                    "role": role,
-                    "hardware_qualifying_count": 28,
-                    "spot_price_qualifying_count": 28,
-                    "requirements": {
-                        "min_vcpus": 8,
-                        "min_ram_gib": 30,
-                        "min_benchmark_score": 1000,
-                        "budget": {
-                            "max_hourly_usd": 0.50,
-                            "max_daily_usd": 12.00,
-                            "max_monthly_usd": 360.00
-                        }
-                    },
-                    "hardware_qualifying": [],
-                    "spot_price_qualifying": []
-                }
-            });
-            json_response(200, &resp)
+                .unwrap_or("cicd_runner")
+                .to_string();
+            match state::handle_qualify(&kv, &role, &qual_req, false, now).await {
+                Ok(resp) => json_response(200, &resp),
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
         }
 
         // Runner pools: Spot hosts administrators launch from the Qualifying Instances table.
@@ -1305,6 +1290,31 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             }
         }
 
+        (Method::Post, "/api/runner-pools/template") => {
+            if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
+            {
+                return Ok(denied);
+            }
+            let tpl_req: runner_pools::SetPoolTemplateRequest = match req.json().await {
+                Ok(r) => r,
+                Err(_) => {
+                    return error_response(
+                        400,
+                        "invalid_request",
+                        "Body must be {\"id\": \"...\", \"cloud_init_template_id\": \"...\"}",
+                    )
+                }
+            };
+            match runner_pools::handle_set_pool_template(&kv, tpl_req, now).await {
+                Ok(body) => json_response(200, &body),
+                Err(state::StateError::NotFound(msg)) => error_response(404, "not_found", &msg),
+                Err(state::StateError::Validation(msg)) => {
+                    error_response(400, "validation_error", &msg)
+                }
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
+        }
+
         // The dashboard's Launch dialog and pools panel, kept out of DASHBOARD_HTML's size budget.
         (Method::Get, "/ui/runner-pools.js") => {
             if let Some(denied) = require_administrator(&kv, verified_session.as_ref(), now).await?
@@ -1324,28 +1334,11 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
             } else {
                 "cicd_runner"
             };
-            let resp = serde_json::json!({
-                "status": "ok",
-                "role": role,
-                "qualification": {
-                    "role": role,
-                    "hardware_qualifying_count": 28,
-                    "spot_price_qualifying_count": 28,
-                    "requirements": {
-                        "min_vcpus": 8,
-                        "min_ram_gib": 30,
-                        "min_benchmark_score": 1000,
-                        "budget": {
-                            "max_hourly_usd": 0.50,
-                            "max_daily_usd": 12.00,
-                            "max_monthly_usd": 360.00
-                        }
-                    },
-                    "hardware_qualifying": [],
-                    "spot_price_qualifying": []
-                }
-            });
-            json_response(200, &resp)
+            let body: Value = req.json().await.unwrap_or(Value::Null);
+            match state::handle_qualify(&kv, role, &body, true, now).await {
+                Ok(resp) => json_response(200, &resp),
+                Err(err) => error_response(500, "internal_error", &err.to_string()),
+            }
         }
 
         // Cloud-Init Visualizer & Editor

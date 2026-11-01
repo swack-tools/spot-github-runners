@@ -1193,6 +1193,29 @@ pub fn build_spot_runner_vm_request(
         )));
     }
 
+    build_runner_vm_request(project, cfg)
+}
+
+/// The VM request for a runner pool host: any machine type a pool may launch
+/// (`runner_pools::machine_shape`), which includes the 2 and 4 vCPU hosts the fleet floor
+/// doesn't use.
+pub fn build_pool_runner_vm_request(
+    project: &str,
+    cfg: &RunnerVmConfig,
+) -> Result<GceInsertInstanceRequest, GcpError> {
+    if crate::runner_pools::machine_shape(cfg.machine_type).is_none() {
+        return Err(GcpError::Validation(format!(
+            "Machine type '{}' can't host a runner pool",
+            cfg.machine_type
+        )));
+    }
+    build_runner_vm_request(project, cfg)
+}
+
+fn build_runner_vm_request(
+    project: &str,
+    cfg: &RunnerVmConfig,
+) -> Result<GceInsertInstanceRequest, GcpError> {
     let is_arm64 = cfg.machine_type.starts_with("c4a-")
         || cfg.machine_type.starts_with("n4a-")
         || cfg.machine_type.starts_with("t2a-");

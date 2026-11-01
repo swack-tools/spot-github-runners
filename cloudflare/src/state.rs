@@ -903,26 +903,13 @@ fn fallback_machine_type_pricing(
     is_builder: bool,
 ) -> Option<serde_json::Value> {
     let mt = normalize_gce_short_name(machine_type.trim()).to_lowercase();
-    let (compute_hourly, disk_hourly): (f64, f64) = match mt.as_str() {
-        "c4a-standard-4" => (0.0210, 0.010),
-        "n4a-standard-4" => (0.0592, 0.010),
-        "t2a-standard-4" => (0.0653, 0.009),
-        "n4d-standard-4" => (0.0575, 0.010),
-        "n4d-standard-16" => (0.2100, 0.014),
-        "c4a-highcpu-8" => (0.0336, 0.014),
-        "c4a-standard-8" => (0.0399, 0.014),
-        "n4a-highcpu-8" => (0.0998, 0.014),
-        "n4a-standard-8" => (0.1183, 0.014),
-        "t2a-standard-8" => (0.1306, 0.013),
-        "c4a-highcpu-16" => (0.0673, if is_builder { 0.028 } else { 0.014 }),
-        "c4a-standard-16" => (0.0798, if is_builder { 0.028 } else { 0.014 }),
-        "n4a-highcpu-16" => (0.1996, if is_builder { 0.028 } else { 0.014 }),
-        "t2a-standard-16" => (0.3213, if is_builder { 0.026 } else { 0.013 }),
-        "n4-highcpu-16" => (0.1550, if is_builder { 0.028 } else { 0.014 }),
-        "c4d-highcpu-16" => (0.1480, 0.014),
-        "c4d-standard-16" => (0.1660, 0.014),
-        _ => return None,
-    };
+    // Spot list prices per vCPU and GiB (see `qualify::spot_rates`), with the data disk the
+    // host gets: 100 GiB for runners, 375 GiB for builders.
+    let compute_hourly = crate::qualify::compute_hourly_usd(&mt)?;
+    let disk_hourly = crate::qualify::disk_hourly_usd(
+        crate::qualify::default_disk_type(&mt),
+        if is_builder { 375 } else { 100 },
+    );
     let compute_daily = ((compute_hourly * 24.0) * 100.0).round() / 100.0;
     let compute_monthly = ((compute_hourly * 720.0) * 100.0).round() / 100.0;
     let disk_daily = ((disk_hourly * 24.0) * 100.0).round() / 100.0;
@@ -944,7 +931,7 @@ fn fallback_machine_type_pricing(
         "total_hourly_usd": total_hourly,
         "total_daily_usd": total_daily,
         "total_monthly_usd": total_monthly,
-        "pricing_source": "gcp_capacity_history"
+        "pricing_source": crate::qualify::PRICING_SOURCE
     }))
 }
 
@@ -2338,6 +2325,91 @@ fn enrich_arm64_catalog_and_qualifications(
     }
 }
 
+/// Every offer the qualification matrix can show for `role`: the stored overview's offers, the
+/// ARM64 offers, and (for runners) the small pool hosts. Filters aren't applied.
+pub fn qualification_catalog(
+    stored_overview: &serde_json::Value,
+    role: &str,
+) -> Vec<serde_json::Value> {
+    let mut ov = stored_overview.clone();
+    if !ov.is_object() {
+        ov = serde_json::json!({});
+    }
+    if let Some(obj) = ov.as_object_mut() {
+        if !obj
+            .get("qualifications")
+            .map(|q| q.is_object())
+            .unwrap_or(false)
+        {
+            obj.insert(
+                "qualifications".to_string(),
+                serde_json::json!({
+                    "cicd_runner": {"hardware_qualifying": [], "spot_price_qualifying": []},
+                    "rust_builder": {"hardware_qualifying": [], "spot_price_qualifying": []},
+                }),
+            );
+        }
+        enrich_arm64_catalog_and_qualifications(obj, "all", None);
+    }
+    crate::qualify::catalog_from_overview(&ov, role)
+}
+
+/// Works the matrix out again from the saved sizing with current Spot prices, when the overview
+/// holds that sizing. The arch and latency filters apply to the result.
+fn requalify_overview(
+    ov_obj: &mut serde_json::Map<String, serde_json::Value>,
+    arch_filter: &str,
+    max_latency_ms: Option<f64>,
+) {
+    let snapshot = serde_json::Value::Object(ov_obj.clone());
+    let Some(qual) = ov_obj
+        .get_mut("qualifications")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+    for role in ["cicd_runner", "rust_builder"] {
+        let Some(reqs) = qual
+            .get(role)
+            .and_then(|r| r.get("requirements"))
+            .filter(|r| r.is_object())
+            .cloned()
+        else {
+            continue;
+        };
+        let catalog: Vec<serde_json::Value> =
+            crate::qualify::catalog_from_overview(&snapshot, role)
+                .into_iter()
+                .filter(|row| {
+                    let arch = row.get("arch").and_then(|v| v.as_str()).unwrap_or_else(|| {
+                        infer_arch(
+                            row.get("machine_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(""),
+                        )
+                    });
+                    let arch_ok = match arch_filter {
+                        "arm64" => arch == "arm64",
+                        "x86_64" | "x86" | "amd64" => arch != "arm64",
+                        _ => true,
+                    };
+                    let lat_ok = match max_latency_ms {
+                        Some(max) => row
+                            .get("latency_ms")
+                            .and_then(|v| v.as_f64())
+                            .map_or(true, |lat| lat <= max),
+                        None => true,
+                    };
+                    arch_ok && lat_ok
+                })
+                .collect();
+        qual.insert(
+            role.to_string(),
+            crate::qualify::qualify(role, &reqs, &catalog),
+        );
+    }
+}
+
 pub fn apply_dynamic_overview_filtering(
     ov: &mut serde_json::Value,
     query: &OverviewQuery,
@@ -2355,6 +2427,7 @@ pub fn apply_dynamic_overview_filtering(
     let arch_filter = query.arch.as_deref().unwrap_or("all").trim().to_lowercase();
     let max_latency_ms = query.max_latency_ms.filter(|v| v.is_finite() && *v > 0.0);
     enrich_arm64_catalog_and_qualifications(ov_obj, &arch_filter, max_latency_ms);
+    requalify_overview(ov_obj, &arch_filter, max_latency_ms);
 
     let mut region_latency_map: HashMap<String, f64> = HashMap::new();
     if let Some(regions_arr) = ov_obj.get("regions").and_then(|v| v.as_array()) {
@@ -3337,6 +3410,7 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
                     obj.insert("profiles".to_string(), pr);
                 }
             }
+            ensure_profiles_and_requirements(obj);
             if let Ok(cit) = serde_json::to_value(&bundle.state.cloud_init_templates) {
                 obj.insert("cloud_init_templates".to_string(), cit);
             }
@@ -3417,6 +3491,9 @@ pub async fn handle_api_overview<K: KvStoreBackend>(
         "dashboard_admins": bundle.state.dashboard_admins
     });
 
+    if let Some(obj) = fallback_overview.as_object_mut() {
+        ensure_profiles_and_requirements(obj);
+    }
     apply_dynamic_overview_filtering(
         &mut fallback_overview,
         &query,
@@ -5840,4 +5917,260 @@ pub fn default_dashboard_bundle(now: u64) -> Result<DashboardBundle, StateError>
         state_fingerprint: fp,
         state,
     })
+}
+
+/// `POST /api/qualify` and `POST /api/profile/<role>`: the qualification matrix for the sizing in
+/// `body`. With `persist`, the sizing is saved, so the matrix opens with it next time.
+pub async fn handle_qualify<K: KvStoreBackend>(
+    kv: &K,
+    role: &str,
+    body: &serde_json::Value,
+    persist: bool,
+    now: u64,
+) -> Result<serde_json::Value, StateError> {
+    let role = if role == "rust_builder" {
+        "rust_builder"
+    } else {
+        "cicd_runner"
+    };
+    let (mut bundle, _) = if persist {
+        load_authoritative_state(kv, now).await?
+    } else {
+        load_state(kv, now).await?
+    };
+    let stored = bundle
+        .state
+        .overview
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let catalog = qualification_catalog(&stored, role);
+    let result = crate::qualify::qualify(role, body, &catalog);
+    if persist {
+        // The sizing goes into the profile. A stored overview also gets it as the matrix's saved
+        // requirements; without one, the overview is built from the profiles each time.
+        let mut ov = stored;
+        let has_overview = bundle
+            .state
+            .overview
+            .as_ref()
+            .is_some_and(|o| o.is_object());
+        let requirements = result
+            .get("requirements")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if let Some(obj) = ov.as_object_mut() {
+            let qual = obj
+                .entry("qualifications".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if !qual.is_object() {
+                *qual = serde_json::json!({});
+            }
+            if let Some(q) = qual.as_object_mut() {
+                let entry = q
+                    .entry(role.to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if !entry.is_object() {
+                    *entry = serde_json::json!({});
+                }
+                if let Some(e) = entry.as_object_mut() {
+                    e.insert("requirements".to_string(), requirements);
+                    for key in ["hardware_qualifying", "spot_price_qualifying"] {
+                        if !e.contains_key(key) {
+                            e.insert(key.to_string(), serde_json::json!([]));
+                        }
+                    }
+                }
+            }
+        }
+        for r in PROFILE_ROLES {
+            let saved = saved_profile(&bundle.state.profiles, Some(&ov), r);
+            let profile = if r == role {
+                let base = saved.unwrap_or_else(|| default_profile(r));
+                Some(profile_with_sizing(&base, body))
+            } else if bundle.state.profiles.contains_key(r) {
+                None
+            } else {
+                Some(saved.unwrap_or_else(|| default_profile(r)))
+            };
+            if let Some(profile) = profile {
+                bundle.state.profiles.insert(r.to_string(), profile);
+            }
+        }
+        if has_overview {
+            bundle.state.overview = Some(ov);
+        }
+        bundle.state.updated_at = now;
+        save_state(kv, &mut bundle, now).await?;
+    }
+    Ok(serde_json::json!({
+        "status": "ok",
+        "role": role,
+        "qualification": result,
+    }))
+}
+
+/// Sizing the dashboard starts with before anyone saves a profile for `role`.
+pub fn default_profile(role: &str) -> ProfileConfig {
+    let builder = role == "rust_builder";
+    let hourly = if builder { 3.5 } else { 5.0 };
+    ProfileConfig {
+        role: if builder {
+            "rust_builder"
+        } else {
+            "cicd_runner"
+        }
+        .to_string(),
+        min_runners: Some(if builder { 1 } else { 2 }),
+        min_instances: Some(1),
+        max_instances: if builder { 2 } else { 10 },
+        runner_vcpu: if builder { 16 } else { 4 },
+        runner_ram_gib: if builder { 28 } else { 8 },
+        host_overhead_gib: if builder { 4 } else { 2 },
+        min_instance_vcpu: if builder { 16 } else { 2 },
+        min_instance_ram_gib: if builder { 32 } else { 8 },
+        min_benchmark_score: if builder { 1400 } else { 0 },
+        disk_category: if builder { "hyperdrive" } else { "any" }.to_string(),
+        disk_type: if builder {
+            "hyperdisk-balanced"
+        } else {
+            "pd-balanced"
+        }
+        .to_string(),
+        boot_disk_gb: 50,
+        data_disk_gb: if builder { 375 } else { 100 },
+        use_vm_template: false,
+        vm_template_id: String::new(),
+        cloud_init_template_id: String::new(),
+        budget: BudgetConfig {
+            active_period: "day".to_string(),
+            // A day and a month at the hourly limit, so the hourly limit is the one that binds.
+            max_hourly_usd: hourly,
+            max_daily_usd: hourly * 24.0,
+            max_monthly_usd: hourly * 730.0,
+            include_disk_costs: true,
+            include_taxes: false,
+            tax_rate_percent: 0.0,
+        },
+    }
+}
+
+const PROFILE_ROLES: [&str; 2] = ["cicd_runner", "rust_builder"];
+
+/// The saved profile for `role`: the state's own, else the one the stored overview carries.
+fn saved_profile(
+    profiles: &HashMap<String, ProfileConfig>,
+    overview: Option<&serde_json::Value>,
+    role: &str,
+) -> Option<ProfileConfig> {
+    profiles.get(role).cloned().or_else(|| {
+        overview
+            .and_then(|ov| ov.get("profiles"))
+            .and_then(|p| p.get(role))
+            .and_then(|p| serde_json::from_value(p.clone()).ok())
+    })
+}
+
+/// One sizing field from the dashboard's form, converted to the type the profile stores.
+fn sizing_field(current: &serde_json::Value, new: &serde_json::Value) -> Option<serde_json::Value> {
+    let whole = |x: f64| serde_json::json!(x.round().min(u32::MAX as f64) as u64);
+    match current {
+        serde_json::Value::Number(n) if n.is_u64() => new
+            .as_f64()
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .map(whole),
+        serde_json::Value::Null => new
+            .as_f64()
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .map(whole),
+        serde_json::Value::Number(_) => new
+            .as_f64()
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .map(|x| serde_json::json!(x)),
+        serde_json::Value::Bool(_) => new.as_bool().map(serde_json::Value::Bool),
+        serde_json::Value::String(_) => new
+            .as_str()
+            .map(|s| serde_json::json!(s.chars().take(128).collect::<String>())),
+        _ => None,
+    }
+}
+
+fn merge_sizing(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    body: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, current) in target.iter_mut() {
+        if key == "role" {
+            continue;
+        }
+        let Some(new) = body.get(key) else {
+            continue;
+        };
+        if let (Some(cur_obj), Some(new_obj)) = (current.as_object_mut(), new.as_object()) {
+            merge_sizing(cur_obj, new_obj);
+        } else if let Some(v) = sizing_field(current, new) {
+            *current = v;
+        }
+    }
+}
+
+/// `base` with the fields the dashboard's sizing form sent in `body`. Unknown keys and values of
+/// the wrong type are ignored, so a bad field keeps its saved value.
+pub fn profile_with_sizing(base: &ProfileConfig, body: &serde_json::Value) -> ProfileConfig {
+    let (Ok(mut value), Some(body_obj)) = (serde_json::to_value(base), body.as_object()) else {
+        return base.clone();
+    };
+    if let Some(obj) = value.as_object_mut() {
+        merge_sizing(obj, body_obj);
+    }
+    serde_json::from_value(value).unwrap_or_else(|_| base.clone())
+}
+
+/// Makes sure the overview has a profile and saved sizing for both roles, so the dashboard's
+/// sizing forms and matrix have something to show on a fresh install.
+fn ensure_profiles_and_requirements(ov_obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let profiles = ov_obj
+        .entry("profiles".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !profiles.is_object() {
+        *profiles = serde_json::json!({});
+    }
+    let mut role_profiles = serde_json::Map::new();
+    if let Some(p) = profiles.as_object_mut() {
+        for role in PROFILE_ROLES {
+            let entry = p.entry(role.to_string()).or_insert_with(|| {
+                serde_json::to_value(default_profile(role)).unwrap_or(serde_json::Value::Null)
+            });
+            role_profiles.insert(role.to_string(), entry.clone());
+        }
+    }
+    let qual = ov_obj
+        .entry("qualifications".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !qual.is_object() {
+        *qual = serde_json::json!({});
+    }
+    if let Some(q) = qual.as_object_mut() {
+        for role in PROFILE_ROLES {
+            let entry = q
+                .entry(role.to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if !entry.is_object() {
+                *entry = serde_json::json!({});
+            }
+            if let Some(e) = entry.as_object_mut() {
+                let has_reqs = e
+                    .get("requirements")
+                    .map(|r| r.is_object())
+                    .unwrap_or(false);
+                if !has_reqs {
+                    let reqs = role_profiles
+                        .get(role)
+                        .filter(|p| p.is_object())
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    e.insert("requirements".to_string(), reqs);
+                }
+            }
+        }
+    }
 }

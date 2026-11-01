@@ -713,6 +713,124 @@ impl GitHubActionsClient {
         Ok(queued_count)
     }
 
+    /// GET a GitHub API path and parse the JSON body; any status but 200 is an error.
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, GitHubError> {
+        let auth_hdr = format!("Bearer {}", self.token);
+        let headers = [
+            ("Authorization", auth_hdr.as_str()),
+            ("Accept", "application/vnd.github+json"),
+            ("X-GitHub-Api-Version", "2022-11-28"),
+            ("User-Agent", "spot-dashboard-edge/1.0"),
+        ];
+        let (status, bytes) = self
+            .transport
+            .request("GET", path, &headers, None)
+            .await
+            .map_err(GitHubError::Http)?;
+        if status != 200 {
+            return Err(GitHubError::Api {
+                status,
+                message: String::from_utf8_lossy(&bytes).to_string(),
+            });
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// The `runs-on` labels of every job waiting in GitHub's queue for `target` (`org` or
+    /// `owner/repo`), so an autoscaling pool can tell which of them its runners could take.
+    /// For an organization it reads the repositories pushed to in the last
+    /// [`QUEUE_SCAN_RECENT_DAYS`] days, at most [`QUEUE_SCAN_MAX_REPOS`] of them. Each
+    /// repository's queued and in-progress runs are read (an in-progress run can have a later job
+    /// still waiting), at most [`QUEUE_SCAN_MAX_RUNS`] runs in all.
+    pub async fn queued_job_labels(
+        &self,
+        target: &str,
+        now: u64,
+    ) -> Result<Vec<Vec<String>>, GitHubError> {
+        let repos: Vec<String> = if target.contains('/') {
+            vec![target.to_string()]
+        } else {
+            let list = self
+                .get_json(&format!(
+                    "orgs/{}/repos?sort=pushed&direction=desc&per_page={}",
+                    target, QUEUE_SCAN_MAX_REPOS
+                ))
+                .await?;
+            let cutoff = now.saturating_sub(QUEUE_SCAN_RECENT_DAYS * 86_400);
+            list.as_array()
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+                .iter()
+                .filter(|r| {
+                    !r.get("archived").and_then(|v| v.as_bool()).unwrap_or(false)
+                        && r.get("pushed_at")
+                            .and_then(|v| v.as_str())
+                            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                            .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+                            .is_some_and(|t| t >= cutoff)
+                })
+                .filter_map(|r| r.get("full_name").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        };
+        // A repository GitHub won't show is skipped, so one locked repository doesn't hide the
+        // queue of the others. When none can be read, the queue is unknown.
+        let mut labels = Vec::new();
+        let mut runs_read = 0usize;
+        let mut last_err = None;
+        let mut repos_read = 0usize;
+        'repos: for repo in &repos {
+            let mut runs = Vec::new();
+            for status in ["queued", "in_progress"] {
+                let page = self
+                    .get_json(&format!(
+                        "repos/{}/actions/runs?status={}&per_page=10",
+                        repo, status
+                    ))
+                    .await
+                    .and_then(|v| {
+                        serde_json::from_value::<WorkflowRunsResponse>(v).map_err(Into::into)
+                    });
+                match page {
+                    Ok(page) => runs.extend(page.workflow_runs),
+                    Err(err) => {
+                        last_err = Some(err);
+                        continue 'repos;
+                    }
+                }
+            }
+            repos_read += 1;
+            for run in runs {
+                if runs_read >= QUEUE_SCAN_MAX_RUNS {
+                    break 'repos;
+                }
+                runs_read += 1;
+                let jobs = self
+                    .get_json(&format!(
+                        "repos/{}/actions/runs/{}/jobs?filter=latest&per_page=100",
+                        repo, run.id
+                    ))
+                    .await
+                    .and_then(|v| {
+                        serde_json::from_value::<WorkflowJobsResponse>(v).map_err(Into::into)
+                    });
+                match jobs {
+                    Ok(jobs) => labels.extend(
+                        jobs.jobs
+                            .into_iter()
+                            .filter(|j| j.status == "queued")
+                            .map(|j| j.labels),
+                    ),
+                    Err(err) => last_err = Some(err),
+                }
+            }
+        }
+        match last_err {
+            Some(err) if repos_read == 0 => Err(err),
+            _ => Ok(labels),
+        }
+    }
+
     /// Count queued jobs backlog across multiple controlled repository targets.
     pub async fn count_total_queued_jobs(
         &self,
@@ -751,6 +869,12 @@ pub const JOB_STARTED: &[u8] = include_bytes!("../../runner/job-started.sh");
 pub const HOST_ADMISSION: &[u8] = b"";
 pub const HOST_EVIDENCE: &[u8] = b"";
 pub const DOCKER_ADMISSION: &[u8] = b"";
+
+/// Limits on the queue scan an autoscaling pool runs on each reconciler tick. One target costs at
+/// most 1 + 2 × 5 + 10 = 21 GitHub requests, shared by every pool for that target.
+pub const QUEUE_SCAN_RECENT_DAYS: u64 = 7;
+pub const QUEUE_SCAN_MAX_REPOS: usize = 5;
+pub const QUEUE_SCAN_MAX_RUNS: usize = 10;
 
 pub const RUNNER_VERSION: &str = "2.337.0";
 

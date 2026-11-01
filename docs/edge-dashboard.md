@@ -228,7 +228,9 @@ The **Runner Patches** tab and `/api/patches` routes (aliased under `/api/patch-
 | `GET /api/repo-specs` | Reports each repository target's `.github/spot-runners.yml`: status, errors, pools, and which pool a floor host serves. See [Repository runner specs](repo-runner-specs.md). |
 | `POST /api/repo-specs/validate` | Validates spec text sent as `{"text": "<YAML>"}` without reading GitHub. |
 | `GET /api/runner-pools` | Lists runner pools with their status, plus the templates, targets, and machine types the **Launch** dialog offers. See [Launch runners from the dashboard](runner-pools.md). |
-| `POST /api/runner-pools` | Creates a runner pool from `target`, `machine_type`, `zone`, `hosts`, `runners_per_host`, `runner_vcpu`, `runner_ram_gib`, `labels`, and `cloud_init_template_id`. |
+| `POST /api/runner-pools` | Creates a runner pool from `target`, `machine_type`, `zone`, `hosts`, `runners_per_host`, `runner_vcpu`, `runner_ram_gib`, `labels`, and `cloud_init_template_id`. Optional `min_hosts` (less than `hosts`) and `idle_minutes` (5 to 240) make the pool spin down when idle. |
+| `POST /api/runner-pools/resize` | Sets the pool's most hosts, `{"id": "<pool>", "hosts": <n>}`, and optionally its fewest hosts, `min_hosts`. |
+| `POST /api/runner-pools/template` | Switches the template the pool's new hosts use, `{"id": "<pool>", "cloud_init_template_id": "<template or empty>"}`. The reconciler replaces idle older hosts one at a time. |
 | `POST /api/runner-pools/delete` | Marks the pool `{"id": "<pool>"}` for removal; the reconciler deletes its hosts and runner registrations. |
 | `GET /ui/runner-pools.js` | The dashboard script for the **Launch** dialog and the **Runner pools** panel. |
 | `POST /api/patches/save` | Opens a pull request on the configuration repository with the updated manifest. Aliased as `/api/patch-console/save`. |
