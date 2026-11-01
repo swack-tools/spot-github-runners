@@ -225,6 +225,8 @@ The **Runner Patches** tab and `/api/patches` routes (aliased under `/api/patch-
 | `GET /api/patches/manifest?path=...` | Retrieves a manifest and calculates its effective patch and canonical SHA-256 digest. Aliased as `/api/patch-console/manifest`. |
 | `POST /api/patches/validate` | Validates manifest syntax and checks hardware sizing floor rules against merged defaults. Aliased as `/api/patch-console/validate`. |
 | `POST /api/patches/preview` | Evaluates running hosts and classifies required actions (`noop`, `hot_patch`, `recreate_containers`, `replace_vm`). Aliased as `/api/patch-console/preview`. |
+| `GET /api/repo-specs` | Reports each repository target's `.github/spot-runners.yml`: status, errors, pools, and which pool a floor host serves. See [Repository runner specs](repo-runner-specs.md). |
+| `POST /api/repo-specs/validate` | Validates spec text sent as `{"text": "<YAML>"}` without reading GitHub. |
 | `POST /api/patches/save` | Opens a pull request on the configuration repository with the updated manifest. Aliased as `/api/patch-console/save`. |
 
 Direct live hot-patching via `POST /api/patches/hot-patch` is deprecated. The patch console bootstrap endpoint indicates `executor.available=false`, explaining that the serverless edge reconciler rolls out manifest updates automatically on the next 5-minute cron tick.

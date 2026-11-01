@@ -4,6 +4,8 @@ A runner patch is a declarative customization of the runner hosts and runner con
 
 This page covers the manifest, how the tools classify a change, the receipts that prove a patch, GitHub label sync, and the operator procedures. For the dashboard console that edits manifests, see [Dashboard](dashboard.md) and [Runner patches in the edge dashboard reference](edge-dashboard.md#runner-patches).
 
+A repository can also ask for runners in a file it owns. See [Repository runner specs](repo-runner-specs.md).
+
 !!! warning "Operator procedures change live resources"
     The commands on this page create, patch, or replace Compute Engine virtual machines (VMs) and relabel GitHub runners. A request to edit code or documentation does not authorize any of them. Run each one only when you intend the live change, and complete the preview step first.
 

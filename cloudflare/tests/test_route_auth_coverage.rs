@@ -86,6 +86,8 @@ fn state_reads_require_an_administrator() {
         "\"/api/admins\")",
         "\"/api/inventory/refresh\"",
         "\"/api/reconciler/tick\"",
+        "\"/api/repo-specs\"",
+        "\"/api/repo-specs/validate\"",
     ] {
         let (_, body) = route_arms()
             .into_iter()
