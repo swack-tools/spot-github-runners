@@ -70,6 +70,16 @@ Click **Refresh** to reload the panel. It also refreshes every minute while the 
 
 All pools together must stay under the hourly limit in the dashboard's **Max Budget** settings. The dashboard refuses a new pool that would go over it.
 
+## Change the number of hosts
+
+1. In **Runner pools**, click **Resize** on the pool's row.
+1. Enter the new number of hosts, from 1 to 10, and confirm.
+1. On its next runs, the reconciler matches the pool to the new number:
+   - To add hosts, it starts one host per run, every 5 minutes.
+   - To remove hosts, it deletes the newest idle hosts first and removes their runner registrations. A host whose runner is running a job stays until the job ends. If GitHub refuses to list the pool's runners, the reconciler waits instead of guessing which hosts are idle.
+
+Growing a pool must keep all pools under the **Max Budget** hourly limit. Shrinking always works.
+
 ## Remove a pool
 
 1. In **Runner pools**, click **Remove** on the pool's row and confirm.
@@ -77,11 +87,11 @@ All pools together must stay under the hourly limit in the dashboard's **Max Bud
 1. When no hosts or runners are left, the pool disappears from the panel.
    A pool that never started a host disappears on the next run, even if GitHub refuses to list its runners.
 
-To change a pool's machine, size, labels, or template, remove the pool. Then launch a new one.
+To change a pool's machine, runner size, labels, or template, remove the pool. Then launch a new one.
 
 ## What pools don't do yet
 
 - Pool hosts use the built-in runner setup and your template only. Runner patches from the configuration repository and [Repository runner specs](repo-runner-specs.md) apply to floor hosts.
-- A pool keeps a fixed number of hosts. It doesn't grow with queued jobs.
+- A pool keeps the number of hosts you set. It doesn't grow with queued jobs.
 - Pool hosts don't count toward the fleet floor or the backlog scale-up limit. When the floor is on, it keeps its own host for each built-in target next to any pools for that target.
 - A host whose setup fails stays up and keeps counting toward the pool until you remove the pool. The **Status** column shows its runners as offline.

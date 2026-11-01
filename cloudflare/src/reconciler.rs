@@ -1803,6 +1803,72 @@ where
                 continue;
             }
 
+            // Scale down: delete hosts above the pool's size, newest idle hosts first. Hosts already
+            // stopping (deleted last tick, or preempted) don't count. Nothing is deleted without a
+            // good runner list, because an empty list would make every host look idle. A host's
+            // runner registrations go first; if GitHub refuses one (it took a job since the list),
+            // the host stays and the next idle host is tried.
+            let active: Vec<&SimpleGceInstance> = hosts
+                .iter()
+                .copied()
+                .filter(|h| {
+                    !["STOPPING", "SUSPENDING", "SUSPENDED"]
+                        .iter()
+                        .any(|s| h.status.eq_ignore_ascii_case(s))
+                })
+                .collect();
+            if active.len() > pool.hosts as usize {
+                let runners_listed = listed_target_paths
+                    .contains(&crate::runner_pools::target_api_path(&pool.target));
+                if runners_listed {
+                    let mut idle: Vec<&SimpleGceInstance> = active
+                        .iter()
+                        .copied()
+                        .filter(|h| {
+                            !pool_runners
+                                .iter()
+                                .any(|r| r.busy && r.name.contains(h.name.as_str()))
+                        })
+                        .collect();
+                    // Host names end in their launch time, so the newest sort last.
+                    idle.sort_by(|a, b| b.name.cmp(&a.name));
+                    let excess = active.len() - pool.hosts as usize;
+                    let mut deleted = 0usize;
+                    for host in idle {
+                        if deleted >= excess {
+                            break;
+                        }
+                        let mut unregistered = true;
+                        for r in pool_runners
+                            .iter()
+                            .filter(|r| r.name.contains(host.name.as_str()))
+                        {
+                            let path = runner_target_map.get(&r.id).cloned().unwrap_or_else(|| {
+                                crate::runner_pools::target_api_path(&pool.target)
+                            });
+                            if gh.delete_runner(&path, r.id).await.is_ok() {
+                                cleaned_runners.push(r.name.clone());
+                            } else {
+                                unregistered = false;
+                            }
+                        }
+                        if !unregistered {
+                            continue;
+                        }
+                        if gcp
+                            .delete_instance(&project, host.zone_short(), &host.name, now)
+                            .await
+                            .is_ok()
+                        {
+                            cleaned_vms.push(host.name.clone());
+                            deleted += 1;
+                        }
+                    }
+                }
+                pool_statuses.insert(pool.id.clone(), status);
+                continue;
+            }
+
             // One launch per pool per tick: the new host shows in the next tick's instance list.
             if (hosts.len() as u32) < pool.hosts {
                 match launch_pool_host(gcp, gh, &project, pool, now).await {

@@ -220,6 +220,8 @@ function buildPanel() {
   $("rp-body").addEventListener("click", (ev) => {
     const b = ev.target.closest("button[data-remove]");
     if (b) removePool(b.getAttribute("data-remove"));
+    const r = ev.target.closest("button[data-resize]");
+    if (r) resizePool(r.getAttribute("data-resize"));
   });
   return panel;
 }
@@ -252,6 +254,8 @@ function renderPools() {
   for (const p of pools) {
     const remove = el("button", { type: "button", class: "btn btn-sm btn-secondary", "data-remove": p.id, text: p.removing ? "Removing…" : "Remove" });
     if (p.removing) remove.disabled = true;
+    const resize = el("button", { type: "button", class: "btn btn-sm btn-secondary", "data-resize": p.id, text: "Resize" });
+    if (p.removing) resize.disabled = true;
     body.append(el("tr", {},
       el("td", { class: "mono", text: p.id }),
       el("td", { class: "mono", text: p.target }),
@@ -261,7 +265,7 @@ function renderPools() {
       el("td", { text: p.cloud_init_template_name || "Built-in" }),
       statusCell(p),
       el("td", { class: "mono", text: p.host_hourly_usd != null ? `${usd(p.host_hourly_usd * p.hosts)}/hr` : "—" }),
-      el("td", {}, remove)));
+      el("td", {}, resize, " ", remove)));
   }
 }
 
@@ -279,6 +283,21 @@ async function removePool(id) {
     renderPools();
     showToast(`Pool ${id} is being removed. Its hosts go away within 5 minutes.`);
   } catch (e) { showToast(`Couldn't remove pool ${id}: ${e.message}`); }
+}
+
+async function resizePool(id) {
+  const p = (POOLS.pools || []).find((x) => x.id === id);
+  if (!p) return;
+  const max = (POOLS.limits || {}).max_hosts_per_pool || 10;
+  const answer = prompt(`Hosts for pool ${p.id} (1 to ${max}, now ${p.hosts}). Scaling down deletes idle hosts first; a host running a job stays until the job ends.`, String(p.hosts));
+  if (answer === null) return;
+  const hosts = Number(answer.trim());
+  if (!Number.isInteger(hosts) || hosts < 1 || hosts > max) { showToast(`Enter a whole number from 1 to ${max}.`); return; }
+  try {
+    POOLS = await api("/api/runner-pools/resize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, hosts }) });
+    renderPools();
+    showToast(`Pool ${id} now wants ${hosts} host(s). The reconciler adjusts it within 5 minutes.`);
+  } catch (e) { showToast(`Couldn't resize pool ${id}: ${e.message}`); }
 }
 
 // --- Qualifying Instances table hook ------------------------------------------------------------
