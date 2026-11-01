@@ -2011,3 +2011,37 @@ async fn resize_can_change_the_fewest_hosts() {
     let p = kv.pools().into_iter().find(|p| p.id == id).unwrap();
     assert_eq!((p.min_hosts(), p.hosts), (1, 5));
 }
+
+#[tokio::test]
+async fn small_e2_and_t2d_hosts_attach_disks_over_scsi() {
+    let _g = lock();
+    for (machine, want) in [
+        ("e2-standard-2", "SCSI"),
+        ("t2d-standard-2", "SCSI"),
+        ("n4a-standard-2", "NVME"),
+        ("t2a-standard-2", "NVME"),
+    ] {
+        invalidate_state_cache();
+        reset_reconciler_state();
+        let kv = Kv::default();
+        seed_pool(
+            &kv,
+            |_| {},
+            CreateRunnerPoolRequest {
+                machine_type: machine.into(),
+                hosts: 1,
+                min_hosts: None,
+                ..small_auto_request()
+            },
+        )
+        .await;
+        let gcp = Gcp::default();
+        let gh = Gh::default();
+        run_reconciliation(&kv, &gcp, &gh, NOW + 60).await.unwrap();
+        let inserted = gcp.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.len(), 1, "{machine}");
+        for disk in &inserted[0].1.disks {
+            assert_eq!(disk.interface.as_deref(), Some(want), "{machine}");
+        }
+    }
+}
