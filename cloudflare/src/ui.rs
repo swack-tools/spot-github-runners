@@ -718,7 +718,7 @@ Auto-refresh:
 <div class="panel-header">
 <div>
 <div class="panel-title">📜 Cloud-Init &amp; VM Initialization Template Editor</div>
-<div class="panel-subtitle">Select, edit, validate, and save <code>#cloud-config</code> templates for GitHub Actions runners or Rust compilers. Use <strong>Save As New Template</strong> to create a new selectable template.</div>
+<div class="panel-subtitle">Edit and save setup templates. Runner pools run shell scripts (<code>#!/bin/bash</code>) while each host builds its runner image; <strong>Save As New Template</strong> adds one.</div>
 </div>
 </div>
 <div class="form-grid">
@@ -1760,6 +1760,7 @@ g.appendChild(pinGroup);
 function renderMapInspector() {
 const panel = document.getElementById("map-inspector-panel");
 const reg = APP_STATE.regions.find(r => r.region === SELECTED_MAP_REGION) || APP_STATE.regions[0];
+if (!reg) { panel.innerHTML = ""; return; }
 const withDiskTax = document.getElementById("map-price-with-disk-tax").checked;
 const running = reg.running_instances || [];
 let instancesHtml = "";
@@ -2323,7 +2324,7 @@ if (!res.ok || data.error) {
 showToast(`Error previewing qualification: ${data.error || res.statusText}`);
 return;
 }
-LAST_QUAL_DATA[role] = data;
+LAST_QUAL_DATA[role] = data.qualification || data;
 renderQualificationTable();
 }
 async function saveProfile(role) {

@@ -31,6 +31,7 @@
 !docs/images/
 !docs/images/*.png
 !docs/images/*.svg
+!docs/images/*.gif
 !docs/stylesheets/
 !docs/stylesheets/*.css
 !docs/javascripts/

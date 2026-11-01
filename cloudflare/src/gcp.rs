@@ -60,6 +60,19 @@ pub fn machine_type_requires_hyperdisk(machine_type: &str) -> bool {
         .any(|p| machine_type.starts_with(p))
 }
 
+/// Disk interface for a machine's Persistent Disks. E2, T2D, and the N1/N2/N2D series attach
+/// Persistent Disk only over SCSI; the others take NVMe.
+pub fn persistent_disk_interface(machine_type: &str) -> &'static str {
+    if ["e2-", "t2d-", "n1-", "n2-", "n2d-"]
+        .iter()
+        .any(|p| machine_type.starts_with(p))
+    {
+        "SCSI"
+    } else {
+        "NVME"
+    }
+}
+
 /// Device name of a runner VM's data disk; the startup script finds it at `/dev/disk/by-id/google-<name>`.
 pub fn runner_data_disk_device_name(instance_name: &str) -> String {
     format!("{}-data", instance_name)
@@ -1193,6 +1206,29 @@ pub fn build_spot_runner_vm_request(
         )));
     }
 
+    build_runner_vm_request(project, cfg)
+}
+
+/// The VM request for a runner pool host: any machine type a pool may launch
+/// (`runner_pools::machine_shape`), which includes the 2 and 4 vCPU hosts the fleet floor
+/// doesn't use.
+pub fn build_pool_runner_vm_request(
+    project: &str,
+    cfg: &RunnerVmConfig,
+) -> Result<GceInsertInstanceRequest, GcpError> {
+    if crate::runner_pools::machine_shape(cfg.machine_type).is_none() {
+        return Err(GcpError::Validation(format!(
+            "Machine type '{}' can't host a runner pool",
+            cfg.machine_type
+        )));
+    }
+    build_runner_vm_request(project, cfg)
+}
+
+fn build_runner_vm_request(
+    project: &str,
+    cfg: &RunnerVmConfig,
+) -> Result<GceInsertInstanceRequest, GcpError> {
     let is_arm64 = cfg.machine_type.starts_with("c4a-")
         || cfg.machine_type.starts_with("n4a-")
         || cfg.machine_type.starts_with("t2a-");
@@ -1243,7 +1279,7 @@ pub fn build_spot_runner_vm_request(
         disk_size_gb: Some(DEFAULT_RUNNER_DATA_DISK_SIZE_GB.to_string()),
         r#type: Some("PERSISTENT".to_string()),
         mode: Some("READ_WRITE".to_string()),
-        interface: Some("NVME".to_string()),
+        interface: Some(persistent_disk_interface(cfg.machine_type).to_string()),
         initialize_params: Some(GceDiskInitializeParams {
             disk_name: data_disk_device_name,
             disk_size_gb: DEFAULT_RUNNER_DATA_DISK_SIZE_GB.to_string(),
@@ -1260,7 +1296,7 @@ pub fn build_spot_runner_vm_request(
         disk_size_gb: Some(DEFAULT_BOOT_DISK_SIZE_GB.to_string()),
         r#type: Some("PERSISTENT".to_string()),
         mode: Some("READ_WRITE".to_string()),
-        interface: Some("NVME".to_string()),
+        interface: Some(persistent_disk_interface(cfg.machine_type).to_string()),
         initialize_params: Some(GceDiskInitializeParams {
             disk_name: format!("{}-boot", cfg.instance_name),
             disk_size_gb: DEFAULT_BOOT_DISK_SIZE_GB.to_string(),

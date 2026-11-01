@@ -72,7 +72,7 @@ qualifying offers, and scaling alerts) and a daily budget tracking bar.
 | --- | --- |
 | World Map and Fleet Inspector | Shows data center pins by region. You can inspect active runners and view candidate regional configurations. |
 | Instances and Cost History | Lists active and deleted instances with sorting, search, time window filters, and total price columns. |
-| Sizing and Benchmark Qualifier | Configures per-runner vCPU and RAM, minimum counts, CPU benchmark floors, disk types, and templates for runners and Rust builders. The qualification matrix displays candidate Spot offers (`/api/qualify` and `/api/profile/{role}` return static placeholders with hard-coded counts and empty lists). |
+| Sizing and Benchmark Qualifier | Configures per-runner vCPU and RAM, minimum counts, CPU benchmark floors, disk types, and templates for runners and Rust builders. The qualification matrix lists the Spot offers that fit, priced from GCP's Spot list prices. `/api/qualify` previews a sizing, and `/api/profile/{role}` saves it as the role's profile. |
 | Scaling and OOM Deep-Links | Configures autoscaling triggers and budget caps. Lists out-of-memory (OOM) events with links to relevant workflow runs. |
 | `Cloud-Init` and VM templates | The `cloud-init` parse endpoint (`POST /api/cloud-init/parse`) is a stub that reports line count and format (`cloud-config` or shell script) with no real validation, and saves VM templates from active configurations. |
 | Regions and Latency Filter | Configures regions by latency, continent, machine families, CPU platforms, and disk types. |

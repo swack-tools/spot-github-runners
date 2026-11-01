@@ -5,6 +5,9 @@
 //! extra labels, and optionally a cloud-init template whose shell commands run while the runner
 //! image builds. The administrator creates a pool with `POST /api/runner-pools`; the reconciler
 //! then launches one missing host per pool on each tick and replaces hosts Spot takes back.
+//! A pool with `min_hosts` below `hosts` scales itself: it starts hosts while jobs that its
+//! runners can take wait in GitHub's queue, and deletes hosts that stayed idle for
+//! `idle_minutes`, down to `min_hosts` (often zero).
 //! `POST /api/runner-pools/delete` marks a pool as removing; the reconciler deletes its hosts and
 //! runner registrations and then drops the record.
 //!
@@ -35,6 +38,13 @@ pub const MAX_SETUP_SCRIPT_BYTES: usize = 64 * 1024;
 /// Memory left for Debian, Docker, the admission service and the Ops Agent.
 pub const HOST_RESERVED_RAM_GIB: u32 = 2;
 pub const POOL_ID_LEN: usize = 6;
+/// How long an idle host stays before an autoscaling pool deletes it, when the pool doesn't say.
+pub const DEFAULT_IDLE_MINUTES: u32 = 10;
+pub const MIN_IDLE_MINUTES: u32 = 5;
+pub const MAX_IDLE_MINUTES: u32 = 240;
+/// A new host isn't idle until its runners had time to come online: building the runner image
+/// takes several minutes, longer on 2 vCPU hosts.
+pub const HOST_BOOT_GRACE_SECS: u64 = 25 * 60;
 
 /// One pool, as an administrator created it. The reconciler never edits these fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -68,6 +78,33 @@ pub struct RunnerPool {
     pub created_by: String,
     #[serde(default)]
     pub removing: bool,
+    /// Fewest hosts an autoscaling pool keeps. `None` (pools made before autoscaling) or a value
+    /// equal to `hosts` keeps the pool at a fixed size; `hosts` is then also the most it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_hosts: Option<u32>,
+    /// Minutes a host of an autoscaling pool may sit idle before it's deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_minutes: Option<u32>,
+    /// When the pool last switched templates. Idle hosts started before then are replaced with
+    /// hosts that run the new template, one per reconciler tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_updated_at: Option<u64>,
+}
+
+impl RunnerPool {
+    /// Fewest hosts the pool keeps.
+    pub fn min_hosts(&self) -> u32 {
+        self.min_hosts.unwrap_or(self.hosts).min(self.hosts)
+    }
+    /// Whether the pool starts and stops hosts by itself.
+    pub fn autoscales(&self) -> bool {
+        self.min_hosts() < self.hosts
+    }
+    pub fn idle_minutes(&self) -> u32 {
+        self.idle_minutes
+            .unwrap_or(DEFAULT_IDLE_MINUTES)
+            .clamp(MIN_IDLE_MINUTES, MAX_IDLE_MINUTES)
+    }
 }
 
 /// What the reconciler last saw for a pool. Written by the reconciler only.
@@ -88,6 +125,19 @@ pub struct RunnerPoolStatus {
     /// The GCE operation of the last create, until the reconciler has read its outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_launch_op: Option<String>,
+    /// Autoscaling pools: jobs in GitHub's queue that the pool's runners could take, as of the
+    /// last tick. `None` when the queue couldn't be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_jobs: Option<u32>,
+    /// Autoscaling pools: hosts the pool wanted on the last tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_hosts: Option<u32>,
+    /// Autoscaling pools: when each idle host was first seen idle (host name to epoch seconds).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub idle_since: BTreeMap<String, u64>,
+    /// When the pool last deleted an idle host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scale_down_at: Option<u64>,
 }
 
 /// Body of `POST /api/runner-pools`.
@@ -105,6 +155,11 @@ pub struct CreateRunnerPoolRequest {
     pub labels: Vec<String>,
     #[serde(default)]
     pub cloud_init_template_id: String,
+    /// Fewest hosts to keep; leave out (or equal to `hosts`) for a fixed-size pool.
+    #[serde(default)]
+    pub min_hosts: Option<u32>,
+    #[serde(default)]
+    pub idle_minutes: Option<u32>,
 }
 
 fn default_hosts() -> u32 {
@@ -122,6 +177,18 @@ pub struct RemoveRunnerPoolRequest {
 pub struct ResizeRunnerPoolRequest {
     pub id: String,
     pub hosts: u32,
+    /// New fewest hosts for an autoscaling pool; leave out to keep the pool's current setting.
+    #[serde(default)]
+    pub min_hosts: Option<u32>,
+}
+
+/// Body of `POST /api/runner-pools/template`: the template new hosts of the pool use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetPoolTemplateRequest {
+    pub id: String,
+    /// Empty for the built-in runner setup only.
+    #[serde(default)]
+    pub cloud_init_template_id: String,
 }
 
 /// vCPU and RAM (GiB) of each machine type a pool may use: the runner allowlists in `patch.rs`.
@@ -141,15 +208,42 @@ pub fn machine_shape(machine_type: &str) -> Option<(u32, u32)> {
         "n4a-standard-8" => (8, 32),
         "t2a-standard-16" => (16, 64),
         "t2a-standard-8" => (8, 32),
+        // Small hosts, for pools of one or two small runners.
+        "n4a-standard-2" => (2, 8),
+        "n4a-standard-4" => (4, 16),
+        "c4a-standard-2" => (2, 8),
+        "c4a-standard-4" => (4, 16),
+        "t2a-standard-2" => (2, 8),
+        "t2a-standard-4" => (4, 16),
+        "t2d-standard-2" => (2, 8),
+        "t2d-standard-4" => (4, 16),
+        "e2-standard-2" => (2, 8),
+        "e2-standard-4" => (4, 16),
         _ => return None,
     })
 }
+
+/// 2 and 4 vCPU machine types only runner pools launch. They stay out of the runner patch
+/// allowlists in `patch.rs`, which the fleet floor uses.
+pub const POOL_SMALL_MACHINE_TYPES: &[&str] = &[
+    "n4a-standard-2",
+    "n4a-standard-4",
+    "c4a-standard-2",
+    "c4a-standard-4",
+    "t2a-standard-2",
+    "t2a-standard-4",
+    "t2d-standard-2",
+    "t2d-standard-4",
+    "e2-standard-2",
+    "e2-standard-4",
+];
 
 /// Machine types a pool can launch, in a stable order.
 pub fn launchable_machine_types() -> Vec<&'static str> {
     crate::patch::PERMITTED_MACHINE_TYPES
         .iter()
         .chain(crate::patch::PERMITTED_ARM64_MACHINE_TYPES.iter())
+        .chain(POOL_SMALL_MACHINE_TYPES.iter())
         .copied()
         .filter(|mt| machine_shape(mt).is_some())
         .collect()
@@ -276,6 +370,37 @@ pub fn pool_labels(pool: &RunnerPool) -> Vec<String> {
         }
     }
     labels
+}
+
+/// Whether a runner with `pool_labels` can take a job that asks for `job_labels`: GitHub hands a
+/// job only to a runner that has every label in its `runs-on`, compared without case.
+pub fn job_fits_labels(job_labels: &[String], pool_labels: &[String]) -> bool {
+    !job_labels.is_empty()
+        && job_labels
+            .iter()
+            .all(|j| pool_labels.iter().any(|p| p.eq_ignore_ascii_case(j)))
+}
+
+/// The labels to put in a workflow's `runs-on` to reach this pool: `self-hosted`, the
+/// architecture, `spot` and the pool's own labels. Without labels of its own, the machine type
+/// keeps jobs off other hosts.
+pub fn runs_on_labels(pool: &RunnerPool) -> Vec<String> {
+    let mut out = vec!["self-hosted".to_string()];
+    out.push(
+        if is_arm64_machine_type(&pool.machine_type) {
+            "ARM64"
+        } else {
+            "X64"
+        }
+        .to_string(),
+    );
+    out.push("spot".to_string());
+    if pool.labels.is_empty() {
+        out.push(pool.machine_type.clone());
+    } else {
+        out.extend(pool.labels.iter().cloned());
+    }
+    out
 }
 
 /// Host names for a pool start with this; the instance name adds `<epoch>-<8 hex>`.
@@ -413,6 +538,26 @@ pub fn validate_create_request(
             MAX_RUNNERS_PER_HOST
         ));
     }
+    let min_hosts = match req.min_hosts {
+        Some(m) if m > req.hosts => {
+            return Err(format!(
+                "Minimum hosts ({}) can't be more than the most hosts ({})",
+                m, req.hosts
+            ))
+        }
+        Some(m) if m < req.hosts => Some(m),
+        _ => None,
+    };
+    let idle_minutes = match req.idle_minutes {
+        Some(m) if !(MIN_IDLE_MINUTES..=MAX_IDLE_MINUTES).contains(&m) => {
+            return Err(format!(
+                "Idle minutes must be {} to {}",
+                MIN_IDLE_MINUTES, MAX_IDLE_MINUTES
+            ))
+        }
+        Some(m) if min_hosts.is_some() => Some(m),
+        _ => None,
+    };
     if req.runner_vcpu == 0 || req.runner_ram_gib == 0 {
         return Err("Each runner needs at least 1 vCPU and 1 GiB".to_string());
     }
@@ -529,6 +674,9 @@ pub fn validate_create_request(
         created_at: now,
         created_by: created_by.to_string(),
         removing: false,
+        min_hosts,
+        idle_minutes,
+        setup_updated_at: None,
     })
 }
 
@@ -574,6 +722,11 @@ pub fn pools_view(state: &DashboardState) -> serde_json::Value {
                 "created_at": p.created_at,
                 "created_by": p.created_by,
                 "removing": p.removing,
+                "min_hosts": p.min_hosts(),
+                "autoscales": p.autoscales(),
+                "idle_minutes": p.idle_minutes(),
+                "setup_updated_at": p.setup_updated_at,
+                "runs_on": runs_on_labels(p),
                 "status": status,
             })
         })
@@ -618,6 +771,9 @@ pub fn pools_view(state: &DashboardState) -> serde_json::Value {
             "max_runners_per_host": MAX_RUNNERS_PER_HOST,
             "max_extra_labels": MAX_EXTRA_LABELS,
             "host_reserved_ram_gib": HOST_RESERVED_RAM_GIB,
+            "default_idle_minutes": DEFAULT_IDLE_MINUTES,
+            "min_idle_minutes": MIN_IDLE_MINUTES,
+            "max_idle_minutes": MAX_IDLE_MINUTES,
         },
     })
 }
@@ -774,7 +930,16 @@ pub async fn handle_resize_runner_pool<K: KvStoreBackend>(
     if let Some(reason) = resize_refusal(&bundle.state, &pool, req.hosts) {
         return Err(StateError::Validation(reason));
     }
-    if pool.hosts != req.hosts {
+    if let Some(m) = req.min_hosts {
+        if m > req.hosts {
+            return Err(StateError::Validation(format!(
+                "Minimum hosts ({}) can't be more than the most hosts ({})",
+                m, req.hosts
+            )));
+        }
+    }
+    let new_min = req.min_hosts.map(|m| (m < req.hosts).then_some(m));
+    if pool.hosts != req.hosts || new_min.is_some_and(|m| m != pool.min_hosts) {
         // Read the list again right before writing and change only this pool's host count, so a
         // pool created or removed meanwhile isn't undone.
         let mut pools = load_pools(kv).await?;
@@ -788,9 +953,65 @@ pub async fn handle_resize_runner_pool<K: KvStoreBackend>(
             )));
         }
         fresh.hosts = req.hosts;
+        if let Some(m) = new_min {
+            fresh.min_hosts = m;
+        }
         save_pools(kv, &pools).await?;
         bundle.state.runner_pools = pools;
     }
+    Ok(pools_view(&bundle.state))
+}
+
+/// Switches the template new hosts of a pool use. Idle hosts started earlier are replaced, one per
+/// reconciler tick, so the change reaches the whole pool without stopping running jobs.
+pub async fn handle_set_pool_template<K: KvStoreBackend>(
+    kv: &K,
+    req: SetPoolTemplateRequest,
+    now: u64,
+) -> Result<serde_json::Value, StateError> {
+    let (mut bundle, _) = load_authoritative_state(kv, now).await?;
+    let template_id = req.cloud_init_template_id.trim();
+    let (name, script) = if template_id.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let Some(t) = bundle
+            .state
+            .cloud_init_templates
+            .iter()
+            .find(|t| t.id == template_id)
+        else {
+            return Err(StateError::NotFound(format!(
+                "Template '{}' not found",
+                template_id
+            )));
+        };
+        if let Some(reason) = template_unusable_reason(t) {
+            return Err(StateError::Validation(format!(
+                "Template '{}' can't be used: {}",
+                t.name, reason
+            )));
+        }
+        (t.name.clone(), t.content.clone())
+    };
+    let id = req.id.trim();
+    let mut pools = load_pools(kv).await?;
+    let Some(pool) = pools.iter_mut().find(|p| p.id == id) else {
+        return Err(StateError::NotFound(format!("Pool '{}' not found", id)));
+    };
+    if pool.removing {
+        return Err(StateError::Validation(format!(
+            "Pool '{}' is being removed",
+            id
+        )));
+    }
+    if pool.setup_script != script || pool.cloud_init_template_id != template_id {
+        pool.cloud_init_template_id = template_id.to_string();
+        pool.cloud_init_template_name = name;
+        pool.setup_script = script;
+        pool.setup_updated_at = Some(now);
+        save_pools(kv, &pools).await?;
+    }
+    bundle.state.runner_pools = pools;
     Ok(pools_view(&bundle.state))
 }
 

@@ -179,6 +179,10 @@ struct Gh {
     minted: Arc<Mutex<Vec<(String, u32, Vec<String>)>>>,
     fail_list: Arc<Mutex<bool>>,
     refuse_delete: Arc<Mutex<Vec<u64>>>,
+    /// Labels of the jobs waiting in GitHub's queue, and whether reading the queue fails.
+    queued: Arc<Mutex<Vec<Vec<String>>>>,
+    fail_queue: Arc<Mutex<bool>>,
+    queue_reads: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -222,6 +226,17 @@ impl GitHubReconcilerClient for Gh {
     async fn count_queued_jobs(&self, _o: &str, _r: &str) -> Result<u32, ReconcilerError> {
         Ok(0)
     }
+    async fn queued_job_labels(
+        &self,
+        _target: &str,
+        _now: u64,
+    ) -> Result<Vec<Vec<String>>, ReconcilerError> {
+        self.queue_reads.fetch_add(1, Ordering::SeqCst);
+        if *self.fail_queue.lock().unwrap() {
+            return Err(ReconcilerError::Github("queue unreadable".into()));
+        }
+        Ok(self.queued.lock().unwrap().clone())
+    }
     async fn fetch_target_patch(&self, _t: &str) -> Result<Option<RunnerPatch>, ReconcilerError> {
         Ok(None)
     }
@@ -255,6 +270,8 @@ fn axion_request(target: &str) -> CreateRunnerPoolRequest {
         runner_ram_gib: 14,
         labels: vec!["rust".into(), "big".into()],
         cloud_init_template_id: String::new(),
+        min_hosts: None,
+        idle_minutes: None,
     }
 }
 
@@ -449,7 +466,8 @@ fn templates_must_be_runner_shell_scripts() {
 #[test]
 fn pools_together_stay_under_the_hourly_budget() {
     let mut state = base_state().state;
-    state.global_budget.max_hourly_usd = 0.10;
+    // One c4a-highcpu-16 host is about $0.31/hr at Spot list prices; two go over.
+    state.global_budget.max_hourly_usd = 0.50;
     let one = validate_create_request(&axion_request("swack-tools"), &state, "o", NOW).unwrap();
     state.runner_pools.push(one);
     let err = validate_create_request(&axion_request("swack-tools"), &state, "o", NOW).unwrap_err();
@@ -463,7 +481,21 @@ fn pools_together_stay_under_the_hourly_budget() {
 fn every_launchable_machine_type_is_allowlisted_and_sized() {
     for mt in launchable_machine_types() {
         let (vcpu, ram) = machine_shape(mt).unwrap();
-        assert!(vcpu >= 8 && ram >= 16, "{}", mt);
+        assert!(vcpu >= 2 && ram >= 8, "{}", mt);
+        // The name-derived shape and price agree with the pool table.
+        let (q_vcpu, q_ram) = spot_dashboard_edge::qualify::machine_shape(mt).unwrap();
+        assert_eq!((vcpu, ram as f64), (q_vcpu, q_ram.floor()), "{}", mt);
+        assert!(
+            spot_dashboard_edge::state::machine_type_hourly_usd(mt).is_some(),
+            "{}",
+            mt
+        );
+    }
+    // Small hosts are for pools only; the floor's patch allowlists stay as they were.
+    for mt in POOL_SMALL_MACHINE_TYPES {
+        assert!(launchable_machine_types().contains(mt));
+        assert!(!spot_dashboard_edge::patch::PERMITTED_MACHINE_TYPES.contains(mt));
+        assert!(!spot_dashboard_edge::patch::PERMITTED_ARM64_MACHINE_TYPES.contains(mt));
     }
     assert!(launchable_machine_types().contains(&"c4a-highcpu-16"));
     assert!(!launchable_machine_types().contains(&"n4-standard-16"));
@@ -1036,6 +1068,29 @@ fn pool_script_stays_small_and_uses_safe_dom_helpers() {
     assert!(html.contains("onclick=\"launchQualRow(${i})\""));
 }
 
+#[test]
+fn pool_script_ids_do_not_clash_with_the_dashboard() {
+    // getElementById returns the first match, so a clashing id would wire the pool dialog to a
+    // dashboard element (as the rollout preview's rp-hosts and rp-refresh once did).
+    use spot_dashboard_edge::ui_runner_pools::RUNNER_POOLS_JS;
+    let html = spot_dashboard_edge::ui::DASHBOARD_HTML;
+    let mut checked = 0;
+    for marker in ["id: \"", "num(\""] {
+        let mut rest = RUNNER_POOLS_JS;
+        while let Some(i) = rest.find(marker) {
+            rest = &rest[i + marker.len()..];
+            let id = &rest[..rest.find('"').unwrap()];
+            assert!(
+                !html.contains(&format!("id=\"{}\"", id)),
+                "id {} is used by both the dashboard and the pool script",
+                id
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 20, "{checked}");
+}
+
 fn legacy_blob_with(pools: &[RunnerPool]) -> String {
     // A state blob written before pools moved to their own key.
     let mut v = serde_json::to_value(base_state()).unwrap();
@@ -1102,6 +1157,7 @@ async fn resize_changes_the_host_count_within_limits_and_budget() {
         ResizeRunnerPoolRequest {
             id: id.clone(),
             hosts: 3,
+            min_hosts: None,
         },
         NOW,
     )
@@ -1116,6 +1172,7 @@ async fn resize_changes_the_host_count_within_limits_and_budget() {
             ResizeRunnerPoolRequest {
                 id: id.clone(),
                 hosts: bad,
+                min_hosts: None,
             },
             NOW,
         )
@@ -1127,6 +1184,7 @@ async fn resize_changes_the_host_count_within_limits_and_budget() {
         ResizeRunnerPoolRequest {
             id: "nope00".into(),
             hosts: 1,
+            min_hosts: None,
         },
         NOW,
     )
@@ -1143,6 +1201,7 @@ async fn resize_changes_the_host_count_within_limits_and_budget() {
         ResizeRunnerPoolRequest {
             id: id.clone(),
             hosts: 10,
+            min_hosts: None,
         },
         NOW,
     )
@@ -1157,6 +1216,7 @@ async fn resize_changes_the_host_count_within_limits_and_budget() {
         ResizeRunnerPoolRequest {
             id: id.clone(),
             hosts: 1,
+            min_hosts: None,
         },
         NOW,
     )
@@ -1168,7 +1228,16 @@ async fn resize_changes_the_host_count_within_limits_and_budget() {
     handle_remove_runner_pool(&kv, RemoveRunnerPoolRequest { id: id.clone() }, NOW)
         .await
         .unwrap();
-    let err = handle_resize_runner_pool(&kv, ResizeRunnerPoolRequest { id, hosts: 2 }, NOW).await;
+    let err = handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id,
+            hosts: 2,
+            min_hosts: None,
+        },
+        NOW,
+    )
+    .await;
     assert!(matches!(err, Err(StateError::Validation(_))));
 }
 
@@ -1211,6 +1280,7 @@ async fn scaling_down_deletes_the_newest_idle_hosts_and_keeps_busy_ones() {
         ResizeRunnerPoolRequest {
             id: id.clone(),
             hosts: 2,
+            min_hosts: None,
         },
         NOW,
     )
@@ -1241,6 +1311,7 @@ async fn scaling_down_deletes_the_newest_idle_hosts_and_keeps_busy_ones() {
         ResizeRunnerPoolRequest {
             id: id.clone(),
             hosts: 1,
+            min_hosts: None,
         },
         NOW,
     )
@@ -1254,9 +1325,17 @@ async fn scaling_down_deletes_the_newest_idle_hosts_and_keeps_busy_ones() {
 
     // Scaling back up launches a host again.
     gcp.instances.lock().unwrap().retain(|i| i.name == new);
-    handle_resize_runner_pool(&kv, ResizeRunnerPoolRequest { id, hosts: 2 }, NOW)
-        .await
-        .unwrap();
+    handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id,
+            hosts: 2,
+            min_hosts: None,
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
     reset_reconciler_state();
     let r = run_reconciliation(&kv, &gcp, &gh, NOW + 1800)
         .await
@@ -1303,6 +1382,7 @@ async fn scaling_down_keeps_a_host_whose_runner_took_a_job_since_the_list() {
         ResizeRunnerPoolRequest {
             id: id.clone(),
             hosts: 1,
+            min_hosts: None,
         },
         NOW,
     )
@@ -1332,6 +1412,7 @@ async fn resize_does_not_undo_a_remove_saved_meanwhile() {
         ResizeRunnerPoolRequest {
             id: id.clone(),
             hosts: 2,
+            min_hosts: None,
         },
         NOW,
     )
@@ -1475,4 +1556,492 @@ async fn a_running_create_is_not_doubled_until_it_is_long_overdue() {
         .unwrap();
     assert_eq!(r.launched_hosts.len(), 1, "{:?}", r);
     assert_eq!(gcp.inserted.lock().unwrap().len(), 2);
+}
+
+// ============================================================================
+// Autoscaling pools: spin up on queued jobs, spin down when idle
+// ============================================================================
+
+fn small_auto_request() -> CreateRunnerPoolRequest {
+    CreateRunnerPoolRequest {
+        target: "swack-tools".into(),
+        machine_type: "n4a-standard-2".into(),
+        zone: "us-central1-a".into(),
+        hosts: 3,
+        runners_per_host: 1,
+        runner_vcpu: 2,
+        runner_ram_gib: 6,
+        labels: vec!["small".into()],
+        cloud_init_template_id: String::new(),
+        min_hosts: Some(0),
+        idle_minutes: Some(10),
+    }
+}
+
+fn labels(l: &[&str]) -> Vec<String> {
+    l.iter().map(|s| s.to_string()).collect()
+}
+
+fn pool_status(kv: &Kv, id: &str) -> RunnerPoolStatus {
+    kv.bundle()
+        .state
+        .runner_pool_status
+        .get(id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[test]
+fn autoscaling_settings_are_validated() {
+    let state = base_state().state;
+    let pool = validate_create_request(&small_auto_request(), &state, "o", NOW).unwrap();
+    assert!(pool.autoscales());
+    assert_eq!(
+        (pool.min_hosts(), pool.hosts, pool.idle_minutes()),
+        (0, 3, 10)
+    );
+    assert_eq!(
+        runs_on_labels(&pool),
+        labels(&["self-hosted", "ARM64", "spot", "small"])
+    );
+
+    let mut req = small_auto_request();
+    req.min_hosts = Some(4);
+    assert!(validate_create_request(&req, &state, "o", NOW)
+        .unwrap_err()
+        .contains("Minimum hosts"));
+    req.min_hosts = Some(0);
+    req.idle_minutes = Some(1);
+    assert!(validate_create_request(&req, &state, "o", NOW)
+        .unwrap_err()
+        .contains("Idle minutes"));
+    // A minimum equal to the size, or none, is a fixed-size pool.
+    req.idle_minutes = None;
+    req.min_hosts = Some(3);
+    let fixed = validate_create_request(&req, &state, "o", NOW).unwrap();
+    assert!(!fixed.autoscales());
+    assert_eq!(fixed.min_hosts, None);
+    // Without labels of its own, runs-on names the machine type.
+    req.labels = vec![];
+    let bare = validate_create_request(&req, &state, "o", NOW).unwrap();
+    assert_eq!(
+        runs_on_labels(&bare),
+        labels(&["self-hosted", "ARM64", "spot", "n4a-standard-2"])
+    );
+}
+
+#[test]
+fn a_job_fits_a_pool_only_when_the_pool_has_all_its_labels() {
+    let pool = labels(&[
+        "self-hosted",
+        "Linux",
+        "ARM64",
+        "spot",
+        "n4a-standard-2",
+        "us-central1-a",
+        "small",
+    ]);
+    assert!(job_fits_labels(
+        &labels(&["self-hosted", "arm64", "small"]),
+        &pool
+    ));
+    assert!(!job_fits_labels(
+        &labels(&["self-hosted", "small", "gpu"]),
+        &pool
+    ));
+    assert!(!job_fits_labels(&labels(&["ubuntu-latest"]), &pool));
+    assert!(!job_fits_labels(&[], &pool));
+}
+
+#[tokio::test]
+async fn an_autoscaling_pool_waits_for_a_matching_queued_job() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, small_auto_request()).await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+
+    // Nothing queued: no host.
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 60).await.unwrap();
+    assert!(r.launched_hosts.is_empty(), "{:?}", r);
+    let st = pool_status(&kv, &id);
+    assert_eq!((st.queued_jobs, st.desired_hosts), (Some(0), Some(0)));
+
+    // A job for other runners doesn't count.
+    *gh.queued.lock().unwrap() = vec![labels(&["ubuntu-latest"]), labels(&["self-hosted", "X64"])];
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 360).await.unwrap();
+    assert!(r.launched_hosts.is_empty(), "{:?}", r);
+
+    // Two jobs this pool can take: it wants two hosts and starts one per tick.
+    gh.queued
+        .lock()
+        .unwrap()
+        .push(labels(&["self-hosted", "ARM64", "small"]));
+    gh.queued
+        .lock()
+        .unwrap()
+        .push(labels(&["self-hosted", "small"]));
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, NOW + 660).await.unwrap();
+    assert_eq!(r.launched_hosts.len(), 1, "{:?}", r);
+    let st = pool_status(&kv, &id);
+    assert_eq!((st.queued_jobs, st.desired_hosts), (Some(2), Some(2)));
+    let inserted = gcp.inserted.lock().unwrap().clone();
+    assert_eq!(
+        inserted[0].1.machine_type,
+        "zones/us-central1-a/machineTypes/n4a-standard-2"
+    );
+}
+
+#[tokio::test]
+async fn idle_hosts_spin_down_after_the_idle_time_and_busy_ones_stay() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, small_auto_request()).await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+    let a = format!("{}{}-aaaa", pool_host_name_prefix(&id), NOW);
+    let b = format!("{}{}-bbbb", pool_host_name_prefix(&id), NOW + 30);
+    for n in [&a, &b] {
+        gcp.instances.lock().unwrap().push(host(n, &id, "RUNNING"));
+    }
+    // Host a is idle, host b runs a job.
+    gh.runners.lock().unwrap().insert(
+        "orgs/swack-tools".into(),
+        vec![pool_runner(1, &a, 1, false), pool_runner(2, &b, 1, true)],
+    );
+
+    // First tick sees a idle and starts its clock; nothing is deleted yet.
+    let t0 = NOW + 1800;
+    run_reconciliation(&kv, &gcp, &gh, t0).await.unwrap();
+    assert!(gcp.deleted.lock().unwrap().is_empty());
+    let st = pool_status(&kv, &id);
+    assert_eq!(st.idle_since.get(&a), Some(&t0));
+    assert!(!st.idle_since.contains_key(&b));
+    assert_eq!(st.desired_hosts, Some(1));
+
+    // Five minutes later it's still under the idle time.
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, t0 + 300).await.unwrap();
+    assert!(gcp.deleted.lock().unwrap().is_empty());
+
+    // If GitHub's queue can't be read, the pool keeps its hosts.
+    *gh.fail_queue.lock().unwrap() = true;
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, t0 + 700).await.unwrap();
+    assert!(gcp.deleted.lock().unwrap().is_empty());
+    assert_eq!(pool_status(&kv, &id).queued_jobs, None);
+
+    // Past ten idle minutes with the queue readable: a goes (registration first), b stays.
+    *gh.fail_queue.lock().unwrap() = false;
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, t0 + 900).await.unwrap();
+    assert_eq!(gcp.deleted.lock().unwrap().clone(), vec![a.clone()]);
+    assert_eq!(gh.deleted.lock().unwrap().clone(), vec![1]);
+    assert!(r.launched_hosts.is_empty());
+    let st = pool_status(&kv, &id);
+    assert_eq!(st.last_scale_down_at, Some(t0 + 900));
+    assert!(!st.idle_since.contains_key(&a));
+
+    // b finishes its job; ten idle minutes later the pool is down to zero hosts.
+    gcp.instances.lock().unwrap().retain(|i| i.name == b);
+    gh.runners.lock().unwrap().insert(
+        "orgs/swack-tools".into(),
+        vec![pool_runner(2, &b, 1, false)],
+    );
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, t0 + 1200).await.unwrap();
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, t0 + 1200 + 600)
+        .await
+        .unwrap();
+    assert_eq!(gcp.deleted.lock().unwrap().clone(), vec![a, b]);
+}
+
+#[tokio::test]
+async fn a_new_host_is_not_idle_while_it_boots() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, small_auto_request()).await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+    let started = NOW + 100;
+    let h = format!("{}{}-aaaa", pool_host_name_prefix(&id), started);
+    gcp.instances.lock().unwrap().push(host(&h, &id, "RUNNING"));
+    // No runner registered yet: still booting for the grace period.
+    run_reconciliation(&kv, &gcp, &gh, started + 600)
+        .await
+        .unwrap();
+    assert!(pool_status(&kv, &id).idle_since.is_empty());
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, started + 1200)
+        .await
+        .unwrap();
+    assert!(gcp.deleted.lock().unwrap().is_empty());
+    // A host whose setup never registered a runner counts as idle after the grace period.
+    reset_reconciler_state();
+    let late = started + HOST_BOOT_GRACE_SECS + 60;
+    run_reconciliation(&kv, &gcp, &gh, late).await.unwrap();
+    assert_eq!(pool_status(&kv, &id).idle_since.get(&h), Some(&late));
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, late + 600)
+        .await
+        .unwrap();
+    assert_eq!(gcp.deleted.lock().unwrap().clone(), vec![h]);
+}
+
+#[tokio::test]
+async fn fixed_size_pools_do_not_read_the_queue_or_spin_down() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, axion_request("swack-tools")).await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+    let h = format!("{}{}-aaaa", pool_host_name_prefix(&id), NOW);
+    gcp.instances.lock().unwrap().push(host(&h, &id, "RUNNING"));
+    gh.runners.lock().unwrap().insert(
+        "orgs/swack-tools".into(),
+        vec![pool_runner(1, &h, 1, false), pool_runner(2, &h, 2, false)],
+    );
+    for t in [NOW + 3600, NOW + 7200] {
+        reset_reconciler_state();
+        run_reconciliation(&kv, &gcp, &gh, t).await.unwrap();
+    }
+    assert!(gcp.deleted.lock().unwrap().is_empty());
+    assert_eq!(gh.queue_reads.load(Ordering::SeqCst), 0);
+    let st = pool_status(&kv, &id);
+    assert_eq!((st.queued_jobs, st.desired_hosts), (None, None));
+}
+
+#[tokio::test]
+async fn switching_a_pools_template_replaces_idle_hosts_one_at_a_time() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    let id = seed_pool(
+        &kv,
+        |s| {
+            s.cloud_init_templates = vec![
+                template("old", "cicd_runner", "#!/bin/bash\necho old\n"),
+                template("new", "cicd_runner", "#!/bin/bash\necho new\n"),
+                template("yaml", "cicd_runner", "#cloud-config\npackages: [jq]\n"),
+            ]
+        },
+        CreateRunnerPoolRequest {
+            hosts: 2,
+            cloud_init_template_id: "old".into(),
+            ..axion_request("swack-tools")
+        },
+    )
+    .await;
+
+    // Unusable templates and unknown pools are refused.
+    let bad = handle_set_pool_template(
+        &kv,
+        SetPoolTemplateRequest {
+            id: id.clone(),
+            cloud_init_template_id: "yaml".into(),
+        },
+        NOW,
+    )
+    .await;
+    assert!(matches!(bad, Err(StateError::Validation(_))), "{:?}", bad);
+    let missing = handle_set_pool_template(
+        &kv,
+        SetPoolTemplateRequest {
+            id: "nope00".into(),
+            cloud_init_template_id: "new".into(),
+        },
+        NOW,
+    )
+    .await;
+    assert!(matches!(missing, Err(StateError::NotFound(_))));
+
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+    let a = format!("{}{}-aaaa", pool_host_name_prefix(&id), NOW + 10);
+    let b = format!("{}{}-bbbb", pool_host_name_prefix(&id), NOW + 20);
+    for n in [&a, &b] {
+        gcp.instances.lock().unwrap().push(host(n, &id, "RUNNING"));
+    }
+    gh.runners.lock().unwrap().insert(
+        "orgs/swack-tools".into(),
+        vec![
+            pool_runner(1, &a, 1, false),
+            pool_runner(2, &a, 2, false),
+            pool_runner(3, &b, 1, true),
+            pool_runner(4, &b, 2, false),
+        ],
+    );
+    let changed = NOW + 1000;
+    let view = handle_set_pool_template(
+        &kv,
+        SetPoolTemplateRequest {
+            id: id.clone(),
+            cloud_init_template_id: "new".into(),
+        },
+        changed,
+    )
+    .await
+    .unwrap();
+    assert_eq!(view["pools"][0]["cloud_init_template_name"], "new template");
+    let pool = kv.pools().into_iter().find(|p| p.id == id).unwrap();
+    assert_eq!(pool.setup_updated_at, Some(changed));
+    assert!(pool.setup_script.contains("echo new"));
+
+    // The idle old host goes; the busy one stays until its job ends.
+    run_reconciliation(&kv, &gcp, &gh, changed + 60)
+        .await
+        .unwrap();
+    assert_eq!(gcp.deleted.lock().unwrap().clone(), vec![a.clone()]);
+    assert!(gcp.inserted.lock().unwrap().is_empty());
+
+    // Next tick: the replacement starts with the new template.
+    gcp.instances.lock().unwrap().retain(|i| i.name != a);
+    reset_reconciler_state();
+    let r = run_reconciliation(&kv, &gcp, &gh, changed + 360)
+        .await
+        .unwrap();
+    assert_eq!(r.launched_hosts.len(), 1, "{:?}", r);
+    let inserted = gcp.inserted.lock().unwrap().clone();
+    let script = startup_script(&inserted[0].1);
+    let marker = "printf '%s' '";
+    let start = script.find(marker).unwrap() + marker.len();
+    let b64 = &script[start..script[start..].find('\'').unwrap() + start];
+    let dockerfile = String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap(),
+    )
+    .unwrap();
+    let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t);
+    assert!(
+        dockerfile.contains(&enc("#!/bin/bash\necho new\n")),
+        "{}",
+        dockerfile
+    );
+    assert!(!dockerfile.contains(&enc("#!/bin/bash\necho old\n")));
+
+    // b's job ends, but the replacement is still booting: b stays, so the pool is never more
+    // than one host short.
+    let c = r.launched_hosts[0].clone();
+    gcp.instances.lock().unwrap().push(host(&c, &id, "RUNNING"));
+    gh.runners.lock().unwrap().insert(
+        "orgs/swack-tools".into(),
+        vec![pool_runner(3, &b, 1, false), pool_runner(4, &b, 2, false)],
+    );
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, changed + 660)
+        .await
+        .unwrap();
+    assert_eq!(gcp.deleted.lock().unwrap().clone(), vec![a.clone()]);
+
+    // Once the replacement's runners are online, b is replaced too.
+    gh.runners.lock().unwrap().insert(
+        "orgs/swack-tools".into(),
+        vec![
+            pool_runner(3, &b, 1, false),
+            pool_runner(4, &b, 2, false),
+            pool_runner(5, &c, 1, false),
+            pool_runner(6, &c, 2, false),
+        ],
+    );
+    reset_reconciler_state();
+    run_reconciliation(&kv, &gcp, &gh, changed + 960)
+        .await
+        .unwrap();
+    assert_eq!(
+        gcp.deleted.lock().unwrap().clone(),
+        vec![a.clone(), b.clone()]
+    );
+}
+
+#[tokio::test]
+async fn resize_can_change_the_fewest_hosts() {
+    let _g = lock();
+    invalidate_state_cache();
+    let kv = Kv::default();
+    let id = seed_pool(&kv, |_| {}, small_auto_request()).await;
+    handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 4,
+            min_hosts: Some(1),
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+    let p = kv.pools().into_iter().find(|p| p.id == id).unwrap();
+    assert_eq!((p.min_hosts(), p.hosts), (1, 4));
+    let err = handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 2,
+            min_hosts: Some(3),
+        },
+        NOW,
+    )
+    .await;
+    assert!(matches!(err, Err(StateError::Validation(_))));
+    // Keeping the minimum out of the request keeps it.
+    handle_resize_runner_pool(
+        &kv,
+        ResizeRunnerPoolRequest {
+            id: id.clone(),
+            hosts: 5,
+            min_hosts: None,
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+    let p = kv.pools().into_iter().find(|p| p.id == id).unwrap();
+    assert_eq!((p.min_hosts(), p.hosts), (1, 5));
+}
+
+#[tokio::test]
+async fn small_e2_and_t2d_hosts_attach_disks_over_scsi() {
+    let _g = lock();
+    for (machine, want) in [
+        ("e2-standard-2", "SCSI"),
+        ("t2d-standard-2", "SCSI"),
+        ("n4a-standard-2", "NVME"),
+        ("t2a-standard-2", "NVME"),
+    ] {
+        invalidate_state_cache();
+        reset_reconciler_state();
+        let kv = Kv::default();
+        seed_pool(
+            &kv,
+            |_| {},
+            CreateRunnerPoolRequest {
+                machine_type: machine.into(),
+                hosts: 1,
+                min_hosts: None,
+                ..small_auto_request()
+            },
+        )
+        .await;
+        let gcp = Gcp::default();
+        let gh = Gh::default();
+        run_reconciliation(&kv, &gcp, &gh, NOW + 60).await.unwrap();
+        let inserted = gcp.inserted.lock().unwrap().clone();
+        assert_eq!(inserted.len(), 1, "{machine}");
+        for disk in &inserted[0].1.disks {
+            assert_eq!(disk.interface.as_deref(), Some(want), "{machine}");
+        }
+    }
 }
