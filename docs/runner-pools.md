@@ -2,7 +2,7 @@
 
 A runner pool is a set of Spot hosts that you start from the dashboard. You pick a machine from the **Qualifying Instances Matrix**, choose the organization or repository the runners register with, and say how many runners each host runs. By default a pool spins down when it's idle: it runs no hosts until a job asks for its runners, starts hosts for the queued jobs, and deletes hosts that sit idle. The Worker's reconciler does this every 5 minutes, and starts a replacement when Spot takes a host back.
 
-Pools sit next to the fleet floor described in [Fleet and autoscaler](fleet-and-autoscaler.md). The floor keeps one fixed-shape x86 host for each built-in target. A pool can use any machine type that the matrix marks as launchable, including small 2 vCPU hosts and ARM64 Axion hosts, and any organization or repository the Worker's GitHub token can register runners with.
+Pools sit next to the fleet floor described in [Fleet and autoscaler](fleet-and-autoscaler.md). The floor keeps one fixed-shape x86 host for each built-in target. A pool can use any machine type that the matrix lists, including small 2 vCPU hosts and ARM64 Axion hosts, and any organization or repository the Worker's GitHub token can register runners with.
 
 ## Before you begin
 
