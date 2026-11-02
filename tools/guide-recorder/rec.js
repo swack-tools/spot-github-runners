@@ -20,6 +20,7 @@ const MASKS = [
   ['xbmc4lyfe/rustnzb', 'example-user/app-two'],
   ['xbmc4lyfe/nntp-proxy', 'example-user/app-three'],
   ['spot.swacktech.com', 'dashboard.example.com'],
+  ['swacktech.com', 'example.com'],
   ['homelab-424523', 'example-ci-fleet'],
   ['swack-tools', 'example-org'],
   ['xbmc4lyfe', 'example-user'],
@@ -108,7 +109,7 @@ async function open(name, opts = {}) {
   cdp.on('Page.screencastFrame', async f => {
     const buf = Buffer.from(f.data, 'base64');
     // Element screenshots show up as odd-sized frames; keep only full-viewport ones.
-    if (buf.readUInt32BE(16) === W && buf.readUInt32BE(20) === H) {
+    if (buf.readUInt32BE(16) === W && buf.readUInt32BE(20) === H && page.url() !== 'about:blank') {
       const file = path.join(fdir, String(frames.length).padStart(5, '0') + '.png');
       frames.push({ file, t: f.metadata.timestamp });
       fs.writeFileSync(file, buf);
