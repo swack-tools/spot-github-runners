@@ -33,7 +33,7 @@ The prices are GCP's Spot list prices for `us-central1`, per vCPU and per GiB of
 
 ## Launch a pool
 
-1. In the matrix, select **CI/CD Runner Candidates**, then click **Launch** on the row you want. **Launch** is unavailable for machine types that can't host runners yet; hover over it to see why.
+1. In the matrix, select **CI/CD Runner Candidates**, then click **Launch** on the row you want. The matrix lists only machines a pool can launch. If the hourly budget cap or the pool limit is in the way, the row says so in place of **Launch**. Over the cap, the row offers a button that raises the cap after you confirm.
 1. In the **Launch runners** dialog, set these fields:
 
     | Field | What it does |
