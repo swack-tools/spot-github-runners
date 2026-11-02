@@ -270,3 +270,12 @@ async fn test_overview_snapshot_serialization_parity() {
         serde_json::from_str(&serialized).expect("Deserialize bundle");
     assert_eq!(bundle, deserialized);
 }
+
+#[test]
+fn two_vcpu_machine_shapes_are_not_rounded_up() {
+    use spot_dashboard_edge::state::infer_machine_type_vcpu_ram as shape;
+    assert_eq!(shape("e2-standard-2", false), (2, 8));
+    assert_eq!(shape("t2d-standard-2", false), (2, 8));
+    assert_eq!(shape("n4a-standard-2", false), (2, 8));
+    assert_eq!(shape("e2-standard-4", false), (4, 16));
+}

@@ -1585,16 +1585,18 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                 Ok(p) => p,
                 Err(msg) => return error_response(500, "launch_plan_failed", &msg),
             };
-            if let Err(e) = client
+            let operation = match client
                 .insert_instance(&plan.zone, &plan.request, None, now)
                 .await
             {
-                return error_response(502, "gcp_error", &e.to_string());
-            }
+                Ok(op) => op.name,
+                Err(e) => return error_response(502, "gcp_error", &e.to_string()),
+            };
             json_response(
                 200,
                 &serde_json::json!({
                     "launched": true,
+                    "operation": operation,
                     "name": plan.instance_name,
                     "zone": plan.zone,
                     "machine_type": builders::BUILDER_MACHINE_TYPE,
@@ -1602,6 +1604,40 @@ pub async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response
                     "ssh_user": plan.ssh_user,
                 }),
             )
+        }
+
+        // GCE accepts an instance insert and reports quota or capacity failures on its operation.
+        (Method::Get, "/api/builders/launch-status") => {
+            let session = match verified_session {
+                Some(ref s) => s,
+                None => return error_response(401, "unauthorized", "Sign in required"),
+            };
+            if session.uid != state::OWNER_UID {
+                return error_response(
+                    403,
+                    "forbidden",
+                    "Only the dashboard owner can launch builders",
+                );
+            }
+            let query = |key: &str| {
+                url.query_pairs()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.into_owned())
+                    .unwrap_or_default()
+            };
+            let zone = query("zone");
+            let operation = query("operation");
+            if let Err(msg) = builders::validate_zone(&zone) {
+                return error_response(400, "validation_error", &msg);
+            }
+            let client = match builder_gcp_client(&env) {
+                Ok(c) => c,
+                Err(msg) => return error_response(503, "gcp_not_configured", &msg),
+            };
+            match client.get_zone_operation(&zone, &operation, now).await {
+                Ok(op) => json_response(200, &builders::launch_status(&op)),
+                Err(e) => error_response(502, "gcp_error", &e.to_string()),
+            }
         }
 
         (Method::Post, "/api/builders/delete") => {

@@ -325,6 +325,7 @@ fn builder_changes_are_owner_only_and_reads_need_an_administrator() {
     };
     for head in [
         "(Method::Post, \"/api/builders/launch\") =>",
+        "(Method::Get, \"/api/builders/launch-status\") =>",
         "(Method::Post, \"/api/builders/delete\") =>",
         "(Method::Post, \"/api/builders/delete-cache-disk\") =>",
     ] {
@@ -610,4 +611,42 @@ fn cargo_remote_refuses_another_rust_version_and_reports_no_ready_builder() {
     let out = sb.run("proj-a", &["remote", "build"]);
     assert_eq!(out.status.code(), Some(64));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no builder is free"));
+}
+
+#[test]
+fn launch_status_reports_a_quota_failure() {
+    let op: spot_dashboard_edge::gcp::GceOperation = serde_json::from_value(serde_json::json!({
+        "name": "operation-1",
+        "status": "DONE",
+        "error": {"errors": [{"code": "QUOTA_EXCEEDED", "message": "Quota 'HDB_TOTAL_GB' exceeded."}]},
+    }))
+    .unwrap();
+    let status = launch_status(&op);
+    assert_eq!(status["done"], true);
+    assert_eq!(status["error"], "Quota 'HDB_TOTAL_GB' exceeded.");
+}
+
+#[test]
+fn launch_status_waits_for_a_running_operation() {
+    let op: spot_dashboard_edge::gcp::GceOperation =
+        serde_json::from_value(serde_json::json!({"name": "operation-1", "status": "RUNNING"}))
+            .unwrap();
+    let status = launch_status(&op);
+    assert_eq!(status["done"], false);
+    assert!(status["error"].is_null());
+}
+
+#[test]
+fn builder_startup_claims_gid_1001_before_installing_docker() {
+    let script = spot_dashboard_edge::gcp::RAW_BUILDER_STARTUP_SCRIPT;
+    let claim = script
+        .find("\nclaim_build_gid\n")
+        .expect("claim_build_gid is called");
+    let docker = script
+        .find("apt-get install -y docker-ce")
+        .expect("docker is installed");
+    assert!(claim < docker);
+    assert!(script.contains("docker | lxd)"));
+    // getent exits 2 for an unused GID, which pipefail and set -e must not turn into a failed setup.
+    assert!(script.contains("holder=$(getent group 1001 | cut -d: -f1) || true"));
 }

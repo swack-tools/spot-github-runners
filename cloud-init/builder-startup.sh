@@ -69,6 +69,26 @@ done
 . /etc/os-release
 [[ "$ID" == debian && "$VERSION_CODENAME" == trixie ]]
 export DEBIAN_FRONTEND=noninteractive
+# Container builds run as UID and GID 1001. The GCE guest agent can create docker and lxd on the next free GIDs
+# before this script runs, so move those aside. Any other group holding 1001 stops the setup.
+claim_build_gid() {
+  local holder gid=1100
+  holder=$(getent group 1001 | cut -d: -f1) || true
+  case "$holder" in
+    oxidex-build) return 0 ;;
+    docker | lxd)
+      while getent group "$gid" >/dev/null; do gid=$((gid + 1)); done
+      groupmod -g "$gid" "$holder"
+      ;;
+    "") ;;
+    *)
+      echo "GID 1001 belongs to group $holder, and container builds need it: hold" >&2
+      exit 78
+      ;;
+  esac
+  groupadd -g1001 oxidex-build
+}
+claim_build_gid
 apt-get update
 apt-get install -y ca-certificates curl gnupg git openssh-client rsync jq util-linux sudo
 install -d -m0755 /etc/apt/keyrings
@@ -163,7 +183,9 @@ docker_root=$(printf '%s' "$docker_info" | jq -re '.DockerRootDir')
 [[ "$docker_root" == "$MOUNT_POINT/docker" ]] || { echo "Docker root is not $MOUNT_POINT/docker: $docker_root" >&2; exit 78; }
 has_snapshotter=$(printf '%s' "$docker_info" | jq -r '[.DriverStatus[][]? | select(tostring | contains("containerd.snapshotter"))] | length')
 [[ "$has_snapshotter" -eq 0 ]] || { echo "Docker containerd snapshotter detected: hold" >&2; exit 78; }
-getent group 1001 >/dev/null && [[ "$(getent group 1001 | cut -d: -f1)" == oxidex-build ]] || { getent group 1001 >/dev/null && exit 78; groupadd -g1001 oxidex-build; }
+claim_build_gid
+# A docker group moved after the socket was bound leaves the socket on its old GID.
+chgrp docker /run/docker.sock
 # Validate the complete host group/account inventory before granting filesystem access.
 uploader_raw='{{UPLOADER_CONFIG}}'
 if [[ "$uploader_raw" =~ ^\{\{.*\}\}$ || -z "$uploader_raw" ]]; then
