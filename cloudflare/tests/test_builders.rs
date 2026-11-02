@@ -650,3 +650,21 @@ fn builder_startup_claims_gid_1001_before_installing_docker() {
     // getent exits 2 for an unused GID, which pipefail and set -e must not turn into a failed setup.
     assert!(script.contains("holder=$(getent group 1001 | cut -d: -f1) || true"));
 }
+
+#[test]
+fn builder_startup_reads_the_probe_container_from_docker() {
+    let script = spot_dashboard_edge::gcp::RAW_BUILDER_STARTUP_SCRIPT;
+    // No program on the VM writes a receipt, so the record has to come from the Docker daemon.
+    let events = script
+        .find("/usr/bin/docker events --since \"$probe_started\"")
+        .expect("reads Docker's event log");
+    let probe = script
+        .find("bootstrap-tools /usr/local/bin/oxidex-toolchain-probe")
+        .expect("runs the probe");
+    assert!(probe < events);
+    assert!(script.contains("if length == 1 then"));
+    // getent exits 2 for an unused UID, which pipefail and set -e must not turn into a failed setup.
+    assert!(
+        script.contains("existing_by_uid=$(getent passwd \"$uploader_uid\" | cut -d: -f1) || true")
+    );
+}
