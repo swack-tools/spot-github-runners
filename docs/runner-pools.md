@@ -33,7 +33,11 @@ The prices are GCP's Spot list prices for `us-central1`, per vCPU and per GiB of
 
 ## Launch a pool
 
-1. In the matrix, select **CI/CD Runner Candidates**, then click **Launch** on the row you want. The matrix lists only machines a pool can launch. If the hourly budget cap or the pool limit is in the way, the row says so in place of **Launch**. Over the cap, the row offers a button that raises the cap after you confirm.
+1. In the matrix, select **CI/CD Runner Candidates**. The matrix lists only machines a pool can launch, and the strip over it counts how many are ready and how many need a budget change. Each row's chip shows **Ready**, **Over cap**, or **Pools full**.
+1. Click **Launch** on the row you want. A panel opens under the row.
+1. Set **Hosts** and the organization or repository. The bar shows what the hosts add against the hourly budget cap.
+1. To launch with the defaults, click **Launch up to** the number of hosts you set. Over the cap, the button reads **Raise cap to** the amount needed **and launch**, and it does both. The defaults are one or more runners per host sized from your profile, spin-down when idle, and no extra labels or template. Then copy the `runs-on` line and click **Done**, and skip the remaining steps.
+1. To change the defaults, click **More options** instead.
 1. In the **Launch runners** dialog, set these fields:
 
     | Field | What it does |

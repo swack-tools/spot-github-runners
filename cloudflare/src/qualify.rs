@@ -9,7 +9,7 @@
 use serde_json::{json, Map, Value};
 
 /// When [`spot_rates`] was read from the Cloud Billing Catalog API (service `6F81-5844-456A`).
-pub const SPOT_PRICES_AS_OF: &str = "2026-11-01";
+pub const SPOT_PRICES_AS_OF: &str = "2026-11-02";
 /// Where the rates apply. Other regions differ by up to about a third.
 pub const SPOT_PRICES_REGION: &str = "us-central1";
 pub const PRICING_SOURCE: &str = "gce_spot_list_price";
@@ -21,13 +21,13 @@ pub fn spot_rates(series: &str) -> Option<(f64, f64)> {
     Some(match series {
         "e2" => (0.01309, 0.001754),
         "t2d" => (0.0165, 0.002212),
-        "t2a" => (0.01345, 0.001836),
-        "c4a" => (0.01525, 0.001736),
+        "t2a" => (0.01278, 0.001744),
+        "c4a" => (0.01601, 0.001823),
         "n4a" => (0.01002, 0.001141),
-        "c2d" => (0.01357, 0.001819),
+        "c2d" => (0.01289, 0.001728),
         // Billed per GB; converted to GiB.
-        "c4d" => (0.01452, 0.001554 * 1.073_741_824),
-        "n4" => (0.01845, 0.002094),
+        "c4d" => (0.01379, 0.001476 * 1.073_741_824),
+        "n4" => (0.01753, 0.001989),
         "c4" => (0.02074, 0.002357),
         "n4d" => (0.01745, 0.001986),
         _ => return None,

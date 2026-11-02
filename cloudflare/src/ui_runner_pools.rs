@@ -73,6 +73,16 @@ document.head.append(el("style", { text: `
 .table-wrap:has(#qualification-table-body) :is(td,th):last-child{position:sticky;right:0}
 .table-wrap:has(#qualification-table-body) td:last-child{background:var(--bg-panel);box-shadow:-10px 0 10px -10px rgba(0,0,0,.6)}
 .table-wrap:has(#qualification-table-body) tr:hover td:last-child{background:var(--bg-card)}
+#rp-qual-summary{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;margin:0 0 var(--space-3,12px)}
+.rp-launch-row td{position:static!important;box-shadow:none!important;white-space:normal;background:var(--bg-card)!important}
+.rp-launch-box{position:sticky;left:0;max-width:640px;display:grid;gap:10px;padding:4px 0}
+.rp-launch-line{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.rp-stepper input{width:64px;text-align:center}
+.rp-bar{position:relative;display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--bg-sunken);border:1px solid var(--border)}
+.rp-bar-used{background:var(--accent)}
+.rp-bar-add{background:var(--success)}
+.rp-bar.over .rp-bar-add{background:var(--warning)}
+.rp-bar-cap{position:absolute;top:0;bottom:0;width:2px;background:var(--text-main)}
 #ci-pool-hint{margin-top:12px;padding:10px 12px;border-radius:8px;background:var(--bg-card);border:1px solid var(--border)}
 ` }));
 
@@ -226,7 +236,7 @@ function check() {
   $("rp-submit").disabled = problems.length > 0;
 }
 
-async function openRunnerLaunch(row) {
+async function openRunnerLaunch(row, hosts) {
   ROW = row;
   const dlg = buildDialog();
   try { POOLS = await api("/api/runner-pools"); } catch (e) { showToast(`Couldn't load runner pools: ${e.message}`); return; }
@@ -237,7 +247,7 @@ async function openRunnerLaunch(row) {
   $("rp-rph").value = String(Math.min(row.units_per_instance || 1, 8));
   $("rp-vcpu").value = String(row.unit_vcpu || 7);
   $("rp-ram").value = String(row.unit_ram_gib || 14);
-  $("rp-max-hosts").value = "2";
+  $("rp-max-hosts").value = String(hosts || 2);
   $("rp-labels").value = "";
   $("rp-auto").checked = true;
   $("rp-min").value = "0";
@@ -555,60 +565,211 @@ window.openRunnerLaunch = openRunnerLaunch;
 window.launchQualRow = function (i) {
   const row = (window.QUAL_ROWS || [])[i];
   if (!row) return;
-  const fn = QUAL_ACTIVE_ROLE === "rust_builder" ? window.openBuilderLaunch : window.openRunnerLaunch;
-  if (typeof fn === "function") fn(row);
+  if (QUAL_ACTIVE_ROLE !== "rust_builder") { toggleLaunchPanel(row); return; }
+  if (typeof window.openBuilderLaunch === "function") window.openBuilderLaunch(row);
   else showToast("Launching from this table isn't available for this role yet.");
 };
 
+const rowKey = (row) => `${row.machine_type}|${row.zone}`;
+
 // Every CI/CD row the matrix lists can host runners. What can still stop a launch is the state of
-// the pools, so a row says what's in the way and offers the fix instead of a Launch that would fail.
-function launchObstacle(row) {
+// the pools, so each row's chip says where it stands.
+function poolsFull() {
   const max = (POOLS.limits || {}).max_pools;
-  if (max && (POOLS.pools || []).filter((p) => !p.removing).length >= max) {
-    return { text: `All ${max} runner pools are in use. Remove one in Runner pools to launch here.` };
-  }
+  return !!max && (POOLS.pools || []).filter((p) => !p.removing).length >= max;
+}
+function overCap(row, hosts) {
   const cap = hourlyCap();
-  const total = poolsHourly() + (row.pool_host_hourly_usd || 0);
-  if (cap !== null && total > cap + 1e-9) {
-    return { text: `One host brings all pools to ${usd(total)}/hr, above the ${usd(cap, 2)}/hr cap.`, raiseTo: Math.ceil(total * 100) / 100 };
-  }
-  return null;
+  const total = poolsHourly() + (row.pool_host_hourly_usd || 0) * hosts;
+  return cap !== null && total > cap + 1e-9 ? Math.ceil(total * 100) / 100 : null;
+}
+const chip = (cls, text) => el("span", { class: `badge ${cls}`, text });
+
+// --- Inline launch panel: one row under the machine, open for one machine at a time ----------------
+let PANEL = null; // { key, row, hosts, target, busy, error, done }
+
+function toggleLaunchPanel(row) {
+  const open = PANEL && PANEL.key === rowKey(row);
+  PANEL = open ? null : { key: rowKey(row), row, hosts: 1, target: (POOLS.targets || [])[0] || "", busy: false, error: "", done: null };
+  const old = $("rp-launch-row");
+  if (old) old.remove();
+  syncLaunchPanel();
 }
 
-async function raiseHourlyCap(raiseTo) {
-  if (!confirm(`Raise the hourly budget cap to ${usd(raiseTo, 2)}/hr? This lets runner pools spend up to that much per hour.`)) return;
+function costBar(row, hosts) {
+  const cap = hourlyCap();
+  if (cap === null) return null;
+  const used = poolsHourly();
+  const add = (row.pool_host_hourly_usd || 0) * hosts;
+  const scale = Math.max(cap, used + add) || 1;
+  const pct = (x) => `${(x / scale) * 100}%`;
+  const bar = el("div", { class: `rp-bar${used + add > cap + 1e-9 ? " over" : ""}`, role: "img", "aria-label": `Runner pools would cost ${usd(used + add)} per hour against a ${usd(cap, 2)} per hour cap` },
+    el("div", { class: "rp-bar-used", style: `width:${pct(used)}` }),
+    el("div", { class: "rp-bar-add", style: `width:${pct(add)}` }),
+    el("div", { class: "rp-bar-cap", style: `left:calc(${pct(cap)} - 2px)` }));
+  return bar;
+}
+
+function fillLaunchPanel(box) {
+  const p = PANEL;
+  const row = p.row;
+  box.replaceChildren();
+  if (p.done) {
+    const line = runsOnLine(p.done.runs_on || []);
+    const copy = el("button", { type: "button", class: "btn btn-sm btn-secondary", text: "Copy runs-on" });
+    copy.addEventListener("click", () => copyText(line));
+    const close = el("button", { type: "button", class: "btn btn-sm", text: "Done" });
+    close.addEventListener("click", () => toggleLaunchPanel(row));
+    box.append(
+      el("div", { class: "rp-ok", text: `Pool ${p.done.id} saved. It starts a host when a job asks for these runners; the reconciler checks every 5 minutes.` }),
+      el("code", { class: "mono", text: line }),
+      el("div", { class: "rp-launch-line" }, copy, close));
+    return;
+  }
+  const max = (POOLS.limits || {}).max_hosts_per_pool || 10;
+  const setHosts = (n) => { p.hosts = Math.min(Math.max(n, 1), max); p.error = ""; fillLaunchPanel(box); };
+  const minus = el("button", { type: "button", class: "btn btn-sm btn-secondary", "aria-label": "Fewer hosts", text: "−" });
+  const plus = el("button", { type: "button", class: "btn btn-sm btn-secondary", "aria-label": "More hosts", text: "+" });
+  const count = el("input", { type: "number", min: "1", max: String(max), step: "1", value: String(p.hosts), "aria-label": "Most hosts" });
+  minus.addEventListener("click", () => setHosts(p.hosts - 1));
+  plus.addEventListener("click", () => setHosts(p.hosts + 1));
+  count.addEventListener("change", () => setHosts(parseInt(count.value, 10) || 1));
+  const target = el("select", { "aria-label": "Organization or repository" });
+  for (const t of POOLS.targets || []) target.append(el("option", { value: t, text: t }));
+  target.value = p.target;
+  target.addEventListener("change", () => { p.target = target.value; });
+  const raiseTo = overCap(row, p.hosts);
+  const hostWord = `${p.hosts} host${p.hosts > 1 ? "s" : ""}`;
+  const go = el("button", { type: "button", class: "btn btn-sm", text: raiseTo ? `Raise cap to ${usd(raiseTo, 2)}/hr and launch` : `Launch up to ${hostWord}` });
+  go.disabled = p.busy || !p.target;
+  go.addEventListener("click", () => launchFromPanel(box));
+  const more = el("button", { type: "button", class: "btn btn-sm btn-secondary", text: "More options" });
+  more.addEventListener("click", () => { const r = row; const h = p.hosts; toggleLaunchPanel(r); openRunnerLaunch(r, h); });
+  const cancel = el("button", { type: "button", class: "btn btn-sm btn-secondary", text: "Cancel" });
+  cancel.addEventListener("click", () => toggleLaunchPanel(row));
+  const each = row.pool_host_hourly_usd || 0;
+  const cap = hourlyCap();
+  const total = poolsHourly() + each * p.hosts;
+  box.append(...[
+    el("div", { class: "rp-launch-line rp-stepper" }, el("span", { text: "Hosts" }), minus, count, plus, el("span", { text: "for" }), target),
+    costBar(row, p.hosts),
+    el("div", { class: "hint-sm", text: `Adds up to ${usd(each * p.hosts)}/hr. All pools: ${usd(total)}/hr${cap !== null ? ` of the ${usd(cap, 2)}/hr cap` : ""}. Hosts start when jobs queue and are deleted after sitting idle, so an idle pool costs nothing.` }),
+    p.error ? el("div", { class: "rp-err", text: p.error }) : null,
+    el("div", { class: "rp-launch-line" }, go, more, cancel),
+  ].filter(Boolean));
+}
+
+function launchBody(row, hosts, target) {
+  return {
+    target,
+    machine_type: row.machine_type,
+    zone: row.zone,
+    hosts,
+    runners_per_host: Math.min(row.units_per_instance || 1, (POOLS.limits || {}).max_runners_per_host || 8),
+    runner_vcpu: row.unit_vcpu,
+    runner_ram_gib: Math.max(Math.floor(row.unit_ram_gib), 1),
+    labels: [],
+    cloud_init_template_id: "",
+    min_hosts: 0,
+    idle_minutes: (POOLS.limits || {}).default_idle_minutes || 10,
+  };
+}
+
+async function launchFromPanel(box) {
+  const p = PANEL;
+  p.busy = true;
+  p.error = "";
+  fillLaunchPanel(box);
+  const raiseTo = overCap(p.row, p.hosts);
+  let raised = false;
   try {
-    await api("/api/budget", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...APP_STATE.global_budget, max_hourly_usd: raiseTo }) });
-    await loadOverview();
-    await refreshPools();
-    showToast(`Hourly budget cap is now ${usd(raiseTo, 2)}/hr.`);
-  } catch (e) { showToast(`Couldn't raise the cap: ${e.message}`); }
+    if (raiseTo) {
+      await api("/api/budget", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...APP_STATE.global_budget, max_hourly_usd: raiseTo }) });
+      raised = true;
+    }
+    const data = await api("/api/runner-pools", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(launchBody(p.row, p.hosts, p.target)) });
+    POOLS = data;
+    p.done = (POOLS.pools || []).find((x) => x.id === POOLS.created) || { id: POOLS.created };
+    if (raised) await loadOverview();
+    renderPools();
+  } catch (e) {
+    p.error = raised ? `The cap is now ${usd(raiseTo, 2)}/hr, but the pool wasn't saved: ${e.message}` : `Nothing changed: ${e.message}`;
+    if (raised) await refreshPools();
+  } finally {
+    p.busy = false;
+    if (PANEL === p) fillLaunchPanel(box);
+  }
+}
+
+// Puts the open panel under its row again after the table redraws, or closes it when its row has
+// gone. `data-after` makes the table's sorter keep the panel with its row.
+function syncLaunchPanel() {
+  const old = $("rp-launch-row");
+  if (!PANEL) { if (old) old.remove(); return; }
+  const rows = window.QUAL_ROWS || [];
+  let host = null;
+  document.querySelectorAll("#qualification-table-body button[onclick^='launchQualRow(']").forEach((b) => {
+    const m = /launchQualRow\((\d+)\)/.exec(b.getAttribute("onclick") || "");
+    const row = m ? rows[Number(m[1])] : null;
+    if (row && rowKey(row) === PANEL.key && !b.hidden) { host = b.closest("tr"); PANEL.row = row; }
+  });
+  if (!host) { PANEL = null; if (old) old.remove(); return; }
+  if (old && host.nextElementSibling === old) {
+    if (!PANEL.busy && !old.contains(document.activeElement)) fillLaunchPanel(old.querySelector(".rp-launch-box"));
+    return;
+  }
+  const tr = old || el("tr", { id: "rp-launch-row", class: "rp-launch-row", "data-after": "1" }, el("td", { colspan: String(host.cells.length) }, el("div", { class: "rp-launch-box" })));
+  host.after(tr);
+  if (!old) fillLaunchPanel(tr.querySelector(".rp-launch-box"));
+}
+
+function renderQualSummary(ready, needBudget) {
+  const anchor = $("qualification-table-body") && $("qualification-table-body").closest(".table-wrap");
+  if (!anchor) return;
+  let strip = $("rp-qual-summary");
+  if (!strip) { strip = el("div", { id: "rp-qual-summary" }); anchor.before(strip); }
+  strip.hidden = QUAL_ACTIVE_ROLE !== "cicd_runner";
+  const cap = hourlyCap();
+  strip.replaceChildren(
+    chip("badge-running", `${ready} ready`),
+    chip(needBudget ? "badge-warn" : "badge-runner", `${needBudget} need a budget change`),
+    el("span", { class: "mono", text: `Runner pools: ${usd(poolsHourly())}/hr${cap !== null ? ` of ${usd(cap, 2)}/hr cap` : ""}` }));
 }
 
 function markLaunchable() {
-  if (QUAL_ACTIVE_ROLE !== "cicd_runner") return;
+  if (QUAL_ACTIVE_ROLE !== "cicd_runner") { renderQualSummary(0, 0); return; }
   const rows = window.QUAL_ROWS || [];
+  let ready = 0;
+  let needBudget = 0;
+  const full = poolsFull();
   // Header sorting reorders the rows, so read each button's own row index.
   document.querySelectorAll("#qualification-table-body button[onclick^='launchQualRow(']").forEach((b) => {
     const m = /launchQualRow\((\d+)\)/.exec(b.getAttribute("onclick") || "");
     const row = m ? rows[Number(m[1])] : null;
     if (!row) return;
-    const obstacle = launchObstacle(row);
+    const over = overCap(row, 1) !== null;
+    b.hidden = full;
+    const status = b.closest("tr").cells[10];
+    if (full) status.replaceChildren(chip("badge-warn", "Pools full"));
+    else if (over) { needBudget += 1; status.replaceChildren(chip("badge-warn", "Over cap")); }
+    else { ready += 1; status.replaceChildren(chip("badge-running", "Ready")); }
+    if (row.price_qualifies === false) status.append(" ", chip("badge-deleted", "Over profile budget"));
     const cell = b.parentElement;
     const old = cell.querySelector(".rp-obstacle");
     if (old) old.remove();
-    b.hidden = !!obstacle;
-    if (!obstacle) return;
-    const note = el("div", { class: "rp-obstacle hint-sm", text: obstacle.text });
-    if (obstacle.raiseTo) {
-      const raise = el("button", { type: "button", class: "btn btn-sm", text: `Raise cap to ${usd(obstacle.raiseTo, 2)}/hr` });
-      raise.addEventListener("click", () => raiseHourlyCap(obstacle.raiseTo));
-      note.append(el("div", { style: "margin-top:4px" }, raise));
-    }
-    cell.append(note);
+    if (full) cell.append(el("div", { class: "rp-obstacle hint-sm", text: `All ${(POOLS.limits || {}).max_pools} runner pools are in use. Remove one in Runner pools.` }));
   });
+  renderQualSummary(ready, needBudget);
+  syncLaunchPanel();
 }
+
 const tbody = $("qualification-table-body");
+// An empty matrix says what to change. The page's own script has no room for this: see its size test.
+const drawMatrix = window.renderQualificationTable;
+window.renderQualificationTable = function () {
+  drawMatrix();
+  if (tbody && !tbody.rows.length) tbody.append(el("tr", {}, el("td", { colspan: "12", class: "hint", text: "No machine fits right now. Uncheck Show Only Spot-Price-Qualifying, raise the budget, lower the hardware or benchmark floor, or widen the filters." })));
+};
 if (tbody) new MutationObserver(markLaunchable).observe(tbody, { childList: true });
 
 refreshPools();

@@ -55,7 +55,7 @@ fn rows(q: &Value, key: &str) -> Vec<Value> {
 fn prices_come_from_spot_rates_per_vcpu_and_gib() {
     // n4a-standard-2: 2 vCPU x 0.01002 + 8 GiB x 0.001141.
     assert_eq!(compute_hourly_usd("n4a-standard-2"), Some(0.0292));
-    assert_eq!(compute_hourly_usd("c4a-highcpu-16"), Some(0.2996));
+    assert_eq!(compute_hourly_usd("c4a-highcpu-16"), Some(0.3145));
     assert_eq!(machine_shape("c4d-highcpu-16"), Some((16, 30.0)));
     assert_eq!(machine_shape("e2-standard-2"), Some((2, 8.0)));
     assert_eq!(compute_hourly_usd("zz9-standard-2"), None);

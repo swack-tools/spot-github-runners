@@ -2370,7 +2370,7 @@ if (!GLOBAL_ARCH_FILTER || GLOBAL_ARCH_FILTER === "all") return true;
 return inferArchClient(r.machine_type, r.arch) === GLOBAL_ARCH_FILTER;
 });
 window.QUAL_ROWS = archFilteredRows.slice(0, 60);
-tbody.innerHTML = !QUAL_ROWS.length ? `<tr><td colspan="12" class="hint">No machine fits. Uncheck the Spot filter, raise the budget, or lower the floors.</td></tr>` : QUAL_ROWS.map((r, i) => `
+tbody.innerHTML = QUAL_ROWS.map((r, i) => `
 <tr>
 <td class="mono emph">${esc(r.machine_type)} ${archBadgeHtml(r.machine_type, r.arch)}</td>
 <td>
@@ -3644,9 +3644,11 @@ function sortNum(v) { const m = /^[$~+]?(-?[\d,]*\.?\d+)/.exec(v); return m ? pa
 function sortTable(b) {
 const s = TSORT[b.id];
 if (!s || b.rows.length < 2) return;
-const rows = [...b.rows].map(r => { const k = sortKey(r, s.i); return [r, k, sortNum(k)]; });
+const p = b.querySelector("[data-after]"), h = p && p.previousElementSibling;
+const rows = [...b.rows].filter(r => r !== p).map(r => { const k = sortKey(r, s.i); return [r, k, sortNum(k)]; });
 rows.sort(([, a, p], [, c, q]) => p === p ? (q === q ? (p - q) * s.d : -1) : q === q ? 1 : a.localeCompare(c, undefined, { numeric: true }) * s.d);
 b.append(...rows.map(x => x[0]));
+if (h) h.after(p);
 }
 function sortByHeader(h) {
 if (h.onclick) return h.click();
