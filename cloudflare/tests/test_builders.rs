@@ -117,7 +117,10 @@ fn launch_plan_is_a_fixed_shape_spot_builder_with_a_kept_cache_disk() {
     assert_eq!(p.cache_disk_name, "builder-us-central1-a-a1b2c3-cache");
     assert_eq!(p.ssh_user, "swackhamer");
     assert!(p.request.machine_type.ends_with("/n4-highcpu-16"));
-    assert_eq!(p.request.scheduling.provisioning_model, "SPOT");
+    assert_eq!(
+        p.request.scheduling.provisioning_model.as_deref(),
+        Some("SPOT")
+    );
     let cache = p
         .request
         .disks

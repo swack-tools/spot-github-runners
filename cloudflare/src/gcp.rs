@@ -128,6 +128,7 @@ pub struct GcpTokenResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GceMetadataItem {
     pub key: String,
+    #[serde(default)]
     pub value: String,
 }
 
@@ -219,25 +220,39 @@ fn default_auto_delete() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GceDiskInitializeParams {
-    #[serde(alias = "disk_name")]
+    #[serde(default, alias = "disk_name")]
     pub disk_name: String,
-    #[serde(alias = "disk_size_gb")]
+    #[serde(default, alias = "disk_size_gb")]
     pub disk_size_gb: String,
-    #[serde(alias = "disk_type")]
+    #[serde(default, alias = "disk_type")]
     pub disk_type: String,
     #[serde(skip_serializing_if = "Option::is_none", alias = "source_image")]
     pub source_image: Option<String>,
 }
 
+/// The insert default sets every field. Listed VMs may omit any of them: a standard VM has no
+/// `instanceTerminationAction`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GceScheduling {
-    #[serde(alias = "provisioning_model")]
-    pub provisioning_model: String, // "SPOT"
-    #[serde(alias = "instance_termination_action")]
-    pub instance_termination_action: String, // "DELETE"
-    #[serde(alias = "on_host_maintenance")]
-    pub on_host_maintenance: String, // "TERMINATE"
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "provisioning_model"
+    )]
+    pub provisioning_model: Option<String>, // "SPOT"
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "instance_termination_action"
+    )]
+    pub instance_termination_action: Option<String>, // "DELETE"
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "on_host_maintenance"
+    )]
+    pub on_host_maintenance: Option<String>, // "TERMINATE"
     #[serde(default, alias = "automatic_restart")]
     pub automatic_restart: bool, // false
 }
@@ -245,9 +260,9 @@ pub struct GceScheduling {
 impl Default for GceScheduling {
     fn default() -> Self {
         Self {
-            provisioning_model: "SPOT".to_string(),
-            instance_termination_action: "DELETE".to_string(),
-            on_host_maintenance: "TERMINATE".to_string(),
+            provisioning_model: Some("SPOT".to_string()),
+            instance_termination_action: Some("DELETE".to_string()),
+            on_host_maintenance: Some("TERMINATE".to_string()),
             automatic_restart: false,
         }
     }
@@ -325,6 +340,8 @@ pub struct GceDisk {
     #[serde(default)]
     pub id: Option<String>,
     pub name: String,
+    // Empty on a regional disk, which has `region` instead; `list_disks` leaves those out.
+    #[serde(default)]
     pub zone: String,
     #[serde(default, alias = "size_gb")]
     pub size_gb: Option<String>,
@@ -400,10 +417,43 @@ pub struct GceAggregatedListEnvelope<T> {
     pub unreachables: Vec<String>,
 }
 
+/// One zone of `instances.aggregatedList`. Entries stay raw so `parse_listed_instances` can decide
+/// about each VM separately.
 #[derive(Debug, Deserialize, Default)]
 pub struct GceInstancesScopedList {
     #[serde(default)]
-    pub instances: Vec<GceInstance>,
+    pub instances: Vec<Value>,
+}
+
+/// Whether a VM name belongs to this fleet: runner hosts, pool hosts and dedicated builders. The
+/// project can also hold VMs the Worker didn't create, and those are never its to change.
+pub fn is_fleet_instance_name(name: &str) -> bool {
+    name.starts_with("oxidex-runners-") || name.starts_with("builder-")
+}
+
+/// Parses one zone's listed VMs. A VM outside the fleet that can't be parsed is logged and skipped,
+/// so it can't fail the whole list. A fleet VM that can't be parsed still fails it: without that VM
+/// the reconciler would undercount its hosts and launch replacements.
+fn parse_listed_instances<T: serde::de::DeserializeOwned>(
+    raw: Vec<Value>,
+) -> Result<Vec<T>, GcpError> {
+    let mut parsed = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        match serde_json::from_value(entry) {
+            Ok(instance) => parsed.push(instance),
+            Err(e) if is_fleet_instance_name(&name) => return Err(e.into()),
+            Err(_e) => {
+                #[cfg(target_arch = "wasm32")]
+                worker::console_error!("Skipping listed VM '{}': {}", name, _e);
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 /// The fields of a builder VM that the dashboard shows: where it runs and how to reach it.
@@ -464,12 +514,6 @@ impl GceBuilderInstance {
             .filter_map(|a| a.nat_ip.as_deref())
             .find(|ip| !ip.trim().is_empty())
     }
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct GceBuilderInstancesScopedList {
-    #[serde(default)]
-    pub instances: Vec<GceBuilderInstance>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -819,7 +863,7 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
             let page: GceAggregatedListEnvelope<GceInstancesScopedList> =
                 serde_json::from_slice(&bytes)?;
             for scoped in page.items.into_values() {
-                instances.extend(scoped.instances);
+                instances.extend(parse_listed_instances::<GceInstance>(scoped.instances)?);
             }
 
             match page.next_page_token {
@@ -865,7 +909,7 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
             let page: GceAggregatedListEnvelope<GceDisksScopedList> =
                 serde_json::from_slice(&bytes)?;
             for scoped in page.items.into_values() {
-                disks.extend(scoped.disks);
+                disks.extend(scoped.disks.into_iter().filter(|d| !d.zone.is_empty()));
             }
 
             match page.next_page_token {
@@ -911,10 +955,11 @@ impl<T: GcpHttpTransport> GceComputeClient<T> {
                 ));
             }
 
-            let page: GceAggregatedListEnvelope<GceBuilderInstancesScopedList> =
+            let page: GceAggregatedListEnvelope<GceInstancesScopedList> =
                 serde_json::from_slice(&bytes)?;
             for scoped in page.items.into_values() {
-                instances.extend(scoped.instances.into_iter().filter(|i| i.is_builder()));
+                let listed = parse_listed_instances::<GceBuilderInstance>(scoped.instances)?;
+                instances.extend(listed.into_iter().filter(|i| i.is_builder()));
             }
 
             match page.next_page_token {

@@ -195,8 +195,11 @@ fn test_spot_runner_vm_request_builder_permitted_machine_types() {
             req.machine_type,
             format!("zones/us-central1-a/machineTypes/{}", mt)
         );
-        assert_eq!(req.scheduling.provisioning_model, "SPOT");
-        assert_eq!(req.scheduling.instance_termination_action, "DELETE");
+        assert_eq!(req.scheduling.provisioning_model.as_deref(), Some("SPOT"));
+        assert_eq!(
+            req.scheduling.instance_termination_action.as_deref(),
+            Some("DELETE")
+        );
 
         // Verify metadata items include JIT configs
         assert_eq!(req.metadata.get("runner_1_jitconfig"), Some("jit1"));
@@ -574,4 +577,204 @@ async fn test_instances_aggregated_list_pagination() {
     assert_eq!(instances.len(), 2);
     assert_eq!(instances[0].name, "oxidex-runners-us-central1-a-1");
     assert_eq!(instances[1].name, "oxidex-runners-us-east1-b-1");
+}
+
+/// A page shaped like a real `instances.aggregatedList` response: a Spot runner, a standard VM with
+/// no `instanceTerminationAction`, a VM with no `scheduling` block, and a zone holding only a warning.
+fn mixed_instances_page() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "compute#instanceAggregatedList",
+        "items": {
+            "zones/us-central1-a": {
+                "instances": [{
+                    "id": "101",
+                    "name": "oxidex-runners-swack-tools-1",
+                    "zone": "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a",
+                    "machineType": "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/machineTypes/c4d-highcpu-16",
+                    "status": "RUNNING",
+                    "scheduling": {
+                        "provisioningModel": "SPOT",
+                        "instanceTerminationAction": "DELETE",
+                        "onHostMaintenance": "TERMINATE",
+                        "automaticRestart": false,
+                        "preemptible": true
+                    }
+                }]
+            },
+            "zones/us-central1-b": {
+                "instances": [
+                    {
+                        "id": "102",
+                        "name": "instance-group-1-p5xn",
+                        "zone": "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-b",
+                        "machineType": "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-b/machineTypes/e2-medium",
+                        "status": "RUNNING",
+                        "metadata": { "items": [{ "key": "created-by" , "value": "mig" }, { "key": "empty" }] },
+                        "scheduling": {
+                            "provisioningModel": "STANDARD",
+                            "onHostMaintenance": "MIGRATE",
+                            "automaticRestart": true,
+                            "preemptible": false
+                        }
+                    },
+                    {
+                        "id": "103",
+                        "name": "no-scheduling",
+                        "zone": "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-b",
+                        "machineType": "https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-b/machineTypes/e2-small",
+                        "status": "TERMINATED"
+                    }
+                ]
+            },
+            "zones/us-east1-b": {
+                "warning": { "code": "NO_RESULTS_ON_PAGE", "message": "No results" }
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_list_instances_accepts_vms_without_spot_scheduling_fields() {
+    let transport = MockGcpHttpTransport::new();
+    transport.set_json_response("aggregated/instances", 200, &mixed_instances_page());
+    let client = GceComputeClient::new(
+        make_test_credentials(),
+        "example-project".to_string(),
+        transport.clone(),
+    );
+
+    let instances = client.list_instances(1700000000).await.unwrap();
+    assert_eq!(instances.len(), 3);
+
+    let spot = instances
+        .iter()
+        .find(|i| i.name == "oxidex-runners-swack-tools-1")
+        .unwrap();
+    let spot_scheduling = spot.scheduling.as_ref().unwrap();
+    assert_eq!(spot_scheduling.provisioning_model.as_deref(), Some("SPOT"));
+    assert_eq!(
+        spot_scheduling.instance_termination_action.as_deref(),
+        Some("DELETE")
+    );
+
+    let standard = instances
+        .iter()
+        .find(|i| i.name == "instance-group-1-p5xn")
+        .unwrap();
+    let standard_scheduling = standard.scheduling.as_ref().unwrap();
+    assert_eq!(
+        standard_scheduling.provisioning_model.as_deref(),
+        Some("STANDARD")
+    );
+    assert_eq!(standard_scheduling.instance_termination_action, None);
+    assert_eq!(standard.metadata.get("empty"), Some(""));
+
+    let bare = instances
+        .iter()
+        .find(|i| i.name == "no-scheduling")
+        .unwrap();
+    assert_eq!(bare.scheduling, None);
+}
+
+#[tokio::test]
+async fn test_list_instances_skips_an_unparseable_vm_outside_the_fleet() {
+    let mut page = mixed_instances_page();
+    page["items"]["zones/us-east1-b"] = serde_json::json!({
+        "instances": [{ "name": "someone-elses-vm", "zone": "z", "status": 7 }]
+    });
+    let transport = MockGcpHttpTransport::new();
+    transport.set_json_response("aggregated/instances", 200, &page);
+    let client = GceComputeClient::new(
+        make_test_credentials(),
+        "example-project".to_string(),
+        transport.clone(),
+    );
+
+    let instances = client.list_instances(1700000000).await.unwrap();
+    assert_eq!(instances.len(), 3);
+    assert!(instances.iter().all(|i| i.name != "someone-elses-vm"));
+}
+
+#[tokio::test]
+async fn test_list_instances_fails_on_an_unparseable_fleet_vm() {
+    // Skipping this VM would make the reconciler undercount its hosts and launch replacements.
+    for name in ["oxidex-runners-swack-tools-2", "builder-a"] {
+        let mut page = mixed_instances_page();
+        page["items"]["zones/us-east1-b"] = serde_json::json!({
+            "instances": [{ "name": name, "zone": "z" }]
+        });
+        let transport = MockGcpHttpTransport::new();
+        transport.set_json_response("aggregated/instances", 200, &page);
+        let client = GceComputeClient::new(
+            make_test_credentials(),
+            "example-project".to_string(),
+            transport.clone(),
+        );
+
+        let err = client.list_instances(1700000000).await.unwrap_err();
+        assert!(matches!(err, GcpError::Serialization(_)), "{}", name);
+    }
+}
+
+#[tokio::test]
+async fn test_list_builder_instances_ignores_unparseable_vms_outside_the_fleet() {
+    let page = serde_json::json!({
+        "items": {
+            "zones/us-central1-a": {
+                "instances": [
+                    { "name": "someone-elses-vm", "status": "RUNNING" },
+                    {
+                        "name": "builder-a",
+                        "zone": "zones/us-central1-a",
+                        "labels": { "spot-role": "rust_builder" }
+                    }
+                ]
+            }
+        }
+    });
+    let transport = MockGcpHttpTransport::new();
+    transport.set_json_response("aggregated/instances", 200, &page);
+    let client = GceComputeClient::new(
+        make_test_credentials(),
+        "example-project".to_string(),
+        transport.clone(),
+    );
+
+    let builders = client.list_builder_instances(1700000000).await.unwrap();
+    assert_eq!(builders.len(), 1);
+    assert_eq!(builders[0].name, "builder-a");
+}
+
+#[tokio::test]
+async fn test_list_disks_leaves_out_regional_disks() {
+    let page = serde_json::json!({
+        "items": {
+            "regions/us-central1": {
+                "disks": [{ "name": "regional-disk", "region": "regions/us-central1" }]
+            },
+            "zones/us-central1-a": {
+                "disks": [{ "name": "builder-a-cache", "zone": "zones/us-central1-a" }]
+            }
+        }
+    });
+    let transport = MockGcpHttpTransport::new();
+    transport.set_json_response("aggregated/disks", 200, &page);
+    let client = GceComputeClient::new(
+        make_test_credentials(),
+        "example-project".to_string(),
+        transport.clone(),
+    );
+
+    let disks = client.list_disks(1700000000).await.unwrap();
+    assert_eq!(disks.len(), 1);
+    assert_eq!(disks[0].name, "builder-a-cache");
+}
+
+#[test]
+fn test_insert_scheduling_still_sends_every_spot_field() {
+    let sent = serde_json::to_value(GceScheduling::default()).unwrap();
+    assert_eq!(sent["provisioningModel"], "SPOT");
+    assert_eq!(sent["instanceTerminationAction"], "DELETE");
+    assert_eq!(sent["onHostMaintenance"], "TERMINATE");
+    assert_eq!(sent["automaticRestart"], false);
 }

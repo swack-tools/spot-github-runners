@@ -242,8 +242,14 @@ async fn test_floor_creation_zero_hosts_launches_one_per_target() {
 
     for inserted in gcp.inserted_instances.lock().unwrap().iter() {
         assert!(inserted.machine_type.contains("c4d-highcpu-16"));
-        assert_eq!(inserted.scheduling.provisioning_model, "SPOT");
-        assert_eq!(inserted.scheduling.instance_termination_action, "DELETE");
+        assert_eq!(
+            inserted.scheduling.provisioning_model.as_deref(),
+            Some("SPOT")
+        );
+        assert_eq!(
+            inserted.scheduling.instance_termination_action.as_deref(),
+            Some("DELETE")
+        );
         // Verify metadata has 2-slot JIT configs and runner count = 2
         assert_eq!(inserted.metadata.get("spot-runner-count"), Some("2"));
         assert_eq!(

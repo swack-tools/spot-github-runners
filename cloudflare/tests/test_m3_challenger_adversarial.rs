@@ -422,8 +422,11 @@ async fn test_adversarial_floor_keeper_exact_specs_and_inflight_dedup() {
                 DEFAULT_ZONE, DEFAULT_MACHINE_TYPE
             )
         );
-        assert_eq!(req.scheduling.provisioning_model, "SPOT");
-        assert_eq!(req.scheduling.instance_termination_action, "DELETE");
+        assert_eq!(req.scheduling.provisioning_model.as_deref(), Some("SPOT"));
+        assert_eq!(
+            req.scheduling.instance_termination_action.as_deref(),
+            Some("DELETE")
+        );
         assert_eq!(req.metadata.get("spot-runner-count"), Some("2"));
         assert_eq!(
             req.metadata.get("runner_1_jitconfig"),
@@ -474,9 +477,11 @@ async fn test_adversarial_preempted_vm_status_matrix() {
     // Terminated variants (must be deleted): "TERMINATED", "terminated", "Terminated"
     // Non-terminated states (must be preserved): "RUNNING", "PROVISIONING", "STAGING", "STOPPING", "SUSPENDED", "REPAIRING"
     let statuses = vec![
-        ("vm-term-upper", "TERMINATED", true),
-        ("vm-term-lower", "terminated", true),
-        ("vm-term-mixed", "Terminated", true),
+        ("oxidex-runners-term-upper", "TERMINATED", true),
+        ("oxidex-runners-term-lower", "terminated", true),
+        ("oxidex-runners-term-mixed", "Terminated", true),
+        // A stopped VM the fleet didn't create is also TERMINATED, and must survive.
+        ("nntmux-stopped", "TERMINATED", false),
         ("vm-running", "RUNNING", false),
         ("vm-provisioning", "PROVISIONING", false),
         ("vm-staging", "STAGING", false),
@@ -502,9 +507,9 @@ async fn test_adversarial_preempted_vm_status_matrix() {
 
     let deleted = gcp.deleted_instances.lock().unwrap().clone();
     assert_eq!(deleted.len(), 3);
-    assert!(deleted.contains(&"vm-term-upper".to_string()));
-    assert!(deleted.contains(&"vm-term-lower".to_string()));
-    assert!(deleted.contains(&"vm-term-mixed".to_string()));
+    assert!(deleted.contains(&"oxidex-runners-term-upper".to_string()));
+    assert!(deleted.contains(&"oxidex-runners-term-lower".to_string()));
+    assert!(deleted.contains(&"oxidex-runners-term-mixed".to_string()));
 
     // Verify non-terminated instances were NOT touched
     for (name, _, should_delete) in &statuses {

@@ -546,7 +546,8 @@ window.launchQualRow = function (i) {
   else showToast("Launching from this table isn't available for this role yet.");
 };
 
-// Grey out Launch on CI/CD rows whose machine type can't host runners yet.
+// Grey out Launch on CI/CD rows whose machine type can't host runners yet, and say why next to the
+// button: a disabled button's tooltip doesn't show on touch screens and is easy to miss elsewhere.
 function markLaunchable() {
   if (QUAL_ACTIVE_ROLE !== "cicd_runner" || !(POOLS.machine_types || []).length) return;
   const rows = window.QUAL_ROWS || [];
@@ -557,7 +558,12 @@ function markLaunchable() {
     if (!row) return;
     const ok = !!shapeOf(row.machine_type);
     b.disabled = !ok;
-    b.title = ok ? "Launch runners on this machine" : `${row.machine_type} can't host runners yet`;
+    const supported = POOLS.machine_types.map((t) => t.machine_type).join(", ");
+    b.title = ok ? "Launch runners on this machine" : `${row.machine_type} can't host runners yet. Runner pools support: ${supported}`;
+    const cell = b.parentElement;
+    const old = cell.querySelector(".rp-launch-why");
+    if (old) old.remove();
+    if (!ok) cell.append(el("div", { class: "hint-sm rp-launch-why", text: "Runner pools don't support this machine type yet." }));
   });
 }
 const tbody = $("qualification-table-body");
