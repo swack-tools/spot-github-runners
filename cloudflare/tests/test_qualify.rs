@@ -80,7 +80,7 @@ fn two_vcpu_sizing_lists_small_hosts_cheapest_first() {
     let cheapest = &hw[0];
     assert_eq!(cheapest["machine_type"], "n4a-standard-2");
     assert_eq!(cheapest["units_per_instance"], 1);
-    assert_eq!(cheapest["launchable"], true);
+    assert!(cheapest["pool_host_hourly_usd"].as_f64().unwrap() > 0.0);
     assert_eq!(cheapest["arch"], "arm64");
     // A 4 vCPU host fits two of these runners.
     let four = hw
@@ -308,4 +308,31 @@ fn only_the_newest_matrix_preview_draws_the_table() {
         .expect("stale answers dropped");
     let draw = body.find("renderQualificationTable()").expect("draw");
     assert!(seq < fetch && fetch < guard && guard < draw);
+}
+
+#[test]
+fn runner_rows_are_only_machines_a_pool_can_launch() {
+    let offer = |mt: &str, zone: &str| json!({ "machine_type": mt, "zone": zone, "benchmark_score": 2434.0 });
+    let catalog = vec![
+        offer("c4-standard-16", "northamerica-northeast1-a"),
+        offer("m3-standard-16", "us-central1-a"),
+        offer("c4d-highcpu-16", "not-a-zone1-z"),
+    ];
+    let reqs = json!({ "min_runners": 1, "runner_vcpu": 2, "runner_ram_gib": 4 });
+
+    let q = qualify("cicd_runner", &reqs, &catalog);
+    let hw = q["hardware_qualifying"].as_array().unwrap();
+    assert_eq!(hw.len(), 1, "{:?}", hw);
+    assert_eq!(hw[0]["machine_type"], "c4-standard-16");
+    assert_eq!(q["hardware_qualifying_count"], 1);
+    assert_eq!(q["disqualified_counts"]["cannot_host_runners"], 2);
+    // Priced from the C4 Spot list rates, not a stored estimate: 16 vCPU and 60 GiB.
+    let compute = hw[0]["pricing"]["compute_hourly_usd"].as_f64().unwrap();
+    assert!((compute - 0.4733).abs() < 1e-4, "{}", compute);
+    assert!(hw[0]["pool_host_hourly_usd"].as_f64().unwrap() >= compute);
+
+    // Builders launch a fixed shape, so their matrix keeps its own rows.
+    let q = qualify("rust_builder", &reqs, &catalog);
+    assert_eq!(q["disqualified_counts"]["cannot_host_runners"], 0);
+    assert!(q["hardware_qualifying_count"].as_u64().unwrap() >= 2);
 }

@@ -191,62 +191,31 @@ pub struct SetPoolTemplateRequest {
     pub cloud_init_template_id: String,
 }
 
-/// vCPU and RAM (GiB) of each machine type a pool may use: the runner allowlists in `patch.rs`.
+/// vCPU counts a pool host can have. Every series below sells at least these predefined sizes.
+const POOL_HOST_VCPUS: &[u32] = &[2, 4, 8, 16, 32];
+
+/// vCPU and RAM (GiB) of a machine type that can host runners, or None if it can't. This is the one
+/// rule for what a pool may launch: the Qualifying Instances matrix lists only machine types that
+/// pass it, and pool creation and the VM request refuse the rest.
+///
+/// A host needs a series with a Spot price (`qualify::spot_rates`) and a known disk and network
+/// setup (`gcp::machine_type_requires_hyperdisk`, `gcp::persistent_disk_interface`), a predefined
+/// size, and RAM left after what the host keeps for itself.
 pub fn machine_shape(machine_type: &str) -> Option<(u32, u32)> {
-    Some(match machine_type {
-        "c4d-highcpu-16" => (16, 30),
-        "n4d-highcpu-16" => (16, 32),
-        "n4-highcpu-16" => (16, 32),
-        "c2d-highcpu-16" => (16, 32),
-        "c4a-highcpu-16" => (16, 32),
-        "c4a-standard-16" => (16, 64),
-        "c4a-highcpu-8" => (8, 16),
-        "c4a-standard-8" => (8, 32),
-        "n4a-highcpu-16" => (16, 32),
-        "n4a-standard-16" => (16, 64),
-        "n4a-highcpu-8" => (8, 16),
-        "n4a-standard-8" => (8, 32),
-        "t2a-standard-16" => (16, 64),
-        "t2a-standard-8" => (8, 32),
-        // Small hosts, for pools of one or two small runners.
-        "n4a-standard-2" => (2, 8),
-        "n4a-standard-4" => (4, 16),
-        "c4a-standard-2" => (2, 8),
-        "c4a-standard-4" => (4, 16),
-        "t2a-standard-2" => (2, 8),
-        "t2a-standard-4" => (4, 16),
-        "t2d-standard-2" => (2, 8),
-        "t2d-standard-4" => (4, 16),
-        "e2-standard-2" => (2, 8),
-        "e2-standard-4" => (4, 16),
-        _ => return None,
-    })
-}
-
-/// 2 and 4 vCPU machine types only runner pools launch. They stay out of the runner patch
-/// allowlists in `patch.rs`, which the fleet floor uses.
-pub const POOL_SMALL_MACHINE_TYPES: &[&str] = &[
-    "n4a-standard-2",
-    "n4a-standard-4",
-    "c4a-standard-2",
-    "c4a-standard-4",
-    "t2a-standard-2",
-    "t2a-standard-4",
-    "t2d-standard-2",
-    "t2d-standard-4",
-    "e2-standard-2",
-    "e2-standard-4",
-];
-
-/// Machine types a pool can launch, in a stable order.
-pub fn launchable_machine_types() -> Vec<&'static str> {
-    crate::patch::PERMITTED_MACHINE_TYPES
-        .iter()
-        .chain(crate::patch::PERMITTED_ARM64_MACHINE_TYPES.iter())
-        .chain(POOL_SMALL_MACHINE_TYPES.iter())
-        .copied()
-        .filter(|mt| machine_shape(mt).is_some())
-        .collect()
+    let mut parts = machine_type.split('-');
+    let series = parts.next()?;
+    let class = parts.next()?;
+    crate::qualify::spot_rates(series)?;
+    // Tau T2 only comes in the standard class, and E2's other classes don't size by the name rule.
+    if matches!(series, "t2a" | "t2d" | "e2") && class != "standard" {
+        return None;
+    }
+    let (vcpu, ram) = crate::qualify::machine_shape(machine_type)?;
+    let ram = ram.floor() as u32;
+    if !POOL_HOST_VCPUS.contains(&vcpu) || ram <= HOST_RESERVED_RAM_GIB {
+        return None;
+    }
+    Some((vcpu, ram))
 }
 
 pub fn is_arm64_machine_type(machine_type: &str) -> bool {
@@ -517,9 +486,8 @@ pub fn validate_create_request(
     let machine_type = req.machine_type.trim();
     let Some((host_vcpu, host_ram)) = machine_shape(machine_type) else {
         return Err(format!(
-            "{} can't be launched as a runner host yet; pick one of: {}",
-            machine_type,
-            launchable_machine_types().join(", ")
+            "{} can't host runners: pick a machine from the Qualifying Instances table",
+            machine_type
         ));
     };
     let zone = req.zone.trim();
@@ -746,24 +714,10 @@ pub fn pools_view(state: &DashboardState) -> serde_json::Value {
             })
         })
         .collect();
-    let machine_types: Vec<serde_json::Value> = launchable_machine_types()
-        .into_iter()
-        .map(|mt| {
-            let (vcpu, ram) = machine_shape(mt).unwrap_or((0, 0));
-            serde_json::json!({
-                "machine_type": mt,
-                "vcpu": vcpu,
-                "ram_gib": ram,
-                "usable_ram_gib": ram.saturating_sub(HOST_RESERVED_RAM_GIB),
-                "arch": if is_arm64_machine_type(mt) { "arm64" } else { "x86_64" },
-            })
-        })
-        .collect();
     serde_json::json!({
         "pools": pools,
         "templates": templates,
         "targets": suggested_targets(state),
-        "machine_types": machine_types,
         "budget_max_hourly_usd": state.global_budget.max_hourly_usd,
         "limits": {
             "max_pools": MAX_POOLS,

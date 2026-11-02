@@ -2370,7 +2370,7 @@ if (!GLOBAL_ARCH_FILTER || GLOBAL_ARCH_FILTER === "all") return true;
 return inferArchClient(r.machine_type, r.arch) === GLOBAL_ARCH_FILTER;
 });
 window.QUAL_ROWS = archFilteredRows.slice(0, 60);
-tbody.innerHTML = QUAL_ROWS.map((r, i) => `
+tbody.innerHTML = !QUAL_ROWS.length ? `<tr><td colspan="12" class="hint">No machine fits. Uncheck the Spot filter, raise the budget, or lower the floors.</td></tr>` : QUAL_ROWS.map((r, i) => `
 <tr>
 <td class="mono emph">${esc(r.machine_type)} ${archBadgeHtml(r.machine_type, r.arch)}</td>
 <td>

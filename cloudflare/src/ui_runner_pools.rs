@@ -10,7 +10,7 @@ pub const RUNNER_POOLS_JS_MAX_BYTES: usize = 48 * 1024;
 
 pub static RUNNER_POOLS_JS: &str = r##"(() => {
 "use strict";
-let POOLS = { pools: [], templates: [], targets: [], machine_types: [], budget_max_hourly_usd: null, limits: {} };
+let POOLS = { pools: [], templates: [], targets: [], budget_max_hourly_usd: null, limits: {} };
 let ROW = null;
 const $ = (id) => document.getElementById(id);
 const el = (tag, props = {}, ...kids) => {
@@ -37,8 +37,19 @@ async function api(path, opts = {}) {
   return data;
 }
 
-function shapeOf(mt) {
-  return (POOLS.machine_types || []).find((m) => m.machine_type === mt) || null;
+// A matrix row's host, sized as the server sizes it: whole GiB, less what the host keeps.
+function shapeOf(row) {
+  const ram = Math.floor(row.ram_gib);
+  return { vcpu: row.vcpu, ram_gib: ram, usable_ram_gib: Math.max(ram - ((POOLS.limits || {}).host_reserved_ram_gib || 2), 0) };
+}
+
+// The hourly cost of every pool that isn't being removed, against the budget cap.
+function poolsHourly() {
+  return (POOLS.pools || []).filter((p) => !p.removing).reduce((sum, p) => sum + (p.host_hourly_usd || 0) * p.hosts, 0);
+}
+function hourlyCap() {
+  const cap = POOLS.budget_max_hourly_usd;
+  return typeof cap === "number" && isFinite(cap) && cap > 0 ? cap : null;
 }
 
 // --- styles -------------------------------------------------------------------------------------
@@ -173,7 +184,7 @@ function currentLabels() {
 
 function check() {
   const box = $("rp-check");
-  const shape = shapeOf(ROW.machine_type);
+  const shape = shapeOf(ROW);
   const rph = parseInt($("rp-rph").value, 10) || 0;
   const vcpu = parseInt($("rp-vcpu").value, 10) || 0;
   const ram = parseInt($("rp-ram").value, 10) || 0;
@@ -182,15 +193,17 @@ function check() {
   const minHosts = parseInt($("rp-min").value, 10);
   const idle = parseInt($("rp-idle").value, 10);
   const problems = [];
-  if (!shape) problems.push(`${ROW.machine_type} can't be launched as a runner host yet.`);
   const target = currentTarget();
   if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\/[A-Za-z0-9._-]{1,100})?$/.test(target)) problems.push("Pick an organization, or type org or owner/repo.");
   if (rph < 1 || rph > 8) problems.push("Runners on each host must be 1 to 8.");
   if (hosts < 1 || hosts > 10) problems.push("Most hosts must be 1 to 10.");
   if (auto && !(minHosts >= 0 && minHosts < hosts)) problems.push(`Fewest hosts must be 0 to ${Math.max(hosts - 1, 0)} (fewer than the most hosts).`);
   if (auto && !(idle >= 5 && idle <= 240)) problems.push("Idle minutes must be 5 to 240.");
-  if (shape && rph * vcpu > shape.vcpu) problems.push(`${rph} × ${vcpu} vCPU = ${rph * vcpu}, but the host has ${shape.vcpu}.`);
-  if (shape && rph * ram > shape.usable_ram_gib) problems.push(`${rph} × ${ram} GiB = ${rph * ram} GiB, but the host has ${shape.usable_ram_gib} GiB free for runners (${shape.ram_gib} GiB minus ${POOLS.limits.host_reserved_ram_gib || 2} for the host).`);
+  if (rph * vcpu > shape.vcpu) problems.push(`${rph} × ${vcpu} vCPU = ${rph * vcpu}, but the host has ${shape.vcpu}.`);
+  if (rph * ram > shape.usable_ram_gib) problems.push(`${rph} × ${ram} GiB = ${rph * ram} GiB, but the host has ${shape.usable_ram_gib} GiB free for runners (${shape.ram_gib} GiB minus ${POOLS.limits.host_reserved_ram_gib || 2} for the host).`);
+  const cap = hourlyCap();
+  const total = poolsHourly() + (ROW.pool_host_hourly_usd || 0) * hosts;
+  if (cap !== null && total > cap + 1e-9) problems.push(`All pools together would cost about ${usd(total)}/hr, above the ${usd(cap, 2)}/hr budget cap. Use fewer hosts or raise the cap.`);
   const badLabel = currentLabels().find((l) => !/^[A-Za-z0-9._-]{1,64}$/.test(l));
   if (badLabel) problems.push(`Label "${badLabel}" may use only letters, digits, ".", "_" and "-".`);
   box.replaceChildren();
@@ -376,6 +389,7 @@ function renderPools() {
       costCell(p),
       el("td", {}, resize, " ", remove)));
   }
+  markLaunchable();
 }
 
 function costCell(p) {
@@ -546,24 +560,58 @@ window.launchQualRow = function (i) {
   else showToast("Launching from this table isn't available for this role yet.");
 };
 
-// Grey out Launch on CI/CD rows whose machine type can't host runners yet.
+// Every CI/CD row the matrix lists can host runners. What can still stop a launch is the state of
+// the pools, so a row says what's in the way and offers the fix instead of a Launch that would fail.
+function launchObstacle(row) {
+  const max = (POOLS.limits || {}).max_pools;
+  if (max && (POOLS.pools || []).filter((p) => !p.removing).length >= max) {
+    return { text: `All ${max} runner pools are in use. Remove one in Runner pools to launch here.` };
+  }
+  const cap = hourlyCap();
+  const total = poolsHourly() + (row.pool_host_hourly_usd || 0);
+  if (cap !== null && total > cap + 1e-9) {
+    return { text: `One host brings all pools to ${usd(total)}/hr, above the ${usd(cap, 2)}/hr cap.`, raiseTo: Math.ceil(total * 100) / 100 };
+  }
+  return null;
+}
+
+async function raiseHourlyCap(raiseTo) {
+  if (!confirm(`Raise the hourly budget cap to ${usd(raiseTo, 2)}/hr? This lets runner pools spend up to that much per hour.`)) return;
+  try {
+    await api("/api/budget", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...APP_STATE.global_budget, max_hourly_usd: raiseTo }) });
+    await loadOverview();
+    await refreshPools();
+    showToast(`Hourly budget cap is now ${usd(raiseTo, 2)}/hr.`);
+  } catch (e) { showToast(`Couldn't raise the cap: ${e.message}`); }
+}
+
 function markLaunchable() {
-  if (QUAL_ACTIVE_ROLE !== "cicd_runner" || !(POOLS.machine_types || []).length) return;
+  if (QUAL_ACTIVE_ROLE !== "cicd_runner") return;
   const rows = window.QUAL_ROWS || [];
   // Header sorting reorders the rows, so read each button's own row index.
   document.querySelectorAll("#qualification-table-body button[onclick^='launchQualRow(']").forEach((b) => {
     const m = /launchQualRow\((\d+)\)/.exec(b.getAttribute("onclick") || "");
     const row = m ? rows[Number(m[1])] : null;
     if (!row) return;
-    const ok = !!shapeOf(row.machine_type);
-    b.disabled = !ok;
-    b.title = ok ? "Launch runners on this machine" : `${row.machine_type} can't host runners yet`;
+    const obstacle = launchObstacle(row);
+    const cell = b.parentElement;
+    const old = cell.querySelector(".rp-obstacle");
+    if (old) old.remove();
+    b.hidden = !!obstacle;
+    if (!obstacle) return;
+    const note = el("div", { class: "rp-obstacle hint-sm", text: obstacle.text });
+    if (obstacle.raiseTo) {
+      const raise = el("button", { type: "button", class: "btn btn-sm", text: `Raise cap to ${usd(obstacle.raiseTo, 2)}/hr` });
+      raise.addEventListener("click", () => raiseHourlyCap(obstacle.raiseTo));
+      note.append(el("div", { style: "margin-top:4px" }, raise));
+    }
+    cell.append(note);
   });
 }
 const tbody = $("qualification-table-body");
 if (tbody) new MutationObserver(markLaunchable).observe(tbody, { childList: true });
 
-refreshPools().then(markLaunchable);
+refreshPools();
 setInterval(() => { if (!document.hidden && $("rp-panel")) refreshPools(); }, 60000);
 })();
 "##;
