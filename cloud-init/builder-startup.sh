@@ -355,6 +355,7 @@ for attempt in $(seq 1 30); do [[ ! -S /run/gha-admission/socket ]] || break; sl
 /usr/local/bin/oxidex-remote-build bootstrap-tools prepare >/dev/null
 printf '[toolchain]\nchannel = "1.99.0"\n' >/mnt/runner-data/remote-build/sources/bootstrap-tools/rust-toolchain.toml
 chmod 0444 /mnt/runner-data/remote-build/sources/bootstrap-tools/rust-toolchain.toml
+probe_started=$(date +%s)
 /usr/local/bin/oxidex-remote-build bootstrap-tools /usr/local/bin/oxidex-toolchain-probe > /var/lib/oxidex-builder/tool-probe-output
 
 for exe in /usr/bin/git /usr/bin/ssh-keygen /usr/local/bin/host-agent; do
@@ -367,10 +368,13 @@ built_image=$(tr -d '[:space:]' </var/lib/oxidex-builder/image-id)
 actual_image=$(/usr/bin/docker image inspect oxidex-remote-builder:1.99.0 | jq -re '.[0].Id')
 [[ "$built_image" == "$actual_image" ]] || { echo "Built image differs" >&2; exit 78; }
 
+# Docker's event log records the probe container, which has already been removed. The launcher starts exactly one.
 last_created="/var/lib/oxidex-builder/last-created-container.json"
-[[ -f "$last_created" ]] || { echo "Missing last created container evidence" >&2; exit 78; }
-[[ "$(jq -re '.image_id' "$last_created")" == "$built_image" ]] || { echo "Probe image ID differs" >&2; exit 78; }
-[[ "$(jq -re '.labels["oxidex.cache-project"]' "$last_created")" == "bootstrap-tools" ]] || { echo "Probe project identity differs" >&2; exit 78; }
+/usr/bin/docker events --since "$probe_started" --until "$(date +%s)" --filter type=container --filter event=create --format '{{json .}}' |
+  jq -se 'if length == 1 then .[0] | {container_id: .Actor.ID, image: .Actor.Attributes.image, labels: .Actor.Attributes} else false end' >"$last_created" ||
+  { echo "Expected one probe container in the Docker event log" >&2; exit 78; }
+[[ "$(jq -re '.image' "$last_created")" == "oxidex-remote-builder:1.99.0" ]] || { echo "Probe image differs" >&2; exit 78; }
+[[ "$(jq -re '.labels["oxidex.remote-build"]' "$last_created")" == "true" ]] || { echo "Probe container is not a remote build" >&2; exit 78; }
 created_cid=$(jq -re '.container_id' "$last_created")
 
 # Extract the complete toolchain-probe JSON payload cleanly (skipping any banner lines)
@@ -493,7 +497,7 @@ if id "$uploader_user" >/dev/null 2>&1; then
   fi
   usermod -aG oxidex-build "$uploader_user"
 else
-  existing_by_uid=$(getent passwd "$uploader_uid" | cut -d: -f1)
+  existing_by_uid=$(getent passwd "$uploader_uid" | cut -d: -f1) || true
   if [ -n "$existing_by_uid" ]; then
     echo "FATAL: Configured uploader UID $uploader_uid is already used by username '$existing_by_uid' (expected '$uploader_user')" >&2
     exit 1
