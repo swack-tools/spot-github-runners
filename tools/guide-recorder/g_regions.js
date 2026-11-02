@@ -13,7 +13,7 @@ const disabled = new Set();
       return { body: { status: 'ok' } };
     },
   });
-  const { page, click, caption, wait, moveTo, shot, scrollTo } = r;
+  const { page, click, caption, wait, moveTo, shot } = r;
   await page.goto(BASE + '/', { waitUntil: 'networkidle' });
   r.frames.length = 0;
   await moveTo(140, 340, 1);

@@ -6,7 +6,7 @@ const { withFleet, observability } = require('./demo-fleet');
     transform(p, j, req) { return p === '/api/overview' ? withFleet(j, req) : j; },
     fulfill(p, req) { return p === '/api/observability' ? { body: observability(req.url()) } : null; },
   });
-  const { page, click, caption, wait, moveTo, shot } = r;
+  const { page, click, caption, moveTo, shot } = r;
   await page.goto(BASE + '/', { waitUntil: 'networkidle' });
   r.frames.length = 0;
   await moveTo(700, 500, 1);

@@ -10,7 +10,7 @@ const { withFleet } = require('./demo-fleet');
       return { body: { region: b.region, role: b.role, current_count: 0, planned_count: b.target_instances, would_launch: [`${b.region}-demo`], would_retire: [] } };
     },
   });
-  const { page, click, caption, wait, moveTo, box, shot, scrollTo } = r;
+  const { page, click, caption, wait, moveTo, shot, scrollTo } = r;
   await page.goto(BASE + '/', { waitUntil: 'networkidle' });
   r.frames.length = 0;
   await page.click('#sidebar-toggle-btn');

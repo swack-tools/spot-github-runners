@@ -26,7 +26,7 @@ const DIGEST = '9e1c7a4f2b3d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7
       return null;
     },
   });
-  const { page, click, type, caption, wait, moveTo, shot, scrollTo } = r;
+  const { page, click, type, caption, wait, moveTo, shot } = r;
   await page.goto(BASE + '/', { waitUntil: 'networkidle' });
   r.frames.length = 0;
   await moveTo(140, 460, 1);
