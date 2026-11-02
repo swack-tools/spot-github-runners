@@ -212,9 +212,15 @@ async fn test_source_instance_template_query_param_and_body_construction() {
         req.machine_type,
         "zones/us-central1-a/machineTypes/c4d-highcpu-16"
     );
-    assert_eq!(req.scheduling.provisioning_model, "SPOT");
-    assert_eq!(req.scheduling.instance_termination_action, "DELETE");
-    assert_eq!(req.scheduling.on_host_maintenance, "TERMINATE");
+    assert_eq!(req.scheduling.provisioning_model.as_deref(), Some("SPOT"));
+    assert_eq!(
+        req.scheduling.instance_termination_action.as_deref(),
+        Some("DELETE")
+    );
+    assert_eq!(
+        req.scheduling.on_host_maintenance.as_deref(),
+        Some("TERMINATE")
+    );
     assert!(!req.scheduling.automatic_restart);
 
     // Boot disk plus the auto-delete runner data disk the startup script mounts

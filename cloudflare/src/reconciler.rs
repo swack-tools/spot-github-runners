@@ -1497,9 +1497,12 @@ where
         }
     }
 
-    // 4. Preempted VM Cleanup (TERMINATED GCE instances)
+    // 4. Preempted VM Cleanup (TERMINATED GCE instances). Deleting also deletes the VM's disks, so
+    // this only touches the fleet's own VMs: another VM in the project may simply be stopped.
     for inst in &instances {
-        if inst.status.eq_ignore_ascii_case("TERMINATED") {
+        if inst.status.eq_ignore_ascii_case("TERMINATED")
+            && crate::gcp::is_fleet_instance_name(&inst.name)
+        {
             let _ = gcp
                 .delete_instance(&project, &inst.zone, &inst.name, now)
                 .await;
