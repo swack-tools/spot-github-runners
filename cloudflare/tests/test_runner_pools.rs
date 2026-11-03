@@ -678,7 +678,7 @@ async fn reconciler_launches_a_missing_pool_host_on_its_shape_and_zone() {
     assert_eq!(req.metadata.get(POOL_METADATA_KEY), Some(id.as_str()));
     assert_eq!(req.metadata.get("spot-runner-count"), Some("2"));
     assert_eq!(req.labels.get(POOL_METADATA_KEY), Some(&id));
-    assert_eq!(req.scheduling.provisioning_model, "SPOT");
+    assert_eq!(req.scheduling.provisioning_model.as_deref(), Some("SPOT"));
     // Arm64 image and Hyperdisk for C4A.
     let boot = req.disks.iter().find(|d| d.boot).unwrap();
     let init = boot.initialize_params.as_ref().unwrap();
