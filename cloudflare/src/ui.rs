@@ -3644,9 +3644,11 @@ function sortNum(v) { const m = /^[$~+]?(-?[\d,]*\.?\d+)/.exec(v); return m ? pa
 function sortTable(b) {
 const s = TSORT[b.id];
 if (!s || b.rows.length < 2) return;
-const rows = [...b.rows].map(r => { const k = sortKey(r, s.i); return [r, k, sortNum(k)]; });
+const p = b.querySelector("[data-after]"), h = p && p.previousElementSibling;
+const rows = [...b.rows].filter(r => r !== p).map(r => { const k = sortKey(r, s.i); return [r, k, sortNum(k)]; });
 rows.sort(([, a, p], [, c, q]) => p === p ? (q === q ? (p - q) * s.d : -1) : q === q ? 1 : a.localeCompare(c, undefined, { numeric: true }) * s.d);
 b.append(...rows.map(x => x[0]));
+if (h) h.after(p);
 }
 function sortByHeader(h) {
 if (h.onclick) return h.click();

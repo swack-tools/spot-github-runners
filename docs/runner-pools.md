@@ -2,7 +2,7 @@
 
 A runner pool is a set of Spot hosts that you start from the dashboard. You pick a machine from the **Qualifying Instances Matrix**, choose the organization or repository the runners register with, and say how many runners each host runs. By default a pool spins down when it's idle: it runs no hosts until a job asks for its runners, starts hosts for the queued jobs, and deletes hosts that sit idle. The Worker's reconciler does this every 5 minutes, and starts a replacement when Spot takes a host back.
 
-Pools sit next to the fleet floor described in [Fleet and autoscaler](fleet-and-autoscaler.md). The floor keeps one fixed-shape x86 host for each built-in target. A pool can use any machine type that the matrix marks as launchable, including small 2 vCPU hosts and ARM64 Axion hosts, and any organization or repository the Worker's GitHub token can register runners with.
+Pools sit next to the fleet floor described in [Fleet and autoscaler](fleet-and-autoscaler.md). The floor keeps one fixed-shape x86 host for each built-in target. A pool can use any machine type that the matrix lists, including small 2 vCPU hosts and ARM64 Axion hosts, and any organization or repository the Worker's GitHub token can register runners with.
 
 ## Before you begin
 
@@ -33,7 +33,11 @@ The prices are GCP's Spot list prices for `us-central1`, per vCPU and per GiB of
 
 ## Launch a pool
 
-1. In the matrix, select **CI/CD Runner Candidates**, then click **Launch** on the row you want. **Launch** is unavailable for machine types that can't host runners yet; hover over it to see why.
+1. In the matrix, select **CI/CD Runner Candidates**. The matrix lists only machines a pool can launch, and the strip over it counts how many are ready and how many need a budget change. Each row's chip shows **Ready**, **Over cap**, or **Pools full**.
+1. Click **Launch** on the row you want. A panel opens under the row.
+1. Set **Hosts** and the organization or repository. The bar shows what the hosts add against the hourly budget cap.
+1. To launch with the defaults, click **Launch up to** the number of hosts you set. Over the cap, the button reads **Raise cap to** the amount needed **and launch**, and it does both. The defaults are one or more runners per host sized from your profile, spin-down when idle, and no extra labels or template. Then copy the `runs-on` line and click **Done**, and skip the remaining steps.
+1. To change the defaults, click **More options** instead.
 1. In the **Launch runners** dialog, set these fields:
 
     | Field | What it does |

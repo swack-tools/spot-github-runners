@@ -368,7 +368,7 @@ fn rejects_runners_that_do_not_fit_the_host() {
 fn rejects_unknown_shapes_bad_targets_zones_and_labels() {
     let state = base_state().state;
     let cases: Vec<Box<dyn Fn(&mut CreateRunnerPoolRequest)>> = vec![
-        Box::new(|r| r.machine_type = "n4-standard-16".into()),
+        Box::new(|r| r.machine_type = "m3-standard-16".into()),
         Box::new(|r| r.machine_type = "e2-micro".into()),
         Box::new(|r| r.target = "swack-tools; rm -rf /".into()),
         Box::new(|r| r.target = "a/b/c".into()),
@@ -478,11 +478,22 @@ fn pools_together_stay_under_the_hourly_budget() {
 }
 
 #[test]
-fn every_launchable_machine_type_is_allowlisted_and_sized() {
-    for mt in launchable_machine_types() {
-        let (vcpu, ram) = machine_shape(mt).unwrap();
-        assert!(vcpu >= 2 && ram >= 8, "{}", mt);
-        // The name-derived shape and price agree with the pool table.
+fn every_series_with_a_spot_price_hosts_runners_at_predefined_sizes() {
+    // Everything pools launched before the rule replaced the allowlist still launches.
+    for mt in spot_dashboard_edge::patch::PERMITTED_MACHINE_TYPES
+        .iter()
+        .chain(spot_dashboard_edge::patch::PERMITTED_ARM64_MACHINE_TYPES.iter())
+        .chain(
+            [
+                "e2-standard-2",
+                "t2d-standard-4",
+                "c4a-standard-2",
+                "n4a-standard-4",
+            ]
+            .iter(),
+        )
+    {
+        let (vcpu, ram) = machine_shape(mt).unwrap_or_else(|| panic!("{}", mt));
         let (q_vcpu, q_ram) = spot_dashboard_edge::qualify::machine_shape(mt).unwrap();
         assert_eq!((vcpu, ram as f64), (q_vcpu, q_ram.floor()), "{}", mt);
         assert!(
@@ -491,14 +502,30 @@ fn every_launchable_machine_type_is_allowlisted_and_sized() {
             mt
         );
     }
-    // Small hosts are for pools only; the floor's patch allowlists stay as they were.
-    for mt in POOL_SMALL_MACHINE_TYPES {
-        assert!(launchable_machine_types().contains(mt));
-        assert!(!spot_dashboard_edge::patch::PERMITTED_MACHINE_TYPES.contains(mt));
-        assert!(!spot_dashboard_edge::patch::PERMITTED_ARM64_MACHINE_TYPES.contains(mt));
+    assert_eq!(machine_shape("c4-standard-16"), Some((16, 60)));
+    assert_eq!(machine_shape("n4-standard-16"), Some((16, 64)));
+    assert!(spot_dashboard_edge::state::machine_type_hourly_usd("c4-standard-16").is_some());
+    // The floor's patch allowlists don't grow with what pools can launch.
+    assert!(!spot_dashboard_edge::patch::PERMITTED_MACHINE_TYPES.contains(&"c4-standard-16"));
+}
+
+#[test]
+fn machines_that_cannot_host_runners_have_no_shape() {
+    for mt in [
+        "",
+        "c4",
+        "c4-standard",
+        "c4-standard-x",
+        "c4-standard-16-lssd",
+        "c4-standard-3",
+        "c4-megamem-16",
+        "m3-standard-16", // no Spot price known
+        "t2d-highcpu-16", // Tau T2 only sells standard
+        "t2a-highmem-8",
+        "e2-highcpu-16", // sizes differently from the name rule
+    ] {
+        assert_eq!(machine_shape(mt), None, "{}", mt);
     }
-    assert!(launchable_machine_types().contains(&"c4a-highcpu-16"));
-    assert!(!launchable_machine_types().contains(&"n4-standard-16"));
 }
 
 // ============================================================================
@@ -524,11 +551,10 @@ async fn create_list_and_remove_round_trip() {
 
     let listed = handle_get_runner_pools(&kv, NOW).await.unwrap();
     assert_eq!(listed["pools"].as_array().unwrap().len(), 1);
-    assert!(listed["machine_types"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|m| m["machine_type"] == "c4a-highcpu-16" && m["usable_ram_gib"] == 30));
+    assert_eq!(
+        listed["limits"]["host_reserved_ram_gib"],
+        HOST_RESERVED_RAM_GIB
+    );
     assert!(listed["targets"]
         .as_array()
         .unwrap()
@@ -579,6 +605,39 @@ async fn seed_pool(
     kv.store(&b);
     let view = handle_create_runner_pool(kv, req, "o", NOW).await.unwrap();
     view["created"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn a_row_the_old_allowlist_refused_launches_on_hyperdisk_and_gvnic() {
+    let _g = lock();
+    invalidate_state_cache();
+    reset_reconciler_state();
+    let kv = Kv::default();
+    seed_pool(
+        &kv,
+        |_| {},
+        CreateRunnerPoolRequest {
+            machine_type: "c4-standard-16".into(),
+            zone: "northamerica-northeast1-a".into(),
+            labels: vec![],
+            ..axion_request("swack-tools")
+        },
+    )
+    .await;
+    let gcp = Gcp::default();
+    let gh = Gh::default();
+
+    let report = run_reconciliation(&kv, &gcp, &gh, NOW + 60).await.unwrap();
+    assert_eq!(report.launched_hosts.len(), 1, "{:?}", report);
+    let inserted = gcp.inserted.lock().unwrap().clone();
+    let (zone, req) = &inserted[0];
+    assert_eq!(zone, "northamerica-northeast1-a");
+    assert!(req.machine_type.ends_with("/c4-standard-16"));
+    assert_eq!(req.network_interfaces[0].nic_type.as_deref(), Some("GVNIC"));
+    assert!(req.disks.iter().all(|d| d
+        .initialize_params
+        .as_ref()
+        .is_some_and(|p| p.disk_type.contains("hyperdisk-balanced"))));
 }
 
 #[tokio::test]

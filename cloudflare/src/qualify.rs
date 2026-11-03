@@ -9,7 +9,7 @@
 use serde_json::{json, Map, Value};
 
 /// When [`spot_rates`] was read from the Cloud Billing Catalog API (service `6F81-5844-456A`).
-pub const SPOT_PRICES_AS_OF: &str = "2026-11-01";
+pub const SPOT_PRICES_AS_OF: &str = "2026-11-02";
 /// Where the rates apply. Other regions differ by up to about a third.
 pub const SPOT_PRICES_REGION: &str = "us-central1";
 pub const PRICING_SOURCE: &str = "gce_spot_list_price";
@@ -21,13 +21,14 @@ pub fn spot_rates(series: &str) -> Option<(f64, f64)> {
     Some(match series {
         "e2" => (0.01309, 0.001754),
         "t2d" => (0.0165, 0.002212),
-        "t2a" => (0.01345, 0.001836),
-        "c4a" => (0.01525, 0.001736),
+        "t2a" => (0.01278, 0.001744),
+        "c4a" => (0.01601, 0.001823),
         "n4a" => (0.01002, 0.001141),
-        "c2d" => (0.01357, 0.001819),
+        "c2d" => (0.01289, 0.001728),
         // Billed per GB; converted to GiB.
-        "c4d" => (0.01452, 0.001554 * 1.073_741_824),
-        "n4" => (0.01845, 0.002094),
+        "c4d" => (0.01379, 0.001476 * 1.073_741_824),
+        "n4" => (0.01753, 0.001989),
+        "c4" => (0.02074, 0.002357),
         "n4d" => (0.01745, 0.001986),
         _ => return None,
     })
@@ -63,6 +64,7 @@ pub fn machine_shape(machine_type: &str) -> Option<(u32, f64)> {
         ("c4d", "highmem") => 7.75,
         ("c4", "standard") => 3.75,
         ("c4", "highcpu") => 2.0,
+        ("c4", "highmem") => 7.75,
         (_, "standard") => 4.0,
         (_, "highcpu") => 2.0,
         (_, "highmem") => 8.0,
@@ -348,8 +350,9 @@ fn disk_matches(category: &str, disk_type: &str) -> bool {
 }
 
 /// Filters `catalog` by `requirements_json` and prices what's left. `role` is `cicd_runner` or
-/// `rust_builder`. Rows keep their own fields; sizing, prices, `price_qualifies` and, for runners,
-/// `launchable` (whether a runner pool can start that machine type) are worked out here.
+/// `rust_builder`. Rows keep their own fields; sizing, prices and `price_qualifies` are worked out
+/// here. For runners, a row must be something a pool can launch: machine types that can't host
+/// runners and zones this project can't use are left out, so every listed row can be launched.
 pub fn qualify(role: &str, requirements_json: &Value, catalog: &[Value]) -> Value {
     let req = Requirements::from_json(requirements_json);
     let reserve = if role == "rust_builder" {
@@ -360,6 +363,7 @@ pub fn qualify(role: &str, requirements_json: &Value, catalog: &[Value]) -> Valu
     let mut seen = std::collections::HashSet::new();
     let mut hardware: Vec<Value> = Vec::new();
     let (mut insufficient, mut below_bench, mut bad_disk, mut over_budget) = (0, 0, 0, 0);
+    let mut cannot_host = 0;
     for row in catalog {
         let Some(obj) = row.as_object() else { continue };
         let mt = obj
@@ -368,6 +372,13 @@ pub fn qualify(role: &str, requirements_json: &Value, catalog: &[Value]) -> Valu
             .unwrap_or("");
         let zone = obj.get("zone").and_then(|v| v.as_str()).unwrap_or("");
         if mt.is_empty() || !seen.insert(format!("{}|{}", mt, zone)) {
+            continue;
+        }
+        if role == "cicd_runner"
+            && (crate::runner_pools::machine_shape(mt).is_none()
+                || !crate::runner_pools::is_known_gce_zone(zone))
+        {
+            cannot_host += 1;
             continue;
         }
         let shape = machine_shape(mt);
@@ -453,9 +464,10 @@ pub fn qualify(role: &str, requirements_json: &Value, catalog: &[Value]) -> Valu
         );
         out.insert("price_qualifies".into(), json!(fits));
         if role == "cicd_runner" {
+            // What one host adds to the pools' hourly budget check, as the server works it out.
             out.insert(
-                "launchable".into(),
-                json!(crate::runner_pools::machine_shape(mt).is_some()),
+                "pool_host_hourly_usd".into(),
+                json!(crate::state::machine_type_hourly_usd(mt)),
             );
         }
         if !fits {
@@ -487,6 +499,7 @@ pub fn qualify(role: &str, requirements_json: &Value, catalog: &[Value]) -> Valu
             "exceeds_spot_budget": over_budget,
             "exceeds_max_instances": 0,
             "region_disabled": 0,
+            "cannot_host_runners": cannot_host,
         },
         "pricing_source": PRICING_SOURCE,
         "pricing_region": SPOT_PRICES_REGION,
